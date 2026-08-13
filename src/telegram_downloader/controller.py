@@ -77,6 +77,12 @@ class _NullLoginDialog:
     def show_error(self, _message: str) -> None:
         pass
 
+    def show_qr(self, _url: str, _expires_at: datetime) -> None:
+        pass
+
+    def show_qr_status(self, _text: str) -> None:
+        pass
+
     def show_ready(self, _name: str) -> None:
         pass
 
@@ -160,6 +166,8 @@ class AppController:
         self.phone = ""
         self.phone_code_hash = ""
         self._background: set[asyncio.Task[Any]] = set()
+        self._qr_wait_task: asyncio.Task[None] | None = None
+        self._qr_generation = 0
         self._ui_slots: list[object] = []
         self._shutting_down = False
         self._settings_dialog: Any | None = None
@@ -217,6 +225,9 @@ class AppController:
         proxy_password: str,
     ) -> None:
         try:
+            await self._cancel_qr_wait()
+            if self.gateway is not None:
+                await self.gateway.disconnect()
             updated_settings = replace(self.settings, api_id=api_id, proxy=proxy)
             updated_secrets = dict(self.secrets)
             updated_secrets["api_hash"] = api_hash
@@ -245,11 +256,107 @@ class AppController:
                     gateway,
                     updated_settings.concurrency,
                 )
-            from telegram_downloader.ui.login import LoginPage
-
-            self.login_dialog.show_page(LoginPage.PHONE)
+            await self.begin_qr_login()
         except Exception as error:
             self.login_dialog.show_error(self._safe_error(error))
+
+    async def begin_qr_login(self) -> None:
+        if self.gateway is None:
+            self.login_dialog.show_error("请先填写 API 凭据")
+            return
+        try:
+            await self._cancel_qr_wait()
+            info = await self.gateway.begin_qr_login()
+            self._show_qr_and_wait(info)
+        except Exception as error:
+            self.login_dialog.show_error(self._safe_error(error))
+
+    async def refresh_qr_login(self) -> None:
+        if self.gateway is None:
+            self.login_dialog.show_error("请先填写 API 凭据")
+            return
+        try:
+            await self._cancel_qr_wait()
+            info = await self.gateway.refresh_qr_login()
+            self._show_qr_and_wait(info)
+        except Exception as error:
+            self.login_dialog.show_error(self._safe_error(error))
+
+    async def use_phone_fallback(self) -> None:
+        await self._cancel_qr_wait()
+        from telegram_downloader.ui.login import LoginPage
+
+        self.login_dialog.show_page(LoginPage.PHONE)
+
+    async def edit_credentials(self) -> None:
+        await self._cancel_qr_wait()
+        if self.gateway is not None:
+            await self.gateway.disconnect()
+        from telegram_downloader.ui.login import LoginPage
+
+        self.login_dialog.show_page(LoginPage.CREDENTIALS)
+
+    async def cancel_login(self) -> None:
+        await self._cancel_qr_wait()
+        if self.gateway is not None:
+            await self.gateway.disconnect()
+
+    def _show_qr_and_wait(self, info) -> None:
+        self._display_qr(info)
+        self._qr_generation += 1
+        generation = self._qr_generation
+        task = asyncio.create_task(self._wait_for_qr(generation))
+        self._qr_wait_task = task
+
+    def _display_qr(self, info) -> None:
+        self.login_dialog.show_qr(info.url, info.expires_at)
+        self.login_dialog.show_qr_status("等待手机扫码确认")
+
+    async def _cancel_qr_wait(self) -> None:
+        task = self._qr_wait_task
+        self._qr_wait_task = None
+        self._qr_generation += 1
+        if task is None or task is asyncio.current_task():
+            return
+        if not task.done():
+            task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    async def _wait_for_qr(self, generation: int) -> None:
+        if self.gateway is None:
+            return
+        try:
+            while generation == self._qr_generation:
+                try:
+                    state = await self.gateway.wait_qr_login()
+                except TimeoutError:
+                    info = await self.gateway.refresh_qr_login()
+                    if generation != self._qr_generation:
+                        return
+                    self._display_qr(info)
+                    continue
+                if generation != self._qr_generation:
+                    return
+                if state is AuthState.PASSWORD_REQUIRED:
+                    from telegram_downloader.ui.login import LoginPage
+
+                    self.login_dialog.show_page(LoginPage.PASSWORD)
+                    return
+                await self._finish_login()
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            safe = self._safe_error(error)
+            if isinstance(error, (GatewayError, ValueError)):
+                _LOGGER.warning("QR login failed (%s): %s", type(error).__name__, safe)
+            else:
+                _LOGGER.error("QR login failed (%s)", type(error).__name__)
+            self.login_dialog.show_error(safe)
+        finally:
+            if self._qr_wait_task is asyncio.current_task():
+                self._qr_wait_task = None
 
     async def submit_phone(self, phone: str) -> None:
         if self.gateway is None:
@@ -370,6 +477,7 @@ class AppController:
         if self._shutting_down:
             return
         self._shutting_down = True
+        await self._cancel_qr_wait()
         await self.scheduler.shutdown()
         pending = tuple(task for task in self._background if not task.done())
         if pending:
@@ -406,6 +514,16 @@ class AppController:
         self.login_dialog.show()
         self.login_dialog.raise_()
         self.login_dialog.activateWindow()
+        if (
+            self.gateway is not None
+            and self.settings.api_id > 0
+            and self.secrets.get("api_hash", "")
+        ):
+            self._spawn_background(self.begin_qr_login())
+            return
+        from telegram_downloader.ui.login import LoginPage
+
+        self.login_dialog.show_page(LoginPage.CREDENTIALS)
 
     async def _finish_login(self) -> None:
         if self.gateway is None:

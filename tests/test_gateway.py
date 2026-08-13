@@ -98,6 +98,37 @@ async def test_qr_login_begin_wait_and_refresh() -> None:
 
 
 @pytest.mark.asyncio
+async def test_qr_begin_connects_disconnected_client_first() -> None:
+    expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
+
+    class FakeQr:
+        url = "tg://login?token=first"
+
+        def __init__(self):
+            self.expires = expires
+
+    class Client:
+        def __init__(self):
+            self.connected = False
+            self.connect_calls = 0
+
+        async def connect(self):
+            self.connect_calls += 1
+            self.connected = True
+
+        async def qr_login(self):
+            assert self.connected is True
+            return FakeQr()
+
+    client = Client()
+    gateway = TelethonGateway.from_client_for_test(client, connected=False)
+
+    await gateway.begin_qr_login()
+
+    assert client.connect_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_qr_wait_reports_2fa_requirement() -> None:
     class PasswordNeeded(Exception):
         pass

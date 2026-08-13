@@ -6,8 +6,14 @@ import pytest
 
 from telegram_downloader.controller import AppController
 from telegram_downloader.domain import MediaKind, TaskStatus
-from telegram_downloader.gateway import AccessDeniedError, AuthState
-from telegram_downloader.settings import ProxySettings
+from telegram_downloader.gateway import (
+    AccessDeniedError,
+    AuthState,
+    GatewayError,
+    QrLoginInfo,
+)
+from telegram_downloader.settings import AppSettings, ProxySettings
+from telegram_downloader.ui.login import LoginPage
 
 
 class Vault:
@@ -92,6 +98,568 @@ async def test_credentials_store_secrets_separately_from_settings() -> None:
     assert controller.settings_store.value.api_id == 123
     assert vault.value == {"api_hash": "api-secret", "proxy_password": "proxy-secret"}
     assert created[0][0] == 123
+
+
+@pytest.mark.asyncio
+async def test_credentials_start_qr_login_instead_of_phone_flow() -> None:
+    expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
+
+    class Gateway:
+        async def connect(self):
+            return None
+
+        async def begin_qr_login(self):
+            return QrLoginInfo("tg://login?token=first", expires)
+
+        async def wait_qr_login(self):
+            return AuthState.PASSWORD_REQUIRED
+
+    class Dialog:
+        def __init__(self):
+            self.pages = []
+            self.qr = None
+
+        def show_qr(self, url, expires_at):
+            self.qr = (url, expires_at)
+
+        def show_qr_status(self, _text):
+            pass
+
+        def show_page(self, page):
+            self.pages.append(page)
+
+        def show_error(self, _message):
+            pass
+
+    dialog = Dialog()
+    controller = AppController.for_test(
+        login_dialog=dialog,
+        gateway_factory=lambda *args: Gateway(),
+    )
+
+    await controller.submit_credentials(123, "api-secret", ProxySettings(), "")
+    await asyncio.sleep(0)
+
+    assert dialog.qr == ("tg://login?token=first", expires)
+    assert LoginPage.PHONE not in dialog.pages
+    assert dialog.pages[-1] is LoginPage.PASSWORD
+    assert controller._qr_wait_task is None
+
+
+@pytest.mark.asyncio
+async def test_show_login_uses_saved_credentials_for_qr() -> None:
+    expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
+
+    class Gateway:
+        async def begin_qr_login(self):
+            return QrLoginInfo("tg://login?token=saved", expires)
+
+        async def wait_qr_login(self):
+            return AuthState.PASSWORD_REQUIRED
+
+    class Dialog:
+        def __init__(self):
+            self.shown = False
+            self.qr = None
+            self.pages = []
+
+        def show(self):
+            self.shown = True
+
+        def raise_(self):
+            pass
+
+        def activateWindow(self):
+            pass
+
+        def show_qr(self, url, expires_at):
+            self.qr = (url, expires_at)
+
+        def show_qr_status(self, _text):
+            pass
+
+        def show_page(self, page):
+            self.pages.append(page)
+
+        def show_error(self, _message):
+            pass
+
+    dialog = Dialog()
+    settings = AppSettings(api_id=123)
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        login_dialog=dialog,
+        settings=settings,
+        secrets={"api_hash": "saved-hash"},
+    )
+
+    controller.show_login()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert dialog.shown is True
+    assert dialog.qr == ("tg://login?token=saved", expires)
+    assert dialog.pages[-1] is LoginPage.PASSWORD
+
+
+@pytest.mark.asyncio
+async def test_manual_qr_refresh_cancels_old_wait_before_starting_new() -> None:
+    expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
+
+    class Gateway:
+        def __init__(self):
+            self.wait_calls = 0
+            self.active = 0
+            self.peak = 0
+            self.cancelled = 0
+
+        async def begin_qr_login(self):
+            return QrLoginInfo("tg://login?token=first", expires)
+
+        async def refresh_qr_login(self):
+            return QrLoginInfo("tg://login?token=second", expires)
+
+        async def wait_qr_login(self):
+            self.wait_calls += 1
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
+            finally:
+                self.active -= 1
+
+    class Dialog:
+        def __init__(self):
+            self.urls = []
+
+        def show_qr(self, url, _expires_at):
+            self.urls.append(url)
+
+        def show_qr_status(self, _text):
+            pass
+
+        def show_error(self, _text):
+            pass
+
+    gateway = Gateway()
+    controller = AppController.for_test(gateway=gateway, login_dialog=Dialog())
+
+    await controller.begin_qr_login()
+    await asyncio.sleep(0)
+    try:
+        await controller.refresh_qr_login()
+        await asyncio.sleep(0)
+
+        assert gateway.wait_calls == 2
+        assert gateway.cancelled == 1
+        assert gateway.peak == 1
+        assert controller.login_dialog.urls == [
+            "tg://login?token=first",
+            "tg://login?token=second",
+        ]
+    finally:
+        if controller._qr_wait_task is not None:
+            controller._qr_wait_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await controller._qr_wait_task
+
+
+@pytest.mark.asyncio
+async def test_expired_qr_refreshes_in_same_wait_task() -> None:
+    expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
+
+    class Gateway:
+        def __init__(self):
+            self.wait_calls = 0
+            self.refresh_calls = 0
+
+        async def begin_qr_login(self):
+            return QrLoginInfo("tg://login?token=first", expires)
+
+        async def refresh_qr_login(self):
+            self.refresh_calls += 1
+            return QrLoginInfo("tg://login?token=second", expires)
+
+        async def wait_qr_login(self):
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise TimeoutError
+            return AuthState.PASSWORD_REQUIRED
+
+    class Dialog:
+        def __init__(self):
+            self.urls = []
+            self.pages = []
+
+        def show_qr(self, url, _expires_at):
+            self.urls.append(url)
+
+        def show_qr_status(self, _text):
+            pass
+
+        def show_page(self, page):
+            self.pages.append(page)
+
+        def show_error(self, _text):
+            pass
+
+    gateway = Gateway()
+    dialog = Dialog()
+    controller = AppController.for_test(gateway=gateway, login_dialog=dialog)
+
+    await controller.begin_qr_login()
+    task = controller._qr_wait_task
+    assert task is not None
+    await task
+
+    assert gateway.wait_calls == 2
+    assert gateway.refresh_calls == 1
+    assert dialog.urls == [
+        "tg://login?token=first",
+        "tg://login?token=second",
+    ]
+    assert dialog.pages[-1] is LoginPage.PASSWORD
+
+
+@pytest.mark.asyncio
+async def test_successful_qr_login_saves_session_through_common_finish_path() -> None:
+    expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
+
+    class Gateway:
+        async def begin_qr_login(self):
+            return QrLoginInfo("tg://login?token=first", expires)
+
+        async def wait_qr_login(self):
+            return AuthState.READY
+
+        def export_session(self):
+            return "qr-portable-session"
+
+        async def account_name(self):
+            return "QR User"
+
+    class Dialog:
+        def __init__(self):
+            self.ready = None
+            self.accepted = False
+
+        def show_qr(self, _url, _expires_at):
+            pass
+
+        def show_qr_status(self, _text):
+            pass
+
+        def show_ready(self, name):
+            self.ready = name
+
+        def accept(self):
+            self.accepted = True
+
+        def show_error(self, _text):
+            pass
+
+    vault = Vault()
+    dialog = Dialog()
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        login_dialog=dialog,
+        vault=vault,
+    )
+
+    await controller.begin_qr_login()
+    task = controller._qr_wait_task
+    assert task is not None
+    await task
+
+    assert vault.value["session"] == "qr-portable-session"
+    assert controller.window.account == "QR User"
+    assert dialog.ready == "QR User"
+    assert dialog.accepted is True
+
+
+@pytest.mark.asyncio
+async def test_phone_fallback_cancels_qr_wait_before_switching_page() -> None:
+    expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
+
+    class Gateway:
+        def __init__(self):
+            self.cancelled = False
+
+        async def begin_qr_login(self):
+            return QrLoginInfo("tg://login?token=first", expires)
+
+        async def wait_qr_login(self):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+    class Dialog:
+        def __init__(self):
+            self.page = None
+
+        def show_qr(self, _url, _expires_at):
+            pass
+
+        def show_qr_status(self, _text):
+            pass
+
+        def show_page(self, page):
+            self.page = page
+
+        def show_error(self, _text):
+            pass
+
+    gateway = Gateway()
+    dialog = Dialog()
+    controller = AppController.for_test(gateway=gateway, login_dialog=dialog)
+    await controller.begin_qr_login()
+    await asyncio.sleep(0)
+
+    await controller.use_phone_fallback()
+
+    assert gateway.cancelled is True
+    assert dialog.page is LoginPage.PHONE
+    assert controller._qr_wait_task is None
+
+
+@pytest.mark.asyncio
+async def test_edit_credentials_cancels_qr_and_disconnects_old_gateway() -> None:
+    expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
+
+    class Gateway:
+        def __init__(self):
+            self.cancelled = False
+            self.disconnected = 0
+
+        async def begin_qr_login(self):
+            return QrLoginInfo("tg://login?token=first", expires)
+
+        async def wait_qr_login(self):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+        async def disconnect(self):
+            self.disconnected += 1
+
+    class Dialog:
+        def __init__(self):
+            self.page = None
+
+        def show_qr(self, _url, _expires_at):
+            pass
+
+        def show_qr_status(self, _text):
+            pass
+
+        def show_page(self, page):
+            self.page = page
+
+        def show_error(self, _text):
+            pass
+
+    gateway = Gateway()
+    dialog = Dialog()
+    controller = AppController.for_test(gateway=gateway, login_dialog=dialog)
+    await controller.begin_qr_login()
+    await asyncio.sleep(0)
+
+    await controller.edit_credentials()
+
+    assert gateway.cancelled is True
+    assert gateway.disconnected == 1
+    assert dialog.page is LoginPage.CREDENTIALS
+
+
+@pytest.mark.asyncio
+async def test_new_credentials_replace_old_gateway_in_safe_order() -> None:
+    expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
+    order = []
+
+    class OldGateway:
+        async def begin_qr_login(self):
+            return QrLoginInfo("tg://login?token=old", expires)
+
+        async def wait_qr_login(self):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                order.append("old-qr-cancelled")
+                raise
+
+        async def disconnect(self):
+            order.append("old-disconnected")
+
+    class NewGateway:
+        async def connect(self):
+            order.append("new-connected")
+
+        async def begin_qr_login(self):
+            return QrLoginInfo("tg://login?token=new", expires)
+
+        async def wait_qr_login(self):
+            return AuthState.PASSWORD_REQUIRED
+
+    class Dialog:
+        def show_qr(self, _url, _expires_at):
+            pass
+
+        def show_qr_status(self, _text):
+            pass
+
+        def show_page(self, _page):
+            pass
+
+        def show_error(self, _text):
+            pass
+
+    old = OldGateway()
+    controller = AppController.for_test(
+        gateway=old,
+        login_dialog=Dialog(),
+        gateway_factory=lambda *args: NewGateway(),
+    )
+    await controller.begin_qr_login()
+    await asyncio.sleep(0)
+
+    await controller.submit_credentials(456, "new-api-secret", ProxySettings(), "")
+    await asyncio.sleep(0)
+
+    assert order == ["old-qr-cancelled", "old-disconnected", "new-connected"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_login_stops_qr_wait_and_disconnects_client() -> None:
+    expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
+
+    class Gateway:
+        def __init__(self):
+            self.cancelled = False
+            self.disconnected = 0
+
+        async def begin_qr_login(self):
+            return QrLoginInfo("tg://login?token=first", expires)
+
+        async def wait_qr_login(self):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+        async def disconnect(self):
+            self.disconnected += 1
+
+    gateway = Gateway()
+    controller = AppController.for_test(gateway=gateway)
+    await controller.begin_qr_login()
+    await asyncio.sleep(0)
+
+    await controller.cancel_login()
+
+    assert gateway.cancelled is True
+    assert gateway.disconnected == 1
+    assert controller._qr_wait_task is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_qr_wait_before_disconnecting_gateway() -> None:
+    expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
+    order = []
+
+    class Gateway:
+        async def begin_qr_login(self):
+            return QrLoginInfo("tg://login?token=first", expires)
+
+        async def wait_qr_login(self):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                order.append("qr-cancelled")
+                raise
+
+        async def disconnect(self):
+            order.append("gateway-disconnected")
+
+    class Scheduler:
+        async def shutdown(self):
+            order.append("scheduler-stopped")
+
+    controller = AppController.for_test(gateway=Gateway(), scheduler=Scheduler())
+    await controller.begin_qr_login()
+    await asyncio.sleep(0)
+
+    await controller.shutdown()
+
+    assert order == ["qr-cancelled", "scheduler-stopped", "gateway-disconnected"]
+    assert controller._qr_wait_task is None
+
+
+@pytest.mark.asyncio
+async def test_qr_wait_failure_is_consumed_and_shown_safely() -> None:
+    expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
+
+    class Gateway:
+        async def begin_qr_login(self):
+            return QrLoginInfo("tg://login?token=first", expires)
+
+        async def wait_qr_login(self):
+            raise GatewayError("Telegram 网络连接失败")
+
+    class Dialog:
+        def __init__(self):
+            self.error = None
+
+        def show_qr(self, _url, _expires_at):
+            pass
+
+        def show_qr_status(self, _text):
+            pass
+
+        def show_error(self, text):
+            self.error = text
+
+    dialog = Dialog()
+    controller = AppController.for_test(gateway=Gateway(), login_dialog=dialog)
+
+    await controller.begin_qr_login()
+    task = controller._qr_wait_task
+    assert task is not None
+    await task
+
+    assert dialog.error == "Telegram 网络连接失败"
+
+
+def test_show_login_without_credentials_returns_to_credentials_page() -> None:
+    class Dialog:
+        def __init__(self):
+            self.page = LoginPage.PHONE
+
+        def show(self):
+            pass
+
+        def raise_(self):
+            pass
+
+        def activateWindow(self):
+            pass
+
+        def show_page(self, page):
+            self.page = page
+
+    dialog = Dialog()
+    controller = AppController.for_test(login_dialog=dialog)
+
+    controller.show_login()
+
+    assert dialog.page is LoginPage.CREDENTIALS
 
 
 @pytest.mark.asyncio

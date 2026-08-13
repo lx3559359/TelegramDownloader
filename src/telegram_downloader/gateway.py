@@ -170,6 +170,7 @@ class TelethonGateway:
         self._check_invite_request = functions.messages.CheckChatInviteRequest
         self._peer_id_getter = utils.get_peer_id
         self._qr_login: object | None = None
+        self._connected = False
 
     @classmethod
     def from_client_for_test(
@@ -186,6 +187,7 @@ class TelethonGateway:
             TimeoutError,
         ),
         peer_id_getter=None,
+        connected: bool = True,
     ) -> TelethonGateway:
         gateway = cls.__new__(cls)
         gateway._client = client
@@ -197,6 +199,7 @@ class TelethonGateway:
         gateway._check_invite_request = None
         gateway._peer_id_getter = peer_id_getter or (lambda entity: entity)
         gateway._qr_login = None
+        gateway._connected = connected
         return gateway
 
     async def connect(self) -> None:
@@ -204,6 +207,7 @@ class TelethonGateway:
             await self._client.connect()
         except Exception as exc:
             self._raise_mapped(exc)
+        self._connected = True
 
     async def request_code(self, phone: str) -> str:
         try:
@@ -241,6 +245,8 @@ class TelethonGateway:
         return AuthState.READY
 
     async def begin_qr_login(self) -> QrLoginInfo:
+        if not self._connected:
+            await self.connect()
         try:
             self._qr_login = await self._client.qr_login()
         except Exception as exc:
@@ -420,6 +426,8 @@ class TelethonGateway:
             await self._client.disconnect()
         except Exception as exc:
             self._raise_mapped(exc)
+        finally:
+            self._connected = False
 
     async def _resolve_entity(self, entity_ref: str) -> object:
         try:

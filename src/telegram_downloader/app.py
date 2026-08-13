@@ -214,6 +214,22 @@ def create_application(root: Path):
     async def password_submitted(password: str) -> None:
         await controller.submit_password(password)
 
+    @qasync.asyncSlot()
+    async def qr_refresh_requested() -> None:
+        await controller.refresh_qr_login()
+
+    @qasync.asyncSlot()
+    async def phone_fallback_requested() -> None:
+        await controller.use_phone_fallback()
+
+    @qasync.asyncSlot()
+    async def credentials_edit_requested() -> None:
+        await controller.edit_credentials()
+
+    @qasync.asyncSlot()
+    async def login_cancelled() -> None:
+        await controller.cancel_login()
+
     @qasync.asyncSlot(str)
     async def resume_requested(task_id: str) -> None:
         await controller.resume_task(task_id)
@@ -253,6 +269,10 @@ def create_application(root: Path):
     login_dialog.phone_submitted.connect(phone_submitted)
     login_dialog.code_submitted.connect(code_submitted)
     login_dialog.password_submitted.connect(password_submitted)
+    login_dialog.qr_refresh_requested.connect(qr_refresh_requested)
+    login_dialog.phone_fallback_requested.connect(phone_fallback_requested)
+    login_dialog.credentials_edit_requested.connect(credentials_edit_requested)
+    login_dialog.login_cancelled.connect(login_cancelled)
     controller._ui_slots.extend(
         (
             scan_requested,
@@ -260,6 +280,10 @@ def create_application(root: Path):
             phone_submitted,
             code_submitted,
             password_submitted,
+            qr_refresh_requested,
+            phone_fallback_requested,
+            credentials_edit_requested,
+            login_cancelled,
             resume_requested,
             retry_requested,
             open_settings,
