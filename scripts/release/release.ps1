@@ -8,6 +8,10 @@ $ErrorActionPreference = 'Stop'
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $projectPrefix = $projectRoot.TrimEnd('\') + '\'
+$initialAppData = $env:APPDATA
+if (-not $env:GH_CONFIG_DIR) {
+    $env:GH_CONFIG_DIR = Join-Path $initialAppData 'GitHub CLI'
+}
 
 function Assert-ProjectChild([string]$Candidate) {
     $resolved = [IO.Path]::GetFullPath($Candidate)

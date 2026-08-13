@@ -180,4 +180,5 @@ def test_release_script_stages_both_platforms_before_promoting() -> None:
     assert "gh repo create 'lx3559359/TelegramDownloader' --public" in script
     assert "publish_modelscope ensure-repo" in script
     assert "MODELSCOPE_API_TOKEN" in script
+    assert "$env:GH_CONFIG_DIR" in script
     assert "Write-Output $env:MODELSCOPE_API_TOKEN" not in script
