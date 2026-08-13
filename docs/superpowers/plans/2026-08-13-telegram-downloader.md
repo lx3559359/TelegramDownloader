@@ -228,7 +228,7 @@ git commit -m "build: bootstrap project-local Python environment"
 - Create: `src/telegram_downloader/paths.py`
 - Test: `tests/test_paths.py`
 
-- [ ] **Step 1: Write containment and directory-layout tests**
+- [x] **Step 1: Write containment and directory-layout tests**
 
 ```python
 # tests/test_paths.py
@@ -260,13 +260,13 @@ def test_guard_accepts_child_and_rejects_parent_escape(tmp_path: Path) -> None:
         paths.guard(tmp_path / ".." / "outside.bin")
 ```
 
-- [ ] **Step 2: Run the path tests and observe the missing module failure**
+- [x] **Step 2: Run the path tests and observe the missing module failure**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_paths.py -q`
 
 Expected: collection fails with `ModuleNotFoundError: telegram_downloader.paths`.
 
-- [ ] **Step 3: Implement one immutable registry for every writable path**
+- [x] **Step 3: Implement one immutable registry for every writable path**
 
 ```python
 # src/telegram_downloader/paths.py
@@ -340,13 +340,13 @@ class PortablePaths:
             self.guard(directory).mkdir(parents=True, exist_ok=True)
 ```
 
-- [ ] **Step 4: Run the focused tests**
+- [x] **Step 4: Run the focused tests**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_paths.py -q`
 
 Expected: `2 passed`.
 
-- [ ] **Step 5: Commit the portable path boundary**
+- [x] **Step 5: Commit the portable path boundary**
 
 ```powershell
 git add src/telegram_downloader/paths.py tests/test_paths.py
