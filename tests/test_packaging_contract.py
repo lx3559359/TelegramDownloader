@@ -8,12 +8,19 @@ def test_build_contract_uses_onedir_and_project_local_workpaths() -> None:
     test = (root / "scripts" / "test.ps1").read_text(encoding="utf-8")
 
     assert "COLLECT(" in spec
+    assert 'name="UpdateHelper"' in spec
+    assert "trusted_update_keys.json" in spec
     assert "console=False" in spec
     assert "QtWebEngine" in spec
     assert "--onefile" not in build
     assert ".build-temp" in build
     assert ".tool-cache" in build
     assert "smoke.ps1" in build
+    assert "generate_runtime_inventory.py" in build
+    assert "UpdateHelper.exe" in build
+    assert "$quotedConfirmation" in (root / "scripts" / "smoke.ps1").read_text(
+        encoding="utf-8"
+    )
     assert "APPDATA" in test
     assert "LOCALAPPDATA" in test
 

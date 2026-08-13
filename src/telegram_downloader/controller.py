@@ -128,6 +128,9 @@ class AppController:
         gateway_factory: Callable[..., TelegramGateway] | None = None,
         service_builder: Callable[[TelegramGateway, int], tuple[Any, Any]] | None = None,
         confirm_preview: Callable[[Any], bool] | None = None,
+        update_coordinator: Any | None = None,
+        update_prompt: Callable[[Any], bool] | None = None,
+        update_shutdown: Callable[[], None] | None = None,
         settings: AppSettings | None = None,
         secrets: dict[str, str] | None = None,
     ) -> None:
@@ -143,6 +146,9 @@ class AppController:
         self.gateway_factory = gateway_factory
         self.service_builder = service_builder
         self.confirm_preview = confirm_preview or (lambda _preview: True)
+        self.update_coordinator = update_coordinator
+        self.update_prompt = update_prompt or (lambda _manifest: False)
+        self.update_shutdown = update_shutdown or (lambda: None)
         self.settings = settings or settings_store.load()
         self.secrets = dict(secrets if secrets is not None else vault.load())
         self.phone = ""
@@ -169,6 +175,9 @@ class AppController:
             gateway_factory=dependencies.pop("gateway_factory", None),
             service_builder=dependencies.pop("service_builder", None),
             confirm_preview=dependencies.pop("confirm_preview", None),
+            update_coordinator=dependencies.pop("update_coordinator", None),
+            update_prompt=dependencies.pop("update_prompt", None),
+            update_shutdown=dependencies.pop("update_shutdown", None),
             settings=dependencies.pop("settings", None),
             secrets=dependencies.pop("secrets", None),
             **dependencies,
@@ -176,6 +185,8 @@ class AppController:
 
     async def start(self) -> None:
         self.refresh_tasks()
+        if self.update_coordinator is not None and self.settings.check_updates_on_startup:
+            self._spawn_background(self._run_update_check())
         if self.gateway is None:
             self.show_login()
             return
@@ -395,9 +406,23 @@ class AppController:
         return await method()
 
     def _start_task(self, task_id: str) -> None:
-        task = asyncio.create_task(self._run_and_refresh(task_id))
+        self._spawn_background(self._run_and_refresh(task_id))
+
+    def _spawn_background(self, operation) -> None:
+        task = asyncio.create_task(operation)
         self._background.add(task)
         task.add_done_callback(self._background.discard)
+
+    async def _run_update_check(self) -> None:
+        try:
+            result = await self.update_coordinator.startup(
+                self.update_prompt,
+                self.update_shutdown,
+            )
+            if str(result) == "blocked":
+                self._show_status("更新检查暂不可用，已继续使用当前版本")
+        except Exception as error:
+            self._show_status(f"更新检查失败（{type(error).__name__}）")
 
     async def _run_and_refresh(self, task_id: str) -> None:
         try:

@@ -1924,25 +1924,25 @@ git commit -m "feat: verify signed updates from dual sources"
 - Test: `tests/update/test_update_coordinator.py`
 - Test: `tests/ui/test_update_dialog.py`
 
-- [ ] **Step 1: Write failing download, transaction, and UI tests**
+- [x] **Step 1: Write failing download, transaction, and UI tests**
 
 Cover HTTP Range resume, server ignoring Range, source failover, corrupted partial files, final size/hash mismatch, insufficient disk space, managed-file inventory validation, preservation of `data`/`downloads`/unknown root files, locked-file failure, process-exit wait, healthy replacement commit, health timeout, replacement crash, automatic rollback, rollback journal recovery after helper interruption, startup non-blocking behavior, user decline, and accepted-update shutdown.
 
-- [ ] **Step 2: Run focused tests and confirm the update workflow is absent**
+- [x] **Step 2: Run focused tests and confirm the update workflow is absent**
 
 Run: `$env:QT_QPA_PLATFORM='offscreen'; .venv\Scripts\python.exe -m pytest tests/update tests/ui/test_update_dialog.py -q`
 
 Expected: collection fails for the missing downloader/coordinator/helper/dialog modules.
 
-- [ ] **Step 3: Implement project-local resumable download and coordinator**
+- [x] **Step 3: Implement project-local resumable download and coordinator**
 
 Write partial packages and metadata under `data/update/staging`; fsync before promoting; always verify the signed manifest, asset size, and SHA-256. Check both sources at startup after local recovery, display version/release notes/size, and begin download only after explicit confirmation. Copy the helper into `data/update/helper/<version>` before asking the main process to exit.
 
-- [ ] **Step 4: Implement journaled replacement and health-check rollback**
+- [x] **Step 4: Implement journaled replacement and health-check rollback**
 
 The helper accepts only absolute paths guarded below the application root, waits for the parent PID, validates a versioned managed-file inventory, moves old managed files to `data/update/backup/<old-version>`, installs the new runtime, and launches `--update-health-check`. It commits only after a transaction-specific confirmation file appears. On any error or timeout it removes only newly managed files, restores the backup, records a redacted result, and starts the old executable. A subsequent helper launch resumes or rolls back an interrupted journal idempotently.
 
-- [ ] **Step 5: Package both executables and run fault-injection tests**
+- [x] **Step 5: Package both executables and run fault-injection tests**
 
 Run: `$env:QT_QPA_PLATFORM='offscreen'; .venv\Scripts\python.exe -m pytest tests/update tests/ui/test_update_dialog.py -q`
 
@@ -1950,7 +1950,7 @@ Run: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1`
 
 Expected: `TelegramDownloader.exe` and `UpdateHelper.exe` are both onedir executables; portable smoke and every injected rollback case pass.
 
-- [ ] **Step 6: Commit online update support**
+- [x] **Step 6: Commit online update support**
 
 ```powershell
 git add src/telegram_downloader TelegramDownloader.spec tests/update tests/ui/test_update_dialog.py

@@ -28,4 +28,17 @@ foreach ($entry in $report.writable_paths.PSObject.Properties) {
         throw "Path escaped package: $resolved"
     }
 }
+
+$confirmation = Join-Path $appDir 'data\update\staging\packaged-health.ok'
+$quotedConfirmation = '"' + $confirmation + '"'
+$health = Start-Process -FilePath $exe -ArgumentList @('--update-health-check', $quotedConfirmation) -WorkingDirectory $appDir -Wait -PassThru -WindowStyle Hidden
+if ($health.ExitCode -ne 0) {
+    throw "Packaged update health check exited $($health.ExitCode)"
+}
+if (-not (Test-Path -LiteralPath $confirmation -PathType Leaf)) {
+    throw 'Packaged update health confirmation missing'
+}
+if ((Get-Content -Raw -LiteralPath $confirmation).Trim() -ne 'ok') {
+    throw 'Packaged update health confirmation is invalid'
+}
 Write-Output 'PACKAGED_SMOKE_OK'

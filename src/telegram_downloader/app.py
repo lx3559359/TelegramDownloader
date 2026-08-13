@@ -17,6 +17,9 @@ from telegram_downloader.repository import TaskRepository
 from telegram_downloader.scheduler import DownloadScheduler
 from telegram_downloader.security import SecretsError, SecretsVault
 from telegram_downloader.settings import AppSettings, SettingsError, SettingsStore
+from telegram_downloader.update import HttpBytesClient, UpdateCoordinator
+from telegram_downloader.update_contract import load_trusted_keys
+from telegram_downloader.update_download import ResumableUpdateDownloader
 
 
 def run_self_test(root: Path) -> dict[str, object]:
@@ -66,6 +69,7 @@ def create_application(root: Path):
     from telegram_downloader.ui.login import LoginDialog
     from telegram_downloader.ui.main import MainWindow
     from telegram_downloader.ui.settings import SettingsDialog
+    from telegram_downloader.ui.update_dialog import UpdateDialog
 
     paths = PortablePaths(root)
     paths.ensure_layout()
@@ -140,6 +144,18 @@ def create_application(root: Path):
         )
         return answer is QMessageBox.StandardButton.Yes
 
+    trusted_keys = load_trusted_keys(Path(__file__).with_name("trusted_update_keys.json"))
+    update_coordinator = UpdateCoordinator(
+        paths,
+        __version__,
+        trusted_keys,
+        HttpBytesClient(),
+        ResumableUpdateDownloader(),
+    )
+
+    def confirm_update(manifest) -> bool:
+        return UpdateDialog(manifest, window).exec() == UpdateDialog.DialogCode.Accepted
+
     controller = AppController(
         gateway=gateway,
         planner=planner,
@@ -153,6 +169,9 @@ def create_application(root: Path):
         gateway_factory=gateway_factory,
         service_builder=build_services,
         confirm_preview=confirm_preview,
+        update_coordinator=update_coordinator,
+        update_prompt=confirm_update,
+        update_shutdown=application.quit,
         settings=settings,
         secrets=secrets,
     )

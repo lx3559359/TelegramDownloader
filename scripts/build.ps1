@@ -44,10 +44,22 @@ foreach ($directory in ($work, $dist)) {
 $pyinstaller = Join-Path $projectRoot '.venv\Scripts\pyinstaller.exe'
 & $pyinstaller --noconfirm --clean --workpath $work --distpath $dist (Join-Path $projectRoot 'TelegramDownloader.spec')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+$appDir = Assert-ProjectChild (Join-Path $dist 'TelegramDownloader')
+$helperExe = Assert-ProjectChild (Join-Path $dist 'UpdateHelper.exe')
+if (-not (Test-Path -LiteralPath $helperExe -PathType Leaf)) {
+    throw "Packaged update helper missing: $helperExe"
+}
+Copy-Item -LiteralPath $helperExe -Destination (Join-Path $appDir 'UpdateHelper.exe') -Force
+
+$version = & (Join-Path $projectRoot '.venv\Scripts\python.exe') -c "from telegram_downloader import __version__; print(__version__)"
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+& (Join-Path $projectRoot '.venv\Scripts\python.exe') (Join-Path $PSScriptRoot 'generate_runtime_inventory.py') --root $appDir --version $version
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
 & (Join-Path $PSScriptRoot 'smoke.ps1')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-$appDir = Assert-ProjectChild (Join-Path $dist 'TelegramDownloader')
 foreach ($runtimeData in ('data', 'downloads')) {
     $candidate = Assert-ProjectChild (Join-Path $appDir $runtimeData)
     if (Test-Path -LiteralPath $candidate) {
@@ -55,7 +67,7 @@ foreach ($runtimeData in ('data', 'downloads')) {
     }
 }
 
-$zip = Assert-ProjectChild (Join-Path $dist 'TelegramDownloader-portable-win-x64.zip')
+$zip = Assert-ProjectChild (Join-Path $dist "TelegramDownloader-$version-win-x64-portable.zip")
 if (Test-Path -LiteralPath $zip) {
     Remove-Item -LiteralPath $zip -Force
 }
