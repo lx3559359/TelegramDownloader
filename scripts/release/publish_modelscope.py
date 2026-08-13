@@ -14,6 +14,7 @@ from typing import Any
 from telegram_downloader.update_contract import canonical_json, parse_latest_pointer, parse_version
 
 LATEST_PATH = "releases/stable/latest.json"
+RELEASE_REVISION = "main"
 
 
 class ModelScopePublishError(RuntimeError):
@@ -108,6 +109,7 @@ class ModelScopePublisher:
                 path,
                 f"releases/stable/{self.version}/{path.name}",
                 commit_message=f"Publish TelegramDownloader {self.version}: {path.name}",
+                revision=RELEASE_REVISION,
                 disable_tqdm=True,
             )
 
@@ -115,7 +117,9 @@ class ModelScopePublisher:
         expected = sorted(modelscope_release_names(self.version))
         prefix = f"releases/stable/{self.version}/"
         actual = []
-        for entry in self.api.list_repo_files(self.repo_id, "model", recursive=True):
+        for entry in self.api.list_repo_files(
+            self.repo_id, "model", revision=RELEASE_REVISION, recursive=True
+        ):
             path = getattr(entry, "path", "")
             if path.startswith(prefix) and getattr(entry, "is_dir", True) is False:
                 relative = path[len(prefix) :]
@@ -138,6 +142,7 @@ class ModelScopePublisher:
             canonical_json({"schemaVersion": 1, "channel": "stable", "version": self.version}),
             LATEST_PATH,
             commit_message=f"Promote TelegramDownloader {self.version}",
+            revision=RELEASE_REVISION,
             disable_tqdm=True,
         )
 
@@ -150,10 +155,13 @@ class ModelScopePublisher:
                 previous,
                 LATEST_PATH,
                 commit_message="Restore previous TelegramDownloader stable pointer",
+                revision=RELEASE_REVISION,
                 disable_tqdm=True,
             )
         else:
-            self.api.delete_files(self.repo_id, "model", [LATEST_PATH])
+            self.api.delete_files(
+                self.repo_id, "model", [LATEST_PATH], revision=RELEASE_REVISION
+            )
 
     def download(self, destination: Path) -> None:
         _empty_directory(destination, self.storage.workspace)
@@ -173,6 +181,7 @@ class ModelScopePublisher:
                 self.repo_id,
                 "model",
                 remote_path,
+                revision=RELEASE_REVISION,
                 local_dir=temporary,
                 force=True,
             )

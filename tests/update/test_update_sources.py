@@ -101,6 +101,7 @@ def test_source_url_builders_use_public_release_and_modelscope_api_paths() -> No
         "https://github.com/lx3559359/TelegramDownloader/releases/latest/download/latest.json"
     )
     assert github.manifest("1.2.3").endswith("/releases/download/v1.2.3/update-manifest.json")
+    assert "Revision=main" in modelscope.latest()
     assert "FilePath=releases%2Fstable%2F1.2.3%2Fupdate-manifest.sig" in (
         modelscope.signature("1.2.3")
     )

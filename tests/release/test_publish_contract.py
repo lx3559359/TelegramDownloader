@@ -6,6 +6,8 @@ import pytest
 
 from scripts.release.publish_github import github_asset_names
 from scripts.release.publish_modelscope import (
+    ModelScopePublisher,
+    ModelScopeStorage,
     configure_project_storage,
     modelscope_release_names,
 )
@@ -33,6 +35,50 @@ def test_modelscope_cache_state_and_temp_are_workspace_local(tmp_path, monkeypat
     assert paths.workspace == tmp_path.resolve()
     for path in (paths.cache, paths.state, paths.temp):
         assert path.is_relative_to(tmp_path)
+
+
+def test_modelscope_release_operations_are_pinned_to_main(tmp_path) -> None:
+    class Api:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str | None]] = []
+
+        def repo_exists(self, *_args) -> bool:
+            return True
+
+        def get_repo(self, *_args):
+            return type("Repo", (), {"private": False, "visibility": "0"})()
+
+        def upload_file(self, *_args, revision=None, **_kwargs) -> None:
+            self.calls.append(("upload", revision))
+
+        def list_repo_files(self, *_args, revision=None, **_kwargs):
+            self.calls.append(("list", revision))
+            return []
+
+        def download_file(self, *_args, revision=None, **_kwargs):
+            self.calls.append(("download", revision))
+            raise FileNotFoundError
+
+        def delete_files(self, *_args, revision=None, **_kwargs) -> None:
+            self.calls.append(("delete", revision))
+
+    source = tmp_path / "candidate"
+    source.mkdir()
+    for name in modelscope_release_names("0.1.0"):
+        (source / name).write_bytes(b"asset")
+    storage = ModelScopeStorage(tmp_path, tmp_path / "cache", tmp_path / "state", tmp_path / "temp")
+    storage.temp.mkdir()
+    api = Api()
+    publisher = ModelScopePublisher(api, "lx3559359/TelegramDownloader", "0.1.0", source, storage)
+
+    publisher.stage()
+    publisher.promote()
+    publisher.restore(b"")
+    with pytest.raises(FileNotFoundError):
+        publisher.save_pointer()
+
+    assert api.calls
+    assert all(revision == "main" for _, revision in api.calls)
 
 
 class Platform:

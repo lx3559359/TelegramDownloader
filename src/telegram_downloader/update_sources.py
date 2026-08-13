@@ -86,7 +86,7 @@ class GitHubSourceUrls:
 @dataclass(frozen=True, slots=True)
 class ModelScopeSourceUrls:
     repo_id: str
-    revision: str = "master"
+    revision: str = "main"
     endpoint: str = "https://www.modelscope.cn"
 
     def __post_init__(self) -> None:

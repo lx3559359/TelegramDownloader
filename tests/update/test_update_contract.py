@@ -39,7 +39,7 @@ def manifest_value(version: str = "0.2.0") -> dict:
                 "urls": {
                     "github": f"https://github.com/lx3559359/TelegramDownloader/releases/download/v{version}/{runtime}",
                     "modelscope": "https://www.modelscope.cn/api/v1/models/lx3559359/TelegramDownloader/repo"
-                    f"?Revision=master&FilePath=releases%2Fstable%2F{version}%2F{runtime}",
+                    f"?Revision=main&FilePath=releases%2Fstable%2F{version}%2F{runtime}",
                 },
             },
             "installer": {
@@ -49,7 +49,7 @@ def manifest_value(version: str = "0.2.0") -> dict:
                 "urls": {
                     "github": f"https://github.com/lx3559359/TelegramDownloader/releases/download/v{version}/{installer}",
                     "modelscope": "https://www.modelscope.cn/api/v1/models/lx3559359/TelegramDownloader/repo"
-                    f"?Revision=master&FilePath=releases%2Fstable%2F{version}%2F{installer}",
+                    f"?Revision=main&FilePath=releases%2Fstable%2F{version}%2F{installer}",
                 },
             },
         },
