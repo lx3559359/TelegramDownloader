@@ -1043,7 +1043,7 @@ git commit -m "feat: add Telegram login and media gateway"
 - Create: `src/telegram_downloader/planner.py`
 - Test: `tests/test_planner.py`
 
-- [ ] **Step 1: Write scan ordering, summary, and commit tests**
+- [x] **Step 1: Write scan ordering, summary, and commit tests**
 
 ```python
 # tests/test_planner.py
@@ -1101,13 +1101,13 @@ async def test_empty_scan_is_rejected(tmp_path: Path) -> None:
         await planner.scan(parse_telegram_link("https://t.me/channel"), ScanFilters(now, now, frozenset(MediaKind), 20))
 ```
 
-- [ ] **Step 2: Run planner tests and confirm the missing planner module**
+- [x] **Step 2: Run planner tests and confirm the missing planner module**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_planner.py -q`
 
 Expected: collection fails with `ModuleNotFoundError: telegram_downloader.planner`.
 
-- [ ] **Step 3: Implement preview-first task planning**
+- [x] **Step 3: Implement preview-first task planning**
 
 ```python
 # src/telegram_downloader/planner.py
@@ -1170,13 +1170,13 @@ class TaskPlanner:
         return queued
 ```
 
-- [ ] **Step 4: Run planner and gateway tests**
+- [x] **Step 4: Run planner and gateway tests**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_planner.py tests/test_gateway.py -q`
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Commit scan planning**
+- [x] **Step 5: Commit scan planning**
 
 ```powershell
 git add src/telegram_downloader/planner.py tests/test_planner.py
