@@ -22,4 +22,4 @@ if (-not (Test-Path $venvPython)) {
 & $venvPython -m pip install --disable-pip-version-check -r (
     Join-Path $projectRoot 'requirements-dev.txt'
 )
-
+& $venvPython -m pip install --disable-pip-version-check --no-deps -e $projectRoot

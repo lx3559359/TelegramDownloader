@@ -167,6 +167,7 @@ if (-not (Test-Path $venvPython)) {
     py -3.12 -m venv (Join-Path $projectRoot '.venv')
 }
 & $venvPython -m pip install --disable-pip-version-check -r (Join-Path $projectRoot 'requirements-dev.txt')
+& $venvPython -m pip install --disable-pip-version-check --no-deps -e $projectRoot
 ```
 
 ```python
@@ -758,7 +759,7 @@ git commit -m "feat: persist and recover download tasks"
 - Test: `tests/test_security.py`
 - Test: `tests/test_logging.py`
 
-- [ ] **Step 1: Write tests for atomic settings, injectable encryption, and log redaction**
+- [x] **Step 1: Write tests for atomic settings, injectable encryption, and log redaction**
 
 ```python
 # tests/test_settings.py
@@ -808,13 +809,13 @@ def test_redaction_removes_registered_secrets() -> None:
     assert record.getMessage() == "hash=***"
 ```
 
-- [ ] **Step 2: Run tests and observe missing modules**
+- [x] **Step 2: Run tests and observe missing modules**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_settings.py tests/test_security.py tests/test_logging.py -q`
 
 Expected: collection fails because the three modules do not exist.
 
-- [ ] **Step 3: Implement the three storage/security boundaries**
+- [x] **Step 3: Implement the three storage/security boundaries**
 
 ```python
 # src/telegram_downloader/settings.py
@@ -895,7 +896,7 @@ def configure_logging(path: Path, secrets: set[str]) -> logging.Logger:
     return logger
 ```
 
-- [ ] **Step 4: Run security tests and a real Windows DPAPI round trip**
+- [x] **Step 4: Run security tests and a real Windows DPAPI round trip**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_settings.py tests/test_security.py tests/test_logging.py -q`
 
@@ -905,7 +906,7 @@ Run: `.venv\Scripts\python.exe -c "from telegram_downloader.security import Dpap
 
 Expected: `DPAPI OK`.
 
-- [ ] **Step 5: Commit configuration and credential safety**
+- [x] **Step 5: Commit configuration and credential safety**
 
 ```powershell
 git add src/telegram_downloader/settings.py src/telegram_downloader/security.py src/telegram_downloader/logging.py tests/test_settings.py tests/test_security.py tests/test_logging.py
