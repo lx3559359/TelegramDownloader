@@ -1515,7 +1515,7 @@ git commit -m "feat: add professional download workbench"
 - Test: `tests/ui/test_login_dialog.py`
 - Test: `tests/ui/test_settings_dialog.py`
 
-- [ ] **Step 1: Write wizard state and settings validation tests**
+- [x] **Step 1: Write wizard state and settings validation tests**
 
 ```python
 # tests/ui/test_login_dialog.py
@@ -1555,13 +1555,13 @@ def test_round_trip_manual_proxy_form(qtbot) -> None:
     assert dialog.concurrency.maximum() == 5
 ```
 
-- [ ] **Step 2: Run dialog tests and observe missing classes**
+- [x] **Step 2: Run dialog tests and observe missing classes**
 
 Run: `$env:QT_QPA_PLATFORM='offscreen'; .venv\Scripts\python.exe -m pytest tests/ui/test_login_dialog.py tests/ui/test_settings_dialog.py -q`
 
 Expected: collection fails because `ui.login` and `ui.settings` do not exist.
 
-- [ ] **Step 3: Implement explicit login states and validated proxy fields**
+- [x] **Step 3: Implement explicit login states and validated proxy fields**
 
 `LoginDialog` uses `QStackedWidget` pages represented by this enum:
 
@@ -1578,13 +1578,13 @@ It exposes password-masked `api_hash`, `proxy_password`, and `password` inputs; 
 
 `SettingsDialog` loads and returns `AppSettings`, supports proxy kinds `none`, `socks5`, and `http`, validates host and port 1–65535 when proxy is enabled, keeps the proxy password in a separate masked field, and emits `test_proxy_requested(ProxySettings, str)` without persisting until the user accepts.
 
-- [ ] **Step 4: Run all GUI tests**
+- [x] **Step 4: Run all GUI tests**
 
 Run: `$env:QT_QPA_PLATFORM='offscreen'; .venv\Scripts\python.exe -m pytest tests/ui -q`
 
 Expected: all GUI tests pass.
 
-- [ ] **Step 5: Commit authentication and settings UI**
+- [x] **Step 5: Commit authentication and settings UI**
 
 ```powershell
 git add src/telegram_downloader/ui/login.py src/telegram_downloader/ui/settings.py tests/ui/test_login_dialog.py tests/ui/test_settings_dialog.py
