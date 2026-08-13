@@ -4,4 +4,4 @@ pytest-asyncio==1.4.0
 pytest-qt==4.5.0
 ruff==0.15.22
 pyinstaller==6.21.0
-
+modelscope_hub==0.1.8

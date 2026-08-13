@@ -119,3 +119,5 @@ dist/release/TelegramDownloader-0.1.0-win-x64-setup.exe
 安装器构建会把 Inno Setup 7.0.2 以便携方式放在项目 `.tool-cache` 中，并在使用前核对官方固定 SHA-256 和 Authenticode 发布者；编译、安装及卸载冒烟测试的临时目录和日志都位于 `.build-temp`。安装验收会真实验证 C 盘拒绝、D 盘安装、自检、原位升级、在线更新运行时文件存在，以及普通卸载后用户数据仍保留。
 
 正式发布流程还会生成带版本号的便携 ZIP、安装程序、`update-manifest.json` 与 `update-manifest.sig`。真实 Telegram 登录和下载测试必须由用户在应用内输入自己的凭据完成；测试代码、构建日志和发布资产不得包含这些凭据。
+
+正式发布命令为 `scripts/release/release.ps1 -Version <X.Y.Z>`。它只允许从干净的 `main` 运行，先重跑测试与两种打包冒烟测试，再生成源码归档、规范清单和 Ed25519 签名；随后先创建 GitHub 草稿 Release 与魔搭候选目录，下载两端资产逐字节比对，最后才公开 Release 并推进双方版本指针。发布私钥只允许位于已忽略的 `.release-secrets` 或 CI secret，禁止提交、复制到产物或输出到日志。

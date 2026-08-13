@@ -1,0 +1,38 @@
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      TEMP: ${{ github.workspace }}\.build-temp\ci\temp
+      TMP: ${{ github.workspace }}\.build-temp\ci\temp
+      APPDATA: ${{ github.workspace }}\.build-temp\ci\user-profile\Roaming
+      LOCALAPPDATA: ${{ github.workspace }}\.build-temp\ci\user-profile\Local
+      PIP_CACHE_DIR: ${{ github.workspace }}\.tool-cache\pip
+      PYTHONPYCACHEPREFIX: ${{ github.workspace }}\.tool-cache\pycache
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: ''
+      - name: Prepare project-local directories
+        run: New-Item -ItemType Directory -Force -Path $env:TEMP,$env:APPDATA,$env:LOCALAPPDATA,$env:PIP_CACHE_DIR | Out-Null
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt -r requirements-dev.txt -e .
+      - name: Test
+        run: python -m pytest -q
+      - name: Lint
+        run: ruff check .
+      - name: Bootstrap self-test
+        run: python -m telegram_downloader --self-test

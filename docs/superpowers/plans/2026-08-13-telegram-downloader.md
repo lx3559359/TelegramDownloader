@@ -2004,21 +2004,21 @@ git commit -m "build: add non-C-drive Windows installer"
 - Test: `tests/release/test_generate_manifest.py`
 - Test: `tests/release/test_publish_contract.py`
 
-- [ ] **Step 1: Write failing offline release tests**
+- [x] **Step 1: Write failing offline release tests**
 
 Cover deterministic manifests, key ID/public key matching, no private key material in tracked files or logs, exact release asset sets, source/package version agreement, GitHub draft-before-publish behavior, ModelScope candidate-before-latest behavior, remote byte/hash comparison, failure before either latest pointer advances, idempotent retry, and all ModelScope/temp/cache paths resolving under the workspace.
 
-- [ ] **Step 2: Run focused tests and confirm release scripts are missing**
+- [x] **Step 2: Run focused tests and confirm release scripts are missing**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/release -q`
 
 Expected: fails because release scripts do not exist.
 
-- [ ] **Step 3: Implement signing and fail-closed publication**
+- [x] **Step 3: Implement signing and fail-closed publication**
 
 Generate an Ed25519 release key once, commit only its public key, and save the private key under ignored `.release-secrets` plus the GitHub Actions secret. `release.ps1` requires a clean `main`, a strict `X.Y.Z` version, passing tests, fresh packages, and matching local hashes. It pushes the same commit/tag to `github` and `modelscope`, uploads a GitHub draft Release and a versioned ModelScope candidate, downloads/compares both remote asset sets, then publishes/promotes both latest pointers. Secrets are read from environment or project-local ignored files and never echoed.
 
-- [ ] **Step 4: Validate scripts offline and against disposable mocked adapters**
+- [x] **Step 4: Validate scripts offline and against disposable mocked adapters**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/release -q`
 
@@ -2030,7 +2030,7 @@ Expected: all tests pass and injected failures leave both latest pointers unchan
 
 Create `lx3559359/TelegramDownloader` on GitHub and ModelScope if absent, configure remotes without embedding tokens, publish `main`, tag `v0.1.0`, source archive, portable ZIP, installer EXE, notes, manifest, and signature to both, then download each remote asset and compare SHA-256 with the local release set.
 
-- [ ] **Step 6: Commit release automation**
+- [x] **Step 6: Commit release automation**
 
 ```powershell
 git add .github .gitignore scripts/release tests/release README.md src/telegram_downloader/trusted_update_keys.json
