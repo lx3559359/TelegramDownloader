@@ -1189,7 +1189,7 @@ git commit -m "feat: preview and persist filtered scans"
 - Create: `src/telegram_downloader/downloader.py`
 - Test: `tests/test_downloader.py`
 
-- [ ] **Step 1: Write resume, completion, and disk-space tests**
+- [x] **Step 1: Write resume, completion, and disk-space tests**
 
 ```python
 # tests/test_downloader.py
@@ -1249,13 +1249,13 @@ async def test_refuses_download_when_space_is_below_remaining_plus_reserve(tmp_p
         await downloader.download(item(paths.downloads / "x.mp4"))
 ```
 
-- [ ] **Step 2: Run downloader tests and verify the expected failure**
+- [x] **Step 2: Run downloader tests and verify the expected failure**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_downloader.py -q`
 
 Expected: collection fails with `ModuleNotFoundError: telegram_downloader.downloader`.
 
-- [ ] **Step 3: Implement guarded streaming and recovery**
+- [x] **Step 3: Implement guarded streaming and recovery**
 
 `MediaDownloader` must use this public API:
 
@@ -1283,13 +1283,13 @@ The implementation sequence is exact:
 
 Use `shutil.disk_usage(path.anchor).free` as the production `free_bytes` function and call it again after each 16 MiB written so a filling disk pauses safely.
 
-- [ ] **Step 4: Run downloader and path tests**
+- [x] **Step 4: Run downloader and path tests**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_downloader.py tests/test_paths.py -q`
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Commit resumable downloads**
+- [x] **Step 5: Commit resumable downloads**
 
 ```powershell
 git add src/telegram_downloader/downloader.py tests/test_downloader.py
