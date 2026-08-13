@@ -1725,7 +1725,7 @@ git commit -m "feat: wire the runnable desktop application"
 - Create: `README.md`
 - Test: `tests/test_packaging_contract.py`
 
-- [ ] **Step 1: Write a packaging contract test before the build files exist**
+- [x] **Step 1: Write a packaging contract test before the build files exist**
 
 ```python
 # tests/test_packaging_contract.py
@@ -1743,13 +1743,13 @@ def test_build_contract_uses_onedir_and_project_local_workpaths() -> None:
     assert "smoke.ps1" in build
 ```
 
-- [ ] **Step 2: Run the contract test and confirm missing packaging files**
+- [x] **Step 2: Run the contract test and confirm missing packaging files**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_packaging_contract.py -q`
 
 Expected: fails with `FileNotFoundError` for `TelegramDownloader.spec`.
 
-- [ ] **Step 3: Add the exact onedir recipe and isolated PowerShell automation**
+- [x] **Step 3: Add the exact onedir recipe and isolated PowerShell automation**
 
 ```python
 # TelegramDownloader.spec
@@ -1850,7 +1850,7 @@ Write-Output $zip
 
 `README.md` must document, in Chinese: Windows 10/11 x64 support; green ZIP usage; how to obtain API ID/Hash from `my.telegram.org`; phone/code/2FA login; single-message and filtered batch workflows; SOCKS5/HTTP fields; the complete portable directory tree; `.part` recovery behavior; DPAPI portability limitation; content-access restrictions; development setup; test/build commands; and the final ZIP path.
 
-- [ ] **Step 4: Run the contract, build the application, and smoke test the EXE**
+- [x] **Step 4: Run the contract, build the application, and smoke test the EXE**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_packaging_contract.py -q`
 
@@ -1860,7 +1860,7 @@ Run: `powershell -ExecutionPolicy Bypass -File scripts/build.ps1`
 
 Expected: tests and Ruff pass, PyInstaller creates `dist/TelegramDownloader/TelegramDownloader.exe`, smoke output contains `PACKAGED_SMOKE_OK`, and `dist/TelegramDownloader-portable-win-x64.zip` exists.
 
-- [ ] **Step 5: Commit packaging and documentation**
+- [x] **Step 5: Commit packaging and documentation**
 
 ```powershell
 git add TelegramDownloader.spec scripts/test.ps1 scripts/smoke.ps1 scripts/build.ps1 README.md tests/test_packaging_contract.py
