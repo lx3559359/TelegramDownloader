@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import Callable
 from contextlib import suppress
@@ -19,6 +20,8 @@ from telegram_downloader.links import InvalidTelegramLink, parse_telegram_link
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.settings import AppSettings, ProxySettings
 from telegram_downloader.ui.models import TaskSummary
+
+_LOGGER = logging.getLogger("telegram_downloader.controller")
 
 
 class _MemorySettingsStore:
@@ -59,6 +62,9 @@ class _NullWindow:
 
     def set_task_summaries(self, value: list[TaskSummary]) -> None:
         self.tasks = value
+
+    def set_scan_busy(self, _busy: bool) -> None:
+        pass
 
     def statusBar(self) -> _NullStatusBar:
         return self.message
@@ -286,8 +292,9 @@ class AppController:
 
     async def scan_link(self, link: str, filters: ScanFilters) -> None:
         if self.planner is None:
-            self._show_status("请先登录 Telegram 账号")
+            self._show_error("请先登录 Telegram 账号")
             return
+        self.window.set_scan_busy(True)
         try:
             source = parse_telegram_link(link)
             preview = await self.planner.scan(source, filters)
@@ -300,7 +307,16 @@ class AppController:
                 self._start_task(task.id)
             self._show_status("任务已加入下载队列")
         except (InvalidTelegramLink, ValueError, GatewayError) as error:
-            self._show_status(self._safe_error(error))
+            safe = self._safe_error(error)
+            _LOGGER.warning("scan rejected (%s): %s", type(error).__name__, safe)
+            self._show_error(safe)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            _LOGGER.error("scan failed (%s)", type(error).__name__)
+            self._show_error(self._safe_error(error))
+        finally:
+            self.window.set_scan_busy(False)
 
     async def test_proxy(self, proxy: ProxySettings, password: str) -> None:
         api_hash = self.secrets.get("api_hash", "")
@@ -368,6 +384,10 @@ class AppController:
             completed = sum(item.status is ItemStatus.COMPLETED for item in items)
             known_size = sum(item.expected_size or 0 for item in items)
             unknown = any(item.expected_size is None for item in items)
+            error_text = task.last_error or next(
+                (item.last_error for item in items if item.last_error),
+                "—",
+            )
             summaries.append(
                 TaskSummary(
                     task.id,
@@ -377,6 +397,7 @@ class AppController:
                     self._format_bytes(known_size) + (" + 未知" if unknown else ""),
                     "—",
                     "—",
+                    error_text,
                 )
             )
         self.window.set_task_summaries(summaries)
@@ -432,6 +453,9 @@ class AppController:
 
     def _show_status(self, message: str) -> None:
         self.window.statusBar().showMessage(message, 8000)
+
+    def _show_error(self, message: str) -> None:
+        self.window.statusBar().showMessage(message, 0)
 
     @staticmethod
     def _safe_error(error: Exception) -> str:

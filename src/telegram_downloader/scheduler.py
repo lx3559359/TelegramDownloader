@@ -144,7 +144,16 @@ class DownloadScheduler:
         if any(status is ItemStatus.PAUSED for status in results):
             self.repository.update_task_status(task_id, TaskStatus.PAUSED)
         elif any(status is ItemStatus.FAILED for status in results):
-            self.repository.update_task_status(task_id, TaskStatus.PARTIAL_FAILURE)
+            failed = self.repository.list_items(task_id, {ItemStatus.FAILED})
+            reason = next(
+                (item.last_error for item in failed if item.last_error),
+                "部分文件下载失败",
+            )
+            self.repository.update_task_status(
+                task_id,
+                TaskStatus.PARTIAL_FAILURE,
+                reason,
+            )
         else:
             self.repository.update_task_status(task_id, TaskStatus.COMPLETED)
 

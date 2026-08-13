@@ -1,11 +1,12 @@
 import asyncio
+import logging
 from datetime import UTC, date, datetime, timedelta, timezone
 
 import pytest
 
 from telegram_downloader.controller import AppController
 from telegram_downloader.domain import MediaKind, TaskStatus
-from telegram_downloader.gateway import AuthState
+from telegram_downloader.gateway import AccessDeniedError, AuthState
 from telegram_downloader.settings import ProxySettings
 
 
@@ -147,6 +148,87 @@ async def test_confirmed_scan_starts_persisted_task() -> None:
         controller.default_filters(datetime(2026, 8, 13, tzinfo=UTC)),
     )
     await asyncio.wait_for(scheduler.started.wait(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_scan_failure_is_persistent_and_releases_busy_state() -> None:
+    class Planner:
+        async def scan(self, source, filters):
+            raise AccessDeniedError("当前账号未加入该私有频道或群组")
+
+    class Window:
+        def __init__(self):
+            self.message = ""
+            self.timeout = -1
+            self.busy_states = []
+
+        def set_task_summaries(self, _tasks):
+            pass
+
+        def set_scan_busy(self, busy):
+            self.busy_states.append(busy)
+
+        def statusBar(self):
+            return self
+
+        def showMessage(self, message, timeout):
+            self.message = message
+            self.timeout = timeout
+
+    window = Window()
+    controller = AppController.for_test(planner=Planner(), window=window)
+
+    await controller.scan_link(
+        "https://t.me/c/123456/7",
+        controller.default_filters(datetime(2026, 8, 14, tzinfo=UTC)),
+    )
+
+    assert window.message == "当前账号未加入该私有频道或群组"
+    assert window.timeout == 0
+    assert window.busy_states == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_unexpected_scan_failure_is_logged_without_secret(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class Planner:
+        async def scan(self, source, filters):
+            raise RuntimeError("api-secret-in-library-error")
+
+    class Window:
+        def __init__(self):
+            self.message = ""
+            self.timeout = -1
+            self.busy = False
+
+        def set_task_summaries(self, _tasks):
+            pass
+
+        def set_scan_busy(self, busy):
+            self.busy = busy
+
+        def statusBar(self):
+            return self
+
+        def showMessage(self, message, timeout):
+            self.message = message
+            self.timeout = timeout
+
+    caplog.set_level(logging.ERROR, logger="telegram_downloader.controller")
+    window = Window()
+    controller = AppController.for_test(planner=Planner(), window=window)
+
+    await controller.scan_link(
+        "https://t.me/example/7",
+        controller.default_filters(datetime(2026, 8, 14, tzinfo=UTC)),
+    )
+
+    assert window.message == "操作失败（RuntimeError）"
+    assert window.timeout == 0
+    assert window.busy is False
+    assert "scan failed (RuntimeError)" in caplog.text
+    assert "api-secret" not in caplog.text
 
 
 def test_local_dates_become_inclusive_utc_boundaries() -> None:

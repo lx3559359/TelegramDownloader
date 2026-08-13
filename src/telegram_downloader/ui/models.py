@@ -17,6 +17,7 @@ class TaskSummary:
     size_text: str
     speed_text: str
     remaining_text: str
+    error_text: str
 
 
 _STATUS_LABELS = {
@@ -41,7 +42,7 @@ _INVALID_INDEX = QModelIndex()
 
 
 class TaskTableModel(QAbstractTableModel):
-    HEADERS = ("任务", "状态", "进度", "大小", "速度", "剩余时间")
+    HEADERS = ("任务", "状态", "进度", "大小", "速度", "剩余时间", "错误")
 
     def __init__(self) -> None:
         super().__init__()
@@ -67,6 +68,7 @@ class TaskTableModel(QAbstractTableModel):
                 task.size_text,
                 task.speed_text,
                 task.remaining_text,
+                task.error_text,
             )
             return values[index.column()]
         if role == Qt.ItemDataRole.ForegroundRole and index.column() == 1:
@@ -74,7 +76,8 @@ class TaskTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.TextAlignmentRole and index.column() > 0:
             return int(Qt.AlignmentFlag.AlignCenter)
         if role == Qt.ItemDataRole.ToolTipRole:
-            return f"{task.title} · {_STATUS_LABELS[task.status]}"
+            summary = f"{task.title} · {_STATUS_LABELS[task.status]}"
+            return summary if task.error_text == "—" else f"{summary} · {task.error_text}"
         return None
 
     def headerData(

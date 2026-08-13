@@ -329,6 +329,11 @@ class MainWindow(QMainWindow):
         if link:
             self.scan_requested.emit(link)
 
+    def set_scan_busy(self, busy: bool) -> None:
+        self.link_input.setEnabled(not busy)
+        self.scan_button.setEnabled(not busy)
+        self.scan_button.setText("扫描中…" if busy else "扫描预览")
+
     def _emit_for_selected(self, callback: Callable[[str], None]) -> None:
         task_id = self.selected_task_id()
         if task_id is not None:

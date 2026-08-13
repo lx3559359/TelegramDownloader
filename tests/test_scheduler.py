@@ -17,11 +17,13 @@ class Repo:
                 retry_count=0,
                 downloaded_bytes=0,
                 status=ItemStatus.QUEUED,
+                last_error=None,
             )
             for index in range(count)
         ]
         self.item_updates = []
         self.task_updates = []
+        self.task_errors = []
         self.recovered = False
 
     def list_items(self, task_id, statuses=None):
@@ -41,11 +43,13 @@ class Repo:
         selected = next(item for item in self.items if item.id == item_id)
         selected.downloaded_bytes = downloaded_bytes
         selected.status = status
+        selected.last_error = error
         if retry_count is not None:
             selected.retry_count = retry_count
 
     def update_task_status(self, task_id, status, error=None):
         self.task_updates.append(status)
+        self.task_errors.append(error)
 
     def recover_interrupted(self):
         self.recovered = True
@@ -180,3 +184,22 @@ async def test_unknown_download_error_does_not_persist_exception_text() -> None:
     stored_error = repo.item_updates[-1][3]
     assert stored_error == "RuntimeError"
     assert "api-secret" not in stored_error
+
+
+@pytest.mark.asyncio
+async def test_partial_failure_preserves_safe_item_error_on_task() -> None:
+    class Downloader:
+        async def download(self, item, should_pause):
+            raise TransientNetworkError("Telegram 网络连接失败")
+
+    repo = Repo()
+    scheduler = DownloadScheduler(
+        repo,
+        Downloader(),
+        retry=RetryPolicy(attempts=1, base_delay=0),
+    )
+
+    await scheduler.run_task("t")
+
+    assert repo.task_updates[-1] is TaskStatus.PARTIAL_FAILURE
+    assert repo.task_errors[-1] == "Telegram 网络连接失败"
