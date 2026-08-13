@@ -1,7 +1,5 @@
 from pathlib import Path
 
-from telegram_downloader import __version__
-
 
 def test_installer_is_current_user_x64_and_rejects_system_volumes() -> None:
     root = Path(__file__).parents[1]
@@ -53,4 +51,6 @@ def test_installer_build_and_smoke_paths_are_project_local_and_versioned() -> No
         "Uninstall",
     ):
         assert required in smoke
-    assert f"TelegramDownloader-{__version__}-win-x64-setup.exe" in smoke
+    assert "$sourceVersion = & $python -c" in smoke
+    assert "TelegramDownloader-$sourceVersion-win-x64-setup.exe" in smoke
+    assert "TelegramDownloader-0.1.0-win-x64-setup.exe" not in smoke

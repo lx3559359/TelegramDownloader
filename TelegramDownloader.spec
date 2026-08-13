@@ -15,6 +15,7 @@ a = Analysis(
     hiddenimports=[
         "qasync",
         "python_socks",
+        "qrcode",
         "telethon.sessions.string",
     ],
     hookspath=[],

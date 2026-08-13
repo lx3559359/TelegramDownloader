@@ -2,9 +2,9 @@
 
 ## 正式版下载
 
-当前正式版：`v0.1.0`（Windows 10/11 x64）
+当前正式版：`v0.2.0`（Windows 10/11 x64）
 
-- [GitHub Release（安装包与便携包）](https://github.com/lx3559359/TelegramDownloader/releases/tag/v0.1.0)
+- [GitHub Release（安装包与便携包）](https://github.com/lx3559359/TelegramDownloader/releases/tag/v0.2.0)
 - [魔搭镜像仓库](https://modelscope.cn/models/lx3559359/TelegramDownloader)
 - 安装包会拒绝安装到 C 盘；便携包请解压到 D、E 等非 C 盘目录后运行。
 - Windows 可能因未购买商业 Authenticode 证书显示 SmartScreen“未知发布者”；在线更新仍会强制验证 Ed25519 签名和 SHA-256。
@@ -16,8 +16,9 @@
 ## 主要功能
 
 - 单条 `t.me` 消息链接下载，自动扩展同一相册。
+- 首次配置个人 API ID/API Hash 后，默认使用 Telegram App 扫二维码登录；保留手机号验证码备用入口。
 - 频道/群组按包含式日期范围、图片、视频、音频、语音、文档、压缩包和数量上限扫描。
-- 专业三栏任务工作台，显示状态、进度、大小、速度和剩余时间。
+- 专业三栏任务工作台，显示状态、进度、大小、速度、剩余时间和持久错误原因。
 - `.part` 分块文件按实际字节偏移续传；异常分片会留档，不静默覆盖已有文件。
 - SOCKS5 与 HTTP 代理，可在保存前测试连接。
 - 启动检查 GitHub / 魔搭正式版更新；Ed25519 验证清单，SHA-256 验证安装包与便携包，替换失败自动回滚。
@@ -61,7 +62,11 @@ TelegramDownloader/
 1. 在浏览器打开 [my.telegram.org](https://my.telegram.org)。
 2. 使用手机号登录，进入 **API development tools**。
 3. 创建应用并复制 API ID、API Hash。
-4. 在本程序登录向导中依次输入 API 凭据、手机号、验证码，以及账号启用时的两步验证密码。
+4. 首次在本程序填写 API 凭据，点击“保存并生成二维码”。
+5. 打开 Telegram App，进入 **设置 → 设备 → 连接桌面设备**，扫描程序显示的二维码并在手机端确认。
+6. 如果账号启用了两步验证，再输入 Telegram 云密码。二维码过期会自动刷新，也可以手动刷新。
+
+以后有效会话会自动恢复；会话失效时默认直接显示新二维码。二维码页始终可以切换到“改用手机号登录”，继续使用手机号、验证码和可选两步验证流程。
 
 API Hash、代理密码和 Telethon StringSession 会写入 `data/config/secrets.dat`，但内容由 DPAPI 加密。把整个便携目录复制到另一台电脑或另一个 Windows 用户后，密文通常无法解密，需要重新登录。
 
@@ -69,7 +74,7 @@ API Hash、代理密码和 Telethon StringSession 会写入 `data/config/secrets
 
 ### 单条消息或相册
 
-粘贴类似 `https://t.me/example/42` 或 `https://t.me/c/123456/99` 的链接，点击“扫描预览”。如果消息属于相册，程序会把同组媒体一起列入预览。用户确认后才创建下载任务。
+粘贴类似 `https://t.me/example/42` 或 `https://t.me/c/123456/99` 的链接，点击“扫描预览”。如果消息属于相册，程序会把同组媒体一起列入预览。用户确认后才创建下载任务。`t.me/c/...` 是私有频道/群组链接，当前登录账号必须已经加入；程序不会自动加入或绕过权限。v0.2.0 会在重启后从账号已有对话中恢复这类私有实体。
 
 ### 频道或群组批量任务
 
@@ -78,6 +83,8 @@ API Hash、代理密码和 Telethon StringSession 会写入 `data/config/secrets
 ### 暂停与恢复
 
 下载中的内容先写入同目录 `.part` 文件。暂停、断网、关闭程序或重启后，会以 `.part` 实际大小作为续传偏移；完成并校验大小后才原子改名为最终文件。
+
+扫描失败会在窗口底部持续显示，直到下一条状态替换；已创建任务的失败原因会显示在任务表“错误”列。脱敏运行日志位于 `data/logs/app.log`。如需检查运行时依赖和所有写入位置，可在应用目录执行 `TelegramDownloader.exe --self-test`；报告保存在 `data/logs/self-test.json`，不包含账号、会话或 API 凭据。
 
 ## 代理
 
@@ -121,8 +128,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1
 
 ```text
 dist/TelegramDownloader/TelegramDownloader.exe
-dist/TelegramDownloader-0.1.0-win-x64-portable.zip
-dist/release/TelegramDownloader-0.1.0-win-x64-setup.exe
+dist/TelegramDownloader-0.2.0-win-x64-portable.zip
+dist/release/TelegramDownloader-0.2.0-win-x64-setup.exe
 ```
 
 安装器构建会把 Inno Setup 7.0.2 以便携方式放在项目 `.tool-cache` 中，并在使用前核对官方固定 SHA-256 和 Authenticode 发布者；编译、安装及卸载冒烟测试的临时目录和日志都位于 `.build-temp`。安装验收会真实验证 C 盘拒绝、D 盘安装、自检、原位升级、在线更新运行时文件存在，以及普通卸载后用户数据仍保留。

@@ -20,7 +20,15 @@ $setup = (Resolve-Path -LiteralPath $SetupPath).Path
 if (-not $setup.StartsWith($projectPrefix, [StringComparison]::OrdinalIgnoreCase)) {
     throw "Installer escaped project: $setup"
 }
-$expectedName = 'TelegramDownloader-0.1.0-win-x64-setup.exe'
+$python = Join-Path $projectRoot '.venv\Scripts\python.exe'
+if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+    throw "Project Python is missing: $python"
+}
+$sourceVersion = & $python -c "import sys; sys.path.insert(0, sys.argv[1]); from telegram_downloader import __version__; print(__version__)" (Join-Path $projectRoot 'src')
+if ($LASTEXITCODE -ne 0) {
+    throw 'Unable to read source version'
+}
+$expectedName = "TelegramDownloader-$sourceVersion-win-x64-setup.exe"
 if ([IO.Path]::GetFileName($setup) -ne $expectedName) {
     throw "Installer version/name mismatch: $setup"
 }

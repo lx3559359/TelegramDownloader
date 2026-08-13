@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Protocol
 
+from telegram_downloader import __version__
 from telegram_downloader.domain import MediaKind, ParsedLink, ScanFilters, SourceKind
 from telegram_downloader.files import classify_media, sanitize_component
 from telegram_downloader.settings import ProxySettings
@@ -144,7 +145,7 @@ class TelethonGateway:
             proxy=proxy_dict(proxy or ProxySettings(), proxy_password),
             flood_sleep_threshold=0,
             device_model="TelegramDownloader Windows",
-            app_version="0.1.0",
+            app_version=__version__,
             system_lang_code="zh-hans",
             lang_code="zh-hans",
         )

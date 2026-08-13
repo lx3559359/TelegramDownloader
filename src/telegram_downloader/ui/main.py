@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from telegram_downloader import __version__
 from telegram_downloader.domain import MediaKind
 from telegram_downloader.ui.models import TaskSummary, TaskTableModel
 from telegram_downloader.ui.theme import DARK_STYLESHEET, ensure_cjk_font
@@ -122,9 +123,9 @@ class MainWindow(QMainWindow):
         privacy.setObjectName("muted")
         privacy.setWordWrap(True)
         layout.addWidget(privacy)
-        version = QLabel("v0.1.0 · stable")
-        version.setObjectName("muted")
-        layout.addWidget(version)
+        self.version_label = QLabel(f"v{__version__} · stable")
+        self.version_label.setObjectName("muted")
+        layout.addWidget(self.version_label)
         return rail
 
     def _build_workspace(self) -> QWidget:
