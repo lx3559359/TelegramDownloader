@@ -121,7 +121,7 @@ class TelethonGateway:
         proxy: ProxySettings | None = None,
         proxy_password: str = "",
     ) -> None:
-        from telethon import TelegramClient, errors, functions
+        from telethon import TelegramClient, errors, functions, utils
         from telethon.sessions import StringSession
 
         self._client = TelegramClient(
@@ -155,6 +155,7 @@ class TelethonGateway:
             TimeoutError,
         )
         self._check_invite_request = functions.messages.CheckChatInviteRequest
+        self._peer_id_getter = utils.get_peer_id
 
     @classmethod
     def from_client_for_test(
@@ -170,6 +171,7 @@ class TelethonGateway:
             OSError,
             TimeoutError,
         ),
+        peer_id_getter=None,
     ) -> TelethonGateway:
         gateway = cls.__new__(cls)
         gateway._client = client
@@ -179,6 +181,7 @@ class TelethonGateway:
         gateway._access_errors = access_errors
         gateway._transient_errors = transient_errors
         gateway._check_invite_request = None
+        gateway._peer_id_getter = peer_id_getter or (lambda entity: entity)
         return gateway
 
     async def connect(self) -> None:
@@ -372,11 +375,22 @@ class TelethonGateway:
             reference: str | int = entity_ref
             if entity_ref.startswith("-100") and entity_ref[1:].isdigit():
                 reference = int(entity_ref)
+                return await self._resolve_private_entity(reference)
             return await self._client.get_entity(reference)
         except AccessDeniedError:
             raise
         except Exception as exc:
             self._raise_mapped(exc)
+
+    async def _resolve_private_entity(self, reference: int) -> object:
+        try:
+            return await self._client.get_entity(reference)
+        except ValueError:
+            async for dialog in self._client.iter_dialogs():
+                entity = getattr(dialog, "entity", None)
+                if entity is not None and self._peer_id_getter(entity) == reference:
+                    return entity
+        raise AccessDeniedError("当前账号未加入该私有频道或群组")
 
     def _raise_mapped(self, error: Exception) -> None:
         if isinstance(error, self._flood_wait_error):

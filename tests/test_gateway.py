@@ -5,6 +5,7 @@ import pytest
 
 from telegram_downloader.domain import MediaKind, ScanFilters
 from telegram_downloader.gateway import (
+    AccessDeniedError,
     AuthState,
     EmptyMediaError,
     TelethonGateway,
@@ -131,6 +132,104 @@ async def test_single_message_expands_album_in_message_order() -> None:
 
     assert [media.message_id for media in result] == [9, 10, 11]
     assert all(media.source_title == "频道" for media in result)
+
+
+@pytest.mark.asyncio
+async def test_private_link_recovers_entity_from_dialogs_when_cache_is_empty() -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    selected = media_message(7, now)
+
+    class Client:
+        async def get_entity(self, entity):
+            assert entity == -100123456
+            raise ValueError("entity cache is empty")
+
+        def iter_dialogs(self):
+            async def dialogs():
+                yield SimpleNamespace(
+                    entity=SimpleNamespace(peer_id=-100123456, title="私有频道")
+                )
+
+            return dialogs()
+
+        async def get_messages(self, entity, ids):
+            assert entity.peer_id == -100123456
+            assert ids == 7
+            return selected
+
+    gateway = TelethonGateway.from_client_for_test(
+        Client(), peer_id_getter=lambda entity: entity.peer_id
+    )
+    filters = ScanFilters(now - timedelta(days=1), now, frozenset(MediaKind), 10)
+
+    result = [
+        item
+        async for item in gateway.scan(
+            parse_telegram_link("https://t.me/c/123456/7"), filters
+        )
+    ]
+
+    assert [item.message_id for item in result] == [7]
+    assert result[0].source_title == "私有频道"
+
+
+@pytest.mark.asyncio
+async def test_private_link_reports_membership_error_when_dialog_is_absent() -> None:
+    class Client:
+        async def get_entity(self, entity):
+            raise ValueError(entity)
+
+        def iter_dialogs(self):
+            async def dialogs():
+                if False:
+                    yield None
+
+            return dialogs()
+
+    gateway = TelethonGateway.from_client_for_test(
+        Client(), peer_id_getter=lambda entity: entity.peer_id
+    )
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+
+    with pytest.raises(
+        AccessDeniedError, match="当前账号未加入该私有频道或群组"
+    ):
+        _ = [
+            item
+            async for item in gateway.scan(
+                parse_telegram_link("https://t.me/c/123456/7"),
+                ScanFilters(now - timedelta(days=1), now, frozenset(MediaKind), 10),
+            )
+        ]
+
+
+@pytest.mark.asyncio
+async def test_public_link_does_not_enumerate_private_dialogs() -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    selected = media_message(7, now)
+
+    class Client:
+        async def get_entity(self, entity):
+            assert entity == "example"
+            return SimpleNamespace(title="公开频道")
+
+        def iter_dialogs(self):
+            raise AssertionError("public links must not enumerate dialogs")
+
+        async def get_messages(self, entity, ids):
+            return selected
+
+    gateway = TelethonGateway.from_client_for_test(Client())
+    filters = ScanFilters(now - timedelta(days=1), now, frozenset(MediaKind), 10)
+
+    result = [
+        item
+        async for item in gateway.scan(
+            parse_telegram_link("https://t.me/example/7"), filters
+        )
+    ]
+
+    assert result[0].source_title == "公开频道"
 
 
 @pytest.mark.asyncio
