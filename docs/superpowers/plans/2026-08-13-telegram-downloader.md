@@ -2026,7 +2026,7 @@ Run: `.venv\Scripts\ruff.exe check scripts/release tests/release`
 
 Expected: all tests pass and injected failures leave both latest pointers unchanged.
 
-- [ ] **Step 5: Create public repositories and publish the first formal release**
+- [x] **Step 5: Create public repositories and publish the first formal release**
 
 Create `lx3559359/TelegramDownloader` on GitHub and ModelScope if absent, configure remotes without embedding tokens, publish `main`, tag `v0.1.0`, source archive, portable ZIP, installer EXE, notes, manifest, and signature to both, then download each remote asset and compare SHA-256 with the local release set.
 
@@ -2043,13 +2043,13 @@ git commit -m "ci: publish signed releases to github and modelscope"
 - Modify: `README.md`
 - Create: `docs/verification/2026-08-13-release-checklist.md`
 
-- [ ] **Step 1: Run the complete automated quality gate from a clean process environment**
+- [x] **Step 1: Run the complete automated quality gate from a clean process environment**
 
 Run: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1`
 
 Expected: every pytest test passes and Ruff reports `All checks passed!`.
 
-- [ ] **Step 2: Rebuild and verify package contents**
+- [x] **Step 2: Rebuild and verify package contents**
 
 Run: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1`
 
@@ -2059,13 +2059,13 @@ Run: `Get-ChildItem -Recurse dist\TelegramDownloader | Select-Object FullName,Le
 
 Expected: the package contains the EXE and runtime libraries, but no pre-created `data`, `downloads`, `.venv`, source tests, or user credentials.
 
-- [ ] **Step 3: Launch the packaged GUI and exercise the credential-free paths**
+- [x] **Step 3: Launch the packaged GUI and exercise the credential-free paths**
 
 Run: `Start-Process -FilePath (Resolve-Path 'dist\TelegramDownloader\TelegramDownloader.exe') -WorkingDirectory (Resolve-Path 'dist\TelegramDownloader')`
 
 Expected: the professional workbench opens, the account badge says `未登录`, the login wizard accepts API/proxy fields, invalid links show Chinese validation, and closing the window leaves no running `TelegramDownloader` process.
 
-- [ ] **Step 4: Record evidence and the only credential-dependent checks**
+- [x] **Step 4: Record evidence and the only credential-dependent checks**
 
 Create `docs/verification/2026-08-13-release-checklist.md` with exact commands, timestamps, test counts, portable/installer sizes and hashes, self-test JSON, update fault-injection results, remote publication verification, and manual GUI observations. Mark these two checks as user-performed after delivery because secrets are intentionally never requested in chat:
 
@@ -2076,7 +2076,7 @@ Create `docs/verification/2026-08-13-release-checklist.md` with exact commands, 
 
 All non-secret acceptance items must be checked as passed before handoff; the two credential-dependent checks remain clearly labeled as post-delivery user verification, not silently claimed as tested.
 
-- [ ] **Step 5: Commit the release evidence**
+- [x] **Step 5: Commit the release evidence**
 
 ```powershell
 git add README.md docs/verification/2026-08-13-release-checklist.md
@@ -2085,13 +2085,13 @@ git commit -m "docs: record signed release verification"
 
 ## Final implementation handoff checklist
 
-- [ ] `git status --short` is empty except intentionally ignored runtime/build directories.
-- [ ] `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1` passes.
-- [ ] `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1` passes.
-- [ ] `dist/TelegramDownloader/TelegramDownloader.exe` launches without system Python.
-- [ ] `dist/release/TelegramDownloader-<version>-win-x64-portable.zip` exists and contains no credentials or runtime data.
-- [ ] `dist/release/TelegramDownloader-<version>-win-x64-setup.exe` installs only to a non-C drive and launches without system Python.
-- [ ] Signed startup update, helper health check, and injected rollback failures pass for both delivery modes.
-- [ ] GitHub and ModelScope public repositories contain the same `main`, `v<version>` tag, release assets, hashes, manifest, signature, and latest pointer.
-- [ ] Every path in packaged `data/logs/self-test.json` resolves below the package root before the clean ZIP is produced.
-- [ ] The final response links the EXE directory, ZIP, README, design, plan, and verification report using absolute paths.
+- [x] `git status --short` is empty except intentionally ignored runtime/build directories.
+- [x] `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1` passes.
+- [x] `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1` passes.
+- [x] `dist/TelegramDownloader/TelegramDownloader.exe` launches without system Python.
+- [x] `dist/release/v0.1.0/TelegramDownloader-<version>-win-x64-portable.zip` exists and contains no credentials or runtime data.
+- [x] `dist/release/v0.1.0/TelegramDownloader-<version>-win-x64-setup.exe` installs only to a non-C drive and launches without system Python.
+- [x] Signed startup update, helper health check, and injected rollback failures pass for both delivery modes.
+- [x] GitHub and ModelScope public repositories contain the same signed source tag, release assets, hashes, manifest, signature, and latest pointer.
+- [x] Every path in packaged `data/logs/self-test.json` resolves below the package root before the clean ZIP is produced.
+- [x] The final response links the EXE directory, ZIP, README, design, plan, and verification report using absolute paths.

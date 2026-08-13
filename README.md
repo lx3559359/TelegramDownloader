@@ -1,5 +1,14 @@
 # TelegramDownloader
 
+## 正式版下载
+
+当前正式版：`v0.1.0`（Windows 10/11 x64）
+
+- [GitHub Release（安装包与便携包）](https://github.com/lx3559359/TelegramDownloader/releases/tag/v0.1.0)
+- [魔搭镜像仓库](https://modelscope.cn/models/lx3559359/TelegramDownloader)
+- 安装包会拒绝安装到 C 盘；便携包请解压到 D、E 等非 C 盘目录后运行。
+- Windows 可能因未购买商业 Authenticode 证书显示 SmartScreen“未知发布者”；在线更新仍会强制验证 Ed25519 签名和 SHA-256。
+
 一个面向 Windows 10/11 x64 的简体中文图形化 Telegram 下载器。它支持单条消息、相册，以及按日期、媒体类型和数量上限扫描频道/群组；下载任务可以暂停、断网续传并在程序重启后恢复。
 
 项目同时交付绿色便携包和安装包，并使用 GitHub、魔搭双源的签名在线更新。所有由应用管理的配置、会话、数据库、日志、缓存、临时文件、更新备份和下载内容都位于应用目录，不把这些数据持久写入 C 盘。
