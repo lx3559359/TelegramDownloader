@@ -92,6 +92,8 @@ class TelegramGateway(Protocol):
 
     async def test_connection(self) -> None: ...
 
+    async def account_name(self) -> str | None: ...
+
     async def disconnect(self) -> None: ...
 
 
@@ -337,6 +339,19 @@ class TelethonGateway:
             raise
         except Exception as exc:
             self._raise_mapped(exc)
+
+    async def account_name(self) -> str | None:
+        try:
+            account = await self._client.get_me()
+        except Exception as exc:
+            self._raise_mapped(exc)
+        if account is None:
+            return None
+        first = getattr(account, "first_name", "") or ""
+        last = getattr(account, "last_name", "") or ""
+        display = " ".join(part for part in (first, last) if part).strip()
+        username = getattr(account, "username", "") or ""
+        return display or (f"@{username}" if username else "已登录")
 
     async def disconnect(self) -> None:
         try:

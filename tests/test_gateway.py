@@ -217,3 +217,14 @@ async def test_single_message_without_media_is_reported() -> None:
                 ScanFilters(now, now, frozenset(MediaKind), 10),
             )
         ]
+
+
+@pytest.mark.asyncio
+async def test_account_name_uses_display_name_or_username() -> None:
+    class Client:
+        async def get_me(self):
+            return SimpleNamespace(first_name="Test", last_name="User", username="tester")
+
+    gateway = TelethonGateway.from_client_for_test(Client())
+
+    assert await gateway.account_name() == "Test User"

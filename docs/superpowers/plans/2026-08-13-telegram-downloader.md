@@ -1600,7 +1600,7 @@ git commit -m "feat: add account login and proxy dialogs"
 - Test: `tests/test_controller.py`
 - Test: `tests/test_self_test.py`
 
-- [ ] **Step 1: Write controller login/scan tests and portable self-test**
+- [x] **Step 1: Write controller login/scan tests and portable self-test**
 
 ```python
 # tests/test_controller.py
@@ -1664,13 +1664,13 @@ def test_self_test_reports_only_paths_under_root(tmp_path) -> None:
     assert disk_report == report
 ```
 
-- [ ] **Step 2: Run integration tests and confirm missing composition modules**
+- [x] **Step 2: Run integration tests and confirm missing composition modules**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_controller.py tests/test_self_test.py -q`
 
 Expected: collection fails because `controller.py` and `app.py` do not exist.
 
-- [ ] **Step 3: Implement orchestration without leaking secrets into the UI or logs**
+- [x] **Step 3: Implement orchestration without leaking secrets into the UI or logs**
 
 `AppController` owns gateway, planner, scheduler, settings store, secrets vault, main window, and login dialog. Its public async methods are:
 
@@ -1698,7 +1698,7 @@ def run(root: Path) -> int: ...
 
 `__main__.py` must import only standard library and `bootstrap` before calling `configure_process(runtime_root())`. Parse `--self-test`; import `run_self_test` or `run` only after bootstrap. Return exit code 0 when self-test reports `ok`, otherwise 1.
 
-- [ ] **Step 4: Run controller, self-test, and full test suite**
+- [x] **Step 4: Run controller, self-test, and full test suite**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_controller.py tests/test_self_test.py -q`
 
@@ -1708,7 +1708,7 @@ Run: `$env:QT_QPA_PLATFORM='offscreen'; .venv\Scripts\python.exe -m pytest -q`
 
 Expected: the complete suite passes.
 
-- [ ] **Step 5: Commit the runnable application**
+- [x] **Step 5: Commit the runnable application**
 
 ```powershell
 git add src/telegram_downloader/controller.py src/telegram_downloader/app.py src/telegram_downloader/__main__.py tests/test_controller.py tests/test_self_test.py
