@@ -92,9 +92,10 @@ async def test_refuses_download_when_space_is_below_remaining_plus_reserve(
 ) -> None:
     paths = PortablePaths(tmp_path)
     paths.ensure_layout()
+    repository = FakeRepository()
     media_downloader = MediaDownloader(
         FakeGateway([b"abcdef"]),
-        FakeRepository(),
+        repository,
         paths,
         free_bytes=lambda _: 7,
         reserve_bytes=2,
@@ -102,6 +103,7 @@ async def test_refuses_download_when_space_is_below_remaining_plus_reserve(
 
     with pytest.raises(InsufficientSpaceError):
         await media_downloader.download(item(paths.downloads / "x.mp4"))
+    assert repository.updates[-1] == ("i", 0, ItemStatus.PAUSED)
 
 
 @pytest.mark.asyncio

@@ -124,6 +124,7 @@ requires-python = ">=3.12,<3.13"
 pythonpath = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+addopts = "--basetemp=.build-temp/pytest"
 
 [tool.ruff]
 target-version = "py312"
@@ -1302,7 +1303,7 @@ git commit -m "feat: resume chunked downloads from partial files"
 - Create: `src/telegram_downloader/scheduler.py`
 - Test: `tests/test_scheduler.py`
 
-- [ ] **Step 1: Write deterministic scheduler tests**
+- [x] **Step 1: Write deterministic scheduler tests**
 
 ```python
 # tests/test_scheduler.py
@@ -1363,13 +1364,13 @@ async def _record_sleep(values, value):
     await asyncio.sleep(0)
 ```
 
-- [ ] **Step 2: Run scheduler tests and confirm the missing module**
+- [x] **Step 2: Run scheduler tests and confirm the missing module**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_scheduler.py -q`
 
 Expected: collection fails with `ModuleNotFoundError: telegram_downloader.scheduler`.
 
-- [ ] **Step 3: Implement bounded concurrency and explicit retry policy**
+- [x] **Step 3: Implement bounded concurrency and explicit retry policy**
 
 ```python
 # src/telegram_downloader/scheduler.py public surface
@@ -1390,13 +1391,13 @@ class DownloadScheduler:
 
 Clamp concurrency to 1–5. `run_task()` marks the task downloading, selects queued/paused/waiting-retry/failed items, and executes `_run_item()` under an `asyncio.Semaphore`. Flood waits set item and task to `WAITING_RETRY`, sleep exactly `seconds`, and do not consume the three transient attempts. `TransientNetworkError` retries at `base_delay * 2**attempt_index`; after the final attempt it marks the item failed. `InsufficientSpaceError` and `DownloadPaused` mark the item and task paused without retrying. Aggregate all item results: all completed becomes task completed; any failed becomes partial failure; any paused remains paused. `shutdown()` sets every task pause flag and awaits active tasks with a five-second timeout.
 
-- [ ] **Step 4: Run scheduler, downloader, and repository tests**
+- [x] **Step 4: Run scheduler, downloader, and repository tests**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_scheduler.py tests/test_downloader.py tests/test_repository.py -q`
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Commit scheduling and recovery**
+- [x] **Step 5: Commit scheduling and recovery**
 
 ```powershell
 git add src/telegram_downloader/scheduler.py tests/test_scheduler.py

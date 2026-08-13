@@ -86,7 +86,15 @@ class MediaDownloader:
             os.replace(part, corrupt)
             offset = 0
 
-        self._ensure_space(target.parent, item.expected_size, offset)
+        try:
+            self._ensure_space(target.parent, item.expected_size, offset)
+        except InsufficientSpaceError:
+            self.repository.update_item_progress(
+                item.id,
+                offset,
+                ItemStatus.PAUSED,
+            )
+            raise
         if pause_requested():
             self.repository.update_item_progress(item.id, offset, ItemStatus.PAUSED)
             raise DownloadPaused("下载已暂停")

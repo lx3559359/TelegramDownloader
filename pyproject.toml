@@ -14,6 +14,7 @@ where = ["src"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+addopts = "--basetemp=.build-temp/pytest"
 
 [tool.ruff]
 target-version = "py312"
