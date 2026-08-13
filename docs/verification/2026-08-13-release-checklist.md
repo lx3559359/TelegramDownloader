@@ -7,7 +7,7 @@
 ## 自动化质量门禁
 
 - [x] `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1`
-  - 结果：`141 passed`，Ruff `All checks passed!`。
+  - 结果：正式发布门禁 `141 passed`；升级 GitHub Actions 后最终 `main` 为 `142 passed`，Ruff `All checks passed!`。
 - [x] `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1`
   - 结果：PyInstaller onedir 主程序和独立 `UpdateHelper.exe` 构建成功，打包自检通过。
 - [x] `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1`

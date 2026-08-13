@@ -182,3 +182,13 @@ def test_release_script_stages_both_platforms_before_promoting() -> None:
     assert "MODELSCOPE_API_TOKEN" in script
     assert "$env:GH_CONFIG_DIR" in script
     assert "Write-Output $env:MODELSCOPE_API_TOKEN" not in script
+
+
+def test_github_workflow_uses_node24_actions() -> None:
+    root = Path(__file__).parents[2]
+    workflow = (root / ".github" / "workflows" / "verify.yml").read_text(encoding="utf-8")
+
+    assert "actions/checkout@v6" in workflow
+    assert "actions/setup-python@v6" in workflow
+    assert "actions/checkout@v4" not in workflow
+    assert "actions/setup-python@v5" not in workflow
