@@ -67,3 +67,18 @@ def test_v020_version_and_qr_runtime_contract_are_consistent() -> None:
     assert "app_version=__version__" in gateway
     assert 'f"v{__version__} · stable"' in main
     assert "v0.1.0 · stable" not in main
+
+
+def test_build_preserves_existing_project_local_runtime_data() -> None:
+    root = Path(__file__).parents[1]
+    script = (root / "scripts/build.ps1").read_text(encoding="utf-8")
+
+    for required in (
+        "build-runtime-preservation",
+        "$preservedRuntime",
+        "foreach ($runtimeData in ('data', 'downloads'))",
+        "Copy-Item -LiteralPath $source",
+        "finally {",
+        "Copy-Item -LiteralPath $preserved",
+    ):
+        assert required in script
