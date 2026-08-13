@@ -235,7 +235,7 @@ class DownloadScheduler:
                     task_id,
                     item.id,
                     ItemStatus.FAILED,
-                    error=f"{type(error).__name__}: {error}",
+                    error=type(error).__name__,
                 )
                 return ItemStatus.FAILED
 

@@ -21,6 +21,34 @@ class Vault:
 
 
 @pytest.mark.asyncio
+async def test_startup_error_does_not_expose_unknown_exception_text() -> None:
+    class Gateway:
+        async def connect(self):
+            raise RuntimeError("proxy-password-secret")
+
+    class Window:
+        def __init__(self):
+            self.message = ""
+
+        def set_task_summaries(self, _tasks):
+            pass
+
+        def statusBar(self):
+            return self
+
+        def showMessage(self, message, _timeout):
+            self.message = message
+
+    window = Window()
+    controller = AppController.for_test(gateway=Gateway(), window=window)
+
+    await controller.start()
+
+    assert "RuntimeError" in window.message
+    assert "proxy-password-secret" not in window.message
+
+
+@pytest.mark.asyncio
 async def test_code_login_saves_exported_session() -> None:
     class Gateway:
         async def sign_in(self, phone, code, phone_code_hash):

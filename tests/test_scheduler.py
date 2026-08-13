@@ -164,3 +164,19 @@ def test_recover_delegates_to_repository() -> None:
     scheduler.recover()
 
     assert repo.recovered is True
+
+
+@pytest.mark.asyncio
+async def test_unknown_download_error_does_not_persist_exception_text() -> None:
+    class Downloader:
+        async def download(self, item, should_pause):
+            raise RuntimeError("api-secret-in-third-party-error")
+
+    repo = Repo()
+    scheduler = DownloadScheduler(repo, Downloader())
+
+    await scheduler.run_task("t")
+
+    stored_error = repo.item_updates[-1][3]
+    assert stored_error == "RuntimeError"
+    assert "api-secret" not in stored_error

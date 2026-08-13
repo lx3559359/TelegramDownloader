@@ -201,7 +201,7 @@ class AppController:
                 if task.status is TaskStatus.QUEUED:
                     self._start_task(task.id)
         except Exception as error:
-            self._show_status(f"Telegram 连接失败：{error}")
+            self._show_status(f"Telegram 连接失败：{self._safe_error(error)}")
 
     async def submit_credentials(
         self,
