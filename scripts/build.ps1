@@ -41,8 +41,8 @@ foreach ($directory in ($work, $dist)) {
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
 }
 
-$pyinstaller = Join-Path $projectRoot '.venv\Scripts\pyinstaller.exe'
-& $pyinstaller --noconfirm --clean --workpath $work --distpath $dist (Join-Path $projectRoot 'TelegramDownloader.spec')
+$python = Join-Path $projectRoot '.venv\Scripts\python.exe'
+& $python -m PyInstaller --noconfirm --clean --workpath $work --distpath $dist (Join-Path $projectRoot 'TelegramDownloader.spec')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $appDir = Assert-ProjectChild (Join-Path $dist 'TelegramDownloader')
@@ -52,9 +52,9 @@ if (-not (Test-Path -LiteralPath $helperExe -PathType Leaf)) {
 }
 Copy-Item -LiteralPath $helperExe -Destination (Join-Path $appDir 'UpdateHelper.exe') -Force
 
-$version = & (Join-Path $projectRoot '.venv\Scripts\python.exe') -c "from telegram_downloader import __version__; print(__version__)"
+$version = & $python -c "from telegram_downloader import __version__; print(__version__)"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-& (Join-Path $projectRoot '.venv\Scripts\python.exe') (Join-Path $PSScriptRoot 'generate_runtime_inventory.py') --root $appDir --version $version
+& $python (Join-Path $PSScriptRoot 'generate_runtime_inventory.py') --root $appDir --version $version
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 & (Join-Path $PSScriptRoot 'smoke.ps1')

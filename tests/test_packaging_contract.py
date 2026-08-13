@@ -13,6 +13,8 @@ def test_build_contract_uses_onedir_and_project_local_workpaths() -> None:
     assert "console=False" in spec
     assert "QtWebEngine" in spec
     assert "--onefile" not in build
+    assert "-m PyInstaller" in build
+    assert ".venv\\Scripts\\pyinstaller.exe" not in build
     assert ".build-temp" in build
     assert ".tool-cache" in build
     assert "smoke.ps1" in build
