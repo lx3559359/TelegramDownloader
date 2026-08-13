@@ -105,13 +105,17 @@ API Hash、代理密码和 Telethon StringSession 会写入 `data/config/secrets
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup-dev.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1
 ```
 
 基础便携构建输出：
 
 ```text
 dist/TelegramDownloader/TelegramDownloader.exe
-dist/TelegramDownloader-portable-win-x64.zip
+dist/TelegramDownloader-0.1.0-win-x64-portable.zip
+dist/release/TelegramDownloader-0.1.0-win-x64-setup.exe
 ```
+
+安装器构建会把 Inno Setup 7.0.2 以便携方式放在项目 `.tool-cache` 中，并在使用前核对官方固定 SHA-256 和 Authenticode 发布者；编译、安装及卸载冒烟测试的临时目录和日志都位于 `.build-temp`。安装验收会真实验证 C 盘拒绝、D 盘安装、自检、原位升级、在线更新运行时文件存在，以及普通卸载后用户数据仍保留。
 
 正式发布流程还会生成带版本号的便携 ZIP、安装程序、`update-manifest.json` 与 `update-manifest.sig`。真实 Telegram 登录和下载测试必须由用户在应用内输入自己的凭据完成；测试代码、构建日志和发布资产不得包含这些凭据。

@@ -1965,25 +1965,25 @@ git commit -m "feat: add rollback-safe online updates"
 - Create: `scripts/smoke-installer.ps1`
 - Test: `tests/test_installer_contract.py`
 
-- [ ] **Step 1: Write a failing installer contract test**
+- [x] **Step 1: Write a failing installer contract test**
 
 Assert current-user privileges, x64 architecture, an explicit target-volume guard rejecting both drive C and the Windows system volume, application-root data paths, preserved `data`/`downloads` on normal uninstall, no MSI dependency, project-local compiler output/log/temp paths, and portable/installer version equality.
 
-- [ ] **Step 2: Run the contract test and confirm installer files are missing**
+- [x] **Step 2: Run the contract test and confirm installer files are missing**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_installer_contract.py -q`
 
 Expected: fails with `FileNotFoundError` for `installer/TelegramDownloader.iss`.
 
-- [ ] **Step 3: Implement and compile the installer**
+- [x] **Step 3: Implement and compile the installer**
 
 Use Inno Setup 7 x64 with `PrivilegesRequired=lowest`. Select a fixed non-system drive by default and block Next/silent installation when the target is on C or the Windows system volume. Install the exact tested onedir runtime, create current-user shortcuts and uninstall metadata, preserve user-created data by default, and offer a separately confirmed uninstall option to remove `data` and `downloads`.
 
-- [ ] **Step 4: Smoke test install, launch, update compatibility, and uninstall**
+- [x] **Step 4: Smoke test install, launch, update compatibility, and uninstall**
 
 Build into `dist/release`; silently install under the worktree's D-drive `.build-temp/installed-smoke`, run `TelegramDownloader.exe --self-test`, verify all reported writable paths are under that install directory, seed sentinel data, uninstall normally, and verify the sentinel remains. Separately assert a C-drive target is rejected before copying application files.
 
-- [ ] **Step 5: Commit installer delivery**
+- [x] **Step 5: Commit installer delivery**
 
 ```powershell
 git add installer scripts/build-installer.ps1 scripts/smoke-installer.ps1 tests/test_installer_contract.py README.md
