@@ -68,7 +68,7 @@ tests/                                 Unit, integration, GUI, update, installer
 - Create: `src/telegram_downloader/bootstrap.py`
 - Test: `tests/test_bootstrap.py`
 
-- [ ] **Step 1: Write the failing bootstrap tests**
+- [x] **Step 1: Write the failing bootstrap tests**
 
 ```python
 # tests/test_bootstrap.py
@@ -101,13 +101,13 @@ def test_configure_process_redirects_temp_and_creates_only_local_dirs(
     assert (tmp_path / "downloads").is_dir()
 ```
 
-- [ ] **Step 2: Run the focused test and confirm the expected failure**
+- [x] **Step 2: Run the focused test and confirm the expected failure**
 
 Run: `python -m pytest tests/test_bootstrap.py -q`
 
 Expected: collection fails with `ModuleNotFoundError: No module named 'telegram_downloader'`.
 
-- [ ] **Step 3: Add pinned dependencies, local setup, and bootstrap implementation**
+- [x] **Step 3: Add pinned dependencies, local setup, and bootstrap implementation**
 
 ```toml
 # pyproject.toml
@@ -205,7 +205,7 @@ def configure_process(root: Path) -> Path:
 
 Create an empty `src/telegram_downloader/__init__.py` containing only `__version__ = "0.1.0"`.
 
-- [ ] **Step 4: Install locally and run the bootstrap tests**
+- [x] **Step 4: Install locally and run the bootstrap tests**
 
 Run: `powershell -ExecutionPolicy Bypass -File scripts/setup-dev.ps1`
 
@@ -215,7 +215,7 @@ Run: `.venv\Scripts\python.exe -m pytest tests/test_bootstrap.py -q`
 
 Expected: `3 passed`.
 
-- [ ] **Step 5: Commit the bootstrap slice**
+- [x] **Step 5: Commit the bootstrap slice**
 
 ```powershell
 git add pyproject.toml requirements.txt requirements-dev.txt scripts/setup-dev.ps1 src/telegram_downloader tests/test_bootstrap.py
