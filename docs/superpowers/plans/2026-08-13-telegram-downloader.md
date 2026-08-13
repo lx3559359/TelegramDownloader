@@ -919,7 +919,7 @@ git commit -m "feat: store portable settings and encrypted secrets"
 - Create: `src/telegram_downloader/gateway.py`
 - Test: `tests/test_gateway.py`
 
-- [ ] **Step 1: Write adapter tests against a fake Telethon client**
+- [x] **Step 1: Write adapter tests against a fake Telethon client**
 
 ```python
 # tests/test_gateway.py
@@ -961,13 +961,13 @@ def test_message_metadata_classifies_voice_and_name() -> None:
     assert media.expected_size == 12
 ```
 
-- [ ] **Step 2: Run the gateway tests and confirm the module is absent**
+- [x] **Step 2: Run the gateway tests and confirm the module is absent**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_gateway.py -q`
 
 Expected: collection fails with `ModuleNotFoundError: telegram_downloader.gateway`.
 
-- [ ] **Step 3: Implement the protocol and Telethon boundary**
+- [x] **Step 3: Implement the protocol and Telethon boundary**
 
 Define these stable public types in `gateway.py`:
 
@@ -1020,7 +1020,7 @@ class TelegramGateway(Protocol):
 
 For a single link, fetch the exact message. When it has `grouped_id`, iterate a bounded window of messages around its ID and yield all matching grouped messages in ascending message ID order. For channel/group scans, iterate newest to oldest, skip messages newer than `date_to_utc`, stop below `date_from_utc`, apply `media_kinds`, and stop at `item_limit`. Use `remote_media_from_message()` for all metadata classification. `stream_media()` refetches the message and yields `client.iter_download(message.media, offset=offset)` chunks.
 
-- [ ] **Step 4: Run the adapter tests and import check**
+- [x] **Step 4: Run the adapter tests and import check**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_gateway.py -q`
 
@@ -1030,7 +1030,7 @@ Run: `.venv\Scripts\python.exe -c "from telegram_downloader.gateway import Telet
 
 Expected: `gateway import OK` without a network connection.
 
-- [ ] **Step 5: Commit the Telegram boundary**
+- [x] **Step 5: Commit the Telegram boundary**
 
 ```powershell
 git add src/telegram_downloader/gateway.py tests/test_gateway.py
