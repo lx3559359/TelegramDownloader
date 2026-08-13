@@ -1413,7 +1413,7 @@ git commit -m "feat: schedule retries and recover interrupted work"
 - Create: `src/telegram_downloader/ui/main.py`
 - Test: `tests/ui/test_main_window.py`
 
-- [ ] **Step 1: Write GUI structure and signal tests**
+- [x] **Step 1: Write GUI structure and signal tests**
 
 ```python
 # tests/ui/test_main_window.py
@@ -1442,13 +1442,13 @@ def test_scan_button_emits_link(qtbot) -> None:
     assert signal.args == ["https://t.me/example/42"]
 ```
 
-- [ ] **Step 2: Run the GUI tests headlessly and confirm the missing UI**
+- [x] **Step 2: Run the GUI tests headlessly and confirm the missing UI**
 
 Run: `$env:QT_QPA_PLATFORM='offscreen'; .venv\Scripts\python.exe -m pytest tests/ui/test_main_window.py -q`
 
 Expected: collection fails with `ModuleNotFoundError: telegram_downloader.ui`.
 
-- [ ] **Step 3: Implement the dark three-column workbench**
+- [x] **Step 3: Implement the dark three-column workbench**
 
 `ui/models.py` defines the exact presentation record below. `TaskTableModel(QAbstractTableModel)` exposes columns `任务`, `状态`, `进度`, `大小`, `速度`, `剩余时间`, accepts `set_tasks(list[TaskSummary])`, returns Chinese state labels, and uses `Qt.UserRole` for task IDs.
 
@@ -1490,7 +1490,7 @@ class MainWindow(QMainWindow):
 
 Build a 1180×720 window with a 180-pixel navigation rail, expanding center panel, and 220-pixel statistics rail. The center panel contains link input and scan button, inclusive date pickers, all six media checkboxes checked by default, limit default 500, the task table, and pause/resume/retry/open-directory buttons. `theme.py` exports one `DARK_STYLESHEET` string using slate backgrounds, cyan primary actions, teal connected state, orange warnings, and visible keyboard focus outlines.
 
-- [ ] **Step 4: Run GUI tests and manually render offscreen**
+- [x] **Step 4: Run GUI tests and manually render offscreen**
 
 Run: `$env:QT_QPA_PLATFORM='offscreen'; .venv\Scripts\python.exe -m pytest tests/ui/test_main_window.py -q`
 
@@ -1500,7 +1500,7 @@ Run: `.venv\Scripts\ruff.exe check src/telegram_downloader/ui tests/ui`
 
 Expected: `All checks passed!`.
 
-- [ ] **Step 5: Commit the workbench UI**
+- [x] **Step 5: Commit the workbench UI**
 
 ```powershell
 git add src/telegram_downloader/ui tests/ui/test_main_window.py
