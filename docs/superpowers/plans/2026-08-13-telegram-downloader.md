@@ -362,7 +362,7 @@ git commit -m "feat: enforce portable write paths"
 - Test: `tests/test_links.py`
 - Test: `tests/test_files.py`
 
-- [ ] **Step 1: Write parsing, classification, and filename tests**
+- [x] **Step 1: Write parsing, classification, and filename tests**
 
 ```python
 # tests/test_links.py
@@ -423,13 +423,13 @@ def test_archive_target_uses_source_month_kind_and_message_id(tmp_path: Path) ->
     assert disambiguate_target(target, 42).name == "clip__42.mp4"
 ```
 
-- [ ] **Step 2: Run the tests and confirm missing domain modules**
+- [x] **Step 2: Run the tests and confirm missing domain modules**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_links.py tests/test_files.py -q`
 
 Expected: collection fails because `telegram_downloader.domain` does not exist.
 
-- [ ] **Step 3: Implement stable enums, records, parsers, and Windows-safe paths**
+- [x] **Step 3: Implement stable enums, records, parsers, and Windows-safe paths**
 
 ```python
 # src/telegram_downloader/domain.py
@@ -606,7 +606,7 @@ def disambiguate_target(target: Path, message_id: int) -> Path:
     return target.with_name(f"{target.stem}_{message_id}{target.suffix}")
 ```
 
-- [ ] **Step 4: Run domain tests and lint the new modules**
+- [x] **Step 4: Run domain tests and lint the new modules**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_links.py tests/test_files.py -q`
 
@@ -616,7 +616,7 @@ Run: `.venv\Scripts\ruff.exe check src/telegram_downloader/domain.py src/telegra
 
 Expected: `All checks passed!`.
 
-- [ ] **Step 5: Commit the domain slice**
+- [x] **Step 5: Commit the domain slice**
 
 ```powershell
 git add src/telegram_downloader/domain.py src/telegram_downloader/links.py src/telegram_downloader/files.py tests/test_links.py tests/test_files.py
