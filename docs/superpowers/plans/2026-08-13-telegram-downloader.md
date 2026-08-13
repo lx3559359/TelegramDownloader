@@ -629,7 +629,7 @@ git commit -m "feat: parse Telegram sources and build archive paths"
 - Create: `src/telegram_downloader/repository.py`
 - Test: `tests/test_repository.py`
 
-- [ ] **Step 1: Write repository round-trip and recovery tests**
+- [x] **Step 1: Write repository round-trip and recovery tests**
 
 ```python
 # tests/test_repository.py
@@ -670,13 +670,13 @@ def test_recover_interrupted_work(tmp_path: Path) -> None:
     assert repo.list_items(task.id)[0].status is ItemStatus.QUEUED
 ```
 
-- [ ] **Step 2: Run repository tests and verify the missing implementation**
+- [x] **Step 2: Run repository tests and verify the missing implementation**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_repository.py -q`
 
 Expected: collection fails with `ModuleNotFoundError: telegram_downloader.repository`.
 
-- [ ] **Step 3: Implement schema, typed mapping, atomic updates, and recovery**
+- [x] **Step 3: Implement schema, typed mapping, atomic updates, and recovery**
 
 Implement `TaskRepository` with one short-lived connection per public operation. `initialize()` must execute this schema and set `PRAGMA journal_mode=WAL`, `PRAGMA foreign_keys=ON`, and `PRAGMA synchronous=NORMAL`:
 
@@ -735,13 +735,13 @@ class TaskRepository:
 
 Serialize datetimes with `datetime.isoformat()`, media kinds as a sorted comma-separated string, and paths with `str(path)`. `recover_interrupted()` must update task states `scanning`, `downloading`, and `waiting_retry` to `queued`, and item states `downloading` and `waiting_retry` to `queued`, inside one transaction.
 
-- [ ] **Step 4: Run repository and existing tests**
+- [x] **Step 4: Run repository and existing tests**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_repository.py tests/test_paths.py tests/test_files.py -q`
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Commit persistence**
+- [x] **Step 5: Commit persistence**
 
 ```powershell
 git add src/telegram_downloader/repository.py tests/test_repository.py
