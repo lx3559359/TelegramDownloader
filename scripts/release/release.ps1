@@ -107,8 +107,8 @@ if ($existingTag) {
 }
 git -C $projectRoot push github HEAD:main $tag
 Assert-Succeeded 'Push GitHub main and tag'
-git -C $projectRoot push modelscope HEAD:main $tag
-Assert-Succeeded 'Push ModelScope main and tag'
+git -C $projectRoot push modelscope HEAD:source $tag
+Assert-Succeeded 'Push ModelScope source branch and tag'
 
 & $python -m scripts.release.publish_github stage --version $Version --source $candidate --workspace $projectRoot
 Assert-Succeeded 'Stage GitHub draft release'

@@ -136,4 +136,4 @@ dist/release/TelegramDownloader-0.2.0-win-x64-setup.exe
 
 正式发布流程还会生成带版本号的便携 ZIP、安装程序、`update-manifest.json` 与 `update-manifest.sig`。真实 Telegram 登录和下载测试必须由用户在应用内输入自己的凭据完成；测试代码、构建日志和发布资产不得包含这些凭据。
 
-正式发布命令为 `scripts/release/release.ps1 -Version <X.Y.Z>`。它只允许从干净的 `main` 运行，先重跑测试与两种打包冒烟测试，再生成源码归档、规范清单和 Ed25519 签名；随后先创建 GitHub 草稿 Release 与魔搭候选目录，下载两端资产逐字节比对，最后才公开 Release 并推进双方版本指针。发布私钥只允许位于已忽略的 `.release-secrets` 或 CI secret，禁止提交、复制到产物或输出到日志。
+正式发布命令为 `scripts/release/release.ps1 -Version <X.Y.Z>`。它只允许从干净的 `main` 运行，先重跑测试与两种打包冒烟测试，再生成源码归档、规范清单和 Ed25519 签名；随后先创建 GitHub 草稿 Release 与魔搭候选目录，下载两端资产逐字节比对，最后才公开 Release 并推进双方版本指针。GitHub 的源码分支为 `main`；魔搭的 `main` 由平台管理发布资产，源码同步到独立 `source` 分支并使用相同版本标签，避免覆盖历史安装包。发布私钥只允许位于已忽略的 `.release-secrets` 或 CI secret，禁止提交、复制到产物或输出到日志。

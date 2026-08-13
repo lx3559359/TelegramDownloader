@@ -184,6 +184,15 @@ def test_release_script_stages_both_platforms_before_promoting() -> None:
     assert "Write-Output $env:MODELSCOPE_API_TOKEN" not in script
 
 
+def test_release_script_keeps_modelscope_asset_main_and_source_history_separate() -> None:
+    root = Path(__file__).parents[2]
+    script = (root / "scripts" / "release" / "release.ps1").read_text(encoding="utf-8")
+
+    assert "push github HEAD:main $tag" in script
+    assert "push modelscope HEAD:source $tag" in script
+    assert "push modelscope HEAD:main $tag" not in script
+
+
 def test_github_workflow_uses_node24_actions() -> None:
     root = Path(__file__).parents[2]
     workflow = (root / ".github" / "workflows" / "verify.yml").read_text(encoding="utf-8")
