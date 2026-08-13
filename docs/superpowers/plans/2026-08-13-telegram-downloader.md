@@ -1,12 +1,12 @@
-# Windows Portable Telegram Downloader Implementation Plan
+# Windows Telegram Downloader Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build and package a Simplified-Chinese Windows desktop application that downloads single Telegram posts or filtered channel/group media while keeping every application-managed write under the portable executable directory.
+**Goal:** Build, package, and formally publish a Simplified-Chinese Windows desktop application that downloads single Telegram posts or filtered channel/group media, ships as both a portable ZIP and a non-C-drive installer, performs signed rollback-safe online updates, and keeps every application-managed write under the project/application directory.
 
-**Architecture:** A path bootstrap runs before any GUI or Telegram import, then composes a PySide6/qasync interface with isolated domain services, a Telethon gateway, an SQLite repository, and a chunked download scheduler. Every external boundary is expressed as a protocol so the complete login, scan, retry, and resume flow can be tested without real Telegram credentials.
+**Architecture:** A path bootstrap runs before any GUI or Telegram import, then composes a PySide6/qasync interface with isolated domain services, a Telethon gateway, an SQLite repository, a chunked download scheduler, and a dual-source update coordinator. A separately packaged helper applies the same signed runtime ZIP to portable and installed editions as a transaction, health-checking the replacement and rolling back on failure. Every external boundary is expressed as a protocol so login, scan, retry, resume, update, rollback, installer, and release flows can be tested without real Telegram credentials or network mutation.
 
-**Tech Stack:** Python 3.12, PySide6 6.11.1, Telethon 1.44.0, qasync 0.28.0, python-socks 2.8.2, SQLite, Windows DPAPI, pytest 9.1.1, pytest-asyncio 1.4.0, pytest-qt 4.5.0, Ruff 0.15.22, PyInstaller 6.21.0
+**Tech Stack:** Python 3.12, PySide6 6.11.1, Telethon 1.44.0, qasync 0.28.0, python-socks 2.8.2, cryptography 49.0.0, SQLite, Windows DPAPI, pytest 9.1.1, pytest-asyncio 1.4.0, pytest-qt 4.5.0, Ruff 0.15.22, PyInstaller 6.21.0, Inno Setup 7 x64, GitHub CLI/API, ModelScope Hub
 
 ---
 
@@ -16,11 +16,17 @@
 pyproject.toml                         Project metadata, pytest and Ruff settings
 requirements.txt                      Pinned runtime dependencies
 requirements-dev.txt                  Pinned test/build dependencies
-TelegramDownloader.spec               PyInstaller onedir recipe
+TelegramDownloader.spec               PyInstaller onedir recipe for app and update helper
+installer/TelegramDownloader.iss      Current-user non-C-drive Inno Setup recipe
 README.md                              Chinese user and build guide
 scripts/setup-dev.ps1                  Project-local virtual environment bootstrap
 scripts/test.ps1                       Local-cache test entry point
 scripts/build.ps1                      Reproducible onedir build and ZIP creation
+scripts/build-installer.ps1            Reproducible installer build and validation
+scripts/release/generate_manifest.py   Canonical manifest, SHA-256, and Ed25519 signature
+scripts/release/publish_github.py      Draft release upload, verification, and promotion
+scripts/release/publish_modelscope.py  Candidate asset upload, verification, and promotion
+scripts/release/release.ps1            Fail-closed two-platform formal release transaction
 scripts/smoke.ps1                      Packaged executable path/self-test
 src/telegram_downloader/bootstrap.py   Pre-import runtime-root and TEMP/TMP bootstrap
 src/telegram_downloader/paths.py       Portable directory registry and containment guard
@@ -35,6 +41,11 @@ src/telegram_downloader/gateway.py     Telegram protocol, errors, and Telethon a
 src/telegram_downloader/planner.py     Scan preview and task creation
 src/telegram_downloader/downloader.py  Chunked .part writer and byte-offset resume
 src/telegram_downloader/scheduler.py   Concurrency, retries, FloodWait, and recovery
+src/telegram_downloader/update_contract.py Strict release manifest parsing and verification
+src/telegram_downloader/update_sources.py  GitHub/ModelScope source adapters and reconciliation
+src/telegram_downloader/update_download.py Resumable, hash-checked package download
+src/telegram_downloader/update.py          Startup checks and update orchestration
+src/telegram_downloader/update_helper.py   External replace, health-check, and rollback transaction
 src/telegram_downloader/ui/theme.py    Dark workbench stylesheet
 src/telegram_downloader/ui/models.py   Qt task table model
 src/telegram_downloader/ui/main.py     Main workbench widgets and user intents
@@ -43,7 +54,7 @@ src/telegram_downloader/ui/settings.py Proxy and concurrency settings dialog
 src/telegram_downloader/controller.py  Async orchestration between UI and services
 src/telegram_downloader/app.py         Composition root and qasync event loop
 src/telegram_downloader/__main__.py    Bootstrap-first executable entry point
-tests/                                 Unit, integration, GUI, and packaging tests
+tests/                                 Unit, integration, GUI, update, installer, release, and packaging tests
 ```
 
 ### Task 1: Project-local toolchain and bootstrap-first entry
@@ -128,6 +139,7 @@ PySide6==6.11.1
 Telethon==1.44.0
 qasync==0.28.0
 python-socks[asyncio]==2.8.2
+cryptography==49.0.0
 ```
 
 ```text
@@ -1853,7 +1865,177 @@ git add TelegramDownloader.spec scripts/test.ps1 scripts/smoke.ps1 scripts/build
 git commit -m "build: package portable Windows downloader"
 ```
 
-### Task 14: Acceptance audit and release candidate verification
+### Task 14: Signed update contract and dual-source reconciliation
+
+**Files:**
+- Create: `src/telegram_downloader/update_contract.py`
+- Create: `src/telegram_downloader/update_sources.py`
+- Create: `src/telegram_downloader/trusted_update_keys.json`
+- Test: `tests/update/test_update_contract.py`
+- Test: `tests/update/test_update_sources.py`
+
+- [ ] **Step 1: Write failing strict-contract and source-reconciliation tests**
+
+Cover canonical JSON serialization; Ed25519 valid/invalid signatures; unknown key IDs; malformed, oversized, duplicate-key, BOM, extra-field, downgrade, prerelease, byte-size, and SHA-256 validation; both sources agreeing; either source being temporarily unavailable; one source being stale; and same-version content conflicts failing closed.
+
+- [ ] **Step 2: Run focused tests and confirm update modules are missing**
+
+Run: `.venv\Scripts\python.exe -m pytest tests/update/test_update_contract.py tests/update/test_update_sources.py -q`
+
+Expected: collection fails because the update contract modules do not exist.
+
+- [ ] **Step 3: Implement immutable contracts and source protocols**
+
+`update_contract.py` exposes immutable manifest/asset models, strict semantic-version parsing, canonical JSON bytes, `verify_manifest(manifest_bytes, signature_bytes, trusted_keys)`, and `verify_asset(path, expected_size, expected_sha256)`. Reject any field not defined by schema version 1. Store only public SPKI DER keys as Base64 in `trusted_update_keys.json`.
+
+`update_sources.py` defines async source adapters returning `latest.json`, versioned manifest, signature, and ranged asset streams. Implement GitHub and ModelScope HTTPS URL builders plus `reconcile_sources(results, current_version)`. A valid single source may proceed when the other is unavailable; same-version disagreement is a hard error.
+
+- [ ] **Step 4: Run focused tests and lint**
+
+Run: `.venv\Scripts\python.exe -m pytest tests/update/test_update_contract.py tests/update/test_update_sources.py -q`
+
+Run: `.venv\Scripts\ruff.exe check src/telegram_downloader/update_contract.py src/telegram_downloader/update_sources.py tests/update`
+
+Expected: all pass.
+
+- [ ] **Step 5: Commit the signed update contract**
+
+```powershell
+git add src/telegram_downloader/update_contract.py src/telegram_downloader/update_sources.py src/telegram_downloader/trusted_update_keys.json tests/update
+git commit -m "feat: verify signed updates from dual sources"
+```
+
+### Task 15: Resumable online update, external replacement, and rollback
+
+**Files:**
+- Create: `src/telegram_downloader/update_download.py`
+- Create: `src/telegram_downloader/update.py`
+- Create: `src/telegram_downloader/update_helper.py`
+- Create: `src/telegram_downloader/ui/update_dialog.py`
+- Modify: `src/telegram_downloader/paths.py`
+- Modify: `src/telegram_downloader/controller.py`
+- Modify: `src/telegram_downloader/app.py`
+- Modify: `src/telegram_downloader/__main__.py`
+- Modify: `TelegramDownloader.spec`
+- Test: `tests/update/test_resumable_update.py`
+- Test: `tests/update/test_update_transaction.py`
+- Test: `tests/update/test_update_coordinator.py`
+- Test: `tests/ui/test_update_dialog.py`
+
+- [ ] **Step 1: Write failing download, transaction, and UI tests**
+
+Cover HTTP Range resume, server ignoring Range, source failover, corrupted partial files, final size/hash mismatch, insufficient disk space, managed-file inventory validation, preservation of `data`/`downloads`/unknown root files, locked-file failure, process-exit wait, healthy replacement commit, health timeout, replacement crash, automatic rollback, rollback journal recovery after helper interruption, startup non-blocking behavior, user decline, and accepted-update shutdown.
+
+- [ ] **Step 2: Run focused tests and confirm the update workflow is absent**
+
+Run: `$env:QT_QPA_PLATFORM='offscreen'; .venv\Scripts\python.exe -m pytest tests/update tests/ui/test_update_dialog.py -q`
+
+Expected: collection fails for the missing downloader/coordinator/helper/dialog modules.
+
+- [ ] **Step 3: Implement project-local resumable download and coordinator**
+
+Write partial packages and metadata under `data/update/staging`; fsync before promoting; always verify the signed manifest, asset size, and SHA-256. Check both sources at startup after local recovery, display version/release notes/size, and begin download only after explicit confirmation. Copy the helper into `data/update/helper/<version>` before asking the main process to exit.
+
+- [ ] **Step 4: Implement journaled replacement and health-check rollback**
+
+The helper accepts only absolute paths guarded below the application root, waits for the parent PID, validates a versioned managed-file inventory, moves old managed files to `data/update/backup/<old-version>`, installs the new runtime, and launches `--update-health-check`. It commits only after a transaction-specific confirmation file appears. On any error or timeout it removes only newly managed files, restores the backup, records a redacted result, and starts the old executable. A subsequent helper launch resumes or rolls back an interrupted journal idempotently.
+
+- [ ] **Step 5: Package both executables and run fault-injection tests**
+
+Run: `$env:QT_QPA_PLATFORM='offscreen'; .venv\Scripts\python.exe -m pytest tests/update tests/ui/test_update_dialog.py -q`
+
+Run: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1`
+
+Expected: `TelegramDownloader.exe` and `UpdateHelper.exe` are both onedir executables; portable smoke and every injected rollback case pass.
+
+- [ ] **Step 6: Commit online update support**
+
+```powershell
+git add src/telegram_downloader TelegramDownloader.spec tests/update tests/ui/test_update_dialog.py
+git commit -m "feat: add rollback-safe online updates"
+```
+
+### Task 16: Non-C-drive Windows installer
+
+**Files:**
+- Create: `installer/TelegramDownloader.iss`
+- Create: `scripts/build-installer.ps1`
+- Create: `scripts/smoke-installer.ps1`
+- Test: `tests/test_installer_contract.py`
+
+- [ ] **Step 1: Write a failing installer contract test**
+
+Assert current-user privileges, x64 architecture, an explicit target-volume guard rejecting both drive C and the Windows system volume, application-root data paths, preserved `data`/`downloads` on normal uninstall, no MSI dependency, project-local compiler output/log/temp paths, and portable/installer version equality.
+
+- [ ] **Step 2: Run the contract test and confirm installer files are missing**
+
+Run: `.venv\Scripts\python.exe -m pytest tests/test_installer_contract.py -q`
+
+Expected: fails with `FileNotFoundError` for `installer/TelegramDownloader.iss`.
+
+- [ ] **Step 3: Implement and compile the installer**
+
+Use Inno Setup 7 x64 with `PrivilegesRequired=lowest`. Select a fixed non-system drive by default and block Next/silent installation when the target is on C or the Windows system volume. Install the exact tested onedir runtime, create current-user shortcuts and uninstall metadata, preserve user-created data by default, and offer a separately confirmed uninstall option to remove `data` and `downloads`.
+
+- [ ] **Step 4: Smoke test install, launch, update compatibility, and uninstall**
+
+Build into `dist/release`; silently install under the worktree's D-drive `.build-temp/installed-smoke`, run `TelegramDownloader.exe --self-test`, verify all reported writable paths are under that install directory, seed sentinel data, uninstall normally, and verify the sentinel remains. Separately assert a C-drive target is rejected before copying application files.
+
+- [ ] **Step 5: Commit installer delivery**
+
+```powershell
+git add installer scripts/build-installer.ps1 scripts/smoke-installer.ps1 tests/test_installer_contract.py README.md
+git commit -m "build: add non-C-drive Windows installer"
+```
+
+### Task 17: Reproducible signed release and GitHub/ModelScope synchronization
+
+**Files:**
+- Create: `scripts/release/generate_manifest.py`
+- Create: `scripts/release/publish_github.py`
+- Create: `scripts/release/publish_modelscope.py`
+- Create: `scripts/release/release.ps1`
+- Create: `scripts/release/verify_remote_release.py`
+- Create: `.github/workflows/verify.yml`
+- Modify: `.gitignore`
+- Modify: `README.md`
+- Test: `tests/release/test_generate_manifest.py`
+- Test: `tests/release/test_publish_contract.py`
+
+- [ ] **Step 1: Write failing offline release tests**
+
+Cover deterministic manifests, key ID/public key matching, no private key material in tracked files or logs, exact release asset sets, source/package version agreement, GitHub draft-before-publish behavior, ModelScope candidate-before-latest behavior, remote byte/hash comparison, failure before either latest pointer advances, idempotent retry, and all ModelScope/temp/cache paths resolving under the workspace.
+
+- [ ] **Step 2: Run focused tests and confirm release scripts are missing**
+
+Run: `.venv\Scripts\python.exe -m pytest tests/release -q`
+
+Expected: fails because release scripts do not exist.
+
+- [ ] **Step 3: Implement signing and fail-closed publication**
+
+Generate an Ed25519 release key once, commit only its public key, and save the private key under ignored `.release-secrets` plus the GitHub Actions secret. `release.ps1` requires a clean `main`, a strict `X.Y.Z` version, passing tests, fresh packages, and matching local hashes. It pushes the same commit/tag to `github` and `modelscope`, uploads a GitHub draft Release and a versioned ModelScope candidate, downloads/compares both remote asset sets, then publishes/promotes both latest pointers. Secrets are read from environment or project-local ignored files and never echoed.
+
+- [ ] **Step 4: Validate scripts offline and against disposable mocked adapters**
+
+Run: `.venv\Scripts\python.exe -m pytest tests/release -q`
+
+Run: `.venv\Scripts\ruff.exe check scripts/release tests/release`
+
+Expected: all tests pass and injected failures leave both latest pointers unchanged.
+
+- [ ] **Step 5: Create public repositories and publish the first formal release**
+
+Create `lx3559359/TelegramDownloader` on GitHub and ModelScope if absent, configure remotes without embedding tokens, publish `main`, tag `v0.1.0`, source archive, portable ZIP, installer EXE, notes, manifest, and signature to both, then download each remote asset and compare SHA-256 with the local release set.
+
+- [ ] **Step 6: Commit release automation**
+
+```powershell
+git add .github .gitignore scripts/release tests/release README.md src/telegram_downloader/trusted_update_keys.json
+git commit -m "ci: publish signed releases to github and modelscope"
+```
+
+### Task 18: Acceptance audit and release candidate verification
 
 **Files:**
 - Modify: `README.md`
@@ -1869,7 +2051,7 @@ Expected: every pytest test passes and Ruff reports `All checks passed!`.
 
 Run: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1`
 
-Expected: build exits 0, packaged self-test reports `PACKAGED_SMOKE_OK`, and the ZIP exists.
+Expected: build exits 0, packaged self-test reports `PACKAGED_SMOKE_OK`, and both the portable ZIP and installer EXE exist.
 
 Run: `Get-ChildItem -Recurse dist\TelegramDownloader | Select-Object FullName,Length`
 
@@ -1883,7 +2065,7 @@ Expected: the professional workbench opens, the account badge says `未登录`, 
 
 - [ ] **Step 4: Record evidence and the only credential-dependent checks**
 
-Create `docs/verification/2026-08-13-release-checklist.md` with exact commands, timestamps, test counts, build ZIP size, self-test JSON, and manual GUI observations. Mark these two checks as user-performed after delivery because secrets are intentionally never requested in chat:
+Create `docs/verification/2026-08-13-release-checklist.md` with exact commands, timestamps, test counts, portable/installer sizes and hashes, self-test JSON, update fault-injection results, remote publication verification, and manual GUI observations. Mark these two checks as user-performed after delivery because secrets are intentionally never requested in chat:
 
 ```text
 - [ ] 使用用户自己的 API ID/API Hash 完成手机号、验证码和可选两步验证登录。
@@ -1896,7 +2078,7 @@ All non-secret acceptance items must be checked as passed before handoff; the tw
 
 ```powershell
 git add README.md docs/verification/2026-08-13-release-checklist.md
-git commit -m "docs: record portable release verification"
+git commit -m "docs: record signed release verification"
 ```
 
 ## Final implementation handoff checklist
@@ -1905,6 +2087,9 @@ git commit -m "docs: record portable release verification"
 - [ ] `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1` passes.
 - [ ] `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1` passes.
 - [ ] `dist/TelegramDownloader/TelegramDownloader.exe` launches without system Python.
-- [ ] `dist/TelegramDownloader-portable-win-x64.zip` exists and contains no credentials or runtime data.
+- [ ] `dist/release/TelegramDownloader-<version>-win-x64-portable.zip` exists and contains no credentials or runtime data.
+- [ ] `dist/release/TelegramDownloader-<version>-win-x64-setup.exe` installs only to a non-C drive and launches without system Python.
+- [ ] Signed startup update, helper health check, and injected rollback failures pass for both delivery modes.
+- [ ] GitHub and ModelScope public repositories contain the same `main`, `v<version>` tag, release assets, hashes, manifest, signature, and latest pointer.
 - [ ] Every path in packaged `data/logs/self-test.json` resolves below the package root before the clean ZIP is produced.
 - [ ] The final response links the EXE directory, ZIP, README, design, plan, and verification report using absolute paths.
