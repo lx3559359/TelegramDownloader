@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import mimetypes
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -29,6 +30,12 @@ class RemoteMedia:
     original_name: str
     expected_size: int | None
     message_date_utc: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class QrLoginInfo:
+    url: str
+    expires_at: datetime
 
 
 class GatewayError(RuntimeError):
@@ -74,6 +81,12 @@ class TelegramGateway(Protocol):
     ) -> AuthState: ...
 
     async def check_password(self, password: str) -> AuthState: ...
+
+    async def begin_qr_login(self) -> QrLoginInfo: ...
+
+    async def wait_qr_login(self) -> AuthState: ...
+
+    async def refresh_qr_login(self) -> QrLoginInfo: ...
 
     def export_session(self) -> str: ...
 
@@ -156,6 +169,7 @@ class TelethonGateway:
         )
         self._check_invite_request = functions.messages.CheckChatInviteRequest
         self._peer_id_getter = utils.get_peer_id
+        self._qr_login: object | None = None
 
     @classmethod
     def from_client_for_test(
@@ -182,6 +196,7 @@ class TelethonGateway:
         gateway._transient_errors = transient_errors
         gateway._check_invite_request = None
         gateway._peer_id_getter = peer_id_getter or (lambda entity: entity)
+        gateway._qr_login = None
         return gateway
 
     async def connect(self) -> None:
@@ -224,6 +239,50 @@ class TelethonGateway:
         except Exception as exc:
             self._raise_mapped(exc)
         return AuthState.READY
+
+    async def begin_qr_login(self) -> QrLoginInfo:
+        try:
+            self._qr_login = await self._client.qr_login()
+        except Exception as exc:
+            self._raise_mapped(exc)
+        return self._qr_info()
+
+    async def wait_qr_login(self) -> AuthState:
+        qr_login = self._require_qr_login()
+        try:
+            await qr_login.wait()
+        except self._password_needed_error:
+            self._qr_login = None
+            return AuthState.PASSWORD_REQUIRED
+        except (TimeoutError, asyncio.CancelledError):
+            raise
+        except Exception as exc:
+            self._raise_mapped(exc)
+        self._qr_login = None
+        return AuthState.READY
+
+    async def refresh_qr_login(self) -> QrLoginInfo:
+        qr_login = self._require_qr_login()
+        try:
+            await qr_login.recreate()
+        except Exception as exc:
+            self._raise_mapped(exc)
+        return self._qr_info()
+
+    def _require_qr_login(self):
+        if self._qr_login is None:
+            raise GatewayError("二维码登录会话尚未创建")
+        return self._qr_login
+
+    def _qr_info(self) -> QrLoginInfo:
+        qr_login = self._require_qr_login()
+        url = getattr(qr_login, "url", "")
+        expires_at = self._utc_datetime(getattr(qr_login, "expires", None))
+        if not isinstance(url, str) or not url.startswith("tg://login?token="):
+            raise GatewayError("Telegram 未返回有效二维码")
+        if expires_at is None:
+            raise GatewayError("Telegram 未返回二维码过期时间")
+        return QrLoginInfo(url, expires_at)
 
     def export_session(self) -> str:
         session = getattr(self._client, "session", None)

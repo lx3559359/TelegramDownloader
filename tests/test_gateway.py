@@ -1,13 +1,16 @@
+import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 
+import telegram_downloader.gateway as gateway_module
 from telegram_downloader.domain import MediaKind, ScanFilters
 from telegram_downloader.gateway import (
     AccessDeniedError,
     AuthState,
     EmptyMediaError,
+    GatewayError,
     TelethonGateway,
     proxy_dict,
 )
@@ -58,6 +61,153 @@ def test_proxy_dict_supports_socks5_and_http() -> None:
         "password": "p",
         "rdns": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_qr_login_begin_wait_and_refresh() -> None:
+    expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
+
+    class FakeQr:
+        def __init__(self):
+            self.url = "tg://login?token=first"
+            self.expires = expires
+            self.waited = False
+
+        async def recreate(self):
+            self.url = "tg://login?token=refreshed"
+
+        async def wait(self):
+            self.waited = True
+
+    qr = FakeQr()
+
+    class Client:
+        async def qr_login(self):
+            return qr
+
+    gateway = TelethonGateway.from_client_for_test(Client())
+
+    info = await gateway.begin_qr_login()
+    refreshed = await gateway.refresh_qr_login()
+    state = await gateway.wait_qr_login()
+
+    assert info == gateway_module.QrLoginInfo("tg://login?token=first", expires)
+    assert state is AuthState.READY
+    assert qr.waited is True
+    assert refreshed == gateway_module.QrLoginInfo("tg://login?token=refreshed", expires)
+
+
+@pytest.mark.asyncio
+async def test_qr_wait_reports_2fa_requirement() -> None:
+    class PasswordNeeded(Exception):
+        pass
+
+    class FakeQr:
+        url = "tg://login?token=first"
+        expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
+
+        def __init__(self, error):
+            self.error = error
+
+        async def wait(self):
+            raise self.error
+
+    class Client:
+        def __init__(self, qr):
+            self.qr = qr
+
+        async def qr_login(self):
+            return self.qr
+
+    password_gateway = TelethonGateway.from_client_for_test(
+        Client(FakeQr(PasswordNeeded())),
+        password_needed_error=PasswordNeeded,
+    )
+    await password_gateway.begin_qr_login()
+
+    assert await password_gateway.wait_qr_login() is AuthState.PASSWORD_REQUIRED
+
+
+
+@pytest.mark.asyncio
+async def test_qr_wait_preserves_timeout_for_controller_refresh() -> None:
+    class FakeQr:
+        url = "tg://login?token=first"
+        expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
+
+        async def wait(self):
+            raise TimeoutError
+
+    class Client:
+        async def qr_login(self):
+            return FakeQr()
+
+    gateway = TelethonGateway.from_client_for_test(Client())
+    await gateway.begin_qr_login()
+
+    with pytest.raises(TimeoutError):
+        await gateway.wait_qr_login()
+
+
+@pytest.mark.asyncio
+async def test_qr_wait_discards_used_token_and_requires_active_session() -> None:
+    class FakeQr:
+        url = "tg://login?token=first"
+        expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
+
+        async def wait(self):
+            return None
+
+        async def recreate(self):
+            return None
+
+    class Client:
+        async def qr_login(self):
+            return FakeQr()
+
+    gateway = TelethonGateway.from_client_for_test(Client())
+
+    with pytest.raises(GatewayError, match="二维码登录会话尚未创建"):
+        await gateway.wait_qr_login()
+
+    await gateway.begin_qr_login()
+    await gateway.wait_qr_login()
+
+    with pytest.raises(GatewayError, match="二维码登录会话尚未创建"):
+        await gateway.refresh_qr_login()
+
+
+@pytest.mark.asyncio
+async def test_qr_wait_propagates_cancellation_for_telethon_cleanup() -> None:
+    started = asyncio.Event()
+    cleaned = False
+
+    class FakeQr:
+        url = "tg://login?token=first"
+        expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
+
+        async def wait(self):
+            nonlocal cleaned
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaned = True
+
+    class Client:
+        async def qr_login(self):
+            return FakeQr()
+
+    gateway = TelethonGateway.from_client_for_test(Client())
+    await gateway.begin_qr_login()
+    waiting = asyncio.create_task(gateway.wait_qr_login())
+    await started.wait()
+
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+
+    assert cleaned is True
     assert proxy_dict(ProxySettings(), "") is None
     assert proxy_dict(ProxySettings("http", "proxy.local", 8080), "") == {
         "proxy_type": "http",
