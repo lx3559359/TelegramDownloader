@@ -23,3 +23,20 @@ def test_self_test_includes_update_storage_and_database(tmp_path: Path) -> None:
 
     assert "update_staging" in report["writable_paths"]
     assert (tmp_path / "data" / "database" / "tasks.sqlite3").is_file()
+
+
+def test_self_test_verifies_frozen_runtime_components_without_secrets(tmp_path: Path) -> None:
+    report = run_self_test(tmp_path)
+
+    assert report["components"] == {
+        "pyside6": True,
+        "telethon": True,
+        "qasync": True,
+        "qrcode": True,
+        "sqlite": True,
+        "dpapi": True,
+    }
+    serialized = json.dumps(report, ensure_ascii=False)
+    assert "tg://login?token=" not in serialized
+    assert "api_hash" not in serialized
+    assert "session" not in serialized

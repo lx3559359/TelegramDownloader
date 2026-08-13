@@ -550,7 +550,17 @@ class AppController:
     def _spawn_background(self, operation) -> None:
         task = asyncio.create_task(operation)
         self._background.add(task)
-        task.add_done_callback(self._background.discard)
+        task.add_done_callback(self._background_finished)
+
+    def _background_finished(self, task: asyncio.Task[Any]) -> None:
+        self._background.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None:
+            return
+        _LOGGER.error("background task failed (%s)", type(error).__name__)
+        self._show_error(self._safe_error(error))
 
     async def _run_update_check(self) -> None:
         try:

@@ -6,6 +6,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 _PHONE_NUMBER = re.compile(r"(?<![\w+])\+\d{7,15}\b")
+_QR_LOGIN_URL = re.compile(r"tg://login\?token=[A-Za-z0-9_-]+")
 
 
 class SecretRedactionFilter(logging.Filter):
@@ -16,6 +17,7 @@ class SecretRedactionFilter(logging.Filter):
     def redact(self, message: str) -> str:
         for secret in self.secrets:
             message = message.replace(secret, "***")
+        message = _QR_LOGIN_URL.sub("***", message)
         return _PHONE_NUMBER.sub("***", message)
 
     def filter(self, record: logging.LogRecord) -> bool:

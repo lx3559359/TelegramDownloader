@@ -799,6 +799,43 @@ async def test_unexpected_scan_failure_is_logged_without_secret(
     assert "api-secret" not in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_background_failure_is_consumed_without_secret(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class Window:
+        def __init__(self):
+            self.message = ""
+            self.timeout = -1
+
+        def set_task_summaries(self, _tasks):
+            pass
+
+        def statusBar(self):
+            return self
+
+        def showMessage(self, message, timeout):
+            self.message = message
+            self.timeout = timeout
+
+    async def fail():
+        raise RuntimeError("api-secret-in-background-error")
+
+    caplog.set_level(logging.ERROR, logger="telegram_downloader.controller")
+    window = Window()
+    controller = AppController.for_test(window=window)
+
+    controller._spawn_background(fail())
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert controller._background == set()
+    assert window.message == "操作失败（RuntimeError）"
+    assert window.timeout == 0
+    assert "background task failed (RuntimeError)" in caplog.text
+    assert "api-secret" not in caplog.text
+
+
 def test_local_dates_become_inclusive_utc_boundaries() -> None:
     filters = AppController.filters_from_dates(
         date(2026, 8, 1),

@@ -31,3 +31,19 @@ def test_configured_logger_writes_only_redacted_project_log(tmp_path) -> None:
     assert "api-secret" not in content
     assert "credential=***" in content
     assert logger.propagate is False
+
+
+def test_redaction_removes_complete_qr_login_url() -> None:
+    record = logging.LogRecord(
+        "test",
+        logging.ERROR,
+        __file__,
+        1,
+        "qr=tg://login?token=secret_token-123",
+        (),
+        None,
+    )
+
+    SecretRedactionFilter(set()).filter(record)
+
+    assert record.getMessage() == "qr=***"

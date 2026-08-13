@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import os
 import sys
@@ -43,10 +44,19 @@ def run_self_test(root: Path) -> dict[str, object]:
         "update_journal": paths.update_journal,
     }
     resolved = {name: str(paths.guard(path)) for name, path in writable.items()}
+    components = {
+        "pyside6": _can_import("PySide6"),
+        "telethon": _can_import("telethon"),
+        "qasync": _can_import("qasync"),
+        "qrcode": _can_import("qrcode"),
+        "sqlite": _can_import("sqlite3"),
+        "dpapi": os.name == "nt",
+    }
     report: dict[str, object] = {
-        "ok": True,
+        "ok": all(components.values()),
         "version": __version__,
         "runtime_root": str(paths.root),
+        "components": components,
         "writable_paths": resolved,
     }
     report_path = paths.guard(paths.log.parent / "self-test.json")
@@ -60,6 +70,14 @@ def run_self_test(root: Path) -> dict[str, object]:
         os.fsync(stream.fileno())
     os.replace(temporary, report_path)
     return report
+
+
+def _can_import(module: str) -> bool:
+    try:
+        importlib.import_module(module)
+    except (ImportError, OSError):
+        return False
+    return True
 
 
 def create_application(root: Path):
