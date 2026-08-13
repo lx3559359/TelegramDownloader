@@ -1,5 +1,6 @@
 # Brainstorming artifacts
 .superpowers/
+.worktrees/
 
 # Local Python environment and caches
 .venv/
