@@ -1876,23 +1876,23 @@ git commit -m "build: package portable Windows downloader"
 - Test: `tests/update/test_update_contract.py`
 - Test: `tests/update/test_update_sources.py`
 
-- [ ] **Step 1: Write failing strict-contract and source-reconciliation tests**
+- [x] **Step 1: Write failing strict-contract and source-reconciliation tests**
 
 Cover canonical JSON serialization; Ed25519 valid/invalid signatures; unknown key IDs; malformed, oversized, duplicate-key, BOM, extra-field, downgrade, prerelease, byte-size, and SHA-256 validation; both sources agreeing; either source being temporarily unavailable; one source being stale; and same-version content conflicts failing closed.
 
-- [ ] **Step 2: Run focused tests and confirm update modules are missing**
+- [x] **Step 2: Run focused tests and confirm update modules are missing**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/update/test_update_contract.py tests/update/test_update_sources.py -q`
 
 Expected: collection fails because the update contract modules do not exist.
 
-- [ ] **Step 3: Implement immutable contracts and source protocols**
+- [x] **Step 3: Implement immutable contracts and source protocols**
 
 `update_contract.py` exposes immutable manifest/asset models, strict semantic-version parsing, canonical JSON bytes, `verify_manifest(manifest_bytes, signature_bytes, trusted_keys)`, and `verify_asset(path, expected_size, expected_sha256)`. Reject any field not defined by schema version 1. Store only public SPKI DER keys as Base64 in `trusted_update_keys.json`.
 
 `update_sources.py` defines async source adapters returning `latest.json`, versioned manifest, signature, and ranged asset streams. Implement GitHub and ModelScope HTTPS URL builders plus `reconcile_sources(results, current_version)`. A valid single source may proceed when the other is unavailable; same-version disagreement is a hard error.
 
-- [ ] **Step 4: Run focused tests and lint**
+- [x] **Step 4: Run focused tests and lint**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/update/test_update_contract.py tests/update/test_update_sources.py -q`
 
@@ -1900,7 +1900,7 @@ Run: `.venv\Scripts\ruff.exe check src/telegram_downloader/update_contract.py sr
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit the signed update contract**
+- [x] **Step 5: Commit the signed update contract**
 
 ```powershell
 git add src/telegram_downloader/update_contract.py src/telegram_downloader/update_sources.py src/telegram_downloader/trusted_update_keys.json tests/update
