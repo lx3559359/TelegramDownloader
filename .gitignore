@@ -1,0 +1,23 @@
+# Brainstorming artifacts
+.superpowers/
+
+# Local Python environment and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.build-temp/
+.tool-cache/
+
+# Build output
+build/
+dist/
+
+# Portable runtime data (never commit credentials or downloads)
+data/
+downloads/
+*.session
+*.session-journal
+*.part
