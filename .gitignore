@@ -4,6 +4,7 @@
 
 # Local Python environment and caches
 .venv/
+*.egg-info/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -11,6 +12,8 @@ __pycache__/
 htmlcov/
 .build-temp/
 .tool-cache/
+.local/
+.release-secrets/
 
 # Build output
 build/
