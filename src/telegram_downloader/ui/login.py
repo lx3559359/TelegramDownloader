@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 from enum import IntEnum
+from math import ceil
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFormLayout,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
@@ -18,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from telegram_downloader.settings import ProxySettings, SettingsError
+from telegram_downloader.ui.qr import render_qr_image
 from telegram_downloader.ui.theme import DARK_STYLESHEET, ensure_cjk_font
 
 _PHONE = re.compile(r"^\+\d{5,15}$")
@@ -25,14 +30,19 @@ _PHONE = re.compile(r"^\+\d{5,15}$")
 
 class LoginPage(IntEnum):
     CREDENTIALS = 0
-    PHONE = 1
-    CODE = 2
-    PASSWORD = 3
-    READY = 4
+    QR = 1
+    PHONE = 2
+    CODE = 3
+    PASSWORD = 4
+    READY = 5
 
 
 class LoginDialog(QDialog):
     credentials_submitted = Signal(int, str, object, str)
+    qr_refresh_requested = Signal()
+    phone_fallback_requested = Signal()
+    credentials_edit_requested = Signal()
+    login_cancelled = Signal()
     phone_submitted = Signal(str)
     code_submitted = Signal(str)
     password_submitted = Signal(str)
@@ -44,6 +54,10 @@ class LoginDialog(QDialog):
         self.setWindowTitle("登录 Telegram")
         self.setModal(True)
         self.setMinimumWidth(520)
+        self._qr_expires_at: datetime | None = None
+        self.qr_countdown_timer = QTimer(self)
+        self.qr_countdown_timer.setInterval(1000)
+        self.qr_countdown_timer.timeout.connect(self._tick_qr_countdown)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 20)
@@ -58,12 +72,14 @@ class LoginDialog(QDialog):
 
         self.stack = QStackedWidget()
         self.credentials_page = self._build_credentials_page()
+        self.qr_page = self._build_qr_page()
         self.phone_page = self._build_phone_page()
         self.code_page = self._build_code_page()
         self.password_page = self._build_password_page()
         self.ready_page = self._build_ready_page()
         for page in (
             self.credentials_page,
+            self.qr_page,
             self.phone_page,
             self.code_page,
             self.password_page,
@@ -116,12 +132,52 @@ class LoginDialog(QDialog):
         form.addRow("代理密码", self.proxy_password)
         layout.addLayout(form)
 
-        self.credentials_next = QPushButton("连接并继续")
+        self.credentials_next = QPushButton("保存并生成二维码")
         self.credentials_next.setObjectName("primaryButton")
         self.credentials_next.clicked.connect(self._submit_credentials)
         layout.addWidget(self.credentials_next, 0, Qt.AlignmentFlag.AlignRight)
         self.proxy_kind.currentIndexChanged.connect(self._update_proxy_fields)
         self._update_proxy_fields()
+        return page
+
+    def _build_qr_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(11)
+        layout.addWidget(self._step_label("扫码登录 · 推荐"))
+
+        description = QLabel("Telegram App → 设置 → 设备 → 连接桌面设备")
+        description.setObjectName("muted")
+        description.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(description)
+
+        self.qr_image = QLabel()
+        self.qr_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.qr_image.setMinimumSize(232, 232)
+        layout.addWidget(self.qr_image)
+
+        self.qr_countdown = QLabel("正在生成二维码…")
+        self.qr_countdown.setObjectName("muted")
+        self.qr_countdown.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.qr_countdown)
+
+        self.qr_status = QLabel("等待手机扫码确认")
+        self.qr_status.setObjectName("muted")
+        self.qr_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.qr_status)
+
+        actions = QHBoxLayout()
+        self.qr_refresh = QPushButton("刷新二维码")
+        self.phone_fallback = QPushButton("改用手机号登录")
+        self.credentials_edit = QPushButton("修改 API/代理设置")
+        self.qr_refresh.clicked.connect(self.qr_refresh_requested.emit)
+        self.phone_fallback.clicked.connect(self.phone_fallback_requested.emit)
+        self.credentials_edit.clicked.connect(self.credentials_edit_requested.emit)
+        actions.addWidget(self.qr_refresh)
+        actions.addWidget(self.phone_fallback)
+        actions.addWidget(self.credentials_edit)
+        layout.addLayout(actions)
         return page
 
     def _build_phone_page(self) -> QWidget:
@@ -206,6 +262,8 @@ class LoginDialog(QDialog):
         return label
 
     def show_page(self, page: LoginPage) -> None:
+        if page is not LoginPage.QR:
+            self._clear_qr()
         self.error_label.clear()
         self.error_label.setVisible(False)
         self.stack.setCurrentIndex(int(page))
@@ -213,6 +271,45 @@ class LoginDialog(QDialog):
     def show_error(self, text: str) -> None:
         self.error_label.setText(text)
         self.error_label.setVisible(True)
+
+    def show_qr(self, url: str, expires_at: datetime) -> None:
+        image = render_qr_image(url)
+        self.qr_image.setPixmap(QPixmap.fromImage(image))
+        self._qr_expires_at = (
+            expires_at.replace(tzinfo=UTC)
+            if expires_at.tzinfo is None
+            else expires_at.astimezone(UTC)
+        )
+        self.show_page(LoginPage.QR)
+        self._tick_qr_countdown()
+        self.qr_countdown_timer.start()
+
+    def update_qr_countdown(self, seconds: int) -> None:
+        if seconds > 0:
+            self.qr_countdown.setText(f"二维码将在 {seconds} 秒后刷新")
+        else:
+            self.qr_countdown.setText("二维码已过期，正在刷新…")
+
+    def show_qr_status(self, text: str) -> None:
+        self.qr_status.setText(text)
+
+    def _tick_qr_countdown(self) -> None:
+        if self._qr_expires_at is None:
+            return
+        seconds = max(0, ceil((self._qr_expires_at - datetime.now(UTC)).total_seconds()))
+        self.update_qr_countdown(seconds)
+
+    def _clear_qr(self) -> None:
+        self.qr_countdown_timer.stop()
+        self._qr_expires_at = None
+        self.qr_image.clear()
+        self.qr_countdown.setText("正在生成二维码…")
+        self.qr_status.setText("等待手机扫码确认")
+
+    def reject(self) -> None:
+        self._clear_qr()
+        self.login_cancelled.emit()
+        super().reject()
 
     def show_ready(self, display_name: str) -> None:
         self.api_hash.clear()

@@ -1,5 +1,7 @@
+from datetime import UTC, datetime, timedelta
+
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QLineEdit
+from PySide6.QtWidgets import QLabel, QLineEdit
 
 from telegram_downloader.ui.login import LoginDialog, LoginPage
 
@@ -52,3 +54,45 @@ def test_ready_state_updates_account_label_and_clears_sensitive_values(qtbot) ->
     assert "Test User" in dialog.ready_label.text()
     assert dialog.api_hash.text() == ""
     assert dialog.password.text() == ""
+
+
+def test_qr_page_renders_in_memory_and_exposes_login_choices(qtbot) -> None:
+    dialog = LoginDialog()
+    qtbot.addWidget(dialog)
+    expires_at = datetime.now(UTC) + timedelta(seconds=60)
+
+    dialog.show_qr("tg://login?token=abc_123", expires_at)
+
+    assert dialog.stack.currentWidget() is dialog.qr_page
+    assert dialog.qr_image.pixmap().isNull() is False
+    assert dialog.qr_countdown_timer.isActive() is True
+    assert "秒" in dialog.qr_countdown.text()
+    assert "tg://login" not in " ".join(
+        label.text() for label in dialog.findChildren(QLabel)
+    )
+
+    with qtbot.waitSignal(dialog.qr_refresh_requested, timeout=500):
+        qtbot.mouseClick(dialog.qr_refresh, Qt.MouseButton.LeftButton)
+    with qtbot.waitSignal(dialog.phone_fallback_requested, timeout=500):
+        qtbot.mouseClick(dialog.phone_fallback, Qt.MouseButton.LeftButton)
+    with qtbot.waitSignal(dialog.credentials_edit_requested, timeout=500):
+        qtbot.mouseClick(dialog.credentials_edit, Qt.MouseButton.LeftButton)
+
+
+def test_qr_state_is_cleared_on_page_switch_and_reject(qtbot) -> None:
+    dialog = LoginDialog()
+    qtbot.addWidget(dialog)
+    expires_at = datetime.now(UTC) + timedelta(seconds=60)
+    dialog.show_qr("tg://login?token=abc_123", expires_at)
+
+    dialog.show_page(LoginPage.PHONE)
+
+    assert dialog.qr_countdown_timer.isActive() is False
+    assert dialog.qr_image.pixmap().isNull() is True
+
+    dialog.show_qr("tg://login?token=xyz_789", expires_at)
+    with qtbot.waitSignal(dialog.login_cancelled, timeout=500):
+        dialog.reject()
+
+    assert dialog.qr_countdown_timer.isActive() is False
+    assert dialog.qr_image.pixmap().isNull() is True
