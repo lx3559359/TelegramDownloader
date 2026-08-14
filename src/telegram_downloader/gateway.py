@@ -97,6 +97,8 @@ class _NoTelethonError(Exception):
 class TelegramGateway(Protocol):
     async def connect(self) -> None: ...
 
+    def is_connected(self) -> bool: ...
+
     async def request_code(self, phone: str) -> str: ...
 
     async def sign_in(
@@ -271,6 +273,10 @@ class TelethonGateway:
         except Exception as exc:
             self._raise_mapped(exc)
         self._connected = True
+
+    def is_connected(self) -> bool:
+        method = getattr(self._client, "is_connected", None)
+        return bool(method()) if callable(method) else self._connected
 
     async def request_code(self, phone: str) -> str:
         try:

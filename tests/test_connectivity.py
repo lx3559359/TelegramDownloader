@@ -55,10 +55,12 @@ async def test_concurrent_callers_share_one_connect_attempt() -> None:
     first = asyncio.create_task(recovery.ensure_connected(gateway))
     second = asyncio.create_task(recovery.ensure_connected(gateway))
     await entered.wait()
+    assert recovery.active is True
     release.set()
     await asyncio.gather(first, second)
 
     assert gateway.calls == 1
+    assert recovery.active is False
 
 
 @pytest.mark.asyncio

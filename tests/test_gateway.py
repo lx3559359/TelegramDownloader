@@ -70,6 +70,16 @@ def test_proxy_dict_supports_socks5_and_http() -> None:
     }
 
 
+def test_gateway_connection_state_comes_from_client() -> None:
+    class Client:
+        def is_connected(self) -> bool:
+            return True
+
+    gateway = TelethonGateway.from_client_for_test(Client(), connected=False)
+
+    assert gateway.is_connected() is True
+
+
 @pytest.mark.asyncio
 async def test_qr_login_begin_wait_and_refresh() -> None:
     expires = datetime(2026, 8, 14, 1, tzinfo=UTC)

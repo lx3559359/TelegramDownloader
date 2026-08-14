@@ -29,6 +29,10 @@ class ConnectionRecovery:
         self.sleeper = sleeper
         self._active: asyncio.Task[None] | None = None
 
+    @property
+    def active(self) -> bool:
+        return self._active is not None and not self._active.done()
+
     async def ensure_connected(
         self,
         gateway: Connectable,

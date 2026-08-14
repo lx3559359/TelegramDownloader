@@ -52,6 +52,9 @@ async def test_startup_error_does_not_expose_unknown_exception_text() -> None:
         async def connect(self):
             raise RuntimeError("proxy-password-secret")
 
+        async def disconnect(self):
+            pass
+
     class Window:
         def __init__(self):
             self.message = ""
@@ -69,9 +72,71 @@ async def test_startup_error_does_not_expose_unknown_exception_text() -> None:
     controller = AppController.for_test(gateway=Gateway(), window=window)
 
     await controller.start()
+    assert window.message == ""
+    assert controller._session_restore_task is not None
+    await controller._session_restore_task
 
     assert "RuntimeError" in window.message
     assert "proxy-password-secret" not in window.message
+    await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_transient_offline_state_keeps_session_and_never_opens_login() -> None:
+    class Gateway:
+        def is_connected(self) -> bool:
+            return False
+
+        async def connect(self) -> None:
+            raise TransientNetworkError("offline")
+
+    vault = Vault()
+    vault.value = {"session": "saved", "api_hash": "hash"}
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        vault=vault,
+        secrets=vault.load(),
+        connection_recovery=ConnectionRecovery(delays=(0.0,)),
+    )
+    shown: list[str] = []
+    controller.show_login = lambda: shown.append("login")
+
+    assert await controller.ensure_telegram_online() is False
+    assert controller.secrets["session"] == "saved"
+    assert vault.load()["session"] == "saved"
+    assert shown == []
+
+
+@pytest.mark.asyncio
+async def test_connection_monitor_waits_30_seconds_and_shutdown_cancels_it() -> None:
+    sleeping = asyncio.Event()
+    blocker = asyncio.Event()
+    intervals: list[float] = []
+
+    async def sleep(value: float) -> None:
+        intervals.append(value)
+        sleeping.set()
+        await blocker.wait()
+
+    class Gateway:
+        def is_connected(self) -> bool:
+            return False
+
+        async def disconnect(self) -> None:
+            pass
+
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        connection_monitor_interval=30.0,
+        connection_sleeper=sleep,
+    )
+    task = asyncio.create_task(controller._monitor_connection())
+    controller._connection_monitor_task = task
+    await sleeping.wait()
+
+    assert intervals == [30.0]
+    await controller.shutdown()
+    assert task.cancelled() is True
 
 
 @pytest.mark.asyncio
@@ -1314,6 +1379,9 @@ async def test_start_displays_cached_content_before_network_failure() -> None:
             calls.append("connect")
             raise RuntimeError("offline")
 
+        async def disconnect(self):
+            pass
+
     window = ContentWindowFake()
     controller = AppController.for_test(
         gateway=Gateway(),
@@ -1323,9 +1391,15 @@ async def test_start_displays_cached_content_before_network_failure() -> None:
 
     await controller.start()
 
-    assert calls == ["cached", "connect"]
+    assert calls == ["cached"]
     assert window.content_page.dialogs == [cached_dialog]
     assert window.content_page.logged_in is False
+    assert controller._session_restore_task is not None
+
+    await controller._session_restore_task
+
+    assert calls == ["cached", "connect"]
+    await controller.shutdown()
 
 
 @pytest.mark.asyncio

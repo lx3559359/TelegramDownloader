@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
@@ -203,10 +203,14 @@ class AppController:
         settings: AppSettings | None = None,
         secrets: dict[str, str] | None = None,
         connection_recovery: ConnectionRecovery | None = None,
+        connection_monitor_interval: float = 30.0,
+        connection_sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
         progress_refresh_interval: float = 0.5,
     ) -> None:
         if progress_refresh_interval <= 0:
             raise ValueError("进度刷新间隔必须大于零")
+        if connection_monitor_interval <= 0:
+            raise ValueError("连接监测间隔必须大于零")
         self.gateway = gateway
         self.planner = planner
         self.scheduler = scheduler or _NullScheduler()
@@ -226,9 +230,13 @@ class AppController:
         self.settings = settings or settings_store.load()
         self.secrets = dict(secrets if secrets is not None else vault.load())
         self.connection_recovery = connection_recovery or ConnectionRecovery()
+        self._connection_monitor_interval = connection_monitor_interval
+        self._connection_sleeper = connection_sleeper
         self.phone = ""
         self.phone_code_hash = ""
         self._background: set[asyncio.Task[Any]] = set()
+        self._connection_monitor_task: asyncio.Task[None] | None = None
+        self._session_restore_task: asyncio.Task[None] | None = None
         self._qr_wait_task: asyncio.Task[None] | None = None
         self._qr_generation = 0
         self._ui_slots: list[object] = []
@@ -278,6 +286,11 @@ class AppController:
             self.show_login()
             return False
 
+        if self._gateway_is_connected(self.gateway):
+            page.set_logged_in(True)
+            page.set_connection_state("连接正常")
+            return True
+
         def attempt(value: tuple[int, int]) -> None:
             number, total = value
             text = (
@@ -311,6 +324,11 @@ class AppController:
         page.set_connection_state("连接已恢复")
         return True
 
+    @staticmethod
+    def _gateway_is_connected(gateway: object) -> bool:
+        method = getattr(gateway, "is_connected", None)
+        return bool(method()) if callable(method) else False
+
     async def start(self) -> None:
         self.refresh_tasks()
         await self.activate_cached_content_account()
@@ -319,6 +337,14 @@ class AppController:
         if self.gateway is None:
             self.show_login()
             return
+        self._connection_monitor_task = self._spawn_background(
+            self._monitor_connection()
+        )
+        self._session_restore_task = self._spawn_background(
+            self._restore_saved_session()
+        )
+
+    async def _restore_saved_session(self) -> None:
         if not await self.ensure_telegram_online():
             return
         try:
@@ -335,6 +361,18 @@ class AppController:
             await self._handle_session_expired(error)
         except Exception as error:
             self._show_status(f"Telegram 连接失败：{self._safe_error(error)}")
+
+    async def _monitor_connection(self) -> None:
+        while not self._shutting_down:
+            await self._connection_sleeper(self._connection_monitor_interval)
+            if self._shutting_down:
+                return
+            gateway = self.gateway
+            if gateway is None or self._gateway_is_connected(gateway):
+                continue
+            if self.connection_recovery.active:
+                continue
+            await self.ensure_telegram_online()
 
     async def submit_credentials(
         self,
@@ -908,6 +946,7 @@ class AppController:
         if self._shutting_down:
             return
         self._shutting_down = True
+        await self._cancel_connection_monitor()
         await self._cancel_qr_wait()
         await self._cancel_content_operations()
         await self.connection_recovery.cancel()
@@ -921,6 +960,15 @@ class AppController:
             go_offline = getattr(self.content_browser, "go_offline", None)
             if go_offline is not None:
                 go_offline()
+
+    async def _cancel_connection_monitor(self) -> None:
+        task = self._connection_monitor_task
+        self._connection_monitor_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
     def refresh_tasks(self, *, now: float | None = None) -> None:
         sampled_at = monotonic_clock() if now is None else now
