@@ -2,9 +2,9 @@
 
 ## 正式版下载
 
-当前正式版：`v0.2.0`（Windows 10/11 x64）
+当前正式版：`v0.2.1`（Windows 10/11 x64）
 
-- [GitHub Release（安装包与便携包）](https://github.com/lx3559359/TelegramDownloader/releases/tag/v0.2.0)
+- [GitHub Release（安装包与便携包）](https://github.com/lx3559359/TelegramDownloader/releases/tag/v0.2.1)
 - [魔搭镜像仓库](https://modelscope.cn/models/lx3559359/TelegramDownloader)
 - 安装包会拒绝安装到 C 盘；便携包请解压到 D、E 等非 C 盘目录后运行。
 - Windows 可能因未购买商业 Authenticode 证书显示 SmartScreen“未知发布者”；在线更新仍会强制验证 Ed25519 签名和 SHA-256。
@@ -128,8 +128,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1
 
 ```text
 dist/TelegramDownloader/TelegramDownloader.exe
-dist/TelegramDownloader-0.2.0-win-x64-portable.zip
-dist/release/TelegramDownloader-0.2.0-win-x64-setup.exe
+dist/TelegramDownloader-0.2.1-win-x64-portable.zip
+dist/release/TelegramDownloader-0.2.1-win-x64-setup.exe
 ```
 
 安装器构建会把 Inno Setup 7.0.2 以便携方式放在项目 `.tool-cache` 中，并在使用前核对官方固定 SHA-256 和 Authenticode 发布者；编译、安装及卸载冒烟测试的临时目录和日志都位于 `.build-temp`。安装验收会真实验证 C 盘拒绝、D 盘安装、自检、原位升级、在线更新运行时文件存在，以及普通卸载后用户数据仍保留。
