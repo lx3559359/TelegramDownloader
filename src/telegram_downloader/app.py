@@ -80,6 +80,10 @@ def _can_import(module: str) -> bool:
     return True
 
 
+def _standard_button_selected(answer: object, expected: object) -> bool:
+    return answer == expected
+
+
 def create_application(root: Path):
     import qasync
     from PySide6.QtWidgets import QApplication, QMessageBox
@@ -160,7 +164,7 @@ def create_application(root: Path):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
-        return answer is QMessageBox.StandardButton.Yes
+        return _standard_button_selected(answer, QMessageBox.StandardButton.Yes)
 
     trusted_keys = load_trusted_keys(Path(__file__).with_name("trusted_update_keys.json"))
     update_coordinator = UpdateCoordinator(
