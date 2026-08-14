@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 import telegram_downloader.controller as controller_module
+from telegram_downloader.connectivity import ConnectionRecovery
 from telegram_downloader.content import (
     AccountProfile,
     ContentSearchQuery,
@@ -35,6 +36,14 @@ class Vault:
 
     def load(self):
         return dict(self.value)
+
+
+class ConnectedGateway:
+    async def connect(self):
+        pass
+
+    async def disconnect(self):
+        pass
 
 
 @pytest.mark.asyncio
@@ -761,6 +770,7 @@ async def test_scan_requires_user_confirmation_before_commit() -> None:
 
     planner = Planner()
     controller = AppController.for_test(
+        gateway=ConnectedGateway(),
         planner=planner,
         confirm_preview=lambda preview: False,
     )
@@ -792,6 +802,7 @@ async def test_confirmed_scan_starts_persisted_task() -> None:
 
     scheduler = Scheduler()
     controller = AppController.for_test(
+        gateway=ConnectedGateway(),
         planner=Planner(),
         scheduler=scheduler,
         confirm_preview=lambda preview: True,
@@ -1004,6 +1015,7 @@ class ContentPageFake:
         self.active_search_id = None
         self.busy = []
         self.sync_states = []
+        self.connection_states = []
         self.thumbnails = {}
         self.errors = []
 
@@ -1027,6 +1039,9 @@ class ContentPageFake:
 
     def set_sync_state(self, text, *, busy=False):
         self.sync_states.append((text, busy))
+
+    def set_connection_state(self, text):
+        self.connection_states.append(text)
 
     def set_thumbnail(self, result_id, path):
         self.thumbnails[result_id] = path
@@ -1053,6 +1068,199 @@ class ContentWindowFake:
 
     def showMessage(self, message, _timeout):
         self.message = message
+
+
+@pytest.mark.asyncio
+async def test_offline_search_reconnects_then_continues() -> None:
+    calls = []
+    active = SimpleNamespace(id="search-1")
+
+    class Gateway:
+        async def connect(self):
+            calls.append("connect")
+
+    class ContentService:
+        async def start_search(self, peer_ref, query):
+            calls.append(("search", peer_ref, query))
+            return active, []
+
+        def list_sessions(self):
+            return [active]
+
+        def list_results(self, _search_id):
+            return []
+
+    query = object()
+    window = ContentWindowFake()
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        content_browser=ContentService(),
+        window=window,
+    )
+
+    await controller.search_content("-1001", query)
+
+    assert calls == ["connect", ("search", "-1001", query)]
+    assert window.content_page.busy == [True, False]
+    assert window.content_page.connection_states[-1] == "连接已恢复"
+
+
+@pytest.mark.asyncio
+async def test_failed_reconnect_keeps_cached_content_and_skips_search() -> None:
+    class Gateway:
+        def __init__(self):
+            self.calls = 0
+
+        async def connect(self):
+            self.calls += 1
+            raise TransientNetworkError("Telegram 网络连接失败")
+
+    class ContentService:
+        def __init__(self):
+            self.search_calls = 0
+
+        async def start_search(self, _peer_ref, _query):
+            self.search_calls += 1
+
+        def list_sessions(self):
+            return []
+
+    gateway = Gateway()
+    content = ContentService()
+    window = ContentWindowFake()
+    cached_dialogs = [SimpleNamespace(peer_ref="-1001")]
+    cached_results = [SimpleNamespace(id="result-1")]
+    window.content_page.dialogs = cached_dialogs
+    window.content_page.results = cached_results
+    controller = AppController.for_test(
+        gateway=gateway,
+        content_browser=content,
+        window=window,
+        connection_recovery=ConnectionRecovery(delays=(0.0, 0.0, 0.0)),
+    )
+
+    await controller.search_content("-1001", object())
+
+    assert gateway.calls == 3
+    assert content.search_calls == 0
+    assert window.content_page.dialogs is cached_dialogs
+    assert window.content_page.results is cached_results
+    assert window.content_page.connection_states[-1] == (
+        "重连失败，请检查网络或代理后重试"
+    )
+    assert window.content_page.busy == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_content_page_only_syncs_stale_dialog_cache() -> None:
+    class Gateway:
+        async def connect(self):
+            pass
+
+    class ContentService:
+        def __init__(self, stale):
+            self.account = AccountProfile("a1", "账号一")
+            self.stale = stale
+            self.sync_calls = 0
+
+        def list_dialogs(self):
+            return []
+
+        def list_sessions(self):
+            return []
+
+        def dialog_cache_stale(self, max_age):
+            assert max_age == timedelta(seconds=60)
+            return self.stale
+
+        async def sync_dialogs(self):
+            self.sync_calls += 1
+            return []
+
+    fresh = ContentService(False)
+    fresh_controller = AppController.for_test(
+        gateway=Gateway(),
+        content_browser=fresh,
+        window=ContentWindowFake(),
+    )
+    await fresh_controller.activate_content_page()
+    assert fresh.sync_calls == 0
+
+    stale = ContentService(True)
+    stale_controller = AppController.for_test(
+        gateway=Gateway(),
+        content_browser=stale,
+        window=ContentWindowFake(),
+    )
+    await stale_controller.activate_content_page()
+    assert stale_controller._dialog_sync_task is not None
+    await stale_controller._dialog_sync_task
+    assert stale.sync_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_dialog_refresh_forces_sync_when_cache_is_fresh() -> None:
+    class Gateway:
+        async def connect(self):
+            pass
+
+    class ContentService:
+        def __init__(self):
+            self.sync_calls = 0
+
+        async def sync_dialogs(self):
+            self.sync_calls += 1
+            return []
+
+    content = ContentService()
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        content_browser=content,
+        window=ContentWindowFake(),
+    )
+
+    await controller.refresh_content_dialogs()
+
+    assert content.sync_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_dialog_selection_restores_history_before_connect_finishes() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    active = SimpleNamespace(id="search-1", peer_ref="-1001")
+    results = [SimpleNamespace(id="result-1")]
+
+    class Gateway:
+        async def connect(self):
+            entered.set()
+            await release.wait()
+
+    class ContentService:
+        def latest_session(self, peer_ref):
+            return active if peer_ref == "-1001" else None
+
+        def list_results(self, search_id):
+            assert search_id == "search-1"
+            return results
+
+        def dialog_cache_stale(self, _max_age):
+            return False
+
+    window = ContentWindowFake()
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        content_browser=ContentService(),
+        window=window,
+    )
+    operation = asyncio.create_task(controller.select_content_dialog("-1001"))
+    await entered.wait()
+
+    assert window.content_page.active_search_id == "search-1"
+    assert window.content_page.results == results
+
+    release.set()
+    await operation
 
 
 @pytest.mark.asyncio
@@ -1224,6 +1432,7 @@ async def test_content_search_selection_and_queue_flow() -> None:
     window = ContentWindowFake()
     scheduler = Scheduler()
     controller = AppController.for_test(
+        gateway=ConnectedGateway(),
         content_browser=ContentService(),
         planner=Planner(),
         scheduler=scheduler,
@@ -1259,6 +1468,7 @@ async def test_cancel_content_search_restores_page_busy_state() -> None:
 
     window = ContentWindowFake()
     controller = AppController.for_test(
+        gateway=ConnectedGateway(),
         content_browser=ContentService(),
         window=window,
     )
@@ -1287,6 +1497,9 @@ async def test_content_search_expired_session_rebuilds_gateway_for_qr_login() ->
             return []
 
     class OldGateway:
+        async def connect(self):
+            pass
+
         async def disconnect(self):
             calls.append("disconnect-old")
 
@@ -1360,6 +1573,9 @@ async def test_dialog_sync_expired_session_stops_spinner_and_logs_out() -> None:
             return []
 
     class Gateway:
+        async def connect(self):
+            pass
+
         async def disconnect(self):
             calls.append("disconnect")
 
@@ -1453,6 +1669,9 @@ async def test_shutdown_cancels_content_operations_before_services() -> None:
             order.append("scheduler")
 
     class Gateway:
+        async def connect(self):
+            pass
+
         async def disconnect(self):
             order.append("gateway")
 
@@ -1501,7 +1720,11 @@ async def test_scan_failure_is_persistent_and_releases_busy_state() -> None:
             self.timeout = timeout
 
     window = Window()
-    controller = AppController.for_test(planner=Planner(), window=window)
+    controller = AppController.for_test(
+        gateway=ConnectedGateway(),
+        planner=Planner(),
+        window=window,
+    )
 
     await controller.scan_link(
         "https://t.me/c/123456/7",
@@ -1542,7 +1765,11 @@ async def test_unexpected_scan_failure_is_logged_without_secret(
 
     caplog.set_level(logging.ERROR, logger="telegram_downloader.controller")
     window = Window()
-    controller = AppController.for_test(planner=Planner(), window=window)
+    controller = AppController.for_test(
+        gateway=ConnectedGateway(),
+        planner=Planner(),
+        window=window,
+    )
 
     await controller.scan_link(
         "https://t.me/example/7",

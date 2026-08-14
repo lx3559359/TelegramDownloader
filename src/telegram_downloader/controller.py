@@ -10,6 +10,7 @@ from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from time import monotonic as monotonic_clock
 from typing import Any
 
+from telegram_downloader.connectivity import ConnectionRecovery
 from telegram_downloader.content import ContentSearchQuery
 from telegram_downloader.content_browser import NothingToQueueError
 from telegram_downloader.domain import (
@@ -100,6 +101,9 @@ class _NullContentPage:
         pass
 
     def set_sync_state(self, _text: str, *, busy: bool = False) -> None:
+        pass
+
+    def set_connection_state(self, _text: str) -> None:
         pass
 
     def set_thumbnail(self, _result_id: str, _path: object) -> None:
@@ -198,6 +202,7 @@ class AppController:
         update_shutdown: Callable[[], None] | None = None,
         settings: AppSettings | None = None,
         secrets: dict[str, str] | None = None,
+        connection_recovery: ConnectionRecovery | None = None,
         progress_refresh_interval: float = 0.5,
     ) -> None:
         if progress_refresh_interval <= 0:
@@ -220,6 +225,7 @@ class AppController:
         self.update_shutdown = update_shutdown or (lambda: None)
         self.settings = settings or settings_store.load()
         self.secrets = dict(secrets if secrets is not None else vault.load())
+        self.connection_recovery = connection_recovery or ConnectionRecovery()
         self.phone = ""
         self.phone_code_hash = ""
         self._background: set[asyncio.Task[Any]] = set()
@@ -258,8 +264,52 @@ class AppController:
             update_shutdown=dependencies.pop("update_shutdown", None),
             settings=dependencies.pop("settings", None),
             secrets=dependencies.pop("secrets", None),
+            connection_recovery=dependencies.pop("connection_recovery", None),
             **dependencies,
         )
+
+    async def ensure_telegram_online(self) -> bool:
+        page = self._content_page()
+        if self.gateway is None:
+            page.set_logged_in(False)
+            page.set_connection_state(
+                "请先登录 Telegram；已保存的搜索历史仍可查看"
+            )
+            self.show_login()
+            return False
+
+        def attempt(value: tuple[int, int]) -> None:
+            number, total = value
+            text = (
+                "正在连接 Telegram…"
+                if number == 1
+                else f"正在重连（{number}/{total}）…"
+            )
+            page.set_connection_state(text)
+
+        try:
+            await self.connection_recovery.ensure_connected(
+                self.gateway,
+                attempt,
+            )
+        except SessionExpiredError as error:
+            await self._handle_session_expired(error)
+            return False
+        except TransientNetworkError:
+            page.set_logged_in(False)
+            page.set_connection_state("重连失败，请检查网络或代理后重试")
+            self._show_status("Telegram 重连失败，请检查网络或代理")
+            return False
+        except Exception as error:
+            safe = self._safe_error(error)
+            page.set_logged_in(False)
+            page.set_connection_state(f"连接失败：{safe}")
+            self._show_status(f"Telegram 连接失败：{safe}")
+            return False
+
+        page.set_logged_in(True)
+        page.set_connection_state("连接已恢复")
+        return True
 
     async def start(self) -> None:
         self.refresh_tasks()
@@ -269,8 +319,9 @@ class AppController:
         if self.gateway is None:
             self.show_login()
             return
+        if not await self.ensure_telegram_online():
+            return
         try:
-            await self.gateway.connect()
             name = await self._account_name()
             if name is None:
                 self.show_login()
@@ -295,6 +346,7 @@ class AppController:
         try:
             await self._cancel_qr_wait()
             await self._cancel_content_operations()
+            await self.connection_recovery.cancel()
             if self.content_browser is not None:
                 go_offline = getattr(self.content_browser, "go_offline", None)
                 if go_offline is not None:
@@ -379,6 +431,7 @@ class AppController:
 
     async def edit_credentials(self) -> None:
         await self._cancel_qr_wait()
+        await self.connection_recovery.cancel()
         if self.gateway is not None:
             await self.gateway.disconnect()
         from telegram_downloader.ui.login import LoginPage
@@ -488,11 +541,13 @@ class AppController:
             self.login_dialog.show_error(self._safe_error(error))
 
     async def scan_link(self, link: str, filters: ScanFilters) -> None:
-        if self.planner is None:
-            self._show_error("请先登录 Telegram 账号")
-            return
         self.window.set_scan_busy(True)
         try:
+            if not await self.ensure_telegram_online():
+                return
+            if self.planner is None:
+                self._show_error("请先登录 Telegram 账号")
+                return
             source = parse_telegram_link(link)
             preview = await self.planner.scan(source, filters)
             if not self.confirm_preview(preview):
@@ -537,13 +592,56 @@ class AppController:
             page.set_logged_in(True)
             page.set_dialogs(dialogs)
             self._reload_content_history()
-            self._dialog_sync_task = self._spawn_background(
-                self.refresh_content_dialogs()
-            )
+            self._schedule_content_dialog_sync_if_stale()
         except SessionExpiredError:
             raise
         except Exception as error:
             self._content_page().show_error(self._safe_error(error))
+
+    async def activate_content_page(self) -> None:
+        if self.content_browser is None:
+            return
+        if not await self.ensure_telegram_online():
+            return
+        account = getattr(self.content_browser, "account", None)
+        if account is None:
+            await self.activate_content_account()
+            return
+        page = self._content_page()
+        page.set_logged_in(True)
+        page.set_dialogs(self.content_browser.list_dialogs())
+        self._reload_content_history()
+        self._schedule_content_dialog_sync_if_stale()
+
+    async def select_content_dialog(self, peer_ref: str) -> None:
+        if self.content_browser is None:
+            return
+        latest = getattr(self.content_browser, "latest_session", None)
+        session = latest(peer_ref) if latest is not None else None
+        page = self._content_page()
+        page.set_active_search(session)
+        page.set_results(
+            self.content_browser.list_results(session.id)
+            if session is not None
+            else []
+        )
+        if not await self.ensure_telegram_online():
+            return
+        self._schedule_content_dialog_sync_if_stale()
+
+    def _schedule_content_dialog_sync_if_stale(self) -> None:
+        if self.content_browser is None:
+            return
+        task = self._dialog_sync_task
+        if task is not None and not task.done():
+            return
+        stale = getattr(self.content_browser, "dialog_cache_stale", None)
+        if stale is not None and not stale(timedelta(seconds=60)):
+            self._content_page().set_sync_state("同步完成", busy=False)
+            return
+        self._dialog_sync_task = self._spawn_background(
+            self.refresh_content_dialogs()
+        )
 
     async def refresh_content_dialogs(self) -> None:
         if self.content_browser is None:
@@ -552,8 +650,11 @@ class AppController:
         current = asyncio.current_task()
         if current is not None:
             self._dialog_sync_task = current
-        page.set_sync_state("正在同步…", busy=True)
+        page.set_sync_state("正在同步群组…", busy=True)
         try:
+            if not await self.ensure_telegram_online():
+                page.set_sync_state("同步失败", busy=False)
+                return
             dialogs = await self.content_browser.sync_dialogs()
             page.set_dialogs(dialogs)
             page.set_sync_state("同步完成", busy=False)
@@ -584,6 +685,8 @@ class AppController:
         page.set_search_busy(True)
         search_id: str | None = None
         try:
+            if not await self.ensure_telegram_online():
+                return
             session, results = await self.content_browser.start_search(
                 peer_ref,
                 query,
@@ -613,6 +716,8 @@ class AppController:
         self._content_search_task = current
         page.set_search_busy(True)
         try:
+            if not await self.ensure_telegram_online():
+                return
             session, results = await self.content_browser.load_more(search_id)
             page.set_active_search(session)
             page.set_results(results)
@@ -797,6 +902,7 @@ class AppController:
         self._shutting_down = True
         await self._cancel_qr_wait()
         await self._cancel_content_operations()
+        await self.connection_recovery.cancel()
         await self.scheduler.shutdown()
         pending = tuple(task for task in self._background if not task.done())
         if pending:
@@ -927,6 +1033,7 @@ class AppController:
         return await method()
 
     async def _handle_session_expired(self, error: SessionExpiredError) -> None:
+        await self.connection_recovery.cancel()
         await self._cancel_content_operations()
         page = self._content_page()
         if self.content_browser is not None:
