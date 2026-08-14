@@ -142,6 +142,44 @@ async def test_connection_monitor_waits_30_seconds_and_shutdown_cancels_it() -> 
 
 
 @pytest.mark.asyncio
+async def test_successful_login_starts_connection_monitor_after_logged_out_start() -> None:
+    sleeping = asyncio.Event()
+    blocker = asyncio.Event()
+
+    async def sleep(_value: float) -> None:
+        sleeping.set()
+        await blocker.wait()
+
+    class Gateway:
+        def export_session(self) -> str:
+            return "new-session"
+
+        async def account_name(self) -> str:
+            return "New User"
+
+        def is_connected(self) -> bool:
+            return True
+
+        async def disconnect(self) -> None:
+            pass
+
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        connection_sleeper=sleep,
+    )
+
+    assert controller._connection_monitor_task is None
+    await controller._finish_login()
+
+    task = controller._connection_monitor_task
+    assert task is not None
+    await sleeping.wait()
+    assert task.done() is False
+    await controller.shutdown()
+    assert task.cancelled() is True
+
+
+@pytest.mark.asyncio
 async def test_code_login_saves_exported_session() -> None:
     class Gateway:
         async def sign_in(self, phone, code, phone_code_hash):

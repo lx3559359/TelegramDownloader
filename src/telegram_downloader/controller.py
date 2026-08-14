@@ -363,11 +363,17 @@ class AppController:
         if self.gateway is None:
             self.show_login()
             return
-        self._connection_monitor_task = self._spawn_background(
-            self._monitor_connection()
-        )
+        self._ensure_connection_monitor()
         self._session_restore_task = self._spawn_background(
             self._restore_saved_session()
+        )
+
+    def _ensure_connection_monitor(self) -> None:
+        task = self._connection_monitor_task
+        if self._shutting_down or (task is not None and not task.done()):
+            return
+        self._connection_monitor_task = self._spawn_background(
+            self._monitor_connection()
         )
 
     async def _restore_saved_session(self) -> None:
@@ -1159,6 +1165,7 @@ class AppController:
         self.phone_code_hash = ""
         self.login_dialog.show_ready(name)
         self.login_dialog.accept()
+        self._ensure_connection_monitor()
         await self.activate_content_account()
 
     async def _account_name(self) -> str | None:
