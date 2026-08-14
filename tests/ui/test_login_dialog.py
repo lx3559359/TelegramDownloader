@@ -1,7 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QLabel, QLineEdit
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtWidgets import QApplication, QLabel, QLineEdit
 
 from telegram_downloader.ui.login import LoginDialog, LoginPage
 
@@ -77,6 +77,22 @@ def test_qr_page_renders_in_memory_and_exposes_login_choices(qtbot) -> None:
         qtbot.mouseClick(dialog.phone_fallback, Qt.MouseButton.LeftButton)
     with qtbot.waitSignal(dialog.credentials_edit_requested, timeout=500):
         qtbot.mouseClick(dialog.credentials_edit, Qt.MouseButton.LeftButton)
+
+
+def test_qr_page_uses_fixed_viewport_and_preserves_complete_pixmap(qtbot) -> None:
+    dialog = LoginDialog()
+    qtbot.addWidget(dialog)
+    dialog.show()
+    expires_at = datetime.now(UTC) + timedelta(seconds=60)
+
+    dialog.show_qr(f"tg://login?token={'a' * 43}", expires_at)
+    QApplication.processEvents()
+
+    pixmap = dialog.qr_image.pixmap()
+    assert dialog.qr_image.size() == QSize(300, 300)
+    assert pixmap.width() <= dialog.qr_image.width()
+    assert pixmap.height() <= dialog.qr_image.height()
+    assert dialog.qr_image.hasScaledContents() is False
 
 
 def test_qr_state_is_cleared_on_page_switch_and_reject(qtbot) -> None:

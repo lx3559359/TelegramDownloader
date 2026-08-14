@@ -154,8 +154,9 @@ class LoginDialog(QDialog):
 
         self.qr_image = QLabel()
         self.qr_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.qr_image.setMinimumSize(232, 232)
-        layout.addWidget(self.qr_image)
+        self.qr_image.setFixedSize(300, 300)
+        self.qr_image.setScaledContents(False)
+        layout.addWidget(self.qr_image, 0, Qt.AlignmentFlag.AlignHCenter)
 
         self.qr_countdown = QLabel("正在生成二维码…")
         self.qr_countdown.setObjectName("muted")
@@ -283,6 +284,7 @@ class LoginDialog(QDialog):
         self.show_page(LoginPage.QR)
         self._tick_qr_countdown()
         self.qr_countdown_timer.start()
+        self.adjustSize()
 
     def update_qr_countdown(self, seconds: int) -> None:
         if seconds > 0:
