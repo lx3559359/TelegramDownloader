@@ -30,6 +30,7 @@ from telegram_downloader.content import (
     SearchStatus,
 )
 from telegram_downloader.domain import MediaKind
+from telegram_downloader.links import is_telegram_link_candidate
 from telegram_downloader.ui.content_models import (
     DialogListModel,
     SearchHistoryTableModel,
@@ -48,6 +49,8 @@ _MEDIA_LABELS = {
 
 class ContentBrowserPage(QWidget):
     refresh_requested = Signal()
+    dialog_selected = Signal(str)
+    link_requested = Signal(str)
     search_requested = Signal(str, str, object, object, object, int)
     cancel_search_requested = Signal()
     load_more_requested = Signal(str)
@@ -300,6 +303,9 @@ class ContentBrowserPage(QWidget):
         )
         self._refresh_actions()
 
+    def set_connection_state(self, text: str) -> None:
+        self.empty_hint.setText(text)
+
     def set_dialogs(self, dialogs: list[ContentDialog]) -> None:
         selected_peer = self._current_peer_ref()
         self.dialog_model.set_dialogs(dialogs)
@@ -324,6 +330,7 @@ class ContentBrowserPage(QWidget):
     def set_active_search(self, session: SearchSession | None) -> None:
         self.active_session = session
         self.active_search_id = session.id if session is not None else None
+        self._set_form_from_session(session)
         self._refresh_actions()
 
     def set_results(self, results: list[SearchResult]) -> None:
@@ -367,9 +374,9 @@ class ContentBrowserPage(QWidget):
         _previous: QModelIndex,
     ) -> None:
         if current.isValid():
-            self.current_dialog_label.setText(
-                self.dialog_model.dialog_at(current.row()).title
-            )
+            dialog = self.dialog_model.dialog_at(current.row())
+            self.current_dialog_label.setText(dialog.title)
+            self.dialog_selected.emit(dialog.peer_ref)
         else:
             self.current_dialog_label.setText("请选择群组或频道")
         self._refresh_actions()
@@ -377,6 +384,10 @@ class ContentBrowserPage(QWidget):
     def _emit_search(self) -> None:
         dialog = self._current_dialog()
         keyword = self.keyword_input.text().strip()
+        if is_telegram_link_candidate(keyword):
+            self.show_error("")
+            self.link_requested.emit(keyword)
+            return
         start = self.date_from.date().toPython()
         end = self.date_to.date().toPython()
         kinds = frozenset(
@@ -492,19 +503,37 @@ class ContentBrowserPage(QWidget):
                 text += f" · {unknown} 项大小未知"
         self.selection_summary.setText(text)
 
+    def _set_form_from_session(self, session: SearchSession | None) -> None:
+        if session is None:
+            self.keyword_input.clear()
+            self.date_from.setDate(QDate.currentDate().addDays(-7))
+            self.date_to.setDate(QDate.currentDate())
+            self.limit_input.setValue(500)
+            selected = frozenset(MediaKind)
+        else:
+            filters = session.query.filters
+            start = filters.date_from_utc.astimezone().date()
+            end = filters.date_to_utc.astimezone().date()
+            self.keyword_input.setText(session.query.keyword)
+            self.date_from.setDate(QDate(start.year, start.month, start.day))
+            self.date_to.setDate(QDate(end.year, end.month, end.day))
+            self.limit_input.setValue(filters.item_limit)
+            selected = filters.media_kinds
+        for kind, check in self.media_checks.items():
+            check.setChecked(kind in selected)
+
     def _refresh_actions(self, *_args) -> None:
         dialog = self._current_dialog()
         dialog_available = dialog is not None and dialog.available
         online_ready = self._logged_in and not self._search_busy
+        form_ready = not self._search_busy
         selectable = any(
             item.selected and item.available and not item.queued
             for item in self.results
         )
-        self.refresh_button.setEnabled(
-            self._logged_in and not self._sync_busy
-        )
-        self.search_button.setEnabled(online_ready and dialog_available)
-        self.keyword_input.setEnabled(online_ready and dialog_available)
+        self.refresh_button.setEnabled(not self._sync_busy)
+        self.search_button.setEnabled(form_ready)
+        self.keyword_input.setEnabled(form_ready)
         self.cancel_button.setVisible(self._search_busy)
         self.select_all_button.setEnabled(
             online_ready and dialog_available and bool(self.results)

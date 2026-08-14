@@ -1,7 +1,11 @@
 import pytest
 
 from telegram_downloader.domain import SourceKind
-from telegram_downloader.links import InvalidTelegramLink, parse_telegram_link
+from telegram_downloader.links import (
+    InvalidTelegramLink,
+    is_telegram_link_candidate,
+    parse_telegram_link,
+)
 
 
 @pytest.mark.parametrize(
@@ -28,6 +32,15 @@ def test_normalizes_host_trailing_slash_and_ignores_single_view_hint() -> None:
     parsed = parse_telegram_link(" HTTPS://WWW.T.ME/example/42/?single ")
 
     assert parsed.normalized_url == "https://t.me/example/42"
+
+
+def test_only_http_tme_urls_are_link_candidates() -> None:
+    assert is_telegram_link_candidate(
+        "https://t.me/Zhangzhoulao66/56156?single"
+    )
+    assert is_telegram_link_candidate("http://www.t.me/example")
+    assert not is_telegram_link_candidate("美丽")
+    assert not is_telegram_link_candidate("https://example.com/t.me/demo")
 
 
 @pytest.mark.parametrize(

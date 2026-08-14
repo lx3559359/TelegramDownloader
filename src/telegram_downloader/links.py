@@ -25,6 +25,14 @@ _PREVIEW = re.compile(
 _INVITE = re.compile(r"^/\+(?P<slug>[A-Za-z0-9_-]+)/?$")
 
 
+def is_telegram_link_candidate(value: str) -> bool:
+    parsed = urlparse(value.strip())
+    return (
+        parsed.scheme.lower() in {"http", "https"}
+        and (parsed.hostname or "").lower() in {"t.me", "www.t.me"}
+    )
+
+
 def parse_telegram_link(value: str) -> ParsedLink:
     parsed = urlparse(value.strip())
     if (

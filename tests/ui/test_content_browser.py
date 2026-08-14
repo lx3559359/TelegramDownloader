@@ -86,18 +86,66 @@ def test_page_contains_content_browser_controls(qtbot) -> None:
     assert page.queue_button.text() == "加入下载队列"
 
 
-def test_logged_out_page_keeps_history_visible_but_disables_online_actions(
+def test_logged_out_page_keeps_query_editable_and_history_visible(
     qtbot,
 ) -> None:
     page = ContentBrowserPage()
     qtbot.addWidget(page)
     page.set_logged_in(False)
 
-    assert page.refresh_button.isEnabled() is False
-    assert page.search_button.isEnabled() is False
+    assert page.refresh_button.isEnabled() is True
+    assert page.search_button.isEnabled() is True
+    assert page.keyword_input.isEnabled() is True
     assert page.queue_button.isEnabled() is False
     assert page.history_table.isEnabled() is True
     assert "登录" in page.empty_hint.text()
+
+
+def test_offline_page_routes_tme_link_without_selected_dialog(qtbot) -> None:
+    page = ContentBrowserPage()
+    qtbot.addWidget(page)
+    page.set_logged_in(False)
+    page.keyword_input.setText(
+        "https://t.me/Zhangzhoulao66/56156?single"
+    )
+
+    with qtbot.waitSignal(page.link_requested, timeout=500) as caught:
+        qtbot.mouseClick(page.search_button, Qt.MouseButton.LeftButton)
+
+    assert caught.args == ["https://t.me/Zhangzhoulao66/56156?single"]
+
+
+def test_dialog_selection_emits_peer_and_restores_search_form(qtbot) -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    page = ContentBrowserPage()
+    qtbot.addWidget(page)
+    page.set_dialogs([dialog(now)])
+
+    with qtbot.waitSignal(page.dialog_selected, timeout=500) as caught:
+        page.dialog_list.setCurrentIndex(page.dialog_model.index(0, 0))
+
+    assert caught.args == ["-1001"]
+
+    restored = session(now)
+    page.set_active_search(restored)
+
+    assert page.keyword_input.text() == "安装"
+    assert page.limit_input.value() == 500
+    assert all(page.media_checks[kind].isChecked() for kind in MediaKind)
+
+    page.keyword_input.setText("不会串群")
+    page.set_active_search(None)
+    assert page.keyword_input.text() == ""
+    assert page.limit_input.value() == 500
+
+
+def test_connection_state_replaces_account_hint(qtbot) -> None:
+    page = ContentBrowserPage()
+    qtbot.addWidget(page)
+
+    page.set_connection_state("正在重连（2/3）…")
+
+    assert page.empty_hint.text() == "正在重连（2/3）…"
 
 
 def test_valid_search_emits_trimmed_parameters_and_invalid_input_stays_local(
