@@ -92,11 +92,32 @@ $python = Join-Path $projectRoot '.venv\Scripts\python.exe'
 $version = & $python -c "from telegram_downloader import __version__; print(__version__)"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $compileLog = Assert-ProjectChild (Join-Path $buildTemp 'iscc.log')
-$versionDefinition = '/DAppVersion="' + $version + '"'
-$sourceDefinition = '/DSourceDir="' + $appDir + '"'
-$outputDefinition = '/DOutputDir="' + $releaseDir + '"'
-& $compiler $versionDefinition $sourceDefinition $outputDefinition (Join-Path $projectRoot 'installer\TelegramDownloader.iss') 2>&1 | Tee-Object -FilePath $compileLog
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$compilerStart = [Diagnostics.ProcessStartInfo]::new()
+$compilerStart.FileName = $compiler
+$compilerStart.UseShellExecute = $false
+$compilerStart.CreateNoWindow = $true
+$compilerStart.RedirectStandardOutput = $true
+$compilerStart.RedirectStandardError = $true
+$compilerStart.ArgumentList.Add("/DAppVersion=$version")
+$compilerStart.ArgumentList.Add("/DSourceDir=$appDir")
+$compilerStart.ArgumentList.Add("/DOutputDir=$releaseDir")
+$compilerStart.ArgumentList.Add((Join-Path $projectRoot 'installer\TelegramDownloader.iss'))
+$compilerProcess = [Diagnostics.Process]::new()
+$compilerProcess.StartInfo = $compilerStart
+if (-not $compilerProcess.Start()) {
+    throw 'Unable to start Inno Setup compiler.'
+}
+$standardOutput = $compilerProcess.StandardOutput.ReadToEndAsync()
+$standardError = $compilerProcess.StandardError.ReadToEndAsync()
+$compilerProcess.WaitForExit()
+$compileOutput = @(
+    $standardOutput.GetAwaiter().GetResult(),
+    $standardError.GetAwaiter().GetResult()
+) -join [Environment]::NewLine
+$compileOutput | Tee-Object -FilePath $compileLog
+if ($compilerProcess.ExitCode -ne 0) {
+    throw "Inno Setup compiler failed: $($compilerProcess.ExitCode)"
+}
 
 $setup = Assert-ProjectChild (Join-Path $releaseDir "TelegramDownloader-$version-win-x64-setup.exe")
 if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) {

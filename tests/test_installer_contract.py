@@ -59,3 +59,13 @@ def test_installer_build_and_smoke_paths_are_project_local_and_versioned() -> No
     assert "$sourceVersion = & $python -c" in smoke
     assert "TelegramDownloader-$sourceVersion-win-x64-setup.exe" in smoke
     assert "TelegramDownloader-0.1.0-win-x64-setup.exe" not in smoke
+
+
+def test_inno_compiler_arguments_preserve_project_paths_with_spaces() -> None:
+    build = (
+        Path(__file__).parents[1] / "scripts" / "build-installer.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert "[Diagnostics.ProcessStartInfo]::new()" in build
+    assert ".ArgumentList.Add(" in build
+    assert "$sourceDefinition" not in build
