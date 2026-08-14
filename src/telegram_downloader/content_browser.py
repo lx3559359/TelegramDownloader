@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -80,6 +80,7 @@ class ContentBrowserService:
         self.uuid_factory = uuid_factory or (lambda: str(uuid4()))
         self.clock = clock or (lambda: datetime.now(UTC))
         self.account: AccountProfile | None = None
+        self._last_dialog_sync_at: datetime | None = None
         self._sync_lock = asyncio.Lock()
         self._search_lock = asyncio.Lock()
 
@@ -103,6 +104,7 @@ class ContentBrowserService:
         self,
     ) -> tuple[AccountProfile | None, list[ContentDialog]]:
         self.account = self.catalog.most_recent_account()
+        self._restore_dialog_sync_time()
         return self.account, self.list_dialogs()
 
     async def activate_account(
@@ -114,6 +116,7 @@ class ContentBrowserService:
         self.catalog.upsert_account(profile, now)
         self.catalog.recover_interrupted_searches(profile.account_id, now)
         self.account = profile
+        self._restore_dialog_sync_time()
         return profile, self.list_dialogs()
 
     def list_dialogs(
@@ -132,6 +135,18 @@ class ContentBrowserService:
         if self.account is None:
             return []
         return self.catalog.list_sessions(self.account.account_id)
+
+    def latest_session(self, peer_ref: str) -> SearchSession | None:
+        return next(
+            (item for item in self.list_sessions() if item.peer_ref == peer_ref),
+            None,
+        )
+
+    def dialog_cache_stale(self, max_age: timedelta) -> bool:
+        if max_age.total_seconds() < 0:
+            raise ValueError("缓存有效期不能为负数")
+        synced_at = self._last_dialog_sync_at
+        return synced_at is None or self.clock() - synced_at > max_age
 
     def list_results(self, search_id: str) -> list[SearchResult]:
         account = self._require_account()
@@ -153,6 +168,7 @@ class ContentBrowserService:
             if self.account != account:
                 return self.list_dialogs()
             self.catalog.replace_dialogs(account.account_id, dialogs, now)
+            self._last_dialog_sync_at = now
             return self.catalog.list_dialogs(account.account_id)
 
     async def start_search(
@@ -497,6 +513,13 @@ class ContentBrowserService:
             self.clock(),
             status=SearchStatus.INCOMPLETE,
             error=error,
+        )
+
+    def _restore_dialog_sync_time(self) -> None:
+        dialogs = self.list_dialogs(include_unavailable=True)
+        self._last_dialog_sync_at = max(
+            (item.last_synced_at for item in dialogs),
+            default=None,
         )
 
     def _require_account(self) -> AccountProfile:

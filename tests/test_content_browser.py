@@ -1,6 +1,6 @@
 import asyncio
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -200,6 +200,70 @@ async def test_cached_account_is_available_offline_then_refreshes_online(
     assert switched.account_id == "a2"
     assert [item.title for item in switched_dialogs] == ["账号二群"]
     assert service.list_dialogs() == switched_dialogs
+
+
+@pytest.mark.asyncio
+async def test_dialog_cache_age_and_empty_sync_are_tracked(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 14, 8, tzinfo=UTC)
+    current = [now]
+    catalog = initialized_catalog(tmp_path)
+    catalog.upsert_account(AccountProfile("a1", "账号一"), now)
+    gateway = FakeGateway(AccountProfile("a1", "账号一"))
+    service = ContentBrowserService(
+        catalog,
+        ThumbnailCache(tmp_path / "thumbs"),
+        gateway=gateway,
+        planner=PlannerStub(),
+        clock=lambda: current[0],
+    )
+    await service.activate_account()
+
+    assert service.dialog_cache_stale(timedelta(seconds=60)) is True
+    await service.sync_dialogs()
+    assert service.dialog_cache_stale(timedelta(seconds=60)) is False
+
+    current[0] = now + timedelta(seconds=61)
+    assert service.dialog_cache_stale(timedelta(seconds=60)) is True
+
+
+@pytest.mark.asyncio
+async def test_latest_session_is_scoped_to_selected_dialog(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 14, 8, tzinfo=UTC)
+    catalog = initialized_catalog(tmp_path)
+    catalog.upsert_account(AccountProfile("a1", "账号一"), now)
+    catalog.replace_dialogs(
+        "a1",
+        [
+            make_dialog("a1", "-1001", "群一", now),
+            make_dialog("a1", "-1002", "群二", now),
+        ],
+        now,
+    )
+    service = ContentBrowserService(
+        catalog,
+        ThumbnailCache(tmp_path / "thumbs"),
+        clock=lambda: now,
+    )
+    await service.activate_cached_account()
+    first = catalog.begin_search(
+        "s1",
+        "a1",
+        "-1001",
+        "群一",
+        make_query(now, "甲"),
+        now,
+    )
+    catalog.begin_search(
+        "s2",
+        "a1",
+        "-1002",
+        "群二",
+        make_query(now, "乙"),
+        now,
+    )
+
+    assert service.latest_session("-1001") == first
+    assert service.latest_session("-9999") is None
 
 
 @pytest.mark.asyncio
