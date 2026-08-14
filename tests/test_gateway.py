@@ -57,6 +57,13 @@ def media_message(
     )
 
 
+def make_search_query(now: datetime) -> ContentSearchQuery:
+    return ContentSearchQuery(
+        "安装",
+        ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 500),
+    )
+
+
 def test_proxy_dict_supports_socks5_and_http() -> None:
     socks = proxy_dict(ProxySettings("socks5", "127.0.0.1", 1080, "u"), "p")
 
@@ -761,6 +768,57 @@ async def test_search_media_page_marks_short_page_exhausted_without_cursor() -> 
     assert [item.remote.message_id for item in page.items] == [2, 1]
     assert page.next_cursor is None
     assert page.exhausted is True
+
+
+@pytest.mark.asyncio
+async def test_search_progress_finishes_with_real_scanned_and_matched_counts() -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    messages = [media_message(value, now) for value in range(25, 0, -1)]
+
+    class Client:
+        async def get_entity(self, _entity):
+            return SimpleNamespace(title="资料群")
+
+        def iter_messages(self, _entity, **_kwargs):
+            async def generate():
+                for message in messages:
+                    yield message
+
+            return generate()
+
+    events = []
+    gateway = TelethonGateway.from_client_for_test(Client())
+
+    await gateway.search_media_page(
+        "-1001",
+        make_search_query(now),
+        None,
+        on_progress=events.append,
+    )
+
+    assert events[-1].inspected == 25
+    assert events[-1].matched == 25
+    assert events[-1].phase == "正在整理结果"
+
+
+@pytest.mark.asyncio
+async def test_resolved_entities_are_cached_per_gateway() -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get_entity(self, entity):
+            self.calls += 1
+            return SimpleNamespace(id=entity, title="资料群")
+
+    client = Client()
+    gateway = TelethonGateway.from_client_for_test(client)
+
+    first = await gateway._resolve_entity("-1001")
+    second = await gateway._resolve_entity("-1001")
+
+    assert first is second
+    assert client.calls == 1
 
 
 @pytest.mark.asyncio

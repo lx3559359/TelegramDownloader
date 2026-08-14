@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import mimetypes
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -16,6 +16,7 @@ from telegram_downloader.content import (
     DialogKind,
     SearchCursor,
 )
+from telegram_downloader.content_progress import SearchProgress, SearchProgressReporter
 from telegram_downloader.domain import MediaKind, ParsedLink, ScanFilters, SourceKind
 from telegram_downloader.files import classify_media, sanitize_component
 from telegram_downloader.settings import ProxySettings
@@ -147,6 +148,8 @@ class TelegramGateway(Protocol):
         peer_ref: str,
         query: ContentSearchQuery,
         cursor: SearchCursor | None,
+        *,
+        on_progress: Callable[[SearchProgress], None] | None = None,
     ) -> RemoteSearchPage: ...
 
     async def expand_album(
@@ -234,6 +237,7 @@ class TelethonGateway:
         self._peer_id_getter = utils.get_peer_id
         self._qr_login: object | None = None
         self._connected = False
+        self._entity_cache: dict[str, object] = {}
 
     @classmethod
     def from_client_for_test(
@@ -265,6 +269,7 @@ class TelethonGateway:
         gateway._peer_id_getter = peer_id_getter or (lambda entity: entity)
         gateway._qr_login = None
         gateway._connected = connected
+        gateway._entity_cache = {}
         return gateway
 
     async def connect(self) -> None:
@@ -533,11 +538,14 @@ class TelethonGateway:
         peer_ref: str,
         query: ContentSearchQuery,
         cursor: SearchCursor | None,
+        *,
+        on_progress: Callable[[SearchProgress], None] | None = None,
     ) -> RemoteSearchPage:
         items: list[RemoteSearchHit] = []
         inspected = 0
         last_inspected_id: int | None = None
         reached_start_date = False
+        reporter = SearchProgressReporter(on_progress) if on_progress else None
         try:
             entity = await self._resolve_entity(peer_ref)
             title = self._entity_title(entity, peer_ref)
@@ -550,20 +558,29 @@ class TelethonGateway:
             async for message in messages:
                 inspected += 1
                 last_inspected_id = int(message.id)
-                message_date = self._utc_datetime(getattr(message, "date", None))
-                if message_date is None:
-                    continue
-                if message_date > query.filters.date_to_utc:
-                    continue
-                if message_date < query.filters.date_from_utc:
-                    reached_start_date = True
-                    break
-                remote = self.remote_media_from_message(peer_ref, message, title)
-                if remote is None or remote.kind not in query.filters.media_kinds:
-                    continue
-                items.append(self._search_hit(remote, message))
+                matched = False
+                try:
+                    message_date = self._utc_datetime(getattr(message, "date", None))
+                    if message_date is None:
+                        continue
+                    if message_date > query.filters.date_to_utc:
+                        continue
+                    if message_date < query.filters.date_from_utc:
+                        reached_start_date = True
+                        break
+                    remote = self.remote_media_from_message(peer_ref, message, title)
+                    if remote is None or remote.kind not in query.filters.media_kinds:
+                        continue
+                    items.append(self._search_hit(remote, message))
+                    matched = True
+                finally:
+                    if reporter is not None:
+                        reporter.record(matched=matched)
         except Exception as exc:
             self._raise_mapped(exc)
+
+        if reporter is not None:
+            reporter.finish("正在整理结果")
 
         exhausted = reached_start_date or inspected < self._SEARCH_PAGE_SIZE
         next_cursor = (
@@ -658,24 +675,32 @@ class TelethonGateway:
             self._connected = False
 
     async def _resolve_entity(self, entity_ref: str) -> object:
+        if entity_ref in self._entity_cache:
+            return self._entity_cache[entity_ref]
         try:
             if entity_ref.startswith("+"):
                 if self._check_invite_request is None:
-                    return await self._client.get_entity(entity_ref)
-                invitation = await self._client(self._check_invite_request(entity_ref[1:]))
-                chat = getattr(invitation, "chat", None)
-                if chat is None:
+                    entity = await self._client.get_entity(entity_ref)
+                else:
+                    invitation = await self._client(
+                        self._check_invite_request(entity_ref[1:])
+                    )
+                    entity = getattr(invitation, "chat", None)
+                if entity is None:
                     raise AccessDeniedError("请先使用 Telegram 加入该邀请链接")
-                return chat
-            reference: str | int = entity_ref
-            if entity_ref.startswith("-100") and entity_ref[1:].isdigit():
-                reference = int(entity_ref)
-                return await self._resolve_private_entity(reference)
-            return await self._client.get_entity(reference)
+            else:
+                reference: str | int = entity_ref
+                if entity_ref.startswith("-100") and entity_ref[1:].isdigit():
+                    reference = int(entity_ref)
+                    entity = await self._resolve_private_entity(reference)
+                else:
+                    entity = await self._client.get_entity(reference)
         except AccessDeniedError:
             raise
         except Exception as exc:
             self._raise_mapped(exc)
+        self._entity_cache[entity_ref] = entity
+        return entity
 
     async def _resolve_private_entity(self, reference: int) -> object:
         try:
