@@ -570,6 +570,14 @@ class AppController:
         finally:
             self.window.set_scan_busy(False)
 
+    def route_content_link(self, link: str) -> None:
+        try:
+            source = parse_telegram_link(link)
+        except (InvalidTelegramLink, ValueError) as error:
+            self._content_page().show_error(str(error))
+            return
+        self.window.open_link_preview(source.normalized_url)
+
     async def activate_cached_content_account(self) -> None:
         page = self._content_page()
         page.set_logged_in(False)

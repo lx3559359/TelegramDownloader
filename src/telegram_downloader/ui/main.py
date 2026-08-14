@@ -41,6 +41,7 @@ _MEDIA_LABELS = {
 
 class MainWindow(QMainWindow):
     scan_requested = Signal(str)
+    content_activated = Signal()
     pause_requested = Signal(str)
     resume_requested = Signal(str)
     retry_failed_requested = Signal(str)
@@ -453,6 +454,13 @@ class MainWindow(QMainWindow):
         self._set_nav_active(
             self.content_nav_button if content else self.tasks_nav_button
         )
+        if content:
+            self.content_activated.emit()
+
+    def open_link_preview(self, link: str) -> None:
+        self.link_input.setText(link)
+        self.show_page("tasks")
+        self.scan_requested.emit(link)
 
     def _set_nav_active(self, active_button: QPushButton) -> None:
         for button in (self.tasks_nav_button, self.content_nav_button):

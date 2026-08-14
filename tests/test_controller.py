@@ -1263,6 +1263,39 @@ async def test_dialog_selection_restores_history_before_connect_finishes() -> No
     await operation
 
 
+def test_content_link_route_normalizes_single_hint_before_task_preview() -> None:
+    class Window(ContentWindowFake):
+        def __init__(self):
+            super().__init__()
+            self.previews = []
+
+        def open_link_preview(self, link):
+            self.previews.append(link)
+
+    window = Window()
+    controller = AppController.for_test(window=window)
+
+    controller.route_content_link(
+        "https://t.me/Zhangzhoulao66/56156?single"
+    )
+
+    assert window.previews == ["https://t.me/Zhangzhoulao66/56156"]
+    assert window.content_page.errors == []
+
+
+def test_invalid_content_link_stays_local_and_shows_parser_error() -> None:
+    class Window(ContentWindowFake):
+        def open_link_preview(self, _link):
+            raise AssertionError("invalid link must not leave content page")
+
+    window = Window()
+    controller = AppController.for_test(window=window)
+
+    controller.route_content_link("https://t.me/example/1#fragment")
+
+    assert window.content_page.errors == ["请输入有效的 t.me 链接"]
+
+
 @pytest.mark.asyncio
 async def test_start_displays_cached_content_before_network_failure() -> None:
     calls = []

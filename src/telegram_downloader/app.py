@@ -290,6 +290,14 @@ def create_application(root: Path):
     async def content_refresh_requested() -> None:
         await controller.refresh_content_dialogs()
 
+    @qasync.asyncSlot()
+    async def content_activated() -> None:
+        await controller.activate_content_page()
+
+    @qasync.asyncSlot(str)
+    async def content_dialog_selected(peer_ref: str) -> None:
+        await controller.select_content_dialog(peer_ref)
+
     @qasync.asyncSlot(str, str, object, object, object, int)
     async def content_search_requested(
         peer_ref: str,
@@ -350,7 +358,10 @@ def create_application(root: Path):
     window.open_directory_requested.connect(controller.open_task_directory)
     window.settings_requested.connect(open_settings)
     window.login_requested.connect(controller.show_login)
+    window.content_activated.connect(content_activated)
     window.content_page.refresh_requested.connect(content_refresh_requested)
+    window.content_page.dialog_selected.connect(content_dialog_selected)
+    window.content_page.link_requested.connect(controller.route_content_link)
     window.content_page.search_requested.connect(content_search_requested)
     window.content_page.cancel_search_requested.connect(
         controller.cancel_content_search
@@ -389,6 +400,8 @@ def create_application(root: Path):
             login_cancelled,
             resume_requested,
             retry_requested,
+            content_activated,
+            content_dialog_selected,
             content_refresh_requested,
             content_search_requested,
             content_load_more_requested,

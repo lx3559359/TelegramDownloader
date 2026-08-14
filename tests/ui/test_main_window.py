@@ -190,3 +190,20 @@ def test_content_navigation_switches_page_and_hides_statistics(qtbot) -> None:
     assert window.page_stack.currentWidget() is window.task_page
     assert window.statistics_panel.isHidden() is False
     assert window.tasks_nav_button.property("active") is True
+
+
+def test_content_navigation_emits_activation_and_link_preview_routes_to_tasks(
+    qtbot,
+) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+
+    with qtbot.waitSignal(window.content_activated, timeout=500):
+        qtbot.mouseClick(window.content_nav_button, Qt.MouseButton.LeftButton)
+
+    with qtbot.waitSignal(window.scan_requested, timeout=500) as caught:
+        window.open_link_preview("https://t.me/Zhangzhoulao66/56156")
+
+    assert window.page_stack.currentWidget() is window.task_page
+    assert window.link_input.text() == "https://t.me/Zhangzhoulao66/56156"
+    assert caught.args == ["https://t.me/Zhangzhoulao66/56156"]
