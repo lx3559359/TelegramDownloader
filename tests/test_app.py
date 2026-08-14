@@ -11,6 +11,30 @@ def test_standard_button_selection_accepts_pyside_integer_result() -> None:
     assert app._standard_button_selected(yes.value, yes) is True
 
 
+def test_duplicate_instance_exits_before_application_construction(
+    tmp_path, monkeypatch
+) -> None:
+    class Guard:
+        def acquire(self) -> bool:
+            return False
+
+        def notify_already_running(self) -> None:
+            self.notified = True
+
+        def release(self) -> None:
+            raise AssertionError("unowned guard must not be released")
+
+    guard = Guard()
+    monkeypatch.setattr(
+        app,
+        "create_application",
+        lambda _root: (_ for _ in ()).throw(AssertionError()),
+    )
+
+    assert app.run(tmp_path, instance_guard=guard) == 2
+    assert guard.notified is True
+
+
 def test_create_application_initializes_project_local_content_services(
     tmp_path,
 ) -> None:

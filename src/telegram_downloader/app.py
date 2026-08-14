@@ -14,6 +14,7 @@ from telegram_downloader.content_browser import ContentBrowserService
 from telegram_downloader.controller import AppController
 from telegram_downloader.downloader import MediaDownloader
 from telegram_downloader.gateway import TelethonGateway
+from telegram_downloader.instance_guard import WindowsInstanceGuard
 from telegram_downloader.logging import configure_logging
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.planner import ScanPreview, TaskPlanner
@@ -418,12 +419,20 @@ def datetime_now_timezone():
     return datetime.now().astimezone().tzinfo
 
 
-def run(root: Path) -> int:
-    application, loop, controller = create_application(root)
-    application.aboutToQuit.connect(loop.stop)
-    with loop:
-        loop.run_until_complete(controller.start())
-        controller.window.show()
-        loop.run_forever()
-        loop.run_until_complete(controller.shutdown())
-    return 0
+def run(root: Path, instance_guard: WindowsInstanceGuard | None = None) -> int:
+    guard = instance_guard or WindowsInstanceGuard()
+    if not guard.acquire():
+        guard.notify_already_running()
+        return 2
+
+    try:
+        application, loop, controller = create_application(root)
+        application.aboutToQuit.connect(loop.stop)
+        with loop:
+            loop.run_until_complete(controller.start())
+            controller.window.show()
+            loop.run_forever()
+            loop.run_until_complete(controller.shutdown())
+        return 0
+    finally:
+        guard.release()
