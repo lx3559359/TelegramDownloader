@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtWidgets import QApplication, QLabel, QLineEdit
 
+from telegram_downloader.settings import ProxySettings
 from telegram_downloader.ui.login import LoginDialog, LoginPage
 
 
@@ -29,6 +30,29 @@ def test_credentials_are_validated_then_emitted(qtbot) -> None:
     assert signal.args[0:2] == [12345, "secret-hash"]
     assert signal.args[2].kind == "none"
     assert signal.args[3] == ""
+
+
+def test_saved_credentials_and_proxy_are_prefilled_but_masked(qtbot) -> None:
+    dialog = LoginDialog()
+    qtbot.addWidget(dialog)
+    proxy = ProxySettings("socks5", "127.0.0.1", 1080, "alice")
+
+    dialog.set_saved_credentials(
+        12345,
+        "saved-hash",
+        proxy,
+        "saved-password",
+    )
+
+    assert dialog.api_id.value() == 12345
+    assert dialog.api_hash.text() == "saved-hash"
+    assert dialog.api_hash.echoMode() is QLineEdit.EchoMode.Password
+    assert dialog.proxy_kind.currentData() == "socks5"
+    assert dialog.proxy_host.text() == "127.0.0.1"
+    assert dialog.proxy_port.value() == 1080
+    assert dialog.proxy_username.text() == "alice"
+    assert dialog.proxy_password.text() == "saved-password"
+    assert dialog.proxy_password.echoMode() is QLineEdit.EchoMode.Password
 
 
 def test_invalid_phone_stays_on_page_and_shows_error(qtbot) -> None:

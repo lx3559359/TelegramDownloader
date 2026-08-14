@@ -23,6 +23,7 @@ from telegram_downloader.gateway import (
     GatewayError,
     SessionExpiredError,
     TelegramGateway,
+    TransientNetworkError,
 )
 from telegram_downloader.links import InvalidTelegramLink, parse_telegram_link
 from telegram_downloader.paths import PortablePaths
@@ -109,6 +110,15 @@ class _NullContentPage:
 
 
 class _NullLoginDialog:
+    def set_saved_credentials(
+        self,
+        _api_id: int,
+        _api_hash: str,
+        _proxy: ProxySettings,
+        _proxy_password: str,
+    ) -> None:
+        pass
+
     def show_page(self, _page: object) -> None:
         pass
 
@@ -335,6 +345,12 @@ class AppController:
             await self._cancel_qr_wait()
             info = await self.gateway.begin_qr_login()
             self._show_qr_and_wait(info)
+        except TransientNetworkError as error:
+            from telegram_downloader.ui.login import LoginPage
+
+            self._prefill_login()
+            self.login_dialog.show_page(LoginPage.CREDENTIALS)
+            self.login_dialog.show_error(self._safe_error(error))
         except Exception as error:
             self.login_dialog.show_error(self._safe_error(error))
 
@@ -346,6 +362,12 @@ class AppController:
             await self._cancel_qr_wait()
             info = await self.gateway.refresh_qr_login()
             self._show_qr_and_wait(info)
+        except TransientNetworkError as error:
+            from telegram_downloader.ui.login import LoginPage
+
+            self._prefill_login()
+            self.login_dialog.show_page(LoginPage.CREDENTIALS)
+            self.login_dialog.show_error(self._safe_error(error))
         except Exception as error:
             self.login_dialog.show_error(self._safe_error(error))
 
@@ -361,6 +383,7 @@ class AppController:
             await self.gateway.disconnect()
         from telegram_downloader.ui.login import LoginPage
 
+        self._prefill_login()
         self.login_dialog.show_page(LoginPage.CREDENTIALS)
 
     async def cancel_login(self) -> None:
@@ -857,6 +880,7 @@ class AppController:
         self.refresh_tasks(now=sampled_at)
 
     def show_login(self) -> None:
+        self._prefill_login()
         self.login_dialog.show()
         self.login_dialog.raise_()
         self.login_dialog.activateWindow()
@@ -870,6 +894,17 @@ class AppController:
         from telegram_downloader.ui.login import LoginPage
 
         self.login_dialog.show_page(LoginPage.CREDENTIALS)
+
+    def _prefill_login(self) -> None:
+        set_saved = getattr(self.login_dialog, "set_saved_credentials", None)
+        if set_saved is None:
+            return
+        set_saved(
+            self.settings.api_id,
+            self.secrets.get("api_hash", ""),
+            self.settings.proxy,
+            self.secrets.get("proxy_password", ""),
+        )
 
     async def _finish_login(self) -> None:
         if self.gateway is None:

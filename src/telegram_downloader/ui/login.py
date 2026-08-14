@@ -273,6 +273,23 @@ class LoginDialog(QDialog):
         self.error_label.setText(text)
         self.error_label.setVisible(True)
 
+    def set_saved_credentials(
+        self,
+        api_id: int,
+        api_hash: str,
+        proxy: ProxySettings,
+        proxy_password: str,
+    ) -> None:
+        self.api_id.setValue(max(0, api_id))
+        self.api_hash.setText(api_hash)
+        index = self.proxy_kind.findData(proxy.kind)
+        self.proxy_kind.setCurrentIndex(max(0, index))
+        self.proxy_host.setText(proxy.host)
+        self.proxy_port.setValue(proxy.port)
+        self.proxy_username.setText(proxy.username)
+        self.proxy_password.setText(proxy_password)
+        self._update_proxy_fields()
+
     def show_qr(self, url: str, expires_at: datetime) -> None:
         image = render_qr_image(url)
         self.qr_image.setPixmap(QPixmap.fromImage(image))

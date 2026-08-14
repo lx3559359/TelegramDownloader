@@ -19,6 +19,7 @@ from telegram_downloader.gateway import (
     GatewayError,
     QrLoginInfo,
     SessionExpiredError,
+    TransientNetworkError,
 )
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.settings import AppSettings, ProxySettings
@@ -209,6 +210,82 @@ async def test_show_login_uses_saved_credentials_for_qr() -> None:
     assert dialog.shown is True
     assert dialog.qr == ("tg://login?token=saved", expires)
     assert dialog.pages[-1] is LoginPage.PASSWORD
+
+
+def test_show_login_prefills_saved_credentials_before_show() -> None:
+    calls = []
+    proxy = ProxySettings("http", "127.0.0.1", 8080, "alice")
+
+    class Dialog:
+        def set_saved_credentials(self, *values):
+            calls.append(("prefill", values))
+
+        def show(self):
+            calls.append("show")
+
+        def raise_(self):
+            calls.append("raise")
+
+        def activateWindow(self):
+            calls.append("activate")
+
+        def show_page(self, page):
+            calls.append(("page", page))
+
+    controller = AppController.for_test(
+        login_dialog=Dialog(),
+        settings=AppSettings(api_id=12345, proxy=proxy),
+        secrets={
+            "api_hash": "saved-hash",
+            "proxy_password": "saved-password",
+        },
+    )
+
+    controller.show_login()
+
+    assert calls[0] == (
+        "prefill",
+        (12345, "saved-hash", proxy, "saved-password"),
+    )
+    assert calls[1:4] == ["show", "raise", "activate"]
+    assert calls[4] == ("page", LoginPage.CREDENTIALS)
+
+
+@pytest.mark.asyncio
+async def test_qr_network_failure_keeps_prefill_and_returns_to_credentials() -> None:
+    calls = []
+    proxy = ProxySettings("socks5", "127.0.0.1", 1080, "alice")
+
+    class Gateway:
+        async def begin_qr_login(self):
+            raise TransientNetworkError("Telegram 网络连接失败")
+
+    class Dialog:
+        def set_saved_credentials(self, *values):
+            calls.append(("prefill", values))
+
+        def show_page(self, page):
+            calls.append(("page", page))
+
+        def show_error(self, message):
+            calls.append(("error", message))
+
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        login_dialog=Dialog(),
+        settings=AppSettings(api_id=12345, proxy=proxy),
+        secrets={
+            "api_hash": "saved-hash",
+            "proxy_password": "saved-password",
+        },
+    )
+
+    await controller.begin_qr_login()
+
+    assert calls[0][0] == "prefill"
+    assert calls[1] == ("page", LoginPage.CREDENTIALS)
+    assert calls[2] == ("error", "Telegram 网络连接失败")
+    assert controller.secrets["api_hash"] == "saved-hash"
 
 
 @pytest.mark.asyncio
