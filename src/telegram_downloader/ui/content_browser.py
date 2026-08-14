@@ -38,6 +38,7 @@ from telegram_downloader.ui.content_models import (
     SearchHistoryTableModel,
     SearchResultTableModel,
 )
+from telegram_downloader.ui.media_preview import MediaPreviewDialog
 
 _MEDIA_LABELS = {
     MediaKind.PHOTO: "图片",
@@ -63,6 +64,7 @@ class ContentBrowserPage(QWidget):
     selection_changed = Signal(str, bool)
     queue_requested = Signal(str)
     thumbnail_requested = Signal(str)
+    preview_requested = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -77,6 +79,7 @@ class ContentBrowserPage(QWidget):
         self._sync_busy = False
         self._search_busy = False
         self._thumbnail_requested_ids: set[str] = set()
+        self._preview_dialogs: set[MediaPreviewDialog] = set()
         self._build_ui()
         self._connect_signals()
         self._refresh_actions()
@@ -324,6 +327,7 @@ class ContentBrowserPage(QWidget):
         self.result_table.verticalScrollBar().valueChanged.connect(
             lambda _value: self.request_visible_thumbnails()
         )
+        self.result_table.doubleClicked.connect(self._request_preview)
 
     def set_logged_in(self, logged_in: bool) -> None:
         self._logged_in = logged_in
@@ -408,6 +412,14 @@ class ContentBrowserPage(QWidget):
     def set_thumbnail(self, result_id: str, path: Path) -> None:
         self.result_model.set_thumbnail(result_id, path)
 
+    def show_preview(self, result: SearchResult, path: Path | None) -> None:
+        dialog = MediaPreviewDialog(result, path, self)
+        self._preview_dialogs.add(dialog)
+        dialog.finished.connect(
+            lambda _result, retained=dialog: self._preview_dialogs.discard(retained)
+        )
+        dialog.open()
+
     def show_error(self, message: str) -> None:
         self.error_label.setText(message)
         self.error_label.setVisible(bool(message))
@@ -425,6 +437,13 @@ class ContentBrowserPage(QWidget):
                 continue
             self._thumbnail_requested_ids.add(result_id)
             self.thumbnail_requested.emit(result_id)
+
+    def _request_preview(self, index: QModelIndex) -> None:
+        if not index.isValid() or index.column() != 1:
+            return
+        result_id = self.result_model.data(index, Qt.ItemDataRole.UserRole)
+        if result_id:
+            self.preview_requested.emit(str(result_id))
 
     def _dialog_changed(
         self,

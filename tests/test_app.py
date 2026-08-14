@@ -52,6 +52,11 @@ def test_create_application_initializes_project_local_content_services(
         )
         assert controller.window.content_page is not None
         assert isinstance(controller.connection_recovery, ConnectionRecovery)
+        slot_names = {
+            getattr(slot, "__name__", "") for slot in controller._ui_slots
+        }
+        assert "content_preview_requested" in slot_names
+        assert "connection_retry_requested" in slot_names
         controller.window.content_page.link_requested.emit(
             "https://t.me/example/1#fragment"
         )

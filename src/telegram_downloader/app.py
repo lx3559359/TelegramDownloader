@@ -328,6 +328,14 @@ def create_application(root: Path):
     async def content_queue_requested(search_id: str) -> None:
         await controller.queue_content_selection(search_id)
 
+    @qasync.asyncSlot(str)
+    async def content_preview_requested(result_id: str) -> None:
+        await controller.open_content_preview(result_id)
+
+    @qasync.asyncSlot()
+    async def connection_retry_requested() -> None:
+        await controller.retry_telegram_connection()
+
     def open_settings() -> None:
         dialog = SettingsDialog(
             controller.settings,
@@ -371,6 +379,10 @@ def create_application(root: Path):
     window.content_page.selection_changed.connect(controller.set_content_selected)
     window.content_page.queue_requested.connect(content_queue_requested)
     window.content_page.thumbnail_requested.connect(controller.request_thumbnail)
+    window.content_page.preview_requested.connect(content_preview_requested)
+    window.content_page.connection_retry_requested.connect(
+        connection_retry_requested
+    )
     window.content_page.history_open_requested.connect(
         controller._reload_content_search
     )
@@ -407,6 +419,8 @@ def create_application(root: Path):
             content_search_requested,
             content_load_more_requested,
             content_queue_requested,
+            content_preview_requested,
+            connection_retry_requested,
             open_settings,
         )
     )

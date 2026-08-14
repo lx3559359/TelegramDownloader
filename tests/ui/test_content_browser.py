@@ -314,3 +314,28 @@ def test_only_visible_thumbnails_are_requested_once(qtbot) -> None:
     before = list(requested)
     page.request_visible_thumbnails()
     assert requested == before
+
+
+def test_result_preview_double_click_emits_result_id(qtbot) -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    page = ContentBrowserPage()
+    qtbot.addWidget(page)
+    page.set_results([result(now, "r1", 1)])
+
+    with qtbot.waitSignal(page.preview_requested, timeout=500) as caught:
+        page.result_table.doubleClicked.emit(page.result_model.index(0, 1))
+
+    assert caught.args == ["r1"]
+
+
+def test_nonblocking_preview_is_retained_until_closed(qtbot) -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    page = ContentBrowserPage()
+    qtbot.addWidget(page)
+
+    page.show_preview(result(now, "r1", 1), None)
+
+    assert len(page._preview_dialogs) == 1
+    preview = next(iter(page._preview_dialogs))
+    preview.reject()
+    qtbot.waitUntil(lambda: not page._preview_dialogs, timeout=500)
