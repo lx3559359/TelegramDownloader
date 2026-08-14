@@ -2,7 +2,9 @@
 
 ## 正式版下载
 
-当前公开正式版：`v0.3.0`（Windows 10/11 x64）
+当前源码候选版：`v0.3.1`（Windows 10/11 x64，尚未正式发布）
+
+当前公开正式版：`v0.3.0`：
 
 - [GitHub Release（安装包与便携包）](https://github.com/lx3559359/TelegramDownloader/releases/tag/v0.3.0)
 - [魔搭镜像仓库](https://modelscope.cn/models/lx3559359/TelegramDownloader)
@@ -141,8 +143,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1
 
 ```text
 dist/TelegramDownloader/TelegramDownloader.exe
-dist/TelegramDownloader-0.3.0-win-x64-portable.zip
-dist/release/TelegramDownloader-0.3.0-win-x64-setup.exe
+dist/TelegramDownloader-0.3.1-win-x64-portable.zip
+dist/release/TelegramDownloader-0.3.1-win-x64-setup.exe
 ```
 
 安装器构建会把 Inno Setup 7.0.2 以便携方式放在项目 `.tool-cache` 中，并在使用前核对官方固定 SHA-256 和 Authenticode 发布者；编译、安装及卸载冒烟测试的临时目录和日志都位于 `.build-temp`。安装验收会真实验证 C 盘拒绝、D 盘安装、自检、原位升级、在线更新运行时文件存在，以及普通卸载后用户数据仍保留。

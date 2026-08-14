@@ -47,7 +47,7 @@ def test_chinese_guide_documents_portable_data_and_security() -> None:
         assert required in readme
 
 
-def test_v030_version_and_content_runtime_contract_are_consistent() -> None:
+def test_v031_version_and_content_runtime_contract_are_consistent() -> None:
     root = Path(__file__).parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     package_init = (root / "src/telegram_downloader/__init__.py").read_text(
@@ -60,9 +60,9 @@ def test_v030_version_and_content_runtime_contract_are_consistent() -> None:
     spec = (root / "TelegramDownloader.spec").read_text(encoding="utf-8")
     app = (root / "src/telegram_downloader/app.py").read_text(encoding="utf-8")
 
-    assert project["project"]["version"] == "0.3.0"
-    assert '__version__ = "0.3.0"' in package_init
-    assert '#define AppVersion "0.3.0"' in installer
+    assert project["project"]["version"] == "0.3.1"
+    assert '__version__ = "0.3.1"' in package_init
+    assert '#define AppVersion "0.3.1"' in installer
     assert "qrcode==8.2" in requirements
     assert '"qrcode"' in spec
     assert "app_version=__version__" in gateway
