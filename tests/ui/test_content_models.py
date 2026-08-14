@@ -238,3 +238,16 @@ def test_result_model_uses_thumbnail_then_media_fallback(
     assert thumbnail.isNull() is False
     assert changed[-1][0].row() == 0
     assert Qt.ItemDataRole.DecorationRole in changed[-1][1]
+
+
+def test_thumbnail_path_returns_the_cached_project_file(tmp_path: Path) -> None:
+    model = SearchResultTableModel()
+    item = search_results(datetime(2026, 8, 15, tzinfo=UTC))[0]
+    path = tmp_path / "data" / "cache" / "thumbnails" / "r1.jpg"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"image")
+    model.set_results([replace(item, id="r1")])
+
+    model.set_thumbnail("r1", path)
+
+    assert model.thumbnail_path("r1") == path

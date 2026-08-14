@@ -1,7 +1,7 @@
 from dataclasses import replace
 from datetime import UTC, date, datetime
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
 
 from telegram_downloader.content import (
     ContentDialog,
@@ -11,6 +11,7 @@ from telegram_downloader.content import (
     SearchSession,
     SearchStatus,
 )
+from telegram_downloader.content_progress import SearchProgress
 from telegram_downloader.domain import MediaKind, ScanFilters
 from telegram_downloader.ui.content_browser import ContentBrowserPage
 
@@ -84,6 +85,49 @@ def test_page_contains_content_browser_controls(qtbot) -> None:
     assert page.select_all_button.text() == "全选"
     assert page.invert_button.text() == "反选"
     assert page.queue_button.text() == "加入下载队列"
+    assert page.result_table.iconSize() == QSize(112, 84)
+    assert page.result_table.verticalHeader().defaultSectionSize() == 96
+
+
+def test_progress_and_retry_widgets_show_honest_operation_state(qtbot) -> None:
+    page = ContentBrowserPage()
+    qtbot.addWidget(page)
+    page.show()
+
+    page.set_search_busy(True)
+    page.set_search_progress(SearchProgress(20, 3, "正在扫描"))
+
+    assert page.search_progress.isVisible()
+    assert "已扫描 20 条" in page.search_state_label.text()
+    assert "找到 3 项" in page.search_state_label.text()
+    assert page.cancel_button.isVisible()
+
+    page.set_sync_state(
+        "正在刷新，已发现 3 个群组/频道",
+        busy=True,
+        count=3,
+    )
+
+    assert page.refresh_button.text() == "刷新中…"
+    assert page.sync_progress.isVisible()
+    assert page.refresh_button.isEnabled() is False
+
+    page.set_connection_state("离线，点击重试", retryable=True)
+
+    assert page.connection_retry_button.isVisible()
+
+
+def test_connection_retry_button_emits_retry_signal(qtbot) -> None:
+    page = ContentBrowserPage()
+    qtbot.addWidget(page)
+    page.show()
+    page.set_connection_state("离线，点击重试", retryable=True)
+
+    with qtbot.waitSignal(page.connection_retry_requested, timeout=500):
+        qtbot.mouseClick(
+            page.connection_retry_button,
+            Qt.MouseButton.LeftButton,
+        )
 
 
 def test_logged_out_page_keeps_query_editable_and_history_visible(

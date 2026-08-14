@@ -313,6 +313,9 @@ class SearchResultTableModel(QAbstractTableModel):
             )
             return
 
+    def thumbnail_path(self, result_id: str) -> Path | None:
+        return self._thumbnails.get(result_id)
+
     def result_at(self, row: int) -> SearchResult:
         return self._results[row]
 

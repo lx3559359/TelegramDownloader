@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QModelIndex, Qt, QTimer, Signal
+from PySide6.QtCore import QDate, QModelIndex, QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListView,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QSplitter,
@@ -29,6 +30,7 @@ from telegram_downloader.content import (
     SearchSession,
     SearchStatus,
 )
+from telegram_downloader.content_progress import SearchProgress
 from telegram_downloader.domain import MediaKind
 from telegram_downloader.links import is_telegram_link_candidate
 from telegram_downloader.ui.content_models import (
@@ -49,6 +51,7 @@ _MEDIA_LABELS = {
 
 class ContentBrowserPage(QWidget):
     refresh_requested = Signal()
+    connection_retry_requested = Signal()
     dialog_selected = Signal(str)
     link_requested = Signal(str)
     search_requested = Signal(str, str, object, object, object, int)
@@ -94,6 +97,13 @@ class ContentBrowserPage(QWidget):
         self.empty_hint.setObjectName("contentHint")
         self.empty_hint.setWordWrap(True)
         root.addWidget(self.empty_hint)
+        self.connection_retry_button = QPushButton("重新连接")
+        self.connection_retry_button.hide()
+        root.addWidget(
+            self.connection_retry_button,
+            0,
+            Qt.AlignmentFlag.AlignLeft,
+        )
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setObjectName("contentSplitter")
@@ -134,6 +144,11 @@ class ContentBrowserPage(QWidget):
         self.sync_state_label = QLabel("尚未同步")
         self.sync_state_label.setObjectName("muted")
         layout.addWidget(self.sync_state_label)
+        self.sync_progress = QProgressBar()
+        self.sync_progress.setRange(0, 0)
+        self.sync_progress.setTextVisible(False)
+        self.sync_progress.hide()
+        layout.addWidget(self.sync_progress)
         self.dialog_list = QListView()
         self.dialog_list.setModel(self.dialog_model)
         self.dialog_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -196,6 +211,16 @@ class ContentBrowserPage(QWidget):
         media_row.addStretch()
         layout.addLayout(media_row)
 
+        self.search_state_label = QLabel("正在准备搜索…")
+        self.search_state_label.setObjectName("muted")
+        self.search_state_label.hide()
+        layout.addWidget(self.search_state_label)
+        self.search_progress = QProgressBar()
+        self.search_progress.setRange(0, 0)
+        self.search_progress.setTextVisible(False)
+        self.search_progress.hide()
+        layout.addWidget(self.search_progress)
+
         self.tabs = QTabWidget()
         self.results_tab = QWidget()
         results_layout = QVBoxLayout(self.results_tab)
@@ -203,10 +228,13 @@ class ContentBrowserPage(QWidget):
         self.result_table = QTableView()
         self.result_table.setModel(self.result_model)
         self._configure_table(self.result_table)
-        self.result_table.verticalHeader().setDefaultSectionSize(54)
+        self.result_table.setIconSize(QSize(112, 84))
+        self.result_table.verticalHeader().setDefaultSectionSize(96)
         result_header = self.result_table.horizontalHeader()
         result_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        for column in (0, 1, 2, 4, 5, 6):
+        result_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.result_table.setColumnWidth(1, 124)
+        for column in (0, 2, 4, 5, 6):
             result_header.setSectionResizeMode(
                 column,
                 QHeaderView.ResizeMode.ResizeToContents,
@@ -271,6 +299,9 @@ class ContentBrowserPage(QWidget):
     def _connect_signals(self) -> None:
         self.dialog_filter.textChanged.connect(self.dialog_model.set_filter)
         self.refresh_button.clicked.connect(self.refresh_requested.emit)
+        self.connection_retry_button.clicked.connect(
+            self.connection_retry_requested.emit
+        )
         self.dialog_list.selectionModel().currentChanged.connect(
             self._dialog_changed
         )
@@ -301,10 +332,13 @@ class ContentBrowserPage(QWidget):
             if logged_in
             else "请先登录 Telegram；已保存的搜索历史仍可查看"
         )
+        if logged_in:
+            self.connection_retry_button.hide()
         self._refresh_actions()
 
-    def set_connection_state(self, text: str) -> None:
+    def set_connection_state(self, text: str, *, retryable: bool = False) -> None:
         self.empty_hint.setText(text)
+        self.connection_retry_button.setVisible(retryable)
 
     def set_dialogs(self, dialogs: list[ContentDialog]) -> None:
         selected_peer = self._current_peer_ref()
@@ -318,9 +352,17 @@ class ContentBrowserPage(QWidget):
                     break
         self._refresh_actions()
 
-    def set_sync_state(self, text: str, *, busy: bool = False) -> None:
+    def set_sync_state(
+        self,
+        text: str,
+        *,
+        busy: bool = False,
+        count: int = 0,
+    ) -> None:
         self._sync_busy = busy
         self.sync_state_label.setText(text)
+        self.refresh_button.setText("刷新中…" if busy else "刷新")
+        self.sync_progress.setVisible(busy)
         self._refresh_actions()
 
     def set_sessions(self, sessions: list[SearchSession]) -> None:
@@ -345,7 +387,23 @@ class ContentBrowserPage(QWidget):
 
     def set_search_busy(self, busy: bool) -> None:
         self._search_busy = busy
+        self.search_state_label.setVisible(busy)
+        self.search_progress.setVisible(busy)
         self._refresh_actions()
+
+    def set_search_progress(self, progress: SearchProgress | None) -> None:
+        if progress is None:
+            if not self._search_busy:
+                self.search_state_label.hide()
+                self.search_progress.hide()
+            return
+        self.search_state_label.setText(
+            f"已扫描 {progress.inspected} 条 · 找到 {progress.matched} 项 · "
+            f"{progress.phase}"
+        )
+        if self._search_busy:
+            self.search_state_label.show()
+            self.search_progress.show()
 
     def set_thumbnail(self, result_id: str, path: Path) -> None:
         self.result_model.set_thumbnail(result_id, path)
