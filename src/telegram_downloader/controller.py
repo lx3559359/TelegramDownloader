@@ -10,6 +10,8 @@ from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from time import monotonic as monotonic_clock
 from typing import Any
 
+from telegram_downloader.content import ContentSearchQuery
+from telegram_downloader.content_browser import NothingToQueueError
 from telegram_downloader.domain import (
     ItemStatus,
     MediaKind,
@@ -57,6 +59,7 @@ class _NullWindow:
         self.account = None
         self.tasks = []
         self.message = _NullStatusBar()
+        self.content_page = _NullContentPage()
 
     def set_account(self, value: str | None) -> None:
         self.account = value
@@ -69,6 +72,35 @@ class _NullWindow:
 
     def statusBar(self) -> _NullStatusBar:
         return self.message
+
+
+class _NullContentPage:
+    def set_logged_in(self, _value: bool) -> None:
+        pass
+
+    def set_dialogs(self, _value: list[object]) -> None:
+        pass
+
+    def set_sessions(self, _value: list[object]) -> None:
+        pass
+
+    def set_active_search(self, _value: object | None) -> None:
+        pass
+
+    def set_results(self, _value: list[object]) -> None:
+        pass
+
+    def set_search_busy(self, _busy: bool) -> None:
+        pass
+
+    def set_sync_state(self, _text: str, *, busy: bool = False) -> None:
+        pass
+
+    def set_thumbnail(self, _result_id: str, _path: object) -> None:
+        pass
+
+    def show_error(self, _message: str) -> None:
+        pass
 
 
 class _NullLoginDialog:
@@ -137,9 +169,14 @@ class AppController:
         vault: Any,
         window: Any,
         login_dialog: Any,
+        content_browser: Any | None = None,
         paths: PortablePaths | None = None,
         gateway_factory: Callable[..., TelegramGateway] | None = None,
-        service_builder: Callable[[TelegramGateway, int], tuple[Any, Any]] | None = None,
+        service_builder: Callable[
+            [TelegramGateway, int],
+            tuple[Any, Any, Any],
+        ]
+        | None = None,
         confirm_preview: Callable[[Any], bool] | None = None,
         update_coordinator: Any | None = None,
         update_prompt: Callable[[Any], bool] | None = None,
@@ -158,6 +195,7 @@ class AppController:
         self.vault = vault
         self.window = window
         self.login_dialog = login_dialog
+        self.content_browser = content_browser
         self.paths = paths
         self.gateway_factory = gateway_factory
         self.service_builder = service_builder
@@ -175,6 +213,9 @@ class AppController:
         self._ui_slots: list[object] = []
         self._shutting_down = False
         self._settings_dialog: Any | None = None
+        self._dialog_sync_task: asyncio.Task[Any] | None = None
+        self._content_search_task: asyncio.Task[Any] | None = None
+        self._thumbnail_tasks: dict[str, asyncio.Task[Any]] = {}
         self._progress_refresh_interval = progress_refresh_interval
         self._next_progress_refresh = 0.0
         self._progress_samples: dict[str, tuple[float, int]] = {}
@@ -192,6 +233,7 @@ class AppController:
             vault=vault,
             window=dependencies.pop("window", _NullWindow()),
             login_dialog=dependencies.pop("login_dialog", _NullLoginDialog()),
+            content_browser=dependencies.pop("content_browser", None),
             paths=dependencies.pop("paths", None),
             gateway_factory=dependencies.pop("gateway_factory", None),
             service_builder=dependencies.pop("service_builder", None),
@@ -206,6 +248,7 @@ class AppController:
 
     async def start(self) -> None:
         self.refresh_tasks()
+        await self.activate_cached_content_account()
         if self.update_coordinator is not None and self.settings.check_updates_on_startup:
             self._spawn_background(self._run_update_check())
         if self.gateway is None:
@@ -218,6 +261,7 @@ class AppController:
                 self.show_login()
                 return
             self.window.set_account(name)
+            await self.activate_content_account()
             for task in self.repository.list_tasks():
                 if task.status is TaskStatus.QUEUED:
                     self._start_task(task.id)
@@ -233,6 +277,11 @@ class AppController:
     ) -> None:
         try:
             await self._cancel_qr_wait()
+            await self._cancel_content_operations()
+            if self.content_browser is not None:
+                go_offline = getattr(self.content_browser, "go_offline", None)
+                if go_offline is not None:
+                    go_offline()
             if self.gateway is not None:
                 await self.gateway.disconnect()
             updated_settings = replace(self.settings, api_id=api_id, proxy=proxy)
@@ -259,10 +308,14 @@ class AppController:
             self.secrets = updated_secrets
             self.gateway = gateway
             if self.service_builder is not None:
-                self.planner, self.scheduler = self.service_builder(
+                services = self.service_builder(
                     gateway,
                     updated_settings.concurrency,
                 )
+                if len(services) == 3:
+                    self.planner, self.scheduler, self.content_browser = services
+                else:
+                    self.planner, self.scheduler = services
             await self.begin_qr_login()
         except Exception as error:
             self.login_dialog.show_error(self._safe_error(error))
@@ -432,6 +485,225 @@ class AppController:
         finally:
             self.window.set_scan_busy(False)
 
+    async def activate_cached_content_account(self) -> None:
+        page = self._content_page()
+        page.set_logged_in(False)
+        if self.content_browser is None:
+            return
+        try:
+            _profile, dialogs = await self.content_browser.activate_cached_account()
+            page.set_dialogs(dialogs)
+            self._reload_content_history()
+        except Exception as error:
+            page.show_error(self._safe_error(error))
+
+    async def activate_content_account(self) -> None:
+        if self.content_browser is None:
+            return
+        try:
+            profile, dialogs = await self.content_browser.activate_account()
+            self.window.set_account(profile.display_name)
+            page = self._content_page()
+            page.set_logged_in(True)
+            page.set_dialogs(dialogs)
+            self._reload_content_history()
+            self._dialog_sync_task = self._spawn_background(
+                self.refresh_content_dialogs()
+            )
+        except Exception as error:
+            self._content_page().show_error(self._safe_error(error))
+
+    async def refresh_content_dialogs(self) -> None:
+        if self.content_browser is None:
+            return
+        page = self._content_page()
+        current = asyncio.current_task()
+        if current is not None:
+            self._dialog_sync_task = current
+        page.set_sync_state("正在同步…", busy=True)
+        try:
+            dialogs = await self.content_browser.sync_dialogs()
+            page.set_dialogs(dialogs)
+            page.set_sync_state("同步完成", busy=False)
+        except asyncio.CancelledError:
+            page.set_sync_state("同步已取消", busy=False)
+            raise
+        except Exception as error:
+            page.set_sync_state("同步失败", busy=False)
+            self._show_status(f"群组同步失败：{self._safe_error(error)}")
+        finally:
+            if self._dialog_sync_task is current:
+                self._dialog_sync_task = None
+
+    async def search_content(
+        self,
+        peer_ref: str,
+        query: ContentSearchQuery,
+    ) -> None:
+        if self.content_browser is None:
+            self._show_error("内容浏览服务不可用")
+            return
+        page = self._content_page()
+        current = asyncio.current_task()
+        self._content_search_task = current
+        page.set_search_busy(True)
+        search_id: str | None = None
+        try:
+            session, results = await self.content_browser.start_search(
+                peer_ref,
+                query,
+            )
+            search_id = session.id
+            page.set_active_search(session)
+            page.set_results(results)
+            page.set_sessions(self.content_browser.list_sessions())
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            page.show_error(self._safe_error(error))
+        finally:
+            if search_id is not None:
+                self._reload_content_search(search_id)
+            page.set_search_busy(False)
+            if self._content_search_task is current:
+                self._content_search_task = None
+
+    async def load_more_content(self, search_id: str) -> None:
+        if self.content_browser is None:
+            return
+        page = self._content_page()
+        current = asyncio.current_task()
+        self._content_search_task = current
+        page.set_search_busy(True)
+        try:
+            session, results = await self.content_browser.load_more(search_id)
+            page.set_active_search(session)
+            page.set_results(results)
+            page.set_sessions(self.content_browser.list_sessions())
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            page.show_error(self._safe_error(error))
+        finally:
+            self._reload_content_search(search_id)
+            page.set_search_busy(False)
+            if self._content_search_task is current:
+                self._content_search_task = None
+
+    def cancel_content_search(self) -> None:
+        task = self._content_search_task
+        if task is not None and not task.done():
+            task.cancel()
+
+    def set_content_selected(
+        self,
+        search_id: str,
+        result_id: str,
+        selected: bool,
+    ) -> None:
+        if self.content_browser is None:
+            return
+        try:
+            results = self.content_browser.set_selected(
+                search_id,
+                result_id,
+                selected,
+            )
+        except Exception as error:
+            self._content_page().show_error(self._safe_error(error))
+            results = self.content_browser.list_results(search_id)
+        self._content_page().set_results(results)
+
+    async def queue_content_selection(self, search_id: str) -> None:
+        if self.content_browser is None or self.planner is None:
+            self._show_error("请先连接 Telegram 账号")
+            return
+        try:
+            preparation = self.content_browser.prepare_download(search_id)
+            if not self.confirm_preview(preparation.preview):
+                self._show_status("已取消创建任务")
+                return
+            committed = self.planner.commit_selected(preparation.preview)
+            joined_count = len(committed.accepted_keys)
+            report = self.content_browser.finalize_queue(
+                search_id,
+                joined_count,
+            )
+            self._reload_content_search(search_id)
+            self.refresh_tasks()
+            self._start_task(committed.task.id)
+            self._show_status(
+                f"选择 {report.selected_count} 项，加入 {report.joined_count} 项，"
+                f"跳过重复 {report.duplicate_count} 项，"
+                f"不可用 {report.unavailable_count} 项"
+            )
+        except NothingToQueueError as error:
+            self._show_status(
+                f"选择 {error.selected_count} 项，加入 0 项，"
+                f"跳过重复 {error.duplicate_count} 项，"
+                f"不可用 {error.unavailable_count} 项"
+            )
+        except Exception as error:
+            self._content_page().show_error(self._safe_error(error))
+
+    def request_thumbnail(self, result_id: str) -> None:
+        if self.content_browser is None:
+            return
+        existing = self._thumbnail_tasks.get(result_id)
+        if existing is not None and not existing.done():
+            return
+
+        async def load() -> None:
+            try:
+                path = await self.content_browser.load_thumbnail(result_id)
+                if path is not None:
+                    self._content_page().set_thumbnail(result_id, path)
+            except asyncio.CancelledError:
+                raise
+            finally:
+                current = asyncio.current_task()
+                if self._thumbnail_tasks.get(result_id) is current:
+                    self._thumbnail_tasks.pop(result_id, None)
+
+        task = self._spawn_background(load())
+        self._thumbnail_tasks[result_id] = task
+
+    def delete_content_history(self, search_id: str) -> None:
+        if self.content_browser is None:
+            return
+        try:
+            warning = self.content_browser.delete_history(search_id)
+            self._reload_content_history()
+            if warning:
+                self._show_status(warning)
+        except Exception as error:
+            self._content_page().show_error(self._safe_error(error))
+
+    def clear_content_history(self) -> None:
+        if self.content_browser is None:
+            return
+        try:
+            warning = self.content_browser.clear_history()
+            self._reload_content_history()
+            if warning:
+                self._show_status(warning)
+        except Exception as error:
+            self._content_page().show_error(self._safe_error(error))
+
+    def clear_thumbnail_cache(self) -> None:
+        if self.content_browser is None:
+            return
+        count, removed_bytes = self.content_browser.thumbnails.clear()
+        dialog = self._settings_dialog
+        if dialog is not None:
+            dialog.set_thumbnail_cache_bytes(
+                self.content_browser.thumbnails.total_bytes()
+            )
+        self._show_status(
+            f"已清理 {count} 个缩略图，共 "
+            f"{self._format_bytes(removed_bytes)}"
+        )
+
     async def test_proxy(self, proxy: ProxySettings, password: str) -> None:
         api_hash = self.secrets.get("api_hash", "")
         if self.gateway_factory is None or self.settings.api_id <= 0 or not api_hash:
@@ -485,12 +757,17 @@ class AppController:
             return
         self._shutting_down = True
         await self._cancel_qr_wait()
+        await self._cancel_content_operations()
         await self.scheduler.shutdown()
         pending = tuple(task for task in self._background if not task.done())
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         if self.gateway is not None:
             await self.gateway.disconnect()
+        if self.content_browser is not None:
+            go_offline = getattr(self.content_browser, "go_offline", None)
+            if go_offline is not None:
+                go_offline()
 
     def refresh_tasks(self, *, now: float | None = None) -> None:
         sampled_at = monotonic_clock() if now is None else now
@@ -590,6 +867,7 @@ class AppController:
         self.phone_code_hash = ""
         self.login_dialog.show_ready(name)
         self.login_dialog.accept()
+        await self.activate_content_account()
 
     async def _account_name(self) -> str | None:
         method = getattr(self.gateway, "account_name", None)
@@ -597,13 +875,67 @@ class AppController:
             return "已登录"
         return await method()
 
+    def _content_page(self):
+        return getattr(self.window, "content_page", _NullContentPage())
+
+    def _reload_content_history(self) -> None:
+        if self.content_browser is None:
+            return
+        page = self._content_page()
+        sessions = self.content_browser.list_sessions()
+        page.set_sessions(sessions)
+        active_id = getattr(page, "active_search_id", None)
+        active = next(
+            (item for item in sessions if item.id == active_id),
+            sessions[0] if sessions else None,
+        )
+        page.set_active_search(active)
+        if active is not None:
+            page.set_results(self.content_browser.list_results(active.id))
+        elif hasattr(page, "set_results"):
+            page.set_results([])
+
+    def _reload_content_search(self, search_id: str) -> None:
+        if self.content_browser is None:
+            return
+        try:
+            sessions = self.content_browser.list_sessions()
+            session = next(item for item in sessions if item.id == search_id)
+            page = self._content_page()
+            page.set_sessions(sessions)
+            page.set_active_search(session)
+            page.set_results(self.content_browser.list_results(search_id))
+        except (KeyError, StopIteration):
+            self._reload_content_history()
+
+    async def _cancel_content_operations(self) -> None:
+        current = asyncio.current_task()
+        tracked = [
+            self._dialog_sync_task,
+            self._content_search_task,
+            *self._thumbnail_tasks.values(),
+        ]
+        pending = [
+            task
+            for task in tracked
+            if task is not None and task is not current and not task.done()
+        ]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._dialog_sync_task = None
+        self._content_search_task = None
+        self._thumbnail_tasks.clear()
+
     def _start_task(self, task_id: str) -> None:
         self._spawn_background(self._run_and_refresh(task_id))
 
-    def _spawn_background(self, operation) -> None:
+    def _spawn_background(self, operation) -> asyncio.Task[Any]:
         task = asyncio.create_task(operation)
         self._background.add(task)
         task.add_done_callback(self._background_finished)
+        return task
 
     def _background_finished(self, task: asyncio.Task[Any]) -> None:
         self._background.discard(task)

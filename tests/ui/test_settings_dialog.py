@@ -47,3 +47,25 @@ def test_invalid_proxy_shows_error_and_does_not_accept(qtbot) -> None:
 
     assert dialog.result() == 0
     assert "代理" in dialog.error_label.text()
+
+
+def test_thumbnail_cache_clear_emits_without_closing_dialog(qtbot) -> None:
+    dialog = SettingsDialog(
+        AppSettings(),
+        thumbnail_cache_bytes=3 * 1024 * 1024,
+    )
+    qtbot.addWidget(dialog)
+
+    assert dialog.thumbnail_cache_size.text() == "3.0 MB"
+    with qtbot.waitSignal(
+        dialog.thumbnail_cache_clear_requested,
+        timeout=500,
+    ):
+        qtbot.mouseClick(
+            dialog.thumbnail_cache_clear_button,
+            Qt.MouseButton.LeftButton,
+        )
+
+    assert dialog.result() == 0
+    dialog.set_thumbnail_cache_bytes(0)
+    assert dialog.thumbnail_cache_size.text() == "0 B"

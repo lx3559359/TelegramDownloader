@@ -9,6 +9,8 @@ from pathlib import Path
 
 from telegram_downloader import __version__
 from telegram_downloader.catalog import CatalogRepository
+from telegram_downloader.content import ContentSearchQuery
+from telegram_downloader.content_browser import ContentBrowserService
 from telegram_downloader.controller import AppController
 from telegram_downloader.downloader import MediaDownloader
 from telegram_downloader.gateway import TelethonGateway
@@ -19,6 +21,7 @@ from telegram_downloader.repository import TaskRepository
 from telegram_downloader.scheduler import DownloadScheduler
 from telegram_downloader.security import SecretsError, SecretsVault
 from telegram_downloader.settings import AppSettings, SettingsError, SettingsStore
+from telegram_downloader.thumbnail_cache import ThumbnailCache
 from telegram_downloader.update import HttpBytesClient, UpdateCoordinator
 from telegram_downloader.update_contract import load_trusted_keys
 from telegram_downloader.update_download import ResumableUpdateDownloader
@@ -32,6 +35,7 @@ def run_self_test(root: Path) -> dict[str, object]:
     repository.recover_interrupted()
     catalog = CatalogRepository(paths.catalog_database)
     catalog.initialize()
+    ThumbnailCache(paths.thumbnail_cache)
 
     writable = {
         "settings": paths.settings,
@@ -123,7 +127,19 @@ def create_application(root: Path):
     repository = TaskRepository(paths.database)
     repository.initialize()
     repository.recover_interrupted()
+    catalog = CatalogRepository(paths.catalog_database)
+    catalog_error: Exception | None = None
+    try:
+        catalog.initialize()
+    except Exception as error:
+        catalog_error = error
+    thumbnails = ThumbnailCache(paths.thumbnail_cache)
+    content_browser = ContentBrowserService(catalog, thumbnails)
     window = MainWindow()
+    if catalog_error is not None:
+        window.content_page.show_error(
+            f"内容目录不可用（{type(catalog_error).__name__}）"
+        )
     login_dialog = LoginDialog(window)
 
     def gateway_factory(
@@ -139,7 +155,8 @@ def create_application(root: Path):
         planner = TaskPlanner(gateway, repository, paths.downloads)
         downloader = MediaDownloader(gateway, repository, paths)
         scheduler = DownloadScheduler(repository, downloader, concurrency=concurrency)
-        return planner, scheduler
+        content_browser.bind_online(gateway, planner)
+        return planner, scheduler, content_browser
 
     gateway = None
     planner = None
@@ -153,7 +170,10 @@ def create_application(root: Path):
             settings.proxy,
             secrets.get("proxy_password", ""),
         )
-        planner, scheduler = build_services(gateway, settings.concurrency)
+        planner, scheduler, content_browser = build_services(
+            gateway,
+            settings.concurrency,
+        )
 
     def confirm_preview(preview: ScanPreview) -> bool:
         known = AppController._format_bytes(preview.known_bytes)
@@ -192,6 +212,7 @@ def create_application(root: Path):
         vault=vault,
         window=window,
         login_dialog=login_dialog,
+        content_browser=content_browser,
         paths=paths,
         gateway_factory=gateway_factory,
         service_builder=build_services,
@@ -265,11 +286,45 @@ def create_application(root: Path):
     async def retry_requested(task_id: str) -> None:
         await controller.retry_failed(task_id)
 
+    @qasync.asyncSlot()
+    async def content_refresh_requested() -> None:
+        await controller.refresh_content_dialogs()
+
+    @qasync.asyncSlot(str, str, object, object, object, int)
+    async def content_search_requested(
+        peer_ref: str,
+        keyword: str,
+        date_from: object,
+        date_to: object,
+        media_kinds: object,
+        item_limit: int,
+    ) -> None:
+        filters = AppController.filters_from_dates(
+            date_from,
+            date_to,
+            frozenset(media_kinds),
+            item_limit,
+            datetime_now_timezone(),
+        )
+        await controller.search_content(
+            peer_ref,
+            ContentSearchQuery(keyword, filters),
+        )
+
+    @qasync.asyncSlot(str)
+    async def content_load_more_requested(search_id: str) -> None:
+        await controller.load_more_content(search_id)
+
+    @qasync.asyncSlot(str)
+    async def content_queue_requested(search_id: str) -> None:
+        await controller.queue_content_selection(search_id)
+
     def open_settings() -> None:
         dialog = SettingsDialog(
             controller.settings,
             controller.secrets.get("proxy_password", ""),
             window,
+            thumbnail_cache_bytes=thumbnails.total_bytes(),
         )
         controller._settings_dialog = dialog
 
@@ -281,6 +336,9 @@ def create_application(root: Path):
             controller.apply_settings(dialog.values(), dialog.proxy_password.text())
 
         dialog.test_proxy_requested.connect(proxy_test_requested)
+        dialog.thumbnail_cache_clear_requested.connect(
+            controller.clear_thumbnail_cache
+        )
         dialog.accepted.connect(save_settings)
         controller._ui_slots.extend((proxy_test_requested, save_settings))
         dialog.open()
@@ -292,6 +350,24 @@ def create_application(root: Path):
     window.open_directory_requested.connect(controller.open_task_directory)
     window.settings_requested.connect(open_settings)
     window.login_requested.connect(controller.show_login)
+    window.content_page.refresh_requested.connect(content_refresh_requested)
+    window.content_page.search_requested.connect(content_search_requested)
+    window.content_page.cancel_search_requested.connect(
+        controller.cancel_content_search
+    )
+    window.content_page.load_more_requested.connect(content_load_more_requested)
+    window.content_page.selection_changed.connect(controller.set_content_selected)
+    window.content_page.queue_requested.connect(content_queue_requested)
+    window.content_page.thumbnail_requested.connect(controller.request_thumbnail)
+    window.content_page.history_open_requested.connect(
+        controller._reload_content_search
+    )
+    window.content_page.history_delete_requested.connect(
+        controller.delete_content_history
+    )
+    window.content_page.history_clear_requested.connect(
+        controller.clear_content_history
+    )
     login_dialog.credentials_submitted.connect(credentials_submitted)
     login_dialog.phone_submitted.connect(phone_submitted)
     login_dialog.code_submitted.connect(code_submitted)
@@ -313,6 +389,10 @@ def create_application(root: Path):
             login_cancelled,
             resume_requested,
             retry_requested,
+            content_refresh_requested,
+            content_search_requested,
+            content_load_more_requested,
+            content_queue_requested,
             open_settings,
         )
     )

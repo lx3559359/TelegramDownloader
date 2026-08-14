@@ -21,12 +21,15 @@ from telegram_downloader.ui.theme import DARK_STYLESHEET, ensure_cjk_font
 
 class SettingsDialog(QDialog):
     test_proxy_requested = Signal(object, str)
+    thumbnail_cache_clear_requested = Signal()
 
     def __init__(
         self,
         settings: AppSettings,
         proxy_password: str = "",
         parent: QWidget | None = None,
+        *,
+        thumbnail_cache_bytes: int = 0,
     ) -> None:
         super().__init__(parent)
         ensure_cjk_font()
@@ -78,6 +81,17 @@ class SettingsDialog(QDialog):
         form.addRow("代理密码", self.proxy_password)
         layout.addLayout(form)
 
+        cache_row = QHBoxLayout()
+        self.thumbnail_cache_size = QLabel(
+            self._format_bytes(thumbnail_cache_bytes)
+        )
+        self.thumbnail_cache_size.setObjectName("muted")
+        self.thumbnail_cache_clear_button = QPushButton("清理缩略图缓存")
+        cache_row.addWidget(self.thumbnail_cache_size)
+        cache_row.addStretch()
+        cache_row.addWidget(self.thumbnail_cache_clear_button)
+        form.addRow("缩略图缓存", cache_row)
+
         self.error_label = QLabel()
         self.error_label.setStyleSheet("color: #fb923c;")
         self.error_label.setWordWrap(True)
@@ -97,6 +111,9 @@ class SettingsDialog(QDialog):
 
         self.proxy_kind.currentIndexChanged.connect(self._update_proxy_fields)
         self.test_button.clicked.connect(self._test_proxy)
+        self.thumbnail_cache_clear_button.clicked.connect(
+            self.thumbnail_cache_clear_requested.emit
+        )
         cancel_button.clicked.connect(self.reject)
         self.save_button.clicked.connect(self._save)
         self._update_proxy_fields()
@@ -151,3 +168,20 @@ class SettingsDialog(QDialog):
     def _show_error(self, text: str) -> None:
         self.error_label.setText(text)
         self.error_label.setVisible(True)
+
+    def set_thumbnail_cache_bytes(self, value: int) -> None:
+        self.thumbnail_cache_size.setText(self._format_bytes(value))
+
+    @staticmethod
+    def _format_bytes(value: int) -> str:
+        amount = float(max(0, value))
+        units = ("B", "KB", "MB", "GB", "TB")
+        for unit in units:
+            if amount < 1024 or unit == units[-1]:
+                return (
+                    f"{amount:.0f} {unit}"
+                    if unit == "B"
+                    else f"{amount:.1f} {unit}"
+                )
+            amount /= 1024
+        return f"{value} B"

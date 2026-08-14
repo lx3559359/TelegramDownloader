@@ -6,6 +6,11 @@ from types import SimpleNamespace
 import pytest
 
 import telegram_downloader.controller as controller_module
+from telegram_downloader.content import (
+    AccountProfile,
+    ContentSearchQuery,
+    SearchStatus,
+)
 from telegram_downloader.controller import AppController
 from telegram_downloader.domain import ItemStatus, MediaKind, TaskStatus
 from telegram_downloader.gateway import (
@@ -910,6 +915,374 @@ def test_progress_refresh_is_throttled_across_concurrent_callers() -> None:
 def test_progress_refresh_interval_must_be_positive() -> None:
     with pytest.raises(ValueError, match="进度刷新间隔必须大于零"):
         AppController.for_test(progress_refresh_interval=0)
+
+
+class ContentPageFake:
+    def __init__(self):
+        self.logged_in = None
+        self.dialogs = []
+        self.sessions = []
+        self.results = []
+        self.active_search_id = None
+        self.busy = []
+        self.sync_states = []
+        self.thumbnails = {}
+
+    def set_logged_in(self, value):
+        self.logged_in = value
+
+    def set_dialogs(self, value):
+        self.dialogs = value
+
+    def set_sessions(self, value):
+        self.sessions = value
+
+    def set_active_search(self, value):
+        self.active_search_id = value.id if value else None
+
+    def set_results(self, value):
+        self.results = value
+
+    def set_search_busy(self, value):
+        self.busy.append(value)
+
+    def set_sync_state(self, text, *, busy=False):
+        self.sync_states.append((text, busy))
+
+    def set_thumbnail(self, result_id, path):
+        self.thumbnails[result_id] = path
+
+    def show_error(self, _message):
+        pass
+
+
+class ContentWindowFake:
+    def __init__(self):
+        self.content_page = ContentPageFake()
+        self.account = None
+        self.message = ""
+
+    def set_task_summaries(self, _tasks):
+        pass
+
+    def set_account(self, value):
+        self.account = value
+        self.content_page.set_logged_in(bool(value))
+
+    def statusBar(self):
+        return self
+
+    def showMessage(self, message, _timeout):
+        self.message = message
+
+
+@pytest.mark.asyncio
+async def test_start_displays_cached_content_before_network_failure() -> None:
+    calls = []
+    cached_dialog = SimpleNamespace(title="离线群")
+
+    class ContentService:
+        async def activate_cached_account(self):
+            calls.append("cached")
+            return AccountProfile("a1", "缓存账号"), [cached_dialog]
+
+        def list_sessions(self):
+            return []
+
+    class Gateway:
+        async def connect(self):
+            calls.append("connect")
+            raise RuntimeError("offline")
+
+    window = ContentWindowFake()
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        content_browser=ContentService(),
+        window=window,
+    )
+
+    await controller.start()
+
+    assert calls == ["cached", "connect"]
+    assert window.content_page.dialogs == [cached_dialog]
+    assert window.content_page.logged_in is False
+
+
+@pytest.mark.asyncio
+async def test_online_activation_starts_dialog_sync_without_blocking_start() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    fresh_dialog = SimpleNamespace(title="新同步群")
+
+    class ContentService:
+        async def activate_cached_account(self):
+            return None, []
+
+        async def activate_account(self):
+            return AccountProfile("a1", "账号一"), [SimpleNamespace(title="缓存群")]
+
+        def list_sessions(self):
+            return []
+
+        async def sync_dialogs(self):
+            started.set()
+            await release.wait()
+            return [fresh_dialog]
+
+        def go_offline(self):
+            pass
+
+    class Gateway:
+        async def connect(self):
+            pass
+
+        async def account_name(self):
+            return "账号一"
+
+        async def disconnect(self):
+            pass
+
+    window = ContentWindowFake()
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        content_browser=ContentService(),
+        window=window,
+    )
+
+    await controller.start()
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    assert window.content_page.dialogs[0].title == "缓存群"
+    assert window.account == "账号一"
+    assert controller._dialog_sync_task is not None
+    assert controller._dialog_sync_task.done() is False
+
+    release.set()
+    await controller._dialog_sync_task
+    assert window.content_page.dialogs == [fresh_dialog]
+    await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_content_search_selection_and_queue_flow() -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    query = ContentSearchQuery(
+        "安装",
+        AppController.default_filters(now),
+    )
+    active = SimpleNamespace(
+        id="search-1",
+        status=SearchStatus.RUNNING,
+        exhausted=False,
+    )
+    first_page = [SimpleNamespace(id="result-1")]
+    calls = []
+
+    class ContentService:
+        async def start_search(self, peer_ref, received_query):
+            calls.append(("search", peer_ref, received_query))
+            return active, first_page
+
+        async def load_more(self, search_id):
+            calls.append(("more", search_id))
+            return (
+                SimpleNamespace(
+                    id="search-1",
+                    status=SearchStatus.COMPLETED,
+                    exhausted=True,
+                ),
+                first_page,
+            )
+
+        def list_sessions(self):
+            return [active]
+
+        def list_results(self, search_id):
+            return first_page
+
+        def set_selected(self, search_id, result_id, selected):
+            calls.append(("select", search_id, result_id, selected))
+            return first_page
+
+        def prepare_download(self, search_id):
+            calls.append(("prepare", search_id))
+            return SimpleNamespace(
+                preview="preview",
+                selected_count=4,
+                duplicate_count=1,
+                unavailable_count=1,
+                preview_result_ids=("r1", "r2"),
+            )
+
+        def finalize_queue(self, search_id, joined_count):
+            calls.append(("finalize", search_id, joined_count))
+            return SimpleNamespace(
+                selected_count=4,
+                joined_count=joined_count,
+                duplicate_count=1,
+                unavailable_count=1,
+            )
+
+    class Planner:
+        def commit_selected(self, preview):
+            calls.append(("commit", preview))
+            return SimpleNamespace(
+                task=SimpleNamespace(id="task-1"),
+                accepted_keys=frozenset({("p", 1, "m1"), ("p", 2, "m2")}),
+            )
+
+    class Scheduler:
+        def __init__(self):
+            self.started = asyncio.Event()
+
+        async def run_task(self, task_id):
+            calls.append(("run", task_id))
+            self.started.set()
+
+        async def shutdown(self):
+            pass
+
+    window = ContentWindowFake()
+    scheduler = Scheduler()
+    controller = AppController.for_test(
+        content_browser=ContentService(),
+        planner=Planner(),
+        scheduler=scheduler,
+        window=window,
+        confirm_preview=lambda preview: True,
+    )
+
+    await controller.search_content("-1001", query)
+    assert window.content_page.active_search_id == "search-1"
+    assert window.content_page.results == first_page
+
+    await controller.load_more_content("search-1")
+    controller.set_content_selected("search-1", "result-1", True)
+    await controller.queue_content_selection("search-1")
+    await asyncio.wait_for(scheduler.started.wait(), timeout=1)
+
+    assert ("commit", "preview") in calls
+    assert ("finalize", "search-1", 2) in calls
+    assert window.message == "选择 4 项，加入 2 项，跳过重复 1 项，不可用 1 项"
+
+
+@pytest.mark.asyncio
+async def test_cancel_content_search_restores_page_busy_state() -> None:
+    started = asyncio.Event()
+
+    class ContentService:
+        async def start_search(self, peer_ref, query):
+            started.set()
+            await asyncio.Event().wait()
+
+        def list_sessions(self):
+            return []
+
+    window = ContentWindowFake()
+    controller = AppController.for_test(
+        content_browser=ContentService(),
+        window=window,
+    )
+    task = asyncio.create_task(controller.search_content("-1001", object()))
+    await started.wait()
+
+    controller.cancel_content_search()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert window.content_page.busy[-1] is False
+
+
+def test_clear_thumbnail_cache_updates_settings_without_touching_history() -> None:
+    class Thumbnails:
+        def clear(self):
+            return 2, 5
+
+        def total_bytes(self):
+            return 0
+
+    class Catalog:
+        def clear_history(self, _account_id):
+            raise AssertionError("thumbnail cleanup must not clear search history")
+
+    class ContentService:
+        thumbnails = Thumbnails()
+        catalog = Catalog()
+
+    class Dialog:
+        def __init__(self):
+            self.cache_bytes = None
+
+        def set_thumbnail_cache_bytes(self, value):
+            self.cache_bytes = value
+
+    window = ContentWindowFake()
+    controller = AppController.for_test(
+        content_browser=ContentService(),
+        window=window,
+    )
+    dialog = Dialog()
+    controller._settings_dialog = dialog
+
+    controller.clear_thumbnail_cache()
+
+    assert dialog.cache_bytes == 0
+    assert window.message == "已清理 2 个缩略图，共 5 B"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_content_operations_before_services() -> None:
+    started = {
+        "sync": asyncio.Event(),
+        "search": asyncio.Event(),
+        "thumbnail": asyncio.Event(),
+    }
+    order = []
+
+    class ContentService:
+        async def sync_dialogs(self):
+            started["sync"].set()
+            await asyncio.Event().wait()
+
+        async def start_search(self, peer_ref, query):
+            started["search"].set()
+            await asyncio.Event().wait()
+
+        async def load_thumbnail(self, result_id):
+            started["thumbnail"].set()
+            await asyncio.Event().wait()
+
+        def list_sessions(self):
+            return []
+
+        def go_offline(self):
+            order.append("offline")
+
+    class Scheduler:
+        async def shutdown(self):
+            order.append("scheduler")
+
+    class Gateway:
+        async def disconnect(self):
+            order.append("gateway")
+
+    controller = AppController.for_test(
+        content_browser=ContentService(),
+        scheduler=Scheduler(),
+        gateway=Gateway(),
+        window=ContentWindowFake(),
+    )
+    sync_task = asyncio.create_task(controller.refresh_content_dialogs())
+    search_task = asyncio.create_task(controller.search_content("-1001", object()))
+    controller.request_thumbnail("result-1")
+    await asyncio.gather(*(event.wait() for event in started.values()))
+
+    await controller.shutdown()
+
+    assert sync_task.cancelled()
+    assert search_task.cancelled()
+    assert not controller._thumbnail_tasks
+    assert order == ["scheduler", "gateway", "offline"]
 
 
 @pytest.mark.asyncio
