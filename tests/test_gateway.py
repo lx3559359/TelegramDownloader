@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 import telegram_downloader.gateway as gateway_module
+from telegram_downloader.content import AccountProfile, DialogKind
 from telegram_downloader.domain import MediaKind, ScanFilters
 from telegram_downloader.gateway import (
     AccessDeniedError,
@@ -503,8 +504,128 @@ async def test_single_message_without_media_is_reported() -> None:
 async def test_account_name_uses_display_name_or_username() -> None:
     class Client:
         async def get_me(self):
-            return SimpleNamespace(first_name="Test", last_name="User", username="tester")
+            return SimpleNamespace(
+                id=42,
+                first_name="Test",
+                last_name="User",
+                username="tester",
+            )
 
     gateway = TelethonGateway.from_client_for_test(Client())
 
     assert await gateway.account_name() == "Test User"
+
+
+@pytest.mark.asyncio
+async def test_account_profile_uses_stable_id_and_display_name() -> None:
+    class Client:
+        async def get_me(self):
+            return SimpleNamespace(
+                id=42,
+                first_name="张",
+                last_name="三",
+                username="zhangsan",
+            )
+
+    gateway = TelethonGateway.from_client_for_test(Client())
+
+    assert await gateway.account_profile() == AccountProfile("42", "张 三")
+
+
+@pytest.mark.asyncio
+async def test_account_profile_requires_logged_in_account_id() -> None:
+    class Client:
+        async def get_me(self):
+            return SimpleNamespace(first_name="无编号")
+
+    gateway = TelethonGateway.from_client_for_test(Client())
+
+    with pytest.raises(GatewayError, match="Telegram 账号尚未登录"):
+        await gateway.account_profile()
+
+
+@pytest.mark.asyncio
+async def test_content_dialogs_include_active_and_archived_but_not_users_or_bots() -> None:
+    group = SimpleNamespace(id=101, title="普通群", username="group")
+    channel = SimpleNamespace(id=102, title="资料频道", username="docs")
+    user = SimpleNamespace(id=103, first_name="某人", bot=False)
+    bot = SimpleNamespace(id=104, first_name="机器人", bot=True)
+
+    class Client:
+        def iter_dialogs(self, *, archived=False):
+            values = (
+                [
+                    SimpleNamespace(
+                        entity=group,
+                        name="普通群",
+                        is_group=True,
+                        is_channel=False,
+                    ),
+                    SimpleNamespace(
+                        entity=user,
+                        name="某人",
+                        is_group=False,
+                        is_channel=False,
+                    ),
+                    SimpleNamespace(
+                        entity=bot,
+                        name="机器人",
+                        is_group=False,
+                        is_channel=False,
+                    ),
+                ]
+                if not archived
+                else [
+                    SimpleNamespace(
+                        entity=channel,
+                        name="资料频道",
+                        is_group=False,
+                        is_channel=True,
+                    )
+                ]
+            )
+
+            async def generate():
+                for value in values:
+                    yield value
+
+            return generate()
+
+    gateway = TelethonGateway.from_client_for_test(
+        Client(), peer_id_getter=lambda entity: -1_000_000_000_000 - entity.id
+    )
+
+    found = [item async for item in gateway.iter_content_dialogs("42")]
+
+    assert [(item.title, item.kind, item.archived) for item in found] == [
+        ("普通群", DialogKind.GROUP, False),
+        ("资料频道", DialogKind.CHANNEL, True),
+    ]
+    assert all(item.account_id == "42" for item in found)
+    assert [item.peer_ref for item in found] == ["-1000000000101", "-1000000000102"]
+
+
+@pytest.mark.asyncio
+async def test_content_dialogs_map_archived_enumeration_access_error() -> None:
+    class DialogAccessError(Exception):
+        pass
+
+    class Client:
+        def iter_dialogs(self, *, archived=False):
+            if archived:
+                raise DialogAccessError("secret server detail")
+
+            async def generate():
+                if False:
+                    yield None
+
+            return generate()
+
+    gateway = TelethonGateway.from_client_for_test(
+        Client(), access_errors=(DialogAccessError,)
+    )
+
+    with pytest.raises(AccessDeniedError) as caught:
+        _ = [item async for item in gateway.iter_content_dialogs("42")]
+
+    assert "secret server detail" not in str(caught.value)

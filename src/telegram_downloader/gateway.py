@@ -9,6 +9,7 @@ from enum import StrEnum
 from typing import Protocol
 
 from telegram_downloader import __version__
+from telegram_downloader.content import AccountProfile, ContentDialog, DialogKind
 from telegram_downloader.domain import MediaKind, ParsedLink, ScanFilters, SourceKind
 from telegram_downloader.files import classify_media, sanitize_component
 from telegram_downloader.settings import ProxySettings
@@ -107,6 +108,13 @@ class TelegramGateway(Protocol):
     async def test_connection(self) -> None: ...
 
     async def account_name(self) -> str | None: ...
+
+    async def account_profile(self) -> AccountProfile: ...
+
+    def iter_content_dialogs(
+        self,
+        account_id: str,
+    ) -> AsyncIterator[ContentDialog]: ...
 
     async def disconnect(self) -> None: ...
 
@@ -409,13 +417,59 @@ class TelethonGateway:
         except Exception as exc:
             self._raise_mapped(exc)
 
-    async def account_name(self) -> str | None:
+    async def account_profile(self) -> AccountProfile:
         try:
             account = await self._client.get_me()
         except Exception as exc:
             self._raise_mapped(exc)
-        if account is None:
-            return None
+        account_id = getattr(account, "id", None) if account is not None else None
+        if not isinstance(account_id, int):
+            raise GatewayError("Telegram 账号尚未登录")
+        return AccountProfile(str(account_id), self._account_display_name(account))
+
+    async def account_name(self) -> str | None:
+        profile = await self.account_profile()
+        return profile.display_name
+
+    async def iter_content_dialogs(
+        self,
+        account_id: str,
+    ) -> AsyncIterator[ContentDialog]:
+        seen: set[str] = set()
+        try:
+            for archived in (False, True):
+                async for dialog in self._client.iter_dialogs(archived=archived):
+                    is_group = bool(getattr(dialog, "is_group", False))
+                    is_channel = bool(getattr(dialog, "is_channel", False))
+                    if not (is_group or is_channel):
+                        continue
+                    entity = getattr(dialog, "entity", None)
+                    if entity is None:
+                        continue
+                    peer_ref = str(self._peer_id_getter(entity))
+                    if peer_ref in seen:
+                        continue
+                    seen.add(peer_ref)
+                    title = str(
+                        getattr(dialog, "name", "")
+                        or getattr(entity, "title", "")
+                        or peer_ref
+                    )
+                    yield ContentDialog(
+                        account_id=account_id,
+                        peer_ref=peer_ref,
+                        title=title,
+                        username=str(getattr(entity, "username", "") or ""),
+                        kind=(DialogKind.GROUP if is_group else DialogKind.CHANNEL),
+                        archived=archived,
+                        available=True,
+                        last_synced_at=datetime.now(UTC),
+                    )
+        except Exception as exc:
+            self._raise_mapped(exc)
+
+    @staticmethod
+    def _account_display_name(account: object) -> str:
         first = getattr(account, "first_name", "") or ""
         last = getattr(account, "last_name", "") or ""
         display = " ".join(part for part in (first, last) if part).strip()
