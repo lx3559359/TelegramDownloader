@@ -71,3 +71,35 @@ def test_create_application_initializes_project_local_content_services(
         controller.window.close()
         loop.close()
         application.processEvents()
+
+
+def test_content_selection_signal_includes_active_search_id(tmp_path) -> None:
+    application, loop, controller = app.create_application(tmp_path)
+    calls: list[tuple[str, str, bool]] = []
+
+    class ContentBrowser:
+        def set_selected(
+            self,
+            search_id: str,
+            result_id: str,
+            selected: bool,
+        ) -> list[object]:
+            calls.append((search_id, result_id, selected))
+            return []
+
+        def list_results(self, _search_id: str) -> list[object]:
+            return []
+
+    try:
+        controller.content_browser = ContentBrowser()
+        page = controller.window.content_page
+        page.active_search_id = "search-1"
+
+        page._selection_changed("result-1", True)
+        application.processEvents()
+
+        assert calls == [("search-1", "result-1", True)]
+    finally:
+        controller.window.close()
+        loop.close()
+        application.processEvents()

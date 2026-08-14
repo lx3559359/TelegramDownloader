@@ -61,7 +61,7 @@ class ContentBrowserPage(QWidget):
     history_open_requested = Signal(str)
     history_delete_requested = Signal(str)
     history_clear_requested = Signal()
-    selection_changed = Signal(str, bool)
+    selection_changed = Signal(str, str, bool)
     queue_requested = Signal(str)
     thumbnail_requested = Signal(str)
     preview_requested = Signal(str)
@@ -499,7 +499,8 @@ class ContentBrowserPage(QWidget):
         ]
         self._update_selection_summary()
         self._refresh_actions()
-        self.selection_changed.emit(result_id, selected)
+        if self.active_search_id:
+            self.selection_changed.emit(self.active_search_id, result_id, selected)
 
     def _select_all(self) -> None:
         for row in range(self.result_model.rowCount()):
