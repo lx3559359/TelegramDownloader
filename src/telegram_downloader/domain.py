@@ -68,6 +68,7 @@ class TaskRecord:
     created_at: datetime
     updated_at: datetime
     last_error: str | None = None
+    display_title: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

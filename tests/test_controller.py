@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import telegram_downloader.controller as controller_module
 from telegram_downloader.controller import AppController
 from telegram_downloader.domain import ItemStatus, MediaKind, TaskStatus
 from telegram_downloader.gateway import (
@@ -13,6 +14,7 @@ from telegram_downloader.gateway import (
     GatewayError,
     QrLoginInfo,
 )
+from telegram_downloader.paths import PortablePaths
 from telegram_downloader.settings import AppSettings, ProxySettings
 from telegram_downloader.ui.login import LoginPage
 
@@ -827,6 +829,64 @@ def test_refresh_tasks_calculates_speed_and_remaining_time() -> None:
     assert summary.speed_text == "512 B/s"
     assert summary.remaining_seconds == 1
     assert summary.remaining_text == "1 秒"
+
+
+def test_search_task_uses_display_title_but_opens_source_directory(
+    tmp_path, monkeypatch
+) -> None:
+    task = SimpleNamespace(
+        id="task-1",
+        source_title="资料群",
+        display_title="资料群（搜索：安装）",
+        status=TaskStatus.QUEUED,
+        last_error=None,
+    )
+    item = SimpleNamespace(
+        status=ItemStatus.QUEUED,
+        expected_size=100,
+        downloaded_bytes=0,
+        last_error=None,
+    )
+
+    class Repository:
+        def list_tasks(self):
+            return [task]
+
+        def list_items(self, _task_id):
+            return [item]
+
+        def get_task(self, task_id):
+            assert task_id == task.id
+            return task
+
+    class Window:
+        def __init__(self):
+            self.tasks = []
+
+        def set_task_summaries(self, summaries):
+            self.tasks = summaries
+
+    opened = []
+    monkeypatch.setattr(
+        controller_module.os,
+        "startfile",
+        lambda directory: opened.append(directory),
+        raising=False,
+    )
+    window = Window()
+    paths = PortablePaths(tmp_path)
+    controller = AppController.for_test(
+        repository=Repository(),
+        window=window,
+        paths=paths,
+    )
+
+    controller.refresh_tasks(now=10.0)
+    controller.open_task_directory(task.id)
+
+    assert window.tasks[0].title == "资料群（搜索：安装）"
+    assert opened == [(paths.downloads / "资料群").resolve()]
+    assert not (paths.downloads / "资料群（搜索：安装）").exists()
 
 
 def test_progress_refresh_is_throttled_across_concurrent_callers() -> None:

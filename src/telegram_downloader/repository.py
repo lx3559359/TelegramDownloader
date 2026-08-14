@@ -4,6 +4,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from itertools import batched
 from pathlib import Path
 
 from telegram_downloader.domain import (
@@ -30,7 +31,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    last_error TEXT
+    last_error TEXT,
+    display_title TEXT
 );
 CREATE TABLE IF NOT EXISTS media_items (
     id TEXT PRIMARY KEY,
@@ -56,7 +58,7 @@ CREATE INDEX IF NOT EXISTS idx_items_task_status ON media_items(task_id, status)
 _TASK_COLUMNS = """
 id, source_kind, source_ref, source_title, source_url,
 date_from_utc, date_to_utc, media_kinds, item_limit, status,
-created_at, updated_at, last_error
+created_at, updated_at, last_error, display_title
 """
 
 _ITEM_COLUMNS = """
@@ -64,6 +66,10 @@ id, task_id, peer_ref, message_id, grouped_id, media_id, media_kind,
 original_name, target_path, expected_size, message_date_utc,
 downloaded_bytes, status, retry_count, last_error
 """
+
+
+class AllMediaAlreadyExists(RuntimeError):
+    pass
 
 
 class TaskRepository:
@@ -88,6 +94,12 @@ class TaskRepository:
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(_SCHEMA)
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
+            }
+            if "display_title" not in columns:
+                connection.execute("ALTER TABLE tasks ADD COLUMN display_title TEXT")
 
     def create_task(self, task: TaskRecord, items: list[MediaItem]) -> None:
         with self._connection() as connection:
@@ -96,6 +108,60 @@ class TaskRepository:
                 if item.task_id != task.id:
                     raise ValueError("媒体项不属于当前任务")
                 self._insert_item(connection, item)
+
+    def create_task_deduplicating(
+        self,
+        task: TaskRecord,
+        items: list[MediaItem],
+    ) -> list[MediaItem]:
+        accepted: list[MediaItem] = []
+        with self._connection() as connection:
+            self._insert_task(connection, task)
+            for item in items:
+                if item.task_id != task.id:
+                    raise ValueError("媒体项不属于当前任务")
+                try:
+                    self._insert_item(connection, item)
+                except sqlite3.IntegrityError:
+                    duplicate = connection.execute(
+                        """
+                        SELECT 1
+                        FROM media_items
+                        WHERE peer_ref = ? AND message_id = ? AND media_id = ?
+                        """,
+                        (item.peer_ref, item.message_id, item.media_id),
+                    ).fetchone()
+                    if duplicate is None:
+                        raise
+                    continue
+                accepted.append(item)
+            if not accepted:
+                raise AllMediaAlreadyExists
+        return accepted
+
+    def existing_media_keys(
+        self,
+        keys: set[tuple[str, int, str]],
+    ) -> set[tuple[str, int, str]]:
+        if not keys:
+            return set()
+        found: set[tuple[str, int, str]] = set()
+        ordered = sorted(keys)
+        with self._connection() as connection:
+            for chunk in batched(ordered, 200):
+                where = " OR ".join(
+                    "(peer_ref=? AND message_id=? AND media_id=?)" for _ in chunk
+                )
+                parameters = [value for key in chunk for value in key]
+                rows = connection.execute(
+                    "SELECT peer_ref, message_id, media_id FROM media_items WHERE "
+                    + where,
+                    parameters,
+                ).fetchall()
+                found.update(
+                    (str(row[0]), int(row[1]), str(row[2])) for row in rows
+                )
+        return found
 
     def insert_item_if_new(self, item: MediaItem) -> bool:
         with self._connection() as connection:
@@ -209,22 +275,8 @@ class TaskRepository:
     def _insert_task(connection: sqlite3.Connection, task: TaskRecord) -> None:
         connection.execute(
             f"INSERT INTO tasks ({_TASK_COLUMNS}) "
-            f"VALUES ({','.join('?' for _ in range(13))})",
-            (
-                task.id,
-                task.source_kind.value,
-                task.source_ref,
-                task.source_title,
-                task.source_url,
-                task.filters.date_from_utc.isoformat(),
-                task.filters.date_to_utc.isoformat(),
-                ",".join(sorted(kind.value for kind in task.filters.media_kinds)),
-                task.filters.item_limit,
-                task.status.value,
-                task.created_at.isoformat(),
-                task.updated_at.isoformat(),
-                task.last_error,
-            ),
+            f"VALUES ({','.join('?' for _ in range(14))})",
+            TaskRepository._task_values(task),
         )
 
     @staticmethod
@@ -256,6 +308,25 @@ class TaskRepository:
         )
 
     @staticmethod
+    def _task_values(task: TaskRecord) -> tuple[object, ...]:
+        return (
+            task.id,
+            task.source_kind.value,
+            task.source_ref,
+            task.source_title,
+            task.source_url,
+            task.filters.date_from_utc.isoformat(),
+            task.filters.date_to_utc.isoformat(),
+            ",".join(sorted(kind.value for kind in task.filters.media_kinds)),
+            task.filters.item_limit,
+            task.status.value,
+            task.created_at.isoformat(),
+            task.updated_at.isoformat(),
+            task.last_error,
+            task.display_title,
+        )
+
+    @staticmethod
     def _task_from_row(row: sqlite3.Row) -> TaskRecord:
         kinds = frozenset(
             MediaKind(value) for value in row["media_kinds"].split(",") if value
@@ -277,6 +348,7 @@ class TaskRepository:
             datetime.fromisoformat(row["created_at"]),
             datetime.fromisoformat(row["updated_at"]),
             row["last_error"],
+            row["display_title"],
         )
 
     @staticmethod

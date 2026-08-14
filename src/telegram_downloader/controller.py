@@ -517,7 +517,7 @@ class AppController:
             summaries.append(
                 TaskSummary(
                     task.id,
-                    task.source_title,
+                    getattr(task, "display_title", None) or task.source_title,
                     task.status,
                     f"{completed} / {len(items)}",
                     self._format_bytes(known_size) + (" + 未知" if unknown else ""),

@@ -7,15 +7,18 @@ from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 
+from telegram_downloader.content import ContentSearchQuery
 from telegram_downloader.domain import (
     MediaItem,
     ParsedLink,
     ScanFilters,
+    SourceKind,
     TaskRecord,
     TaskStatus,
 )
 from telegram_downloader.files import archive_target, disambiguate_target
 from telegram_downloader.gateway import RemoteMedia, TelegramGateway
+from telegram_downloader.repository import AllMediaAlreadyExists
 
 
 class EmptyScanError(ValueError):
@@ -25,6 +28,17 @@ class EmptyScanError(ValueError):
 class TaskWriter(Protocol):
     def create_task(self, task: TaskRecord, items: list[MediaItem]) -> None: ...
 
+    def create_task_deduplicating(
+        self,
+        task: TaskRecord,
+        items: list[MediaItem],
+    ) -> list[MediaItem]: ...
+
+    def existing_media_keys(
+        self,
+        keys: set[tuple[str, int, str]],
+    ) -> set[tuple[str, int, str]]: ...
+
 
 @dataclass(frozen=True, slots=True)
 class ScanPreview:
@@ -32,6 +46,13 @@ class ScanPreview:
     items: tuple[MediaItem, ...]
     known_bytes: int
     unknown_size_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class SelectedCommit:
+    task: TaskRecord
+    accepted_keys: frozenset[tuple[str, int, str]]
+    skipped_count: int
 
 
 class TaskPlanner:
@@ -50,31 +71,92 @@ class TaskPlanner:
         self.clock = clock or (lambda: datetime.now(UTC))
 
     async def scan(self, source: ParsedLink, filters: ScanFilters) -> ScanPreview:
+        remote = [item async for item in self.gateway.scan(source, filters)]
+        source_title = remote[0].source_title if remote else source.entity_ref
+        return self._build_preview(
+            source_kind=source.kind,
+            source_ref=source.entity_ref,
+            source_title=source_title,
+            source_url=source.normalized_url,
+            filters=filters,
+            remote=remote,
+            display_title=None,
+            empty_message="筛选范围内没有找到可下载媒体",
+            skip_existing=False,
+        )
+
+    def plan_selected(
+        self,
+        source_ref: str,
+        source_title: str,
+        query: ContentSearchQuery,
+        selected: list[RemoteMedia],
+    ) -> ScanPreview:
+        return self._build_preview(
+            source_kind=SourceKind.CHANNEL_OR_GROUP,
+            source_ref=source_ref,
+            source_title=source_title,
+            source_url=f"telegram://peer/{source_ref}",
+            filters=query.filters,
+            remote=selected,
+            display_title=f"{source_title}（搜索：{query.keyword}）",
+            empty_message="所选媒体已全部存在于下载队列",
+            skip_existing=True,
+        )
+
+    def existing_media_keys(
+        self,
+        keys: set[tuple[str, int, str]],
+    ) -> set[tuple[str, int, str]]:
+        return self.repository.existing_media_keys(keys)
+
+    def _build_preview(
+        self,
+        *,
+        source_kind: SourceKind,
+        source_ref: str,
+        source_title: str,
+        source_url: str,
+        filters: ScanFilters,
+        remote: list[RemoteMedia],
+        display_title: str | None,
+        empty_message: str,
+        skip_existing: bool,
+    ) -> ScanPreview:
         task_id = self.uuid_factory()
         now = self.clock()
-        remote = self._deduplicate(
-            [item async for item in self.gateway.scan(source, filters)]
-        )
+        remote = self._deduplicate(remote)
+        if skip_existing:
+            keys = {
+                (item.peer_ref, item.message_id, item.media_id) for item in remote
+            }
+            existing = self.repository.existing_media_keys(keys)
+            remote = [
+                item
+                for item in remote
+                if (item.peer_ref, item.message_id, item.media_id) not in existing
+            ]
         if not remote:
-            raise EmptyScanError("筛选范围内没有找到可下载媒体")
+            raise EmptyScanError(empty_message)
 
         task = TaskRecord(
             task_id,
-            source.kind,
-            source.entity_ref,
-            remote[0].source_title,
-            source.normalized_url,
+            source_kind,
+            source_ref,
+            source_title,
+            source_url,
             filters,
             TaskStatus.DRAFT,
             now,
             now,
+            display_title=display_title,
         )
         planned: list[MediaItem] = []
         used: set[Path] = set()
         for item in remote:
             target = archive_target(
                 self.downloads,
-                item.source_title,
+                source_title,
                 item.message_date_utc,
                 item.kind,
                 item.original_name,
@@ -112,6 +194,28 @@ class TaskPlanner:
         )
         self.repository.create_task(queued, list(preview.items))
         return queued
+
+    def commit_selected(self, preview: ScanPreview) -> SelectedCommit:
+        queued = replace(
+            preview.task,
+            status=TaskStatus.QUEUED,
+            updated_at=self.clock(),
+        )
+        try:
+            accepted = self.repository.create_task_deduplicating(
+                queued,
+                list(preview.items),
+            )
+        except AllMediaAlreadyExists as exc:
+            raise EmptyScanError("所选媒体已全部存在于下载队列") from exc
+        accepted_keys = frozenset(
+            (item.peer_ref, item.message_id, item.media_id) for item in accepted
+        )
+        return SelectedCommit(
+            queued,
+            accepted_keys,
+            len(preview.items) - len(accepted),
+        )
 
     @staticmethod
     def _deduplicate(remote: list[RemoteMedia]) -> list[RemoteMedia]:
