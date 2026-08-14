@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from telegram_downloader import __version__
+from telegram_downloader.catalog import CatalogRepository
 from telegram_downloader.controller import AppController
 from telegram_downloader.downloader import MediaDownloader
 from telegram_downloader.gateway import TelethonGateway
@@ -29,13 +30,17 @@ def run_self_test(root: Path) -> dict[str, object]:
     repository = TaskRepository(paths.database)
     repository.initialize()
     repository.recover_interrupted()
+    catalog = CatalogRepository(paths.catalog_database)
+    catalog.initialize()
 
     writable = {
         "settings": paths.settings,
         "secrets": paths.secrets,
         "database": paths.database,
+        "catalog_database": paths.catalog_database,
         "log": paths.log,
         "cache": paths.cache,
+        "thumbnail_cache": paths.thumbnail_cache,
         "temp": paths.temp,
         "downloads": paths.downloads,
         "update_staging": paths.update_staging,

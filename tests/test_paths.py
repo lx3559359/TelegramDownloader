@@ -12,9 +12,12 @@ def test_ensure_layout_creates_every_managed_directory(tmp_path: Path) -> None:
     assert paths.settings == tmp_path / "data" / "config" / "settings.json"
     assert paths.secrets == tmp_path / "data" / "config" / "secrets.dat"
     assert paths.database == tmp_path / "data" / "database" / "tasks.sqlite3"
+    assert paths.catalog_database == tmp_path / "data" / "database" / "catalog.sqlite3"
     assert paths.log == tmp_path / "data" / "logs" / "app.log"
     assert paths.update_journal == tmp_path / "data" / "update" / "journal.json"
     assert paths.cache.is_dir()
+    assert paths.thumbnail_cache == tmp_path / "data" / "cache" / "thumbnails"
+    assert paths.thumbnail_cache.is_dir()
     assert paths.temp.is_dir()
     assert paths.update_staging.is_dir()
     assert paths.update_backup.is_dir()

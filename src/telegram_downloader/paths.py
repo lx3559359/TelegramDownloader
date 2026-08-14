@@ -32,12 +32,20 @@ class PortablePaths:
         return self.data / "database" / "tasks.sqlite3"
 
     @property
+    def catalog_database(self) -> Path:
+        return self.data / "database" / "catalog.sqlite3"
+
+    @property
     def log(self) -> Path:
         return self.data / "logs" / "app.log"
 
     @property
     def cache(self) -> Path:
         return self.data / "cache"
+
+    @property
+    def thumbnail_cache(self) -> Path:
+        return self.cache / "thumbnails"
 
     @property
     def temp(self) -> Path:
@@ -86,6 +94,7 @@ class PortablePaths:
             self.database.parent,
             self.log.parent,
             self.cache,
+            self.thumbnail_cache,
             self.temp,
             self.update_staging,
             self.update_backup,

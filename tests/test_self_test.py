@@ -22,7 +22,10 @@ def test_self_test_includes_update_storage_and_database(tmp_path: Path) -> None:
     report = run_self_test(tmp_path)
 
     assert "update_staging" in report["writable_paths"]
+    assert "catalog_database" in report["writable_paths"]
+    assert "thumbnail_cache" in report["writable_paths"]
     assert (tmp_path / "data" / "database" / "tasks.sqlite3").is_file()
+    assert (tmp_path / "data" / "database" / "catalog.sqlite3").is_file()
 
 
 def test_self_test_verifies_frozen_runtime_components_without_secrets(tmp_path: Path) -> None:
