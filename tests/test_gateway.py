@@ -17,6 +17,7 @@ from telegram_downloader.gateway import (
     AuthState,
     EmptyMediaError,
     GatewayError,
+    SessionExpiredError,
     TelethonGateway,
     proxy_dict,
 )
@@ -546,6 +547,27 @@ async def test_account_profile_requires_logged_in_account_id() -> None:
     gateway = TelethonGateway.from_client_for_test(Client())
 
     with pytest.raises(GatewayError, match="Telegram 账号尚未登录"):
+        await gateway.account_profile()
+
+
+@pytest.mark.asyncio
+async def test_account_profile_maps_unregistered_auth_key_to_expired_login() -> None:
+    class AuthKeyUnregisteredError(Exception):
+        pass
+
+    class Client:
+        async def get_me(self):
+            raise AuthKeyUnregisteredError("secret server detail")
+
+    gateway = TelethonGateway.from_client_for_test(
+        Client(),
+        authorization_errors=(AuthKeyUnregisteredError,),
+    )
+
+    with pytest.raises(
+        SessionExpiredError,
+        match="Telegram 登录已失效，请重新扫码登录",
+    ):
         await gateway.account_profile()
 
 

@@ -18,7 +18,12 @@ from telegram_downloader.domain import (
     ScanFilters,
     TaskStatus,
 )
-from telegram_downloader.gateway import AuthState, GatewayError, TelegramGateway
+from telegram_downloader.gateway import (
+    AuthState,
+    GatewayError,
+    SessionExpiredError,
+    TelegramGateway,
+)
 from telegram_downloader.links import InvalidTelegramLink, parse_telegram_link
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.settings import AppSettings, ProxySettings
@@ -265,6 +270,8 @@ class AppController:
             for task in self.repository.list_tasks():
                 if task.status is TaskStatus.QUEUED:
                     self._start_task(task.id)
+        except SessionExpiredError as error:
+            await self._handle_session_expired(error)
         except Exception as error:
             self._show_status(f"Telegram 连接失败：{self._safe_error(error)}")
 
@@ -510,6 +517,8 @@ class AppController:
             self._dialog_sync_task = self._spawn_background(
                 self.refresh_content_dialogs()
             )
+        except SessionExpiredError:
+            raise
         except Exception as error:
             self._content_page().show_error(self._safe_error(error))
 
@@ -528,6 +537,9 @@ class AppController:
         except asyncio.CancelledError:
             page.set_sync_state("同步已取消", busy=False)
             raise
+        except SessionExpiredError as error:
+            page.set_sync_state("登录已失效", busy=False)
+            await self._handle_session_expired(error)
         except Exception as error:
             page.set_sync_state("同步失败", busy=False)
             self._show_status(f"群组同步失败：{self._safe_error(error)}")
@@ -559,6 +571,8 @@ class AppController:
             page.set_sessions(self.content_browser.list_sessions())
         except asyncio.CancelledError:
             raise
+        except SessionExpiredError as error:
+            await self._handle_session_expired(error)
         except Exception as error:
             page.show_error(self._safe_error(error))
         finally:
@@ -582,6 +596,8 @@ class AppController:
             page.set_sessions(self.content_browser.list_sessions())
         except asyncio.CancelledError:
             raise
+        except SessionExpiredError as error:
+            await self._handle_session_expired(error)
         except Exception as error:
             page.show_error(self._safe_error(error))
         finally:
@@ -874,6 +890,60 @@ class AppController:
         if method is None:
             return "已登录"
         return await method()
+
+    async def _handle_session_expired(self, error: SessionExpiredError) -> None:
+        await self._cancel_content_operations()
+        page = self._content_page()
+        if self.content_browser is not None:
+            go_offline = getattr(self.content_browser, "go_offline", None)
+            if go_offline is not None:
+                go_offline()
+
+        self.secrets.pop("session", None)
+        self.vault.save(self.secrets)
+        self.window.set_account(None)
+        page.set_logged_in(False)
+        page.show_error(str(error))
+
+        previous_scheduler = self.scheduler
+        previous_gateway = self.gateway
+        self.gateway = None
+        self.planner = None
+        self.scheduler = _NullScheduler()
+        with suppress(Exception):
+            await previous_scheduler.shutdown()
+        if previous_gateway is not None:
+            with suppress(Exception):
+                await previous_gateway.disconnect()
+
+        api_hash = self.secrets.get("api_hash", "")
+        if self.gateway_factory is not None and self.settings.api_id > 0 and api_hash:
+            fresh_gateway = self.gateway_factory(
+                self.settings.api_id,
+                api_hash,
+                "",
+                self.settings.proxy,
+                self.secrets.get("proxy_password", ""),
+            )
+            self.gateway = fresh_gateway
+            try:
+                await fresh_gateway.connect()
+            except Exception as reconnect_error:
+                _LOGGER.warning(
+                    "fresh Telegram connection failed (%s)",
+                    type(reconnect_error).__name__,
+                )
+            if self.service_builder is not None:
+                services = self.service_builder(
+                    fresh_gateway,
+                    self.settings.concurrency,
+                )
+                if len(services) == 3:
+                    self.planner, self.scheduler, self.content_browser = services
+                else:
+                    self.planner, self.scheduler = services
+
+        self.show_login()
 
     def _content_page(self):
         return getattr(self.window, "content_page", _NullContentPage())

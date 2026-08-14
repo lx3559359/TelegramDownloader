@@ -18,6 +18,7 @@ from telegram_downloader.gateway import (
     AuthState,
     GatewayError,
     QrLoginInfo,
+    SessionExpiredError,
 )
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.settings import AppSettings, ProxySettings
@@ -927,6 +928,7 @@ class ContentPageFake:
         self.busy = []
         self.sync_states = []
         self.thumbnails = {}
+        self.errors = []
 
     def set_logged_in(self, value):
         self.logged_in = value
@@ -952,8 +954,8 @@ class ContentPageFake:
     def set_thumbnail(self, result_id, path):
         self.thumbnails[result_id] = path
 
-    def show_error(self, _message):
-        pass
+    def show_error(self, message):
+        self.errors.append(message)
 
 
 class ContentWindowFake:
@@ -1191,6 +1193,117 @@ async def test_cancel_content_search_restores_page_busy_state() -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     assert window.content_page.busy[-1] is False
+
+
+@pytest.mark.asyncio
+async def test_content_search_expired_session_rebuilds_gateway_for_qr_login() -> None:
+    calls = []
+
+    class ContentService:
+        async def start_search(self, _peer_ref, _query):
+            raise SessionExpiredError("Telegram 登录已失效，请重新扫码登录")
+
+        def go_offline(self):
+            calls.append("offline")
+
+        def list_sessions(self):
+            return []
+
+    class OldGateway:
+        async def disconnect(self):
+            calls.append("disconnect-old")
+
+    class FreshGateway:
+        async def connect(self):
+            calls.append("connect-fresh")
+
+    class Scheduler:
+        async def shutdown(self):
+            calls.append("shutdown-scheduler")
+
+    content = ContentService()
+    fresh = FreshGateway()
+    vault = Vault()
+    vault.value = {"api_hash": "saved-api-hash", "session": "expired-session"}
+    window = ContentWindowFake()
+
+    def gateway_factory(api_id, api_hash, session, _proxy, _proxy_password):
+        calls.append(("factory", api_id, api_hash, session))
+        return fresh
+
+    def service_builder(gateway, concurrency):
+        calls.append(("services", gateway, concurrency))
+        return "planner", "scheduler", content
+
+    controller = AppController.for_test(
+        gateway=OldGateway(),
+        scheduler=Scheduler(),
+        content_browser=content,
+        window=window,
+        vault=vault,
+        secrets=vault.value,
+        settings=AppSettings(api_id=12345),
+        gateway_factory=gateway_factory,
+        service_builder=service_builder,
+    )
+    controller.show_login = lambda: calls.append("show-login")
+
+    await controller.search_content("-1001", object())
+
+    assert controller.secrets == {"api_hash": "saved-api-hash"}
+    assert vault.value == {"api_hash": "saved-api-hash"}
+    assert controller.gateway is fresh
+    assert calls == [
+        "offline",
+        "shutdown-scheduler",
+        "disconnect-old",
+        ("factory", 12345, "saved-api-hash", ""),
+        "connect-fresh",
+        ("services", fresh, 3),
+        "show-login",
+    ]
+    assert window.account is None
+    assert window.content_page.logged_in is False
+    assert window.content_page.busy[-1] is False
+    assert window.content_page.errors[-1] == "Telegram 登录已失效，请重新扫码登录"
+
+
+@pytest.mark.asyncio
+async def test_dialog_sync_expired_session_stops_spinner_and_logs_out() -> None:
+    calls = []
+
+    class ContentService:
+        async def sync_dialogs(self):
+            raise SessionExpiredError("Telegram 登录已失效，请重新扫码登录")
+
+        def go_offline(self):
+            calls.append("offline")
+
+        def list_sessions(self):
+            return []
+
+    class Gateway:
+        async def disconnect(self):
+            calls.append("disconnect")
+
+    vault = Vault()
+    vault.value = {"api_hash": "saved-api-hash", "session": "expired-session"}
+    window = ContentWindowFake()
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        content_browser=ContentService(),
+        window=window,
+        vault=vault,
+        secrets=vault.value,
+    )
+    controller.show_login = lambda: calls.append("show-login")
+
+    await controller.refresh_content_dialogs()
+
+    assert window.content_page.sync_states[-1] == ("登录已失效", False)
+    assert window.content_page.logged_in is False
+    assert vault.value == {"api_hash": "saved-api-hash"}
+    assert calls == ["offline", "disconnect", "show-login"]
 
 
 def test_clear_thumbnail_cache_updates_settings_without_touching_history() -> None:

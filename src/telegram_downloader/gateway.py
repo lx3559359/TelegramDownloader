@@ -64,6 +64,10 @@ class GatewayError(RuntimeError):
     pass
 
 
+class SessionExpiredError(GatewayError):
+    pass
+
+
 class AccessDeniedError(GatewayError):
     pass
 
@@ -201,6 +205,12 @@ class TelethonGateway:
         )
         self._password_needed_error: type[BaseException] = errors.SessionPasswordNeededError
         self._flood_wait_error: type[BaseException] = errors.FloodWaitError
+        self._authorization_errors: tuple[type[BaseException], ...] = (
+            errors.AuthKeyDuplicatedError,
+            errors.AuthKeyInvalidError,
+            errors.AuthKeyUnregisteredError,
+            errors.SessionRevokedError,
+        )
         self._reference_expired_errors: tuple[type[BaseException], ...] = (
             errors.FileReferenceExpiredError,
         )
@@ -230,6 +240,7 @@ class TelethonGateway:
         *,
         password_needed_error: type[BaseException] = _NoTelethonError,
         flood_wait_error: type[BaseException] = _NoTelethonError,
+        authorization_errors: tuple[type[BaseException], ...] = (),
         reference_expired_errors: tuple[type[BaseException], ...] = (),
         access_errors: tuple[type[BaseException], ...] = (),
         transient_errors: tuple[type[BaseException], ...] = (
@@ -244,6 +255,7 @@ class TelethonGateway:
         gateway._client = client
         gateway._password_needed_error = password_needed_error
         gateway._flood_wait_error = flood_wait_error
+        gateway._authorization_errors = authorization_errors
         gateway._reference_expired_errors = reference_expired_errors
         gateway._access_errors = access_errors
         gateway._transient_errors = transient_errors
@@ -670,6 +682,10 @@ class TelethonGateway:
         raise AccessDeniedError("当前账号未加入该私有频道或群组")
 
     def _raise_mapped(self, error: Exception) -> None:
+        if isinstance(error, self._authorization_errors):
+            raise SessionExpiredError(
+                "Telegram 登录已失效，请重新扫码登录"
+            ) from error
         if isinstance(error, self._flood_wait_error):
             raise FloodWaitError(max(1, int(getattr(error, "seconds", 1)))) from error
         if isinstance(error, self._reference_expired_errors):
