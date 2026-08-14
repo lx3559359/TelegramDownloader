@@ -2,11 +2,9 @@
 
 ## 正式版下载
 
-当前源码候选版：`v0.3.1`（Windows 10/11 x64，尚未正式发布）
+当前公开正式版：`v0.3.1`（Windows 10/11 x64）：
 
-当前公开正式版：`v0.3.0`：
-
-- [GitHub Release（安装包与便携包）](https://github.com/lx3559359/TelegramDownloader/releases/tag/v0.3.0)
+- [GitHub Release（安装包与便携包）](https://github.com/lx3559359/TelegramDownloader/releases/tag/v0.3.1)
 - [魔搭镜像仓库](https://modelscope.cn/models/lx3559359/TelegramDownloader)
 - 安装包会拒绝安装到 C 盘；便携包请解压到 D、E 等非 C 盘目录后运行。
 - Windows 可能因未购买商业 Authenticode 证书显示 SmartScreen“未知发布者”；在线更新仍会强制验证 Ed25519 签名和 SHA-256。
