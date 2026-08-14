@@ -133,3 +133,43 @@ def test_live_summary_updates_statistics_and_current_task(qtbot) -> None:
     assert window.current_progress.value() == 50
     assert "1 / 2" in window.current_detail.text()
     assert "剩余 1 秒" in window.current_detail.text()
+
+
+def test_live_refresh_preserves_selected_task(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    initial = TaskSummary(
+        "task-1",
+        "示例频道",
+        TaskStatus.DOWNLOADING,
+        "0 / 2",
+        "1.0 KB",
+        "—",
+        "—",
+        "—",
+        total_items=2,
+        total_bytes=1024,
+    )
+    updated = TaskSummary(
+        "task-1",
+        "示例频道",
+        TaskStatus.DOWNLOADING,
+        "1 / 2",
+        "1.0 KB",
+        "512 B/s",
+        "1 秒",
+        "—",
+        completed_items=1,
+        total_items=2,
+        downloaded_bytes=512,
+        total_bytes=1024,
+        speed_bps=512,
+        remaining_seconds=1,
+    )
+    window.set_task_summaries([initial])
+    window.task_table.selectRow(0)
+
+    window.set_task_summaries([updated])
+
+    assert window.selected_task_id() == "task-1"
+    assert window.pause_button.isEnabled() is True

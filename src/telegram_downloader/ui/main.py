@@ -361,7 +361,15 @@ class MainWindow(QMainWindow):
         return frozenset(kind for kind, check in self.media_checks.items() if check.isChecked())
 
     def set_task_summaries(self, tasks: list[TaskSummary]) -> None:
+        selected_task_id = self.selected_task_id()
         self.task_model.set_tasks(tasks)
+        if selected_task_id is not None:
+            selected_row = next(
+                (row for row, task in enumerate(tasks) if task.id == selected_task_id),
+                None,
+            )
+            if selected_row is not None:
+                self.task_table.selectRow(selected_row)
         self._update_action_state()
 
         total_speed = sum(
