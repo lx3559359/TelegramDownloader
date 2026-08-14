@@ -18,6 +18,12 @@ class TaskSummary:
     speed_text: str
     remaining_text: str
     error_text: str
+    completed_items: int = 0
+    total_items: int = 0
+    downloaded_bytes: int = 0
+    total_bytes: int | None = None
+    speed_bps: float = 0.0
+    remaining_seconds: int | None = None
 
 
 _STATUS_LABELS = {

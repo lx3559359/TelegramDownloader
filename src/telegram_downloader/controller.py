@@ -7,6 +7,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
+from time import monotonic as monotonic_clock
 from typing import Any
 
 from telegram_downloader.domain import (
@@ -145,7 +146,10 @@ class AppController:
         update_shutdown: Callable[[], None] | None = None,
         settings: AppSettings | None = None,
         secrets: dict[str, str] | None = None,
+        progress_refresh_interval: float = 0.5,
     ) -> None:
+        if progress_refresh_interval <= 0:
+            raise ValueError("进度刷新间隔必须大于零")
         self.gateway = gateway
         self.planner = planner
         self.scheduler = scheduler or _NullScheduler()
@@ -171,6 +175,9 @@ class AppController:
         self._ui_slots: list[object] = []
         self._shutting_down = False
         self._settings_dialog: Any | None = None
+        self._progress_refresh_interval = progress_refresh_interval
+        self._next_progress_refresh = 0.0
+        self._progress_samples: dict[str, tuple[float, int]] = {}
 
     @classmethod
     def for_test(cls, **dependencies) -> AppController:
@@ -485,13 +492,24 @@ class AppController:
         if self.gateway is not None:
             await self.gateway.disconnect()
 
-    def refresh_tasks(self) -> None:
+    def refresh_tasks(self, *, now: float | None = None) -> None:
+        sampled_at = monotonic_clock() if now is None else now
         summaries: list[TaskSummary] = []
+        active_ids: set[str] = set()
         for task in self.repository.list_tasks():
             items = self.repository.list_items(task.id)
             completed = sum(item.status is ItemStatus.COMPLETED for item in items)
+            downloaded = sum(item.downloaded_bytes for item in items)
             known_size = sum(item.expected_size or 0 for item in items)
             unknown = any(item.expected_size is None for item in items)
+            total_bytes = None if unknown else known_size
+            speed = self._sample_speed(task.id, task.status, downloaded, sampled_at)
+            remaining_seconds = None
+            if total_bytes is not None and speed > 0:
+                remaining_seconds = max(
+                    0,
+                    round((total_bytes - downloaded) / speed),
+                )
             error_text = task.last_error or next(
                 (item.last_error for item in items if item.last_error),
                 "—",
@@ -503,12 +521,47 @@ class AppController:
                     task.status,
                     f"{completed} / {len(items)}",
                     self._format_bytes(known_size) + (" + 未知" if unknown else ""),
-                    "—",
-                    "—",
+                    self._format_rate(speed),
+                    self._format_duration(remaining_seconds),
                     error_text,
+                    completed,
+                    len(items),
+                    downloaded,
+                    total_bytes,
+                    speed,
+                    remaining_seconds,
                 )
             )
+            if task.status is TaskStatus.DOWNLOADING:
+                active_ids.add(task.id)
+        for task_id in set(self._progress_samples) - active_ids:
+            self._progress_samples.pop(task_id, None)
         self.window.set_task_summaries(summaries)
+
+    def _sample_speed(
+        self,
+        task_id: str,
+        status: TaskStatus,
+        downloaded: int,
+        now: float,
+    ) -> float:
+        if status is not TaskStatus.DOWNLOADING:
+            self._progress_samples.pop(task_id, None)
+            return 0.0
+        previous = self._progress_samples.get(task_id)
+        self._progress_samples[task_id] = (now, downloaded)
+        if previous is None:
+            return 0.0
+        elapsed = now - previous[0]
+        delta = downloaded - previous[1]
+        return delta / elapsed if elapsed > 0 and delta > 0 else 0.0
+
+    def _refresh_tasks_if_due(self, now: float | None = None) -> None:
+        sampled_at = monotonic_clock() if now is None else now
+        if sampled_at < self._next_progress_refresh:
+            return
+        self._next_progress_refresh = sampled_at + self._progress_refresh_interval
+        self.refresh_tasks(now=sampled_at)
 
     def show_login(self) -> None:
         self.login_dialog.show()
@@ -574,8 +627,18 @@ class AppController:
             self._show_status(f"更新检查失败（{type(error).__name__}）")
 
     async def _run_and_refresh(self, task_id: str) -> None:
+        operation = asyncio.create_task(self.scheduler.run_task(task_id))
         try:
-            await self.scheduler.run_task(task_id)
+            while not operation.done():
+                self._refresh_tasks_if_due()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(operation),
+                        timeout=self._progress_refresh_interval,
+                    )
+                except TimeoutError:
+                    continue
+            await operation
         finally:
             self.refresh_tasks()
 
@@ -600,6 +663,19 @@ class AppController:
                 return f"{amount:.0f} {unit}" if unit == "B" else f"{amount:.1f} {unit}"
             amount /= 1024
         return f"{value} B"
+
+    @classmethod
+    def _format_rate(cls, value: float) -> str:
+        return "—" if value <= 0 else f"{cls._format_bytes(round(value))}/s"
+
+    @staticmethod
+    def _format_duration(value: int | None) -> str:
+        if value is None:
+            return "—"
+        if value < 60:
+            return f"{value} 秒"
+        minutes, seconds = divmod(value, 60)
+        return f"{minutes} 分 {seconds} 秒"
 
     @staticmethod
     def filters_from_dates(

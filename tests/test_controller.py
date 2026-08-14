@@ -1,11 +1,12 @@
 import asyncio
 import logging
 from datetime import UTC, date, datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
 from telegram_downloader.controller import AppController
-from telegram_downloader.domain import MediaKind, TaskStatus
+from telegram_downloader.domain import ItemStatus, MediaKind, TaskStatus
 from telegram_downloader.gateway import (
     AccessDeniedError,
     AuthState,
@@ -716,6 +717,139 @@ async def test_confirmed_scan_starts_persisted_task() -> None:
         controller.default_filters(datetime(2026, 8, 13, tzinfo=UTC)),
     )
     await asyncio.wait_for(scheduler.started.wait(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_running_task_refreshes_window_before_download_finishes() -> None:
+    release = asyncio.Event()
+    started = asyncio.Event()
+    task = SimpleNamespace(
+        id="task-1",
+        source_title="示例频道",
+        status=TaskStatus.QUEUED,
+        last_error=None,
+    )
+    item = SimpleNamespace(
+        status=ItemStatus.QUEUED,
+        expected_size=100,
+        downloaded_bytes=0,
+        last_error=None,
+    )
+
+    class Repository:
+        def list_tasks(self):
+            return [task]
+
+        def list_items(self, task_id):
+            assert task_id == "task-1"
+            return [item]
+
+    class Scheduler:
+        async def run_task(self, task_id):
+            assert task_id == "task-1"
+            task.status = TaskStatus.DOWNLOADING
+            item.status = ItemStatus.DOWNLOADING
+            item.downloaded_bytes = 25
+            started.set()
+            await release.wait()
+            item.downloaded_bytes = 100
+            item.status = ItemStatus.COMPLETED
+            task.status = TaskStatus.COMPLETED
+
+    class Window:
+        def __init__(self):
+            self.snapshots = []
+            self.downloading = asyncio.Event()
+
+        def set_task_summaries(self, summaries):
+            self.snapshots.append(summaries)
+            if summaries and summaries[0].status is TaskStatus.DOWNLOADING:
+                self.downloading.set()
+
+    window = Window()
+    controller = AppController.for_test(
+        repository=Repository(),
+        scheduler=Scheduler(),
+        window=window,
+        progress_refresh_interval=0.01,
+    )
+
+    running = asyncio.create_task(controller._run_and_refresh("task-1"))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    await asyncio.wait_for(window.downloading.wait(), timeout=1)
+
+    assert running.done() is False
+    assert window.snapshots[-1][0].downloaded_bytes == 25
+
+    release.set()
+    await running
+
+    assert window.snapshots[-1][0].status is TaskStatus.COMPLETED
+    assert window.snapshots[-1][0].completed_items == 1
+
+
+def test_refresh_tasks_calculates_speed_and_remaining_time() -> None:
+    task = SimpleNamespace(
+        id="task-1",
+        source_title="频道",
+        status=TaskStatus.DOWNLOADING,
+        last_error=None,
+    )
+    item = SimpleNamespace(
+        status=ItemStatus.DOWNLOADING,
+        expected_size=1024,
+        downloaded_bytes=0,
+        last_error=None,
+    )
+
+    class Repository:
+        def list_tasks(self):
+            return [task]
+
+        def list_items(self, _task_id):
+            return [item]
+
+    class Window:
+        def __init__(self):
+            self.tasks = []
+
+        def set_task_summaries(self, summaries):
+            self.tasks = summaries
+
+    window = Window()
+    controller = AppController.for_test(repository=Repository(), window=window)
+    controller.refresh_tasks(now=10.0)
+    item.downloaded_bytes = 512
+    controller.refresh_tasks(now=11.0)
+
+    summary = window.tasks[0]
+    assert summary.speed_bps == 512
+    assert summary.speed_text == "512 B/s"
+    assert summary.remaining_seconds == 1
+    assert summary.remaining_text == "1 秒"
+
+
+def test_progress_refresh_is_throttled_across_concurrent_callers() -> None:
+    class Window:
+        def __init__(self):
+            self.refreshes = 0
+
+        def set_task_summaries(self, _summaries):
+            self.refreshes += 1
+
+    window = Window()
+    controller = AppController.for_test(window=window, progress_refresh_interval=0.5)
+
+    controller._refresh_tasks_if_due(20.0)
+    controller._refresh_tasks_if_due(20.1)
+    controller._refresh_tasks_if_due(20.5)
+
+    assert window.refreshes == 2
+
+
+def test_progress_refresh_interval_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="进度刷新间隔必须大于零"):
+        AppController.for_test(progress_refresh_interval=0)
 
 
 @pytest.mark.asyncio
