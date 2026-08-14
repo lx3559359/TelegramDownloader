@@ -9,7 +9,13 @@ from enum import StrEnum
 from typing import Protocol
 
 from telegram_downloader import __version__
-from telegram_downloader.content import AccountProfile, ContentDialog, DialogKind
+from telegram_downloader.content import (
+    AccountProfile,
+    ContentDialog,
+    ContentSearchQuery,
+    DialogKind,
+    SearchCursor,
+)
 from telegram_downloader.domain import MediaKind, ParsedLink, ScanFilters, SourceKind
 from telegram_downloader.files import classify_media, sanitize_component
 from telegram_downloader.settings import ProxySettings
@@ -32,6 +38,20 @@ class RemoteMedia:
     original_name: str
     expected_size: int | None
     message_date_utc: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteSearchHit:
+    remote: RemoteMedia
+    excerpt: str
+    thumbnail_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteSearchPage:
+    items: tuple[RemoteSearchHit, ...]
+    next_cursor: SearchCursor | None
+    exhausted: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +136,27 @@ class TelegramGateway(Protocol):
         account_id: str,
     ) -> AsyncIterator[ContentDialog]: ...
 
+    async def search_media_page(
+        self,
+        peer_ref: str,
+        query: ContentSearchQuery,
+        cursor: SearchCursor | None,
+    ) -> RemoteSearchPage: ...
+
+    async def expand_album(
+        self,
+        peer_ref: str,
+        message_id: int,
+        grouped_id: int,
+    ) -> tuple[RemoteSearchHit, ...]: ...
+
+    async def load_thumbnail(
+        self,
+        peer_ref: str,
+        message_id: int,
+        media_id: str,
+    ) -> bytes | None: ...
+
     async def disconnect(self) -> None: ...
 
 
@@ -134,6 +175,7 @@ def proxy_dict(settings: ProxySettings, password: str) -> dict[str, object] | No
 
 class TelethonGateway:
     _ALBUM_RADIUS = 20
+    _SEARCH_PAGE_SIZE = 100
 
     def __init__(
         self,
@@ -467,6 +509,119 @@ class TelethonGateway:
                     )
         except Exception as exc:
             self._raise_mapped(exc)
+
+    async def search_media_page(
+        self,
+        peer_ref: str,
+        query: ContentSearchQuery,
+        cursor: SearchCursor | None,
+    ) -> RemoteSearchPage:
+        items: list[RemoteSearchHit] = []
+        inspected = 0
+        last_inspected_id: int | None = None
+        reached_start_date = False
+        try:
+            entity = await self._resolve_entity(peer_ref)
+            title = self._entity_title(entity, peer_ref)
+            messages = self._client.iter_messages(
+                entity,
+                search=query.keyword,
+                offset_id=cursor.offset_id if cursor else 0,
+                limit=self._SEARCH_PAGE_SIZE,
+            )
+            async for message in messages:
+                inspected += 1
+                last_inspected_id = int(message.id)
+                message_date = self._utc_datetime(getattr(message, "date", None))
+                if message_date is None:
+                    continue
+                if message_date > query.filters.date_to_utc:
+                    continue
+                if message_date < query.filters.date_from_utc:
+                    reached_start_date = True
+                    break
+                remote = self.remote_media_from_message(peer_ref, message, title)
+                if remote is None or remote.kind not in query.filters.media_kinds:
+                    continue
+                items.append(self._search_hit(remote, message))
+        except Exception as exc:
+            self._raise_mapped(exc)
+
+        exhausted = reached_start_date or inspected < self._SEARCH_PAGE_SIZE
+        next_cursor = (
+            None
+            if exhausted or last_inspected_id is None
+            else SearchCursor(last_inspected_id)
+        )
+        return RemoteSearchPage(tuple(items), next_cursor, exhausted)
+
+    async def expand_album(
+        self,
+        peer_ref: str,
+        message_id: int,
+        grouped_id: int,
+    ) -> tuple[RemoteSearchHit, ...]:
+        grouped: dict[int, RemoteSearchHit] = {}
+        try:
+            entity = await self._resolve_entity(peer_ref)
+            title = self._entity_title(entity, peer_ref)
+            messages = self._client.iter_messages(
+                entity,
+                min_id=max(0, message_id - self._ALBUM_RADIUS - 1),
+                max_id=message_id + self._ALBUM_RADIUS + 1,
+            )
+            async for message in messages:
+                if getattr(message, "grouped_id", None) != grouped_id:
+                    continue
+                remote = self.remote_media_from_message(peer_ref, message, title)
+                if remote is not None:
+                    grouped[remote.message_id] = self._search_hit(remote, message)
+        except Exception as exc:
+            self._raise_mapped(exc)
+        return tuple(grouped[item_id] for item_id in sorted(grouped))
+
+    async def load_thumbnail(
+        self,
+        peer_ref: str,
+        message_id: int,
+        media_id: str,
+    ) -> bytes | None:
+        try:
+            entity = await self._resolve_entity(peer_ref)
+            message = await self._client.get_messages(entity, ids=message_id)
+            media = getattr(message, "media", None) if message is not None else None
+            if media is None:
+                return None
+            title = self._entity_title(entity, peer_ref)
+            remote = self.remote_media_from_message(peer_ref, message, title)
+            if remote is None or remote.media_id != media_id:
+                return None
+            downloaded = await self._client.download_media(
+                media,
+                file=bytes,
+                thumb=-1,
+            )
+            return downloaded if isinstance(downloaded, bytes) else None
+        except Exception as exc:
+            self._raise_mapped(exc)
+
+    @classmethod
+    def _search_hit(cls, remote: RemoteMedia, message: object) -> RemoteSearchHit:
+        return RemoteSearchHit(
+            remote=remote,
+            excerpt=cls._message_excerpt(message),
+            thumbnail_key=(
+                f"{remote.peer_ref}:{remote.message_id}:{remote.media_id}"
+            ),
+        )
+
+    @staticmethod
+    def _message_excerpt(message: object) -> str:
+        raw = str(getattr(message, "message", "") or "")
+        visible = "".join(
+            char for char in raw if char.isprintable() or char in "\n\t"
+        )
+        return " ".join(visible.split())[:500]
 
     @staticmethod
     def _account_display_name(account: object) -> str:

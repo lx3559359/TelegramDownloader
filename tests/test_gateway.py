@@ -5,7 +5,12 @@ from types import SimpleNamespace
 import pytest
 
 import telegram_downloader.gateway as gateway_module
-from telegram_downloader.content import AccountProfile, DialogKind
+from telegram_downloader.content import (
+    AccountProfile,
+    ContentSearchQuery,
+    DialogKind,
+    SearchCursor,
+)
 from telegram_downloader.domain import MediaKind, ScanFilters
 from telegram_downloader.gateway import (
     AccessDeniedError,
@@ -629,3 +634,176 @@ async def test_content_dialogs_map_archived_enumeration_access_error() -> None:
         _ = [item async for item in gateway.iter_content_dialogs("42")]
 
     assert "secret server detail" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_search_media_page_uses_server_search_and_raw_message_cursor() -> None:
+    now = datetime(2026, 8, 14, 12, tzinfo=UTC)
+    messages = []
+    for index, message_id in enumerate(range(200, 99, -1)):
+        message = media_message(
+            message_id,
+            now,
+            kind="video" if index % 2 == 0 else "voice",
+        )
+        message.message = (
+            "\x00安装\t教程\n" + "文" * 600 + "\x07"
+            if message_id == 200
+            else f"结果 {message_id}"
+        )
+        messages.append(message)
+
+    class Client:
+        def __init__(self):
+            self.calls: list[dict[str, object]] = []
+            self.last_scanned_id = 0
+
+        async def get_entity(self, entity):
+            assert entity == -1001
+            return SimpleNamespace(title="资料群")
+
+        def iter_messages(self, entity, **kwargs):
+            self.calls.append(kwargs)
+
+            async def generate():
+                for message in messages[: int(kwargs["limit"])]:
+                    self.last_scanned_id = message.id
+                    yield message
+
+            return generate()
+
+    client = Client()
+    gateway = TelethonGateway.from_client_for_test(client)
+    query = ContentSearchQuery(
+        "安装教程",
+        ScanFilters(
+            datetime(2026, 8, 1, tzinfo=UTC),
+            datetime(2026, 8, 14, 23, 59, tzinfo=UTC),
+            frozenset({MediaKind.VIDEO}),
+            500,
+        ),
+    )
+
+    page = await gateway.search_media_page("-1001", query, SearchCursor())
+
+    assert client.calls[0] == {
+        "search": "安装教程",
+        "offset_id": 0,
+        "limit": 100,
+    }
+    assert len(page.items) == 50
+    assert all(item.remote.kind is MediaKind.VIDEO for item in page.items)
+    assert all(len(item.excerpt) <= 500 for item in page.items)
+    assert page.items[0].excerpt.startswith("安装 教程 ")
+    assert not any(ord(char) < 32 for char in page.items[0].excerpt)
+    assert page.next_cursor == SearchCursor(client.last_scanned_id)
+    assert page.exhausted is False
+
+
+@pytest.mark.asyncio
+async def test_search_media_page_marks_short_page_exhausted_without_cursor() -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    messages = [media_message(2, now), media_message(1, now)]
+    for message in messages:
+        message.message = "安装"
+
+    class Client:
+        async def get_entity(self, entity):
+            return SimpleNamespace(title="资料群")
+
+        def iter_messages(self, entity, **kwargs):
+            async def generate():
+                for message in messages:
+                    yield message
+
+            return generate()
+
+    gateway = TelethonGateway.from_client_for_test(Client())
+    query = ContentSearchQuery(
+        "安装",
+        ScanFilters(now - timedelta(days=1), now, frozenset(MediaKind), 500),
+    )
+
+    page = await gateway.search_media_page("-1001", query, None)
+
+    assert [item.remote.message_id for item in page.items] == [2, 1]
+    assert page.next_cursor is None
+    assert page.exhausted is True
+
+
+@pytest.mark.asyncio
+async def test_expand_album_returns_matching_media_in_message_order() -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    messages = [
+        media_message(51, now, grouped_id=900),
+        media_message(48, now, grouped_id=901),
+        media_message(49, now, grouped_id=900),
+        media_message(50, now, grouped_id=900),
+    ]
+
+    class Client:
+        async def get_entity(self, entity):
+            assert entity == -1001
+            return SimpleNamespace(title="资料群")
+
+        def iter_messages(self, entity, **kwargs):
+            assert kwargs == {"min_id": 29, "max_id": 71}
+
+            async def generate():
+                for message in messages:
+                    yield message
+
+            return generate()
+
+    gateway = TelethonGateway.from_client_for_test(Client())
+
+    found = await gateway.expand_album("-1001", 50, 900)
+
+    assert [item.remote.message_id for item in found] == [49, 50, 51]
+    assert all(item.remote.grouped_id == 900 for item in found)
+
+
+@pytest.mark.asyncio
+async def test_load_thumbnail_validates_current_media_and_returns_only_bytes() -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    message = media_message(50, now)
+    non_bytes_message = media_message(51, now)
+
+    class Client:
+        async def get_entity(self, entity):
+            assert entity == -1001
+            return SimpleNamespace(title="资料群")
+
+        async def get_messages(self, entity, ids):
+            return {50: message, 51: non_bytes_message}.get(ids)
+
+        async def download_media(self, media, *, file, thumb):
+            assert file is bytes
+            assert thumb == -1
+            return b"jpeg" if media is message.media else "thumbnail.jpg"
+
+    gateway = TelethonGateway.from_client_for_test(Client())
+
+    assert await gateway.load_thumbnail("-1001", 50, "m50") == b"jpeg"
+    assert await gateway.load_thumbnail("-1001", 51, "m51") is None
+    assert await gateway.load_thumbnail("-1001", 50, "changed") is None
+    assert await gateway.load_thumbnail("-1001", 404, "missing") is None
+
+
+@pytest.mark.asyncio
+async def test_load_thumbnail_maps_access_errors() -> None:
+    class ThumbnailAccessError(Exception):
+        pass
+
+    class Client:
+        async def get_entity(self, entity):
+            raise ThumbnailAccessError("private detail")
+
+    gateway = TelethonGateway.from_client_for_test(
+        Client(), access_errors=(ThumbnailAccessError,)
+    )
+
+    with pytest.raises(AccessDeniedError) as caught:
+        await gateway.load_thumbnail("-1001", 50, "m50")
+
+    assert "private detail" not in str(caught.value)
