@@ -26,24 +26,32 @@ _INVITE = re.compile(r"^/\+(?P<slug>[A-Za-z0-9_-]+)/?$")
 
 
 def is_telegram_link_candidate(value: str) -> bool:
-    parsed = urlparse(value.strip())
+    try:
+        parsed = urlparse(value.strip())
+        hostname = (parsed.hostname or "").lower()
+    except ValueError:
+        return False
     return (
         parsed.scheme.lower() in {"http", "https"}
-        and (parsed.hostname or "").lower() in {"t.me", "www.t.me"}
+        and hostname in {"t.me", "www.t.me"}
     )
 
 
 def parse_telegram_link(value: str) -> ParsedLink:
-    parsed = urlparse(value.strip())
-    if (
-        parsed.scheme.lower() not in {"http", "https"}
-        or (parsed.hostname or "").lower() not in {"t.me", "www.t.me"}
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.port is not None
-        or parsed.fragment
-        or parsed.query not in {"", "single"}
-    ):
+    try:
+        parsed = urlparse(value.strip())
+        invalid = (
+            parsed.scheme.lower() not in {"http", "https"}
+            or (parsed.hostname or "").lower() not in {"t.me", "www.t.me"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port is not None
+            or parsed.fragment
+            or parsed.query not in {"", "single"}
+        )
+    except ValueError as error:
+        raise InvalidTelegramLink("请输入有效的 t.me 链接") from error
+    if invalid:
         raise InvalidTelegramLink("请输入有效的 t.me 链接")
 
     match = _PRIVATE.fullmatch(parsed.path)

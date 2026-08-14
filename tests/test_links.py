@@ -43,6 +43,10 @@ def test_only_http_tme_urls_are_link_candidates() -> None:
     assert not is_telegram_link_candidate("https://example.com/t.me/demo")
 
 
+def test_malformed_url_is_not_a_link_candidate() -> None:
+    assert not is_telegram_link_candidate("https://[")
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -52,6 +56,7 @@ def test_only_http_tme_urls_are_link_candidates() -> None:
         "https://t.me/example/not-a-message",
         "https://t.me/example/0",
         "https://user:password@t.me/example/1",
+        "https://t.me:bad/example/1",
         "https://t.me/example/1#fragment",
     ],
 )
