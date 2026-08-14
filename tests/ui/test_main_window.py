@@ -100,3 +100,36 @@ def test_scan_busy_state_disables_source_controls(qtbot) -> None:
     assert window.link_input.isEnabled() is True
     assert window.scan_button.isEnabled() is True
     assert window.scan_button.text() == "扫描预览"
+
+
+def test_live_summary_updates_statistics_and_current_task(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.set_task_summaries(
+        [
+            TaskSummary(
+                "task-1",
+                "示例频道",
+                TaskStatus.DOWNLOADING,
+                "1 / 2",
+                "1.0 KB",
+                "512 B/s",
+                "1 秒",
+                "—",
+                completed_items=1,
+                total_items=2,
+                downloaded_bytes=512,
+                total_bytes=1024,
+                speed_bps=512,
+                remaining_seconds=1,
+            )
+        ]
+    )
+
+    assert window.speed_value.text() == "512 B/s"
+    assert window.completed_value.text() == "1"
+    assert window.remaining_value.text() == "1"
+    assert window.current_task_label.text() == "示例频道"
+    assert window.current_progress.value() == 50
+    assert "1 / 2" in window.current_detail.text()
+    assert "剩余 1 秒" in window.current_detail.text()

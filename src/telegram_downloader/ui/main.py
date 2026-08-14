@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from telegram_downloader import __version__
-from telegram_downloader.domain import MediaKind
+from telegram_downloader.domain import MediaKind, TaskStatus
 from telegram_downloader.ui.models import TaskSummary, TaskTableModel
 from telegram_downloader.ui.theme import DARK_STYLESHEET, ensure_cjk_font
 
@@ -363,6 +363,59 @@ class MainWindow(QMainWindow):
     def set_task_summaries(self, tasks: list[TaskSummary]) -> None:
         self.task_model.set_tasks(tasks)
         self._update_action_state()
+
+        total_speed = sum(
+            task.speed_bps for task in tasks if task.status is TaskStatus.DOWNLOADING
+        )
+        completed = sum(task.completed_items for task in tasks)
+        remaining = sum(
+            max(0, task.total_items - task.completed_items) for task in tasks
+        )
+        self.speed_value.setText(self._format_rate(total_speed))
+        self.completed_value.setText(str(completed))
+        self.remaining_value.setText(str(remaining))
+
+        active = next(
+            (
+                task
+                for task in tasks
+                if task.status in {TaskStatus.DOWNLOADING, TaskStatus.WAITING_RETRY}
+            ),
+            None,
+        )
+        if active is None:
+            self.current_task_label.setText("暂无活动任务")
+            self.current_progress.setValue(0)
+            self.current_detail.setText("等待任务进入队列")
+            return
+
+        if active.total_bytes is not None and active.total_bytes > 0:
+            progress = round(active.downloaded_bytes * 100 / active.total_bytes)
+        elif active.total_items > 0:
+            progress = round(active.completed_items * 100 / active.total_items)
+        else:
+            progress = 0
+        self.current_task_label.setText(active.title)
+        self.current_progress.setValue(max(0, min(100, progress)))
+        detail = f"{active.progress_text} · {active.speed_text}"
+        if active.remaining_text != "—":
+            detail += f" · 剩余 {active.remaining_text}"
+        self.current_detail.setText(detail)
+
+    @staticmethod
+    def _format_rate(value: float) -> str:
+        if value <= 0:
+            return "0 B/s"
+        amount = value
+        for unit in ("B/s", "KB/s", "MB/s", "GB/s", "TB/s"):
+            if amount < 1024 or unit == "TB/s":
+                return (
+                    f"{amount:.0f} {unit}"
+                    if unit == "B/s"
+                    else f"{amount:.1f} {unit}"
+                )
+            amount /= 1024
+        return "0 B/s"
 
     def set_account(self, display_name: str | None) -> None:
         self.account_badge.setText(display_name or "未登录")
