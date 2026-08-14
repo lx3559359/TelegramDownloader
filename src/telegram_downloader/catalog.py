@@ -189,6 +189,18 @@ class CatalogRepository:
             ).fetchall()
         return [self._dialog_from_row(row) for row in rows]
 
+    def get_dialog(self, account_id: str, peer_ref: str) -> ContentDialog:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT account_id, peer_ref, title, username, kind, archived, "
+                "available, last_synced_at FROM dialogs "
+                "WHERE account_id=? AND peer_ref=?",
+                (account_id, peer_ref),
+            ).fetchone()
+        if row is None:
+            raise KeyError(peer_ref)
+        return self._dialog_from_row(row)
+
     def begin_search(
         self,
         search_id: str,
@@ -298,7 +310,11 @@ class CatalogRepository:
                     "expected_size=excluded.expected_size, "
                     "message_date_utc=excluded.message_date_utc, "
                     "excerpt=excluded.excerpt, thumbnail_key=excluded.thumbnail_key, "
-                    "available=excluded.available, generation=excluded.generation",
+                    "available=excluded.available, "
+                    "queued=MAX(search_results.queued, excluded.queued), "
+                    "selected=CASE WHEN excluded.queued=1 THEN 0 "
+                    "ELSE search_results.selected END, "
+                    "generation=excluded.generation",
                     (
                         item.id,
                         item.search_id,
@@ -390,6 +406,19 @@ class CatalogRepository:
             ).fetchall()
         return [self._result_from_row(row) for row in rows]
 
+    def get_result(self, account_id: str, result_id: str) -> SearchResult:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT result.* FROM search_results AS result "
+                "JOIN search_sessions AS session ON session.id=result.search_id "
+                "WHERE session.account_id=? AND result.id=? "
+                "AND result.generation=session.generation",
+                (account_id, result_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(result_id)
+        return self._result_from_row(row)
+
     def set_selected(
         self,
         account_id: str,
@@ -398,22 +427,34 @@ class CatalogRepository:
         selected: bool,
     ) -> None:
         with self._connection() as connection:
-            row = connection.execute(
-                "SELECT result.available, result.queued FROM search_results AS result "
+            cursor = connection.execute(
+                "UPDATE search_results SET selected=? "
+                "WHERE account_id=? AND search_id=? AND id=? "
+                "AND generation=(SELECT generation FROM search_sessions "
+                "WHERE account_id=? AND id=?) "
+                "AND (?=0 OR (available=1 AND queued=0))",
+                (
+                    int(selected),
+                    account_id,
+                    search_id,
+                    result_id,
+                    account_id,
+                    search_id,
+                    int(selected),
+                ),
+            )
+            if cursor.rowcount == 1:
+                return
+            exists = connection.execute(
+                "SELECT 1 FROM search_results AS result "
                 "JOIN search_sessions AS session ON session.id=result.search_id "
                 "WHERE session.account_id=? AND session.id=? AND result.id=? "
                 "AND result.generation=session.generation",
                 (account_id, search_id, result_id),
             ).fetchone()
-            if row is None:
+            if exists is None:
                 raise KeyError(result_id)
-            if selected and (not bool(row["available"]) or bool(row["queued"])):
-                raise ValueError("该媒体当前不可选择")
-            connection.execute(
-                "UPDATE search_results SET selected=? "
-                "WHERE account_id=? AND search_id=? AND id=?",
-                (int(selected), account_id, search_id, result_id),
-            )
+            raise ValueError("该媒体当前不可选择")
 
     def mark_queued(self, account_id: str, result_ids: tuple[str, ...]) -> None:
         if not result_ids:
@@ -425,6 +466,65 @@ class CatalogRepository:
                 f"AND id IN ({placeholders})",
                 (account_id, *result_ids),
             )
+
+    def mark_unavailable(
+        self,
+        account_id: str,
+        result_ids: tuple[str, ...],
+    ) -> None:
+        if not result_ids:
+            return
+        placeholders = ",".join("?" for _ in result_ids)
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE search_results SET available=0 WHERE account_id=? "
+                f"AND id IN ({placeholders})",
+                (account_id, *result_ids),
+            )
+
+    def list_thumbnail_keys(
+        self,
+        account_id: str,
+        search_id: str | None = None,
+    ) -> set[str]:
+        parameters: list[object] = [account_id]
+        where = "session.account_id=?"
+        if search_id is not None:
+            where += " AND session.id=?"
+            parameters.append(search_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT result.thumbnail_key "
+                "FROM search_results AS result "
+                "JOIN search_sessions AS session ON session.id=result.search_id "
+                f"WHERE {where}",
+                parameters,
+            ).fetchall()
+        return {str(row["thumbnail_key"]) for row in rows}
+
+    def referenced_thumbnail_keys(
+        self,
+        account_id: str,
+        keys: set[str],
+    ) -> set[str]:
+        if not keys:
+            return set()
+        found: set[str] = set()
+        ordered = sorted(keys)
+        with self._connection() as connection:
+            for start in range(0, len(ordered), 500):
+                chunk = ordered[start : start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    "SELECT DISTINCT result.thumbnail_key "
+                    "FROM search_results AS result "
+                    "JOIN search_sessions AS session ON session.id=result.search_id "
+                    "WHERE session.account_id=? "
+                    f"AND result.thumbnail_key IN ({placeholders})",
+                    (account_id, *chunk),
+                ).fetchall()
+                found.update(str(row["thumbnail_key"]) for row in rows)
+        return found
 
     def delete_session(self, account_id: str, search_id: str) -> None:
         with self._connection() as connection:

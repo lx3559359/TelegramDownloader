@@ -239,3 +239,105 @@ def test_recover_interrupted_searches_preserves_results(tmp_path: Path) -> None:
     assert recovered.status is SearchStatus.INCOMPLETE
     assert recovered.last_error == "上次搜索未正常结束"
     assert repo.list_results("a1", session.id)[0].selected is True
+
+
+def test_catalog_service_helpers_are_account_scoped(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    repo = CatalogRepository(tmp_path / "catalog.sqlite3")
+    repo.initialize()
+    query = ContentSearchQuery(
+        "资料",
+        ScanFilters(now, now, frozenset(MediaKind), 10),
+    )
+    sessions = {}
+    for account, peer in (("a1", "-1001"), ("a2", "-1002")):
+        repo.upsert_account(AccountProfile(account, account), now)
+        repo.replace_dialogs(
+            account,
+            [dialog(account, peer, f"群-{account}", now)],
+            now,
+        )
+        sessions[account] = repo.begin_search(
+            f"search-{account}",
+            account,
+            peer,
+            f"群-{account}",
+            query,
+            now,
+        )
+    first = replace(
+        result(sessions["a1"].id, "a1", now),
+        thumbnail_key="a1:shared",
+    )
+    second = replace(
+        result(
+            sessions["a2"].id,
+            "a2",
+            now,
+            result_id="result-a2",
+            message_id=8,
+        ),
+        peer_ref="-1002",
+        thumbnail_key="a2:shared",
+    )
+    repo.save_search_page("a1", sessions["a1"].id, 1, [first])
+    repo.save_search_page("a2", sessions["a2"].id, 1, [second])
+
+    assert repo.get_dialog("a1", "-1001").title == "群-a1"
+    with pytest.raises(KeyError):
+        repo.get_dialog("a1", "-1002")
+    assert repo.get_result("a1", first.id) == first
+    with pytest.raises(KeyError):
+        repo.get_result("a1", second.id)
+
+    repo.set_selected("a1", sessions["a1"].id, first.id, True)
+    repo.mark_unavailable("a1", (first.id, second.id))
+    unavailable = repo.get_result("a1", first.id)
+    assert unavailable.available is False
+    assert unavailable.selected is True
+    with pytest.raises(ValueError, match="该媒体当前不可选择"):
+        repo.set_selected("a1", sessions["a1"].id, first.id, True)
+
+    repo.mark_queued("a1", (first.id, second.id))
+    queued = repo.get_result("a1", first.id)
+    assert queued.queued is True
+    assert queued.selected is False
+    assert repo.get_result("a2", second.id).queued is False
+
+
+def test_thumbnail_reference_queries_follow_history_deletion(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    repo = CatalogRepository(tmp_path / "catalog.sqlite3")
+    repo.initialize()
+    repo.upsert_account(AccountProfile("a1", "账号"), now)
+    first_query = ContentSearchQuery(
+        "资料一",
+        ScanFilters(now, now, frozenset(MediaKind), 10),
+    )
+    second_query = ContentSearchQuery(
+        "资料二",
+        ScanFilters(now, now, frozenset(MediaKind), 10),
+    )
+    first = repo.begin_search("s1", "a1", "-1001", "群", first_query, now)
+    second = repo.begin_search("s2", "a1", "-1001", "群", second_query, now)
+    shared_first = replace(
+        result(first.id, "a1", now),
+        thumbnail_key="a1:shared",
+    )
+    shared_second = replace(
+        result(second.id, "a1", now, result_id="r2"),
+        thumbnail_key="a1:shared",
+    )
+    repo.save_search_page("a1", first.id, first.generation, [shared_first])
+    repo.save_search_page("a1", second.id, second.generation, [shared_second])
+
+    assert repo.list_thumbnail_keys("a1") == {"a1:shared"}
+    assert repo.list_thumbnail_keys("a1", first.id) == {"a1:shared"}
+    assert repo.referenced_thumbnail_keys("a1", {"a1:shared", "missing"}) == {
+        "a1:shared"
+    }
+
+    repo.delete_session("a1", first.id)
+    assert repo.referenced_thumbnail_keys("a1", {"a1:shared"}) == {"a1:shared"}
+    repo.delete_session("a1", second.id)
+    assert repo.referenced_thumbnail_keys("a1", {"a1:shared"}) == set()
