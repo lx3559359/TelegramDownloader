@@ -10,10 +10,12 @@ from telegram_downloader.connectivity import ConnectionRecovery
 from telegram_downloader.content import (
     AccountProfile,
     ContentSearchQuery,
+    SearchSession,
     SearchStatus,
 )
+from telegram_downloader.content_progress import DialogSyncProgress, SearchProgress
 from telegram_downloader.controller import AppController
-from telegram_downloader.domain import ItemStatus, MediaKind, TaskStatus
+from telegram_downloader.domain import ItemStatus, MediaKind, ScanFilters, TaskStatus
 from telegram_downloader.gateway import (
     AccessDeniedError,
     AuthState,
@@ -1079,9 +1081,12 @@ class ContentPageFake:
         self.results = []
         self.active_search_id = None
         self.busy = []
+        self.search_progress = []
         self.sync_states = []
         self.connection_states = []
+        self.connection_retryable = []
         self.thumbnails = {}
+        self.previews = []
         self.errors = []
 
     def set_logged_in(self, value):
@@ -1102,14 +1107,21 @@ class ContentPageFake:
     def set_search_busy(self, value):
         self.busy.append(value)
 
-    def set_sync_state(self, text, *, busy=False):
-        self.sync_states.append((text, busy))
+    def set_search_progress(self, progress):
+        self.search_progress.append(progress)
 
-    def set_connection_state(self, text):
+    def set_sync_state(self, text, *, busy=False, count=0):
+        self.sync_states.append((text, busy, count))
+
+    def set_connection_state(self, text, *, retryable=False):
         self.connection_states.append(text)
+        self.connection_retryable.append(retryable)
 
     def set_thumbnail(self, result_id, path):
         self.thumbnails[result_id] = path
+
+    def show_preview(self, result, path):
+        self.previews.append((result, path))
 
     def show_error(self, message):
         self.errors.append(message)
@@ -1136,6 +1148,252 @@ class ContentWindowFake:
 
 
 @pytest.mark.asyncio
+async def test_manual_refresh_reports_counts_and_keeps_one_task() -> None:
+    dialogs = [SimpleNamespace(id="d1"), SimpleNamespace(id="d2")]
+
+    class Gateway:
+        def is_connected(self) -> bool:
+            return True
+
+    class ContentService:
+        async def sync_dialogs(self, *, on_progress=None):
+            on_progress(DialogSyncProgress(1))
+            on_progress(DialogSyncProgress(2))
+            return dialogs
+
+    window = ContentWindowFake()
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        content_browser=ContentService(),
+        window=window,
+    )
+
+    await controller.refresh_content_dialogs()
+
+    assert window.content_page.sync_states == [
+        ("正在刷新群组…", True, 0),
+        ("正在刷新，已发现 1 个群组/频道", True, 1),
+        ("正在刷新，已发现 2 个群组/频道", True, 2),
+        ("刚刚同步，共 2 个", False, 2),
+    ]
+    assert controller._dialog_sync_task is None
+
+
+@pytest.mark.asyncio
+async def test_repeated_manual_refresh_does_not_stack_sync_tasks() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class Gateway:
+        def is_connected(self) -> bool:
+            return True
+
+    class ContentService:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def sync_dialogs(self, *, on_progress=None):
+            self.calls += 1
+            started.set()
+            await release.wait()
+            return []
+
+    content = ContentService()
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        content_browser=content,
+        window=ContentWindowFake(),
+    )
+    first = asyncio.create_task(controller.refresh_content_dialogs())
+    await started.wait()
+
+    await controller.refresh_content_dialogs()
+
+    assert content.calls == 1
+    release.set()
+    await first
+
+
+@pytest.mark.asyncio
+async def test_search_progress_is_forwarded_and_always_stops() -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    query = ContentSearchQuery(
+        "安装",
+        ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 500),
+    )
+    session = SearchSession(
+        "search-1",
+        "a1",
+        "-1001",
+        "资料群",
+        query,
+        SearchStatus.COMPLETED,
+        1,
+        None,
+        True,
+        3,
+        now,
+        now,
+    )
+
+    class Gateway:
+        def is_connected(self) -> bool:
+            return True
+
+    class Browser:
+        async def start_search(self, _peer_ref, _query, *, on_progress=None):
+            on_progress(SearchProgress(20, 3, "正在整理结果"))
+            return session, []
+
+        def list_sessions(self):
+            return [session]
+
+        def list_results(self, _search_id):
+            return []
+
+    window = ContentWindowFake()
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        content_browser=Browser(),
+        window=window,
+    )
+
+    await controller.search_content("-1001", query)
+
+    assert window.content_page.busy == [True, False]
+    assert window.content_page.search_progress[0] == SearchProgress(
+        0, 0, "正在连接 Telegram"
+    )
+    assert window.content_page.search_progress[-2].inspected == 20
+    assert window.content_page.search_progress[-1] is None
+
+
+@pytest.mark.asyncio
+async def test_new_search_cancels_the_running_search_before_replacement() -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    first_started = asyncio.Event()
+    calls: list[str] = []
+
+    def make_query(keyword: str) -> ContentSearchQuery:
+        return ContentSearchQuery(
+            keyword,
+            ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 500),
+        )
+
+    def make_session(query: ContentSearchQuery) -> SearchSession:
+        return SearchSession(
+            f"session-{query.keyword}",
+            "a1",
+            "-1001",
+            "资料群",
+            query,
+            SearchStatus.COMPLETED,
+            1,
+            None,
+            True,
+            0,
+            now,
+            now,
+        )
+
+    class Gateway:
+        def is_connected(self) -> bool:
+            return True
+
+    class Browser:
+        async def start_search(self, _peer_ref, query, *, on_progress=None):
+            calls.append(query.keyword)
+            if query.keyword == "first":
+                first_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    calls.append("first-cancelled")
+                    raise
+            return make_session(query), []
+
+        def list_sessions(self):
+            return []
+
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        content_browser=Browser(),
+        window=ContentWindowFake(),
+    )
+    first = asyncio.create_task(
+        controller.search_content("-1001", make_query("first"))
+    )
+    await first_started.wait()
+
+    await controller.search_content("-1001", make_query("second"))
+
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert calls == ["first", "first-cancelled", "second"]
+
+
+@pytest.mark.asyncio
+async def test_manual_connection_retry_shares_the_existing_recovery() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class Gateway:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def is_connected(self) -> bool:
+            return False
+
+        async def connect(self) -> None:
+            self.calls += 1
+            entered.set()
+            await release.wait()
+
+    gateway = Gateway()
+    recovery = ConnectionRecovery(delays=(0.0,))
+    controller = AppController.for_test(
+        gateway=gateway,
+        connection_recovery=recovery,
+        window=ContentWindowFake(),
+    )
+    first = asyncio.create_task(controller.retry_telegram_connection())
+    second = asyncio.create_task(controller.retry_telegram_connection())
+    await entered.wait()
+    release.set()
+
+    assert await asyncio.gather(first, second) == [True, True]
+    assert gateway.calls == 1
+    assert controller.connection_recovery is recovery
+
+
+@pytest.mark.asyncio
+async def test_content_preview_uses_scoped_metadata_and_loaded_thumbnail(
+    tmp_path,
+) -> None:
+    result = SimpleNamespace(id="result-1")
+    path = tmp_path / "preview.jpg"
+
+    class Browser:
+        def get_result(self, result_id):
+            assert result_id == result.id
+            return result
+
+        async def load_thumbnail(self, result_id):
+            assert result_id == result.id
+            return path
+
+    window = ContentWindowFake()
+    controller = AppController.for_test(
+        content_browser=Browser(),
+        window=window,
+    )
+
+    await controller.open_content_preview(result.id)
+
+    assert window.content_page.previews == [(result, path)]
+
+
+@pytest.mark.asyncio
 async def test_offline_search_reconnects_then_continues() -> None:
     calls = []
     active = SimpleNamespace(id="search-1")
@@ -1145,7 +1403,7 @@ async def test_offline_search_reconnects_then_continues() -> None:
             calls.append("connect")
 
     class ContentService:
-        async def start_search(self, peer_ref, query):
+        async def start_search(self, peer_ref, query, *, on_progress=None):
             calls.append(("search", peer_ref, query))
             return active, []
 
@@ -1184,7 +1442,7 @@ async def test_failed_reconnect_keeps_cached_content_and_skips_search() -> None:
         def __init__(self):
             self.search_calls = 0
 
-        async def start_search(self, _peer_ref, _query):
+        async def start_search(self, _peer_ref, _query, *, on_progress=None):
             self.search_calls += 1
 
         def list_sessions(self):
@@ -1238,7 +1496,7 @@ async def test_content_page_only_syncs_stale_dialog_cache() -> None:
             assert max_age == timedelta(seconds=60)
             return self.stale
 
-        async def sync_dialogs(self):
+        async def sync_dialogs(self, *, on_progress=None):
             self.sync_calls += 1
             return []
 
@@ -1273,7 +1531,7 @@ async def test_manual_dialog_refresh_forces_sync_when_cache_is_fresh() -> None:
         def __init__(self):
             self.sync_calls = 0
 
-        async def sync_dialogs(self):
+        async def sync_dialogs(self, *, on_progress=None):
             self.sync_calls += 1
             return []
 
@@ -1418,7 +1676,7 @@ async def test_online_activation_starts_dialog_sync_without_blocking_start() -> 
         def list_sessions(self):
             return []
 
-        async def sync_dialogs(self):
+        async def sync_dialogs(self, *, on_progress=None):
             started.set()
             await release.wait()
             return [fresh_dialog]
@@ -1473,11 +1731,11 @@ async def test_content_search_selection_and_queue_flow() -> None:
     calls = []
 
     class ContentService:
-        async def start_search(self, peer_ref, received_query):
+        async def start_search(self, peer_ref, received_query, *, on_progress=None):
             calls.append(("search", peer_ref, received_query))
             return active, first_page
 
-        async def load_more(self, search_id):
+        async def load_more(self, search_id, *, on_progress=None):
             calls.append(("more", search_id))
             return (
                 SimpleNamespace(
@@ -1566,7 +1824,7 @@ async def test_cancel_content_search_restores_page_busy_state() -> None:
     started = asyncio.Event()
 
     class ContentService:
-        async def start_search(self, peer_ref, query):
+        async def start_search(self, peer_ref, query, *, on_progress=None):
             started.set()
             await asyncio.Event().wait()
 
@@ -1594,7 +1852,7 @@ async def test_content_search_expired_session_rebuilds_gateway_for_qr_login() ->
     calls = []
 
     class ContentService:
-        async def start_search(self, _peer_ref, _query):
+        async def start_search(self, _peer_ref, _query, *, on_progress=None):
             raise SessionExpiredError("Telegram 登录已失效，请重新扫码登录")
 
         def go_offline(self):
@@ -1670,7 +1928,7 @@ async def test_dialog_sync_expired_session_stops_spinner_and_logs_out() -> None:
     calls = []
 
     class ContentService:
-        async def sync_dialogs(self):
+        async def sync_dialogs(self, *, on_progress=None):
             raise SessionExpiredError("Telegram 登录已失效，请重新扫码登录")
 
         def go_offline(self):
@@ -1700,7 +1958,7 @@ async def test_dialog_sync_expired_session_stops_spinner_and_logs_out() -> None:
 
     await controller.refresh_content_dialogs()
 
-    assert window.content_page.sync_states[-1] == ("登录已失效", False)
+    assert window.content_page.sync_states[-1] == ("登录已失效", False, 0)
     assert window.content_page.logged_in is False
     assert vault.value == {"api_hash": "saved-api-hash"}
     assert calls == ["offline", "disconnect", "show-login"]
@@ -1753,11 +2011,11 @@ async def test_shutdown_cancels_content_operations_before_services() -> None:
     order = []
 
     class ContentService:
-        async def sync_dialogs(self):
+        async def sync_dialogs(self, *, on_progress=None):
             started["sync"].set()
             await asyncio.Event().wait()
 
-        async def start_search(self, peer_ref, query):
+        async def start_search(self, peer_ref, query, *, on_progress=None):
             started["search"].set()
             await asyncio.Event().wait()
 

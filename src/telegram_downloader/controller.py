@@ -7,12 +7,14 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
+from pathlib import Path
 from time import monotonic as monotonic_clock
 from typing import Any
 
 from telegram_downloader.connectivity import ConnectionRecovery
-from telegram_downloader.content import ContentSearchQuery
+from telegram_downloader.content import ContentSearchQuery, SearchResult
 from telegram_downloader.content_browser import NothingToQueueError
+from telegram_downloader.content_progress import DialogSyncProgress, SearchProgress
 from telegram_downloader.domain import (
     ItemStatus,
     MediaKind,
@@ -100,13 +102,30 @@ class _NullContentPage:
     def set_search_busy(self, _busy: bool) -> None:
         pass
 
-    def set_sync_state(self, _text: str, *, busy: bool = False) -> None:
+    def set_search_progress(self, _progress: SearchProgress | None) -> None:
         pass
 
-    def set_connection_state(self, _text: str) -> None:
+    def set_sync_state(
+        self,
+        _text: str,
+        *,
+        busy: bool = False,
+        count: int = 0,
+    ) -> None:
+        pass
+
+    def set_connection_state(
+        self,
+        _text: str,
+        *,
+        retryable: bool = False,
+    ) -> None:
         pass
 
     def set_thumbnail(self, _result_id: str, _path: object) -> None:
+        pass
+
+    def show_preview(self, _result: SearchResult, _path: Path | None) -> None:
         pass
 
     def show_error(self, _message: str) -> None:
@@ -281,14 +300,15 @@ class AppController:
         if self.gateway is None:
             page.set_logged_in(False)
             page.set_connection_state(
-                "请先登录 Telegram；已保存的搜索历史仍可查看"
+                "请先登录 Telegram；已保存的搜索历史仍可查看",
+                retryable=False,
             )
             self.show_login()
             return False
 
         if self._gateway_is_connected(self.gateway):
             page.set_logged_in(True)
-            page.set_connection_state("连接正常")
+            page.set_connection_state("连接正常", retryable=False)
             return True
 
         def attempt(value: tuple[int, int]) -> None:
@@ -298,7 +318,7 @@ class AppController:
                 if number == 1
                 else f"正在重连（{number}/{total}）…"
             )
-            page.set_connection_state(text)
+            page.set_connection_state(text, retryable=False)
 
         try:
             await self.connection_recovery.ensure_connected(
@@ -310,19 +330,25 @@ class AppController:
             return False
         except TransientNetworkError:
             page.set_logged_in(False)
-            page.set_connection_state("重连失败，请检查网络或代理后重试")
+            page.set_connection_state(
+                "重连失败，请检查网络或代理后重试",
+                retryable=True,
+            )
             self._show_status("Telegram 重连失败，请检查网络或代理")
             return False
         except Exception as error:
             safe = self._safe_error(error)
             page.set_logged_in(False)
-            page.set_connection_state(f"连接失败：{safe}")
+            page.set_connection_state(f"连接失败：{safe}", retryable=True)
             self._show_status(f"Telegram 连接失败：{safe}")
             return False
 
         page.set_logged_in(True)
-        page.set_connection_state("连接已恢复")
+        page.set_connection_state("连接已恢复", retryable=False)
         return True
+
+    async def retry_telegram_connection(self) -> bool:
+        return await self.ensure_telegram_online()
 
     @staticmethod
     def _gateway_is_connected(gateway: object) -> bool:
@@ -683,7 +709,7 @@ class AppController:
             return
         stale = getattr(self.content_browser, "dialog_cache_stale", None)
         if stale is not None and not stale(timedelta(seconds=60)):
-            self._content_page().set_sync_state("同步完成", busy=False)
+            self._content_page().set_sync_state("同步完成", busy=False, count=0)
             return
         self._dialog_sync_task = self._spawn_background(
             self.refresh_content_dialogs()
@@ -694,24 +720,43 @@ class AppController:
             return
         page = self._content_page()
         current = asyncio.current_task()
+        active = self._dialog_sync_task
+        if active is not None and active is not current and not active.done():
+            return
         if current is not None:
             self._dialog_sync_task = current
-        page.set_sync_state("正在同步群组…", busy=True)
+        discovered = 0
+        page.set_sync_state("正在刷新群组…", busy=True, count=0)
+
+        def progress(value: DialogSyncProgress) -> None:
+            nonlocal discovered
+            discovered = value.discovered
+            page.set_sync_state(
+                f"正在刷新，已发现 {discovered} 个群组/频道",
+                busy=True,
+                count=discovered,
+            )
+
         try:
             if not await self.ensure_telegram_online():
-                page.set_sync_state("同步失败", busy=False)
+                page.set_sync_state("刷新失败", busy=False, count=discovered)
                 return
-            dialogs = await self.content_browser.sync_dialogs()
+            dialogs = await self.content_browser.sync_dialogs(on_progress=progress)
             page.set_dialogs(dialogs)
-            page.set_sync_state("同步完成", busy=False)
+            discovered = len(dialogs)
+            page.set_sync_state(
+                f"刚刚同步，共 {discovered} 个",
+                busy=False,
+                count=discovered,
+            )
         except asyncio.CancelledError:
-            page.set_sync_state("同步已取消", busy=False)
+            page.set_sync_state("刷新已取消", busy=False, count=discovered)
             raise
         except SessionExpiredError as error:
-            page.set_sync_state("登录已失效", busy=False)
+            page.set_sync_state("登录已失效", busy=False, count=discovered)
             await self._handle_session_expired(error)
         except Exception as error:
-            page.set_sync_state("同步失败", busy=False)
+            page.set_sync_state("刷新失败", busy=False, count=discovered)
             self._show_status(f"群组同步失败：{self._safe_error(error)}")
         finally:
             if self._dialog_sync_task is current:
@@ -727,8 +772,10 @@ class AppController:
             return
         page = self._content_page()
         current = asyncio.current_task()
+        await self._cancel_replaced_content_search(current)
         self._content_search_task = current
         page.set_search_busy(True)
+        page.set_search_progress(SearchProgress(0, 0, "正在连接 Telegram"))
         search_id: str | None = None
         try:
             if not await self.ensure_telegram_online():
@@ -736,6 +783,7 @@ class AppController:
             session, results = await self.content_browser.start_search(
                 peer_ref,
                 query,
+                on_progress=page.set_search_progress,
             )
             search_id = session.id
             page.set_active_search(session)
@@ -751,6 +799,7 @@ class AppController:
             if search_id is not None:
                 self._reload_content_search(search_id)
             page.set_search_busy(False)
+            page.set_search_progress(None)
             if self._content_search_task is current:
                 self._content_search_task = None
 
@@ -759,12 +808,17 @@ class AppController:
             return
         page = self._content_page()
         current = asyncio.current_task()
+        await self._cancel_replaced_content_search(current)
         self._content_search_task = current
         page.set_search_busy(True)
+        page.set_search_progress(SearchProgress(0, 0, "正在连接 Telegram"))
         try:
             if not await self.ensure_telegram_online():
                 return
-            session, results = await self.content_browser.load_more(search_id)
+            session, results = await self.content_browser.load_more(
+                search_id,
+                on_progress=page.set_search_progress,
+            )
             page.set_active_search(session)
             page.set_results(results)
             page.set_sessions(self.content_browser.list_sessions())
@@ -777,6 +831,7 @@ class AppController:
         finally:
             self._reload_content_search(search_id)
             page.set_search_busy(False)
+            page.set_search_progress(None)
             if self._content_search_task is current:
                 self._content_search_task = None
 
@@ -784,6 +839,17 @@ class AppController:
         task = self._content_search_task
         if task is not None and not task.done():
             task.cancel()
+
+    async def _cancel_replaced_content_search(
+        self,
+        current: asyncio.Task[Any] | None,
+    ) -> None:
+        task = self._content_search_task
+        if task is None or task is current or task.done():
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
     def set_content_selected(
         self,
@@ -857,6 +923,19 @@ class AppController:
 
         task = self._spawn_background(load())
         self._thumbnail_tasks[result_id] = task
+
+    async def open_content_preview(self, result_id: str) -> None:
+        if self.content_browser is None:
+            return
+        page = self._content_page()
+        try:
+            result = self.content_browser.get_result(result_id)
+            path = await self.content_browser.load_thumbnail(result_id)
+            page.show_preview(result, path)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            page.show_error(self._safe_error(error))
 
     def delete_content_history(self, search_id: str) -> None:
         if self.content_browser is None:
