@@ -95,6 +95,75 @@ QFrame#card, QFrame#statCard {
     border-radius: 10px;
 }
 
+QFrame#contentPanel {
+    background: #101a29;
+    border: 1px solid #25364c;
+    border-radius: 10px;
+}
+
+QSplitter#contentSplitter::handle {
+    width: 8px;
+    background: transparent;
+}
+
+QLabel#contentHint {
+    padding: 8px 11px;
+    border: 1px solid #29435a;
+    border-radius: 7px;
+    background: #102333;
+    color: #93c5d7;
+}
+
+QLabel#errorText {
+    padding: 8px 11px;
+    border: 1px solid #7c3d49;
+    border-radius: 7px;
+    background: #301923;
+    color: #fda4af;
+}
+
+QLabel#selectionSummary {
+    color: #67e8f9;
+    font-weight: 650;
+}
+
+QTabWidget::pane {
+    border: 1px solid #283950;
+    border-radius: 8px;
+    background: #0e1724;
+}
+
+QTabBar::tab {
+    min-width: 92px;
+    min-height: 32px;
+    padding: 0 12px;
+    border: 1px solid #283950;
+    background: #111c2b;
+    color: #8fa2ba;
+}
+
+QTabBar::tab:selected {
+    border-color: #2d7284;
+    background: #173341;
+    color: #67e8f9;
+}
+
+QListView {
+    border: 1px solid #283950;
+    border-radius: 8px;
+    background: #0e1724;
+    color: #dfe9f6;
+    selection-background-color: #18495a;
+    selection-color: #f5fdff;
+    outline: 0;
+}
+
+QListView::item {
+    min-height: 38px;
+    padding: 0 8px;
+    border-bottom: 1px solid #18263a;
+}
+
 QLabel#statValue {
     color: #f8fbff;
     font-size: 22px;

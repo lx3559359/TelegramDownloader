@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSpinBox,
+    QStackedWidget,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
 
 from telegram_downloader import __version__
 from telegram_downloader.domain import MediaKind, TaskStatus
+from telegram_downloader.ui.content_browser import ContentBrowserPage
 from telegram_downloader.ui.models import TaskSummary, TaskTableModel
 from telegram_downloader.ui.theme import DARK_STYLESHEET, ensure_cjk_font
 
@@ -59,8 +61,14 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
         root_layout.addWidget(self._build_navigation())
-        root_layout.addWidget(self._build_workspace(), 1)
-        root_layout.addWidget(self._build_statistics())
+        self.task_page = self._build_workspace()
+        self.content_page = ContentBrowserPage()
+        self.page_stack = QStackedWidget()
+        self.page_stack.addWidget(self.task_page)
+        self.page_stack.addWidget(self.content_page)
+        root_layout.addWidget(self.page_stack, 1)
+        self.statistics_panel = self._build_statistics()
+        root_layout.addWidget(self.statistics_panel)
         self.setCentralWidget(root)
         self.statusBar().showMessage("准备就绪")
 
@@ -80,6 +88,8 @@ class MainWindow(QMainWindow):
         self.task_table.selectionModel().selectionChanged.connect(
             self._update_action_state
         )
+        self.tasks_nav_button.clicked.connect(lambda: self.show_page("tasks"))
+        self.content_nav_button.clicked.connect(lambda: self.show_page("content"))
         self._update_action_state()
 
     def _build_navigation(self) -> QWidget:
@@ -109,14 +119,16 @@ class MainWindow(QMainWindow):
         layout.addLayout(brand)
         layout.addSpacing(25)
 
-        tasks = self._nav_button("任务中心", active=True)
-        login = self._nav_button("账号登录")
-        settings = self._nav_button("设置")
-        login.clicked.connect(self.login_requested.emit)
-        settings.clicked.connect(self.settings_requested.emit)
-        layout.addWidget(tasks)
-        layout.addWidget(login)
-        layout.addWidget(settings)
+        self.tasks_nav_button = self._nav_button("任务中心", active=True)
+        self.content_nav_button = self._nav_button("账号内容")
+        self.login_nav_button = self._nav_button("账号登录")
+        self.settings_nav_button = self._nav_button("设置")
+        self.login_nav_button.clicked.connect(self.login_requested.emit)
+        self.settings_nav_button.clicked.connect(self.settings_requested.emit)
+        layout.addWidget(self.tasks_nav_button)
+        layout.addWidget(self.content_nav_button)
+        layout.addWidget(self.login_nav_button)
+        layout.addWidget(self.settings_nav_button)
         layout.addStretch()
 
         privacy = QLabel("本地存储\n数据不离开应用目录")
@@ -430,3 +442,20 @@ class MainWindow(QMainWindow):
         self.account_badge.setProperty("connected", bool(display_name))
         self.account_badge.style().unpolish(self.account_badge)
         self.account_badge.style().polish(self.account_badge)
+        self.content_page.set_logged_in(bool(display_name))
+
+    def show_page(self, name: str) -> None:
+        content = name == "content"
+        self.page_stack.setCurrentWidget(
+            self.content_page if content else self.task_page
+        )
+        self.statistics_panel.setVisible(not content)
+        self._set_nav_active(
+            self.content_nav_button if content else self.tasks_nav_button
+        )
+
+    def _set_nav_active(self, active_button: QPushButton) -> None:
+        for button in (self.tasks_nav_button, self.content_nav_button):
+            button.setProperty("active", button is active_button)
+            button.style().unpolish(button)
+            button.style().polish(button)

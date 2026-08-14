@@ -173,3 +173,20 @@ def test_live_refresh_preserves_selected_task(qtbot) -> None:
 
     assert window.selected_task_id() == "task-1"
     assert window.pause_button.isEnabled() is True
+
+
+def test_content_navigation_switches_page_and_hides_statistics(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+
+    qtbot.mouseClick(window.content_nav_button, Qt.MouseButton.LeftButton)
+
+    assert window.page_stack.currentWidget() is window.content_page
+    assert window.statistics_panel.isHidden() is True
+    assert window.content_nav_button.property("active") is True
+
+    qtbot.mouseClick(window.tasks_nav_button, Qt.MouseButton.LeftButton)
+    assert window.page_stack.currentWidget() is window.task_page
+    assert window.statistics_panel.isHidden() is False
+    assert window.tasks_nav_button.property("active") is True
