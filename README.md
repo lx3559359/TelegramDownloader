@@ -2,7 +2,9 @@
 
 ## 正式版下载
 
-当前正式版：`v0.2.1`（Windows 10/11 x64）
+当前源码候选版：`v0.3.0`（Windows 10/11 x64，尚未正式发布）
+
+当前公开正式版仍为 `v0.2.1`：
 
 - [GitHub Release（安装包与便携包）](https://github.com/lx3559359/TelegramDownloader/releases/tag/v0.2.1)
 - [魔搭镜像仓库](https://modelscope.cn/models/lx3559359/TelegramDownloader)
@@ -16,6 +18,10 @@
 ## 主要功能
 
 - 单条 `t.me` 消息链接下载，自动扩展同一相册。
+- “账号内容”入口自动列出当前账号已经加入的群组和频道；不会自动加入会话，也不会展示陌生账号内容。
+- 在选定群组/频道内使用 Telegram 服务端关键词搜索（关键词必填），首批显示后可继续“加载更多”。
+- 搜索结果支持相册完整补齐后逐项选择、全选/反选和选择性加入下载队列；已存在任务会自动跳过并报告。
+- 搜索记录和勾选状态可在重启后恢复；离线时仍可查看缓存记录，但同步、搜索和加入队列需要重新联网。
 - 首次配置个人 API ID/API Hash 后，默认使用 Telegram App 扫二维码登录；保留手机号验证码备用入口。
 - 频道/群组按包含式日期范围、图片、视频、音频、语音、文档、压缩包和数量上限扫描。
 - 专业三栏任务工作台，显示状态、进度、大小、速度、剩余时间和持久错误原因。
@@ -41,8 +47,9 @@ TelegramDownloader/
 │  ├─ config/settings.json
 │  ├─ config/secrets.dat
 │  ├─ database/tasks.sqlite3
+│  ├─ database/catalog.sqlite3
 │  ├─ logs/app.log
-│  ├─ cache/
+│  ├─ cache/thumbnails/
 │  ├─ temp/
 │  └─ update/
 └─ downloads/
@@ -71,6 +78,14 @@ TelegramDownloader/
 API Hash、代理密码和 Telethon StringSession 会写入 `data/config/secrets.dat`，但内容由 DPAPI 加密。把整个便携目录复制到另一台电脑或另一个 Windows 用户后，密文通常无法解密，需要重新登录。
 
 ## 下载流程
+
+### 浏览账号内容并选择下载
+
+打开左侧“账号内容”，程序会读取当前账号已经加入的群组和频道。选择会话后输入必填关键词，设置日期、媒体类型和 1–10,000 的结果上限，再开始搜索。每次最多读取一页，尚有结果时可点击“加载更多”。
+
+相册会完整补齐但仍可逐项勾选；同一媒体不会因分页或相册重叠而重复显示。加入队列前和数据库提交瞬间都会再次去重，界面会分别报告已加入、重复和不可用数量。搜索历史保存在 `data/database/catalog.sqlite3`，缩略图保存在 `data/cache/thumbnails/`；它们和下载任务数据库相互独立。
+
+设置页的“清理缩略图缓存”只删除缩略图文件，不删除搜索记录或下载文件。删除单条搜索记录或清空当前账号历史时，只清理已无其他记录引用的缩略图。离线启动可以查看已保存历史和结果，但不能刷新会话、发起搜索或加入下载队列。
 
 ### 单条消息或相册
 
@@ -128,8 +143,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1
 
 ```text
 dist/TelegramDownloader/TelegramDownloader.exe
-dist/TelegramDownloader-0.2.1-win-x64-portable.zip
-dist/release/TelegramDownloader-0.2.1-win-x64-setup.exe
+dist/TelegramDownloader-0.3.0-win-x64-portable.zip
+dist/release/TelegramDownloader-0.3.0-win-x64-setup.exe
 ```
 
 安装器构建会把 Inno Setup 7.0.2 以便携方式放在项目 `.tool-cache` 中，并在使用前核对官方固定 SHA-256 和 Authenticode 发布者；编译、安装及卸载冒烟测试的临时目录和日志都位于 `.build-temp`。安装验收会真实验证 C 盘拒绝、D 盘安装、自检、原位升级、在线更新运行时文件存在，以及普通卸载后用户数据仍保留。

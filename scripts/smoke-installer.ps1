@@ -98,11 +98,33 @@ foreach ($entry in $report.writable_paths.PSObject.Properties) {
     }
 }
 
-$sentinel = Join-Path $installDir 'data\sentinel.keep'
+$catalogPath = Assert-ProjectChild (Join-Path $installDir 'data\database\catalog.sqlite3')
+$thumbnailPath = Assert-ProjectChild (Join-Path $installDir 'data\cache\thumbnails\preserve.thumb')
+$sentinel = Assert-ProjectChild (Join-Path $installDir 'data\sentinel.keep')
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $catalogPath), (Split-Path -Parent $thumbnailPath) | Out-Null
+& $python -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('INSERT OR REPLACE INTO accounts(account_id,display_name,last_used_at) VALUES(?,?,?)',('synthetic-smoke','Synthetic Smoke','2026-01-01T00:00:00+00:00')); c.commit(); c.close()" $catalogPath
+if ($LASTEXITCODE -ne 0) {
+    throw 'Unable to create synthetic catalog smoke data'
+}
+[IO.File]::WriteAllBytes($thumbnailPath, [byte[]](1, 2, 3, 4))
 Set-Content -LiteralPath $sentinel -Value 'preserve-on-upgrade-and-uninstall' -Encoding UTF8
+$preservedPaths = @($catalogPath, $thumbnailPath, $sentinel)
+$preservedHashes = @{}
+foreach ($path in $preservedPaths) {
+    $preservedHashes[$path] = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash
+}
+
 $upgraded = Start-Process -FilePath $setup -ArgumentList $installArguments -WorkingDirectory $smokeRoot -Wait -PassThru -WindowStyle Hidden
 if ($upgraded.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $sentinel -PathType Leaf)) {
     throw 'Installer upgrade did not preserve project-local data'
+}
+foreach ($path in $preservedPaths) {
+    if (
+        -not (Test-Path -LiteralPath $path -PathType Leaf) -or
+        (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash -ne $preservedHashes[$path]
+    ) {
+        throw "upgrade changed preserved user data: $path"
+    }
 }
 
 $uninstaller = Join-Path $installDir 'unins000.exe'
@@ -116,6 +138,14 @@ if ($uninstalled.ExitCode -ne 0) {
 }
 if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf)) {
     throw 'Normal uninstall removed user data'
+}
+foreach ($path in $preservedPaths) {
+    if (
+        -not (Test-Path -LiteralPath $path -PathType Leaf) -or
+        (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash -ne $preservedHashes[$path]
+    ) {
+        throw "uninstall changed preserved user data: $path"
+    }
 }
 if (Test-Path -LiteralPath $exe) {
     throw 'Normal uninstall did not remove managed runtime files'

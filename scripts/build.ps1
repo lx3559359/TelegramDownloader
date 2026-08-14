@@ -20,6 +20,12 @@ $existingAppDir = Assert-ProjectChild (Join-Path $dist 'TelegramDownloader')
 $preservationRoot = Assert-ProjectChild (Join-Path $buildTemp (
     'build-runtime-preservation-' + [Guid]::NewGuid().ToString('N')
 ))
+$preservedHashes = @{}
+$preservedFiles = @(
+    'data\database\catalog.sqlite3',
+    'data\cache\thumbnails\preserve.thumb',
+    'data\sentinel.keep'
+)
 
 $env:TEMP = $buildTemp
 $env:TMP = $buildTemp
@@ -50,6 +56,12 @@ if (Test-Path -LiteralPath $existingExe -PathType Leaf) {
 }
 
 $preservedRuntime = $false
+foreach ($relativePath in $preservedFiles) {
+    $candidate = Assert-ProjectChild (Join-Path $existingAppDir $relativePath)
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+        $preservedHashes[$relativePath] = (Get-FileHash -Algorithm SHA256 -LiteralPath $candidate).Hash
+    }
+}
 foreach ($runtimeData in ('data', 'downloads')) {
     $source = Assert-ProjectChild (Join-Path $existingAppDir $runtimeData)
     if (Test-Path -LiteralPath $source) {
@@ -99,6 +111,24 @@ try {
         Remove-Item -LiteralPath $zip -Force
     }
     Compress-Archive -Path (Join-Path $appDir '*') -DestinationPath $zip -CompressionLevel Optimal
+    $zipValidation = Assert-ProjectChild (Join-Path $buildTemp 'portable-zip-validation')
+    if (Test-Path -LiteralPath $zipValidation) {
+        Remove-Item -LiteralPath $zipValidation -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force -Path $zipValidation | Out-Null
+    try {
+        Expand-Archive -LiteralPath $zip -DestinationPath $zipValidation -Force
+        foreach ($runtimeData in ('data', 'downloads')) {
+            $unexpected = Assert-ProjectChild (Join-Path $zipValidation $runtimeData)
+            if (Test-Path -LiteralPath $unexpected) {
+                throw "Portable ZIP unexpectedly contains user data: $runtimeData"
+            }
+        }
+    } finally {
+        if (Test-Path -LiteralPath $zipValidation) {
+            Remove-Item -LiteralPath $zipValidation -Recurse -Force
+        }
+    }
     Write-Output $zip
 } finally {
     if ($preservedRuntime) {
@@ -113,6 +143,16 @@ try {
                 Remove-Item -LiteralPath $destination -Recurse -Force
             }
             Copy-Item -LiteralPath $preserved -Destination $destination -Recurse -Force
+        }
+        foreach ($relativePath in $preservedHashes.Keys) {
+            $restored = Assert-ProjectChild (Join-Path $existingAppDir $relativePath)
+            if (-not (Test-Path -LiteralPath $restored -PathType Leaf)) {
+                throw "Build did not restore preserved user data: $relativePath"
+            }
+            $restoredHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $restored).Hash
+            if ($restoredHash -ne $preservedHashes[$relativePath]) {
+                throw "Build changed preserved user data: $relativePath"
+            }
         }
         Remove-Item -LiteralPath $preservationRoot -Recurse -Force
     }

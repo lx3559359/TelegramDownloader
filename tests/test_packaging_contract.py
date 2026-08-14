@@ -47,7 +47,7 @@ def test_chinese_guide_documents_portable_data_and_security() -> None:
         assert required in readme
 
 
-def test_v023_version_and_qr_runtime_contract_are_consistent() -> None:
+def test_v030_version_and_content_runtime_contract_are_consistent() -> None:
     root = Path(__file__).parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     package_init = (root / "src/telegram_downloader/__init__.py").read_text(
@@ -58,15 +58,23 @@ def test_v023_version_and_qr_runtime_contract_are_consistent() -> None:
     installer = (root / "installer/TelegramDownloader.iss").read_text(encoding="utf-8")
     requirements = (root / "requirements.txt").read_text(encoding="utf-8")
     spec = (root / "TelegramDownloader.spec").read_text(encoding="utf-8")
+    app = (root / "src/telegram_downloader/app.py").read_text(encoding="utf-8")
 
-    assert project["project"]["version"] == "0.2.3"
-    assert '__version__ = "0.2.3"' in package_init
-    assert '#define AppVersion "0.2.3"' in installer
+    assert project["project"]["version"] == "0.3.0"
+    assert '__version__ = "0.3.0"' in package_init
+    assert '#define AppVersion "0.3.0"' in installer
     assert "qrcode==8.2" in requirements
     assert '"qrcode"' in spec
     assert "app_version=__version__" in gateway
     assert 'f"v{__version__} · stable"' in main
     assert "v0.1.0 · stable" not in main
+    for component in (
+        "ContentBrowserService",
+        "CatalogRepository",
+        "ThumbnailCache",
+    ):
+        assert f"import {component}" in app
+        assert f"{component}(" in app
 
 
 def test_build_preserves_existing_project_local_runtime_data() -> None:
@@ -80,5 +88,11 @@ def test_build_preserves_existing_project_local_runtime_data() -> None:
         "Copy-Item -LiteralPath $source",
         "finally {",
         "Copy-Item -LiteralPath $preserved",
+        "data\\database\\catalog.sqlite3",
+        "data\\cache\\thumbnails\\preserve.thumb",
+        "data\\sentinel.keep",
+        "Get-FileHash",
+        "Expand-Archive",
+        "Portable ZIP unexpectedly contains user data",
     ):
         assert required in script

@@ -22,6 +22,16 @@ if (-not $report.ok) {
     throw 'Packaged path self-test failed'
 }
 $appPrefix = $appDir.TrimEnd('\') + '\'
+foreach ($requiredPath in ('catalog_database', 'thumbnail_cache')) {
+    $property = $report.writable_paths.PSObject.Properties[$requiredPath]
+    if ($null -eq $property) {
+        throw "Self-test omitted required writable path: $requiredPath"
+    }
+    $requiredResolved = [IO.Path]::GetFullPath([string]$property.Value)
+    if (-not $requiredResolved.StartsWith($appPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Required path escaped package: $requiredResolved"
+    }
+}
 foreach ($entry in $report.writable_paths.PSObject.Properties) {
     $resolved = [IO.Path]::GetFullPath([string]$entry.Value)
     if (-not $resolved.StartsWith($appPrefix, [StringComparison]::OrdinalIgnoreCase)) {

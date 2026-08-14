@@ -46,7 +46,12 @@ def test_installer_build_and_smoke_paths_are_project_local_and_versioned() -> No
     for required in (
         ".build-temp\\installed-smoke",
         "--self-test",
-        "sentinel",
+        "data\\database\\catalog.sqlite3",
+        "data\\cache\\thumbnails\\preserve.thumb",
+        "data\\sentinel.keep",
+        "Get-FileHash",
+        "upgrade changed preserved user data",
+        "uninstall changed preserved user data",
         "C:\\TelegramDownloader-Installer-Rejection-Smoke",
         "Uninstall",
     ):
