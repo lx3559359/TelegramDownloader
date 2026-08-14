@@ -17,6 +17,7 @@ from telegram_downloader.content import (
     SearchSession,
     SearchStatus,
 )
+from telegram_downloader.content_progress import DialogSyncProgress, SearchProgress
 from telegram_downloader.gateway import (
     AccessDeniedError,
     FloodWaitError,
@@ -72,7 +73,11 @@ class ContentBrowserService:
         planner: TaskPlanner | None = None,
         uuid_factory: Callable[[], str] | None = None,
         clock: Callable[[], datetime] | None = None,
+        album_concurrency: int = 4,
+        thumbnail_concurrency: int = 4,
     ) -> None:
+        if album_concurrency <= 0 or thumbnail_concurrency <= 0:
+            raise ValueError("内容查询并发数必须大于零")
         self.gateway = gateway
         self.catalog = catalog
         self.planner = planner
@@ -83,6 +88,8 @@ class ContentBrowserService:
         self._last_dialog_sync_at: datetime | None = None
         self._sync_lock = asyncio.Lock()
         self._search_lock = asyncio.Lock()
+        self._album_semaphore = asyncio.Semaphore(album_concurrency)
+        self._thumbnail_semaphore = asyncio.Semaphore(thumbnail_concurrency)
 
     @property
     def online(self) -> bool:
@@ -152,19 +159,30 @@ class ContentBrowserService:
         account = self._require_account()
         return self.catalog.list_results(account.account_id, search_id)
 
-    async def sync_dialogs(self) -> list[ContentDialog]:
+    def get_result(self, result_id: str) -> SearchResult:
+        account = self._require_account()
+        return self.catalog.get_result(account.account_id, result_id)
+
+    async def sync_dialogs(
+        self,
+        *,
+        on_progress: Callable[[DialogSyncProgress], None] | None = None,
+    ) -> list[ContentDialog]:
         async with self._sync_lock:
             gateway, _planner = self._require_online()
             account = self._require_account()
             now = self.clock()
-            dialogs = [
-                replace(
-                    item,
-                    account_id=account.account_id,
-                    last_synced_at=now,
+            dialogs: list[ContentDialog] = []
+            async for item in gateway.iter_content_dialogs(account.account_id):
+                dialogs.append(
+                    replace(
+                        item,
+                        account_id=account.account_id,
+                        last_synced_at=now,
+                    )
                 )
-                async for item in gateway.iter_content_dialogs(account.account_id)
-            ]
+                if on_progress is not None:
+                    on_progress(DialogSyncProgress(len(dialogs)))
             if self.account != account:
                 return self.list_dialogs()
             self.catalog.replace_dialogs(account.account_id, dialogs, now)
@@ -175,6 +193,8 @@ class ContentBrowserService:
         self,
         peer_ref: str,
         query: ContentSearchQuery,
+        *,
+        on_progress: Callable[[SearchProgress], None] | None = None,
     ) -> tuple[SearchSession, list[SearchResult]]:
         async with self._search_lock:
             account = self._require_account()
@@ -190,11 +210,13 @@ class ContentBrowserService:
                 query,
                 self.clock(),
             )
-            return await self._fetch_page(session)
+            return await self._fetch_page(session, on_progress=on_progress)
 
     async def load_more(
         self,
         search_id: str,
+        *,
+        on_progress: Callable[[SearchProgress], None] | None = None,
     ) -> tuple[SearchSession, list[SearchResult]]:
         async with self._search_lock:
             account = self._require_account()
@@ -202,11 +224,13 @@ class ContentBrowserService:
             session = self.catalog.get_session(account.account_id, search_id)
             if session.exhausted:
                 return session, self.catalog.list_results(account.account_id, search_id)
-            return await self._fetch_page(session)
+            return await self._fetch_page(session, on_progress=on_progress)
 
     async def _fetch_page(
         self,
         session: SearchSession,
+        *,
+        on_progress: Callable[[SearchProgress], None] | None = None,
     ) -> tuple[SearchSession, list[SearchResult]]:
         account = self._require_account()
         gateway, planner = self._require_online()
@@ -215,25 +239,32 @@ class ContentBrowserService:
                 session.peer_ref,
                 session.query,
                 session.cursor,
+                on_progress=on_progress,
             )
             expanded = list(page.items)
-            expanded_groups: set[int] = set()
             group_triggers: dict[int, int] = {}
             for hit in page.items:
                 grouped_id = hit.remote.grouped_id
                 if grouped_id is None:
                     continue
                 group_triggers.setdefault(grouped_id, hit.remote.message_id)
-                if grouped_id in expanded_groups:
-                    continue
-                expanded_groups.add(grouped_id)
-                expanded.extend(
-                    await gateway.expand_album(
+
+            async def expand(
+                trigger: tuple[int, int],
+            ) -> tuple[RemoteSearchHit, ...]:
+                grouped_id, message_id = trigger
+                async with self._album_semaphore:
+                    return await gateway.expand_album(
                         session.peer_ref,
-                        hit.remote.message_id,
+                        message_id,
                         grouped_id,
                     )
-                )
+
+            album_values = await asyncio.gather(
+                *(expand(item) for item in group_triggers.items())
+            )
+            for values in album_values:
+                expanded.extend(values)
 
             unique = self._deduplicate_hits(expanded)
             existing_results = self.catalog.list_results(
@@ -465,11 +496,12 @@ class ContentBrowserService:
         if self.gateway is None:
             return None
         try:
-            content = await self.gateway.load_thumbnail(
-                result.peer_ref,
-                result.message_id,
-                result.media_id,
-            )
+            async with self._thumbnail_semaphore:
+                content = await self.gateway.load_thumbnail(
+                    result.peer_ref,
+                    result.message_id,
+                    result.media_id,
+                )
         except asyncio.CancelledError:
             raise
         except Exception:

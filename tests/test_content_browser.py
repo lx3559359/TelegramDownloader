@@ -19,6 +19,7 @@ from telegram_downloader.content_browser import (
     ContentBrowserService,
     NothingToQueueError,
 )
+from telegram_downloader.content_progress import DialogSyncProgress, SearchProgress
 from telegram_downloader.domain import (
     MediaItem,
     MediaKind,
@@ -104,11 +105,13 @@ class FakeGateway:
 
         return generate()
 
-    async def search_media_page(self, peer_ref, query, cursor):
+    async def search_media_page(self, peer_ref, query, cursor, *, on_progress=None):
         self.search_cursors.append(cursor)
         value = self.pages.pop(0)
         if isinstance(value, BaseException):
             raise value
+        if on_progress is not None:
+            on_progress(SearchProgress(len(value.items), len(value.items), "正在整理结果"))
         return value
 
     async def expand_album(self, peer_ref, message_id, grouped_id):
@@ -152,6 +155,212 @@ def initialized_catalog(tmp_path: Path) -> CatalogRepository:
     catalog = CatalogRepository(tmp_path / "catalog.sqlite3")
     catalog.initialize()
     return catalog
+
+
+async def prepared_online_service(
+    tmp_path: Path,
+    now: datetime,
+    gateway: FakeGateway,
+    *,
+    album_concurrency: int = 4,
+    thumbnail_concurrency: int = 4,
+) -> ContentBrowserService:
+    catalog = initialized_catalog(tmp_path)
+    service = ContentBrowserService(
+        catalog,
+        ThumbnailCache(tmp_path / "thumbs"),
+        gateway=gateway,
+        planner=PlannerStub(),
+        clock=lambda: now,
+        album_concurrency=album_concurrency,
+        thumbnail_concurrency=thumbnail_concurrency,
+    )
+    await service.activate_account()
+    catalog.replace_dialogs(
+        "a1",
+        [make_dialog("a1", "-1001", "资料群", now)],
+        now,
+    )
+    return service
+
+
+@pytest.mark.asyncio
+async def test_sync_and_search_forward_incremental_progress(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    gateway = FakeGateway(AccountProfile("a1", "账号一"))
+    gateway.dialogs = [
+        make_dialog("a1", "-1001", "群一", now),
+        make_dialog("a1", "-1002", "群二", now),
+    ]
+    gateway.pages = [RemoteSearchPage((make_hit(10, now),), None, True)]
+    service = ContentBrowserService(
+        initialized_catalog(tmp_path),
+        ThumbnailCache(tmp_path / "thumbs"),
+        gateway=gateway,
+        planner=PlannerStub(),
+        clock=lambda: now,
+    )
+    await service.activate_account()
+    sync_events: list[DialogSyncProgress] = []
+
+    await service.sync_dialogs(on_progress=sync_events.append)
+
+    assert [item.discovered for item in sync_events] == [1, 2]
+    search_events: list[SearchProgress] = []
+
+    await service.start_search(
+        "-1001",
+        make_query(now),
+        on_progress=search_events.append,
+    )
+
+    assert search_events[-1].inspected == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_dialog_sync_preserves_cached_dialogs(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    catalog = initialized_catalog(tmp_path)
+    catalog.upsert_account(AccountProfile("a1", "账号一"), now)
+    old = make_dialog("a1", "-1001", "旧缓存群", now)
+    catalog.replace_dialogs("a1", [old], now)
+
+    class Gateway(FakeGateway):
+        def iter_content_dialogs(self, account_id: str):
+            async def generate():
+                yield make_dialog(account_id, "-1002", "未完成的新群", now)
+                raise TransientNetworkError("offline")
+
+            return generate()
+
+    gateway = Gateway(AccountProfile("a1", "账号一"))
+    service = ContentBrowserService(
+        catalog,
+        ThumbnailCache(tmp_path / "thumbs"),
+        gateway=gateway,
+        planner=PlannerStub(),
+        clock=lambda: now,
+    )
+    await service.activate_account()
+
+    with pytest.raises(TransientNetworkError):
+        await service.sync_dialogs()
+
+    assert catalog.list_dialogs("a1") == [old]
+
+
+@pytest.mark.asyncio
+async def test_album_expansion_uses_at_most_four_concurrent_requests(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    reached_four = asyncio.Event()
+    release = asyncio.Event()
+
+    class Gateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__(AccountProfile("a1", "账号一"))
+            self.active = 0
+            self.max_active = 0
+
+        async def expand_album(self, _peer_ref, _message_id, _grouped_id):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            if self.active == 4:
+                reached_four.set()
+            await release.wait()
+            self.active -= 1
+            return ()
+
+    gateway = Gateway()
+    gateway.pages = [
+        RemoteSearchPage(
+            tuple(make_hit(100 - value, now, grouped_id=value) for value in range(1, 6)),
+            None,
+            True,
+        )
+    ]
+    service = await prepared_online_service(
+        tmp_path,
+        now,
+        gateway,
+        album_concurrency=4,
+    )
+    operation = asyncio.create_task(service.start_search("-1001", make_query(now)))
+    try:
+        await asyncio.wait_for(reached_four.wait(), timeout=1)
+        assert gateway.max_active == 4
+    finally:
+        release.set()
+    _session, results = await operation
+
+    assert [item.message_id for item in results] == [99, 98, 97, 96, 95]
+
+
+@pytest.mark.asyncio
+async def test_thumbnail_loading_uses_at_most_four_concurrent_requests(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    reached_four = asyncio.Event()
+    release = asyncio.Event()
+
+    class Gateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__(AccountProfile("a1", "账号一"))
+            self.active = 0
+            self.max_active = 0
+
+        async def load_thumbnail(self, _peer_ref, _message_id, _media_id):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            if self.active == 4:
+                reached_four.set()
+            await release.wait()
+            self.active -= 1
+            return b"thumbnail"
+
+    gateway = Gateway()
+    service = await prepared_online_service(
+        tmp_path,
+        now,
+        gateway,
+        thumbnail_concurrency=4,
+    )
+    session = service.catalog.begin_search(
+        "s1", "a1", "-1001", "资料群", make_query(now), now
+    )
+    hits = [make_hit(100 - value, now) for value in range(6)]
+    saved = [
+        service._result_from_hit("a1", session, hit, queued=False) for hit in hits
+    ]
+    service.catalog.save_search_page("a1", "s1", session.generation, saved)
+    assert service.get_result(saved[0].id) == saved[0]
+    tasks = [asyncio.create_task(service.load_thumbnail(item.id)) for item in saved]
+    try:
+        await asyncio.wait_for(reached_four.wait(), timeout=1)
+        assert gateway.max_active == 4
+    finally:
+        release.set()
+
+    assert all(path is not None for path in await asyncio.gather(*tasks))
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [("album_concurrency", 0), ("thumbnail_concurrency", 0)],
+)
+def test_content_lookup_concurrency_must_be_positive(
+    tmp_path: Path,
+    name: str,
+    value: int,
+) -> None:
+    with pytest.raises(ValueError, match="并发数"):
+        ContentBrowserService(
+            initialized_catalog(tmp_path / name),
+            ThumbnailCache(tmp_path / f"{name}-thumbs"),
+            **{name: value},
+        )
 
 
 @pytest.mark.asyncio
