@@ -23,7 +23,9 @@ from telegram_downloader.update_contract import (
     SIGNATURE_MAX_BYTES,
     ReleaseManifest,
     UpdateContractError,
+    UpdatePolicyError,
     parse_latest_pointer,
+    parse_version,
     verify_asset,
     verify_manifest,
 )
@@ -116,7 +118,14 @@ class UpdateCoordinator:
             self._check_source(UpdateSourceId.GITHUB),
             self._check_source(UpdateSourceId.MODELSCOPE),
         )
-        return reconcile_sources((checks[0], checks[1]), self.current_version)
+        update = reconcile_sources((checks[0], checks[1]), self.current_version)
+        if (
+            update.manifest is not None
+            and parse_version(self.current_version)
+            < parse_version(update.manifest.minimum_updater_version)
+        ):
+            raise UpdatePolicyError("当前更新器版本过低，无法安全应用该更新")
+        return update
 
     async def startup(
         self,
@@ -178,7 +187,6 @@ class UpdateCoordinator:
                 manifest_bytes,
                 signature,
                 self.trusted_keys,
-                installed_version=self.current_version,
             )
             if verified.manifest.version != latest.version:
                 raise UpdateContractError("版本指针与签名清单不一致")

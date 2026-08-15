@@ -15,10 +15,19 @@ from telegram_downloader.update import (
     UpdateStartupResult,
 )
 from telegram_downloader.update_contract import canonical_json
-from telegram_downloader.update_sources import GitHubSourceUrls, ModelScopeSourceUrls
+from telegram_downloader.update_sources import (
+    GitHubSourceUrls,
+    ModelScopeSourceUrls,
+    UpdateSourceId,
+)
 
 
-def release_documents(version: str, runtime: bytes):
+def release_documents(
+    version: str,
+    runtime: bytes,
+    *,
+    minimum_updater_version: str = "0.1.0",
+):
     github = GitHubSourceUrls("lx3559359", "TelegramDownloader")
     modelscope = ModelScopeSourceUrls("lx3559359/TelegramDownloader")
     runtime_name = f"TelegramDownloader-{version}-win-x64-portable.zip"
@@ -30,7 +39,7 @@ def release_documents(version: str, runtime: bytes):
         "architecture": "x64",
         "version": version,
         "publishedAt": "2026-08-13T12:00:00Z",
-        "minimumUpdaterVersion": "0.1.0",
+        "minimumUpdaterVersion": minimum_updater_version,
         "keyId": "test",
         "releaseNotes": "更新说明",
         "assets": {
@@ -138,6 +147,51 @@ async def test_accepted_update_downloads_then_launches_project_local_helper(tmp_
     assert launched[0].package.is_relative_to(tmp_path)
     assert launched[0].parent_pid > 0
     assert shutdown == [True]
+
+
+@pytest.mark.asyncio
+async def test_signed_older_release_is_no_update_not_invalid(tmp_path) -> None:
+    runtime = b"runtime"
+    documents, keys = release_documents("0.3.1", runtime)
+    coordinator = UpdateCoordinator(
+        PortablePaths(tmp_path),
+        "0.4.2",
+        keys,
+        BytesClient(documents),
+        Downloader(runtime),
+    )
+
+    update = await coordinator.check_for_update()
+    startup = await coordinator.startup(lambda _manifest: True, lambda: None)
+
+    assert update.manifest is None
+    assert update.blocked is False
+    assert set(update.available_sources) == {
+        UpdateSourceId.GITHUB,
+        UpdateSourceId.MODELSCOPE,
+    }
+    assert startup is UpdateStartupResult.NO_UPDATE
+
+
+@pytest.mark.asyncio
+async def test_newer_release_requiring_newer_updater_is_blocked(tmp_path) -> None:
+    runtime = b"runtime"
+    documents, keys = release_documents(
+        "0.5.0",
+        runtime,
+        minimum_updater_version="0.4.3",
+    )
+    coordinator = UpdateCoordinator(
+        PortablePaths(tmp_path),
+        "0.4.2",
+        keys,
+        BytesClient(documents),
+        Downloader(runtime),
+    )
+
+    result = await coordinator.startup(lambda _manifest: True, lambda: None)
+
+    assert result is UpdateStartupResult.BLOCKED
 
 
 @pytest.mark.asyncio
