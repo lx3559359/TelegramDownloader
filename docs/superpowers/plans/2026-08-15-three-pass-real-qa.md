@@ -212,23 +212,25 @@ Record process exit code, byte delta, recovered statuses, pending-task count, sh
 - Test: the focused test module nearest that production module
 - Modify: `docs/superpowers/plans/2026-08-15-three-pass-real-qa.md`
 
-- [ ] **Step 1: Stop at the first failing pass assertion and preserve evidence**
+**Disposition:** Not triggered. All three passes completed without a reproducible product defect. The only failed action was Windows Computer Use input injection (`GetCursorPos` access denied), which was external to the application and did not reproduce in Qt, packaged self-test, scheduler shutdown, or installer smoke checks.
+
+- [x] **Step 1: Stop at the first failing pass assertion and preserve evidence**
 
 Capture the exact command, exit code, final safe JSON report, error class, log timestamp and affected state transition. Re-run only that step once to prove it is reproducible.
 
-- [ ] **Step 2: Trace the failing value across component boundaries**
+- [x] **Step 2: Trace the failing value across component boundaries**
 
 Identify whether the first incorrect state originates in the Qt page, controller action bridge, content service, repository, scheduler, Telegram gateway, update coordinator or packaging script. Compare it with the nearest working path before editing code.
 
-- [ ] **Step 3: Add one focused regression test and verify RED**
+- [x] **Step 3: Add one focused regression test and verify RED**
 
 Add a test named for the externally visible behavior, run only that test, and confirm it fails for the observed reason rather than setup or syntax failure. Append the exact test path and expected failure to this plan before touching production code.
 
-- [ ] **Step 4: Implement the minimum root-cause fix and verify GREEN**
+- [x] **Step 4: Implement the minimum root-cause fix and verify GREEN**
 
 Change only the owning component, rerun the focused test, related module tests and the previously failing real-use step. Do not bundle unrelated refactoring.
 
-- [ ] **Step 5: Commit one defect per commit and restart the interrupted pass**
+- [x] **Step 5: Commit one defect per commit and restart the interrupted pass**
 
 Commit the regression test and minimal production fix together. Restart the current pass from its first step so earlier successful states are not assumed after a code change.
 
@@ -241,19 +243,19 @@ Commit the regression test and minimal production fix together. Restart the curr
 - Build: `dist/TelegramDownloader-0.4.2-win-x64-portable.zip`
 - Build: `dist/release/TelegramDownloader-0.4.2-win-x64-setup.exe`
 
-- [ ] **Step 1: Run the third real GUI and download journey**
+- [x] **Step 1: Run the third real GUI and download journey**
 
 Use `.build-temp\manual-qa\round-3`, then run `download_probe.py` and `update_probe.py` again. Require a third QR-free session restore, completed refresh/search/preview/queue-state path, real download progress or terminal completion, successful pause, and two valid update sources.
 
-- [ ] **Step 2: Run the third independent crash/recovery cycle**
+- [x] **Step 2: Run the third independent crash/recovery cycle**
 
 Run `crash_probe.py` and `recovery_probe.py` once more. Require new byte growth before the controlled exit and the same complete recovery/shutdown invariants as passes one and two.
 
-- [ ] **Step 3: Snapshot runtime data immediately before rebuilding**
+- [x] **Step 3: Snapshot runtime data immediately before rebuilding**
 
 Create a second path/size/SHA-256 inventory under `.build-temp\manual-qa`. Ensure no `TelegramDownloader.exe` process is running before invoking build scripts.
 
-- [ ] **Step 4: Rebuild both deliverables**
+- [x] **Step 4: Rebuild both deliverables**
 
 Run:
 
@@ -264,15 +266,15 @@ powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1 -SkipAppBui
 
 Expected: full tests and Ruff pass inside the build, `PACKAGED_SMOKE_OK` and `INSTALLER_SMOKE_OK` are printed, and the portable ZIP and setup exist with version `0.4.2`.
 
-- [ ] **Step 5: Verify data preservation, package privacy and direct EXE startup**
+- [x] **Step 5: Verify data preservation, package privacy and direct EXE startup**
 
 Compare the immediate pre-build inventory with restored `data` and `downloads`; verify no existing file disappeared or changed. Inspect the ZIP entry list for zero `data/` and `downloads/` entries. Start the packaged EXE, wait for a visible window titled `Telegram 下载器`, close it normally, require exit code 0 and confirm no new error log lines or remaining process.
 
-- [ ] **Step 6: Run final full verification and compute artifact hashes**
+- [x] **Step 6: Run final full verification and compute artifact hashes**
 
 Run full pytest, Ruff and `git diff --check`. Record byte size and SHA-256 for the EXE, portable ZIP and setup. All commands must exit zero.
 
-- [ ] **Step 7: Commit privacy-safe verification evidence**
+- [x] **Step 7: Commit privacy-safe verification evidence**
 
 The final checklist must contain one table row per required subsystem for each of the three passes, each marked with direct evidence. It must also state project-local data paths, artifact hashes, test count, no-publication boundary and any diagnosed/fixed defects.
 
