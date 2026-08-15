@@ -69,6 +69,13 @@ class SubscriptionService:
         account = self._require_account()
         return self.catalog.latest_subscription_runs(account.account_id)
 
+    def resume_after_connection(self) -> int:
+        account = self._require_account()
+        return self.catalog.resume_connection_blocked_subscriptions(
+            account.account_id,
+            self.clock(),
+        )
+
     def get_rule(self, rule_id: str) -> SubscriptionRule:
         account = self._require_account()
         return self.catalog.get_subscription(account.account_id, rule_id)

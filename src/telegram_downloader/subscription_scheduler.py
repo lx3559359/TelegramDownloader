@@ -161,12 +161,22 @@ class SubscriptionScheduler:
                 None,
                 "Telegram 登录已失效",
             )
-        except (AccessDeniedError, SubscriptionUnavailableError) as error:
+        except AccessDeniedError as error:
+            self.service.set_enabled(rule.id, False)
+            self._record_failure(
+                rule,
+                SubscriptionState.PAUSED,
+                None,
+                str(error),
+            )
+        except SubscriptionUnavailableError as error:
+            failure_count = rule.failure_count + 1
             self._record_failure(
                 rule,
                 SubscriptionState.FAILED,
-                None,
+                now + self._backoff(failure_count),
                 str(error),
+                failure_count=failure_count,
             )
         except Exception as error:
             failure_count = rule.failure_count + 1

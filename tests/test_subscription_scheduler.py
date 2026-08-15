@@ -139,6 +139,15 @@ class Service:
             failure_count=failure_count,
         )
 
+    def set_enabled(self, rule_id: str, enabled: bool) -> SubscriptionRule:
+        self.rules[rule_id] = replace(
+            self.rules[rule_id],
+            enabled=enabled,
+            state=SubscriptionState.WAITING if enabled else SubscriptionState.PAUSED,
+            next_run_at=NOW if enabled else None,
+        )
+        return self.rules[rule_id]
+
 
 async def wait_until(predicate, timeout: float = 1.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
@@ -296,7 +305,7 @@ async def test_shutdown_cancels_and_awaits_active_rule() -> None:
     ("error", "expected_state", "expected_next"),
     [
         (SessionExpiredError("expired"), SubscriptionState.AUTH_REQUIRED, None),
-        (AccessDeniedError("无权访问"), SubscriptionState.FAILED, None),
+        (AccessDeniedError("无权访问"), SubscriptionState.PAUSED, None),
         (
             RuntimeError("boom"),
             SubscriptionState.FAILED,
@@ -325,3 +334,5 @@ async def test_scheduler_classifies_non_network_failures(
 
     assert service.runtime_calls[0][1] is expected_state
     assert service.runtime_calls[0][2] == expected_next
+    if isinstance(error, AccessDeniedError):
+        assert service.rules["r1"].enabled is False

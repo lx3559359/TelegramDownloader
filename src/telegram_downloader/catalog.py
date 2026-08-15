@@ -173,6 +173,10 @@ class CatalogRepository:
             elif version != 2:
                 raise CatalogError(f"不支持的内容目录版本：{version}")
 
+    def schema_version(self) -> int:
+        with self._connection() as connection:
+            return int(connection.execute("PRAGMA user_version").fetchone()[0])
+
     def upsert_account(self, profile: AccountProfile, used_at: datetime) -> None:
         with self._connection() as connection:
             connection.execute(
@@ -784,6 +788,26 @@ class CatalogRepository:
                     now.isoformat(),
                     SubscriptionState.RUNNING.value,
                     SubscriptionState.BASELINING.value,
+                ),
+            )
+            return cursor.rowcount
+
+    def resume_connection_blocked_subscriptions(
+        self,
+        account_id: str,
+        now: datetime,
+    ) -> int:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE subscription_rules SET state=?, next_run_at=?, updated_at=? "
+                "WHERE account_id=? AND enabled=1 AND state IN (?, ?)",
+                (
+                    SubscriptionState.WAITING.value,
+                    now.isoformat(),
+                    now.isoformat(),
+                    account_id,
+                    SubscriptionState.WAITING_NETWORK.value,
+                    SubscriptionState.AUTH_REQUIRED.value,
                 ),
             )
             return cursor.rowcount

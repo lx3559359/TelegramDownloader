@@ -239,6 +239,9 @@ class _NullSubscriptionService:
     def latest_runs(self) -> dict[str, object]:
         return {}
 
+    def resume_after_connection(self) -> int:
+        return 0
+
     def go_offline(self) -> None:
         pass
 
@@ -753,6 +756,7 @@ class AppController:
             subscription_page = self._subscription_page()
             subscription_page.set_logged_in(True)
             subscription_page.set_dialogs(dialogs)
+            self.subscriptions.resume_after_connection()
             self._reload_subscriptions()
             self.subscription_scheduler.set_account(profile.account_id)
             self.subscription_scheduler.start()

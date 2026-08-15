@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from telegram_downloader import catalog as catalog_module
 from telegram_downloader.catalog import CatalogError, CatalogRepository, StaleSearchError
 from telegram_downloader.content import (
     AccountProfile,
@@ -169,6 +170,26 @@ def test_catalog_schema_v2_keeps_existing_search_tables(tmp_path: Path) -> None:
     with sqlite3.connect(database) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
     assert reopened.list_sessions("a1")[0].query.keyword == "资料"
+
+
+def test_catalog_migrates_existing_v1_database_without_losing_accounts(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    database = tmp_path / "catalog.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(catalog_module._SCHEMA_V1)
+        connection.execute(
+            "INSERT INTO accounts(account_id, display_name, last_used_at) VALUES(?, ?, ?)",
+            ("a1", "旧账号", now.isoformat()),
+        )
+
+    repo = CatalogRepository(database)
+    repo.initialize()
+
+    assert repo.schema_version() == 2
+    assert repo.most_recent_account() == AccountProfile("a1", "旧账号")
+    assert repo.list_subscriptions("a1") == []
 
 
 def test_subscription_crud_and_due_queries_are_account_scoped(

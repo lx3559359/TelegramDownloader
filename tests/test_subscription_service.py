@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -335,3 +336,29 @@ async def test_rule_edit_pause_resume_due_and_delete_lifecycle(
 
     service.delete_rule(saved.id)
     assert service.list_rules() == []
+
+
+@pytest.mark.asyncio
+async def test_successful_reconnection_makes_blocked_rule_due_immediately(
+    tmp_path: Path,
+) -> None:
+    service, _gateway, catalog, _tasks = build_service(tmp_path)
+    saved = await service.create_rule(
+        SubscriptionDraft("-1001", "美女", frozenset({MediaKind.PHOTO}))
+    )
+    catalog.save_subscription(
+        replace(
+            saved,
+            state=SubscriptionState.AUTH_REQUIRED,
+            next_run_at=None,
+            last_error="Telegram 登录已失效",
+        )
+    )
+
+    assert service.resume_after_connection() == 1
+
+    [resumed] = service.list_due_rules(NOW)
+    assert resumed.id == saved.id
+    assert resumed.state is SubscriptionState.WAITING
+    assert resumed.next_run_at == NOW
+    assert resumed.last_error == "Telegram 登录已失效"

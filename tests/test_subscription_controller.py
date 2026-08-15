@@ -109,6 +109,7 @@ class Subscriptions:
         self.account = None
         self.rules = []
         self.calls = []
+        self.resume_count = 0
 
     def set_account(self, account):
         self.account = account
@@ -119,6 +120,10 @@ class Subscriptions:
 
     def latest_runs(self):
         return {"rule-1": "latest"} if self.rules else {}
+
+    def resume_after_connection(self):
+        self.resume_count += 1
+        return 0
 
     def get_rule(self, rule_id):
         return next(item for item in self.rules if item.id == rule_id)
@@ -177,6 +182,7 @@ async def test_account_activation_binds_rules_and_starts_subscription_scheduler(
     await controller.activate_content_account()
 
     assert subscriptions.account == AccountProfile("a1", "账号一")
+    assert subscriptions.resume_count == 1
     assert scheduler.account_ids == ["a1"]
     assert scheduler.started == 1
     assert scheduler.wakes == [None]

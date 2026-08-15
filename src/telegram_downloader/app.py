@@ -119,6 +119,7 @@ def run_self_test(root: Path) -> dict[str, object]:
     report: dict[str, object] = {
         "ok": all(components.values()),
         "version": __version__,
+        "catalog_schema_version": catalog.schema_version(),
         "runtime_root": str(paths.root),
         "components": components,
         "writable_paths": resolved,
