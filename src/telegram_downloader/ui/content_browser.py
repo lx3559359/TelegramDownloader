@@ -607,6 +607,12 @@ class ContentBrowserPage(QWidget):
             text += f" · 已知 {self._format_bytes(known)}"
             if unknown:
                 text += f" · {unknown} 项大小未知"
+        queued = sum(item.available and item.queued for item in self.results)
+        unavailable = sum(not item.available for item in self.results)
+        if queued:
+            text += f" · {queued} 项已入队"
+        if unavailable:
+            text += f" · {unavailable} 项不可用"
         self.selection_summary.setText(text)
 
     def _set_form_from_session(self, session: SearchSession | None) -> None:
@@ -637,16 +643,19 @@ class ContentBrowserPage(QWidget):
             item.selected and item.available and not item.queued
             for item in self.results
         )
+        has_eligible_results = any(
+            item.available and not item.queued for item in self.results
+        )
         self.refresh_button.setEnabled(not self._sync_busy)
         self.connection_retry_button.setEnabled(not self._connection_action_busy)
         self.search_button.setEnabled(form_ready)
         self.keyword_input.setEnabled(form_ready)
         self.cancel_button.setVisible(self._search_busy)
         self.select_all_button.setEnabled(
-            online_ready and dialog_available and bool(self.results)
+            online_ready and dialog_available and has_eligible_results
         )
         self.invert_button.setEnabled(
-            online_ready and dialog_available and bool(self.results)
+            online_ready and dialog_available and has_eligible_results
         )
         self.queue_button.setEnabled(
             online_ready

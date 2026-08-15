@@ -275,19 +275,46 @@ def test_selection_summary_and_queue_signal_skip_unavailable_and_queued(
     queued = replace(result(now, "r4", 6), queued=True)
     page.set_results([first, second, unavailable, queued])
 
+    assert page.select_all_button.isEnabled() is True
+    assert page.invert_button.isEnabled() is True
     qtbot.mouseClick(page.select_all_button, Qt.MouseButton.LeftButton)
 
     assert page.result_model.result_at(0).selected is True
     assert page.result_model.result_at(1).selected is True
     assert page.result_model.result_at(2).selected is False
     assert page.result_model.result_at(3).selected is False
-    assert page.selection_summary.text() == "已选 2 项 · 已知 3.0 MB · 1 项大小未知"
+    assert page.selection_summary.text() == (
+        "已选 2 项 · 已知 3.0 MB · 1 项大小未知 · 1 项已入队 · 1 项不可用"
+    )
 
     with qtbot.waitSignal(page.queue_requested, timeout=500) as caught:
         qtbot.mouseClick(page.queue_button, Qt.MouseButton.LeftButton)
     assert caught.args == ["search-1"]
     assert page.queue_button.text() == "正在准备已选 2 项…"
     assert page.queue_button.isEnabled() is False
+
+
+def test_bulk_selection_explains_when_every_result_is_excluded(qtbot) -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    page = ContentBrowserPage()
+    qtbot.addWidget(page)
+    page.set_logged_in(True)
+    page.set_dialogs([dialog(now)])
+    page.dialog_list.setCurrentIndex(page.dialog_model.index(0, 0))
+    page.set_active_search(session(now))
+    page.set_results(
+        [
+            replace(result(now, "queued-1", 9), queued=True),
+            replace(result(now, "queued-2", 8), queued=True),
+            replace(result(now, "unavailable", 7), available=False),
+        ]
+    )
+
+    assert page.select_all_button.isEnabled() is False
+    assert page.invert_button.isEnabled() is False
+    assert page.selection_summary.text() == (
+        "已选 0 项 · 2 项已入队 · 1 项不可用"
+    )
 
 
 def test_history_open_delete_and_clear_emit_independent_signals(qtbot) -> None:
