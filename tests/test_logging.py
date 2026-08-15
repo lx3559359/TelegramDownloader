@@ -3,7 +3,9 @@ import logging
 from types import SimpleNamespace
 
 from telegram_downloader.controller import AppController
+from telegram_downloader.domain import ItemStatus
 from telegram_downloader.logging import SecretRedactionFilter, configure_logging
+from telegram_downloader.paths import PortablePaths
 
 
 def test_redaction_removes_registered_secrets_and_phone_numbers() -> None:
@@ -107,3 +109,23 @@ def test_subscription_probe_never_logs_or_displays_rule_content(caplog) -> None:
 
     assert window.subscriptions_page.errors == ["操作失败（RuntimeError）"]
     assert all(value not in caplog.text for value in sensitive)
+
+
+def test_rejected_media_path_does_not_display_private_file_name(tmp_path) -> None:
+    private_name = "private-task-file-name.mp4"
+    paths = PortablePaths(tmp_path / "application")
+    paths.ensure_layout()
+
+    class Repository:
+        def get_item(self, _item_id):
+            return SimpleNamespace(
+                status=ItemStatus.COMPLETED,
+                target_path=tmp_path / private_name,
+            )
+
+    controller = AppController.for_test(repository=Repository(), paths=paths)
+
+    controller.open_media_file("item")
+
+    assert controller.window.message.last_message == "安全限制：文件路径不在应用目录内"
+    assert private_name not in controller.window.message.last_message
