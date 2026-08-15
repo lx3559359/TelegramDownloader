@@ -930,6 +930,8 @@ class AppController:
         if existing is not None and not existing.done():
             return
 
+        task: asyncio.Task[Any] | None = None
+
         async def load() -> None:
             try:
                 path = await self.content_browser.load_thumbnail(result_id)
@@ -938,12 +940,15 @@ class AppController:
             except asyncio.CancelledError:
                 raise
             finally:
-                current = asyncio.current_task()
-                if self._thumbnail_tasks.get(result_id) is current:
-                    self._thumbnail_tasks.pop(result_id, None)
+                if task is not None:
+                    self._forget_thumbnail_task(result_id, task)
 
         task = self._spawn_background(load())
         self._thumbnail_tasks[result_id] = task
+
+    def _forget_thumbnail_task(self, result_id: str, task: object) -> None:
+        if self._thumbnail_tasks.get(result_id) is task:
+            self._thumbnail_tasks.pop(result_id, None)
 
     async def open_content_preview(self, result_id: str) -> None:
         if self.content_browser is None:

@@ -1522,6 +1522,16 @@ async def test_content_preview_opens_before_network_thumbnail_finishes(
     assert window.content_page.preview_updates == [(result.id, path)]
 
 
+def test_thumbnail_task_cleanup_is_safe_without_running_event_loop() -> None:
+    controller = AppController.for_test()
+    task = SimpleNamespace()
+    controller._thumbnail_tasks["result-1"] = task
+
+    controller._forget_thumbnail_task("result-1", task)
+
+    assert controller._thumbnail_tasks == {}
+
+
 @pytest.mark.asyncio
 async def test_offline_search_reconnects_then_continues() -> None:
     calls = []

@@ -1,4 +1,5 @@
-from inspect import isawaitable
+import asyncio
+from inspect import getsource, isawaitable
 from types import SimpleNamespace
 
 from PySide6.QtCore import QTimer
@@ -38,6 +39,44 @@ def test_download_confirmation_is_nonblocking_and_awaitable(tmp_path) -> None:
         controller.window.close()
         loop.close()
         application.processEvents()
+
+
+def test_graceful_shutdown_cleans_async_work_before_quitting() -> None:
+    events: list[str] = []
+
+    class AsyncActions:
+        async def shutdown(self) -> None:
+            events.append("actions")
+
+    class Controller:
+        _async_actions = AsyncActions()
+
+        async def shutdown(self) -> None:
+            events.append("controller")
+
+    async def exercise() -> None:
+        shutdown = app._GracefulShutdown(
+            Controller(),
+            lambda: events.append("quit"),
+        )
+
+        first = shutdown.request()
+        second = shutdown.request()
+        await shutdown.wait()
+
+        assert first is second
+        assert shutdown.completed is True
+
+    asyncio.run(exercise())
+
+    assert events == ["actions", "controller", "quit"]
+
+
+def test_run_keeps_startup_inside_the_continuous_event_loop() -> None:
+    source = getsource(app.run)
+
+    assert "run_until_complete(controller.start())" not in source
+    assert "loop.create_task(start_application())" in source
 
 
 def test_duplicate_instance_exits_before_application_construction(

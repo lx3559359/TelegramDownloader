@@ -5,7 +5,9 @@ import importlib
 import json
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from telegram_downloader import __version__
 from telegram_downloader.catalog import CatalogRepository
@@ -26,6 +28,54 @@ from telegram_downloader.thumbnail_cache import ThumbnailCache
 from telegram_downloader.update import HttpBytesClient, UpdateCoordinator
 from telegram_downloader.update_contract import load_trusted_keys
 from telegram_downloader.update_download import ResumableUpdateDownloader
+
+
+class _GracefulShutdown:
+    def __init__(self, controller: Any, quit_application: Callable[[], None]) -> None:
+        self.controller = controller
+        self.quit_application = quit_application
+        self.task: asyncio.Task[None] | None = None
+        self.completed = False
+
+    def request(self) -> asyncio.Task[None]:
+        if self.task is None:
+            self.task = asyncio.create_task(self._run())
+        return self.task
+
+    async def wait(self) -> None:
+        if self.task is not None:
+            await asyncio.shield(self.task)
+
+    async def _run(self) -> None:
+        try:
+            async_actions = getattr(self.controller, "_async_actions", None)
+            if async_actions is not None:
+                await async_actions.shutdown()
+            await self.controller.shutdown()
+        finally:
+            self.completed = True
+            self.quit_application()
+
+
+def _install_graceful_shutdown(application: Any, controller: Any):
+    from PySide6.QtCore import QEvent, QObject
+
+    shutdown = _GracefulShutdown(controller, application.quit)
+
+    class WindowCloseFilter(QObject):
+        def eventFilter(self, watched, event):
+            if event.type() == QEvent.Type.Close and not shutdown.completed:
+                event.ignore()
+                watched.hide()
+                shutdown.request()
+                return True
+            return super().eventFilter(watched, event)
+
+    close_filter = WindowCloseFilter(controller.window)
+    controller.window.installEventFilter(close_filter)
+    application.setQuitOnLastWindowClosed(False)
+    controller.update_shutdown = shutdown.request
+    return shutdown, close_filter
 
 
 def run_self_test(root: Path) -> dict[str, object]:
@@ -485,13 +535,35 @@ def run(root: Path, instance_guard: WindowsInstanceGuard | None = None) -> int:
 
     try:
         application, loop, controller = create_application(root)
+        graceful_shutdown, close_filter = _install_graceful_shutdown(
+            application,
+            controller,
+        )
         application.aboutToQuit.connect(loop.stop)
         with loop:
-            loop.run_until_complete(controller.start())
-            controller.window.show()
+            async def start_application() -> None:
+                await controller.start()
+                controller.window.show()
+
+            startup_task = loop.create_task(start_application())
+
+            def startup_finished(task: asyncio.Task[None]) -> None:
+                if not task.cancelled() and task.exception() is not None:
+                    graceful_shutdown.request()
+
+            startup_task.add_done_callback(startup_finished)
             loop.run_forever()
+            loop.run_until_complete(graceful_shutdown.wait())
             loop.run_until_complete(controller._async_actions.shutdown())
             loop.run_until_complete(controller.shutdown())
+            if not startup_task.done():
+                startup_task.cancel()
+                loop.run_until_complete(
+                    asyncio.gather(startup_task, return_exceptions=True)
+                )
+            if not startup_task.cancelled():
+                startup_task.result()
+        del close_filter
         return 0
     finally:
         guard.release()
