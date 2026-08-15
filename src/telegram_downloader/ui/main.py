@@ -354,14 +354,25 @@ class MainWindow(QMainWindow):
             callback(task_id)
 
     def _update_action_state(self, *_args) -> None:
-        enabled = self.selected_task_id() is not None
-        for button in (
-            self.pause_button,
-            self.resume_button,
-            self.retry_button,
-            self.open_button,
-        ):
-            button.setEnabled(enabled)
+        task = self._selected_task_summary()
+        status = task.status if task is not None else None
+        self.pause_button.setEnabled(
+            status
+            in {
+                TaskStatus.QUEUED,
+                TaskStatus.DOWNLOADING,
+                TaskStatus.WAITING_RETRY,
+            }
+        )
+        self.resume_button.setEnabled(status is TaskStatus.PAUSED)
+        self.retry_button.setEnabled(status is TaskStatus.PARTIAL_FAILURE)
+        self.open_button.setEnabled(task is not None)
+
+    def _selected_task_summary(self) -> TaskSummary | None:
+        rows = self.task_table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        return self.task_model.task_at(rows[0].row())
 
     def selected_task_id(self) -> str | None:
         rows = self.task_table.selectionModel().selectedRows()

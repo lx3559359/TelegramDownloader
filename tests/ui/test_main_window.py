@@ -1,3 +1,4 @@
+import pytest
 from PySide6.QtCore import Qt
 
 from telegram_downloader.domain import MediaKind, TaskStatus
@@ -57,6 +58,45 @@ def test_task_actions_emit_selected_task_id(qtbot) -> None:
         qtbot.mouseClick(window.pause_button, Qt.MouseButton.LeftButton)
 
     assert signal.args == ["task-7"]
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (TaskStatus.QUEUED, (True, False, False, True)),
+        (TaskStatus.DOWNLOADING, (True, False, False, True)),
+        (TaskStatus.WAITING_RETRY, (True, False, False, True)),
+        (TaskStatus.PAUSED, (False, True, False, True)),
+        (TaskStatus.COMPLETED, (False, False, False, True)),
+        (TaskStatus.PARTIAL_FAILURE, (False, False, True, True)),
+    ],
+)
+def test_task_actions_match_selected_task_status(qtbot, status, expected) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.set_task_summaries(
+        [
+            TaskSummary(
+                "task-1",
+                "示例频道",
+                status,
+                "1 / 2",
+                "1 MB",
+                "—",
+                "—",
+                "—",
+            )
+        ]
+    )
+
+    window.task_table.selectRow(0)
+
+    assert (
+        window.pause_button.isEnabled(),
+        window.resume_button.isEnabled(),
+        window.retry_button.isEnabled(),
+        window.open_button.isEnabled(),
+    ) == expected
 
 
 def test_task_model_exposes_chinese_status_and_id_role(qtbot) -> None:
