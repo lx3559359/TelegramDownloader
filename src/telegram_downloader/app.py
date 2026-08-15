@@ -98,6 +98,7 @@ def create_application(root: Path):
     import qasync
     from PySide6.QtWidgets import QApplication, QMessageBox
 
+    from telegram_downloader.ui.async_actions import ActionHooks, AsyncActionBridge
     from telegram_downloader.ui.login import LoginDialog
     from telegram_downloader.ui.main import MainWindow
     from telegram_downloader.ui.settings import SettingsDialog
@@ -224,6 +225,8 @@ def create_application(root: Path):
         settings=settings,
         secrets=secrets,
     )
+    async_actions = AsyncActionBridge()
+    controller._async_actions = async_actions
 
     @qasync.asyncSlot(str)
     async def scan_requested(link: str) -> None:
@@ -263,22 +266,6 @@ def create_application(root: Path):
     async def password_submitted(password: str) -> None:
         await controller.submit_password(password)
 
-    @qasync.asyncSlot()
-    async def qr_refresh_requested() -> None:
-        await controller.refresh_qr_login()
-
-    @qasync.asyncSlot()
-    async def phone_fallback_requested() -> None:
-        await controller.use_phone_fallback()
-
-    @qasync.asyncSlot()
-    async def credentials_edit_requested() -> None:
-        await controller.edit_credentials()
-
-    @qasync.asyncSlot()
-    async def login_cancelled() -> None:
-        await controller.cancel_login()
-
     @qasync.asyncSlot(str)
     async def resume_requested(task_id: str) -> None:
         await controller.resume_task(task_id)
@@ -286,14 +273,6 @@ def create_application(root: Path):
     @qasync.asyncSlot(str)
     async def retry_requested(task_id: str) -> None:
         await controller.retry_failed(task_id)
-
-    @qasync.asyncSlot()
-    async def content_refresh_requested() -> None:
-        await controller.refresh_content_dialogs()
-
-    @qasync.asyncSlot()
-    async def content_activated() -> None:
-        await controller.activate_content_page()
 
     @qasync.asyncSlot(str)
     async def content_dialog_selected(peer_ref: str) -> None:
@@ -332,10 +311,6 @@ def create_application(root: Path):
     async def content_preview_requested(result_id: str) -> None:
         await controller.open_content_preview(result_id)
 
-    @qasync.asyncSlot()
-    async def connection_retry_requested() -> None:
-        await controller.retry_telegram_connection()
-
     def open_settings() -> None:
         dialog = SettingsDialog(
             controller.settings,
@@ -367,8 +342,6 @@ def create_application(root: Path):
     window.open_directory_requested.connect(controller.open_task_directory)
     window.settings_requested.connect(open_settings)
     window.login_requested.connect(controller.show_login)
-    window.content_activated.connect(content_activated)
-    window.content_page.refresh_requested.connect(content_refresh_requested)
     window.content_page.dialog_selected.connect(content_dialog_selected)
     window.content_page.link_requested.connect(controller.route_content_link)
     window.content_page.search_requested.connect(content_search_requested)
@@ -380,9 +353,6 @@ def create_application(root: Path):
     window.content_page.queue_requested.connect(content_queue_requested)
     window.content_page.thumbnail_requested.connect(controller.request_thumbnail)
     window.content_page.preview_requested.connect(content_preview_requested)
-    window.content_page.connection_retry_requested.connect(
-        connection_retry_requested
-    )
     window.content_page.history_open_requested.connect(
         controller._reload_content_search
     )
@@ -396,10 +366,68 @@ def create_application(root: Path):
     login_dialog.phone_submitted.connect(phone_submitted)
     login_dialog.code_submitted.connect(code_submitted)
     login_dialog.password_submitted.connect(password_submitted)
-    login_dialog.qr_refresh_requested.connect(qr_refresh_requested)
-    login_dialog.phone_fallback_requested.connect(phone_fallback_requested)
-    login_dialog.credentials_edit_requested.connect(credentials_edit_requested)
-    login_dialog.login_cancelled.connect(login_cancelled)
+    def content_failure(error: Exception) -> None:
+        window.content_page.show_error(controller._safe_error(error))
+
+    def login_hooks(action: str) -> ActionHooks:
+        return ActionHooks(
+            started=lambda: login_dialog.set_action_busy(action, True),
+            failed=lambda error: login_dialog.show_error(
+                controller._safe_error(error)
+            ),
+            finished=lambda: login_dialog.set_action_busy(action, False),
+        )
+
+    async_actions.connect(
+        window.content_activated,
+        "content.activate",
+        lambda: controller.activate_content_page(),
+        hooks=ActionHooks(failed=content_failure),
+    )
+    async_actions.connect(
+        window.content_page.refresh_requested,
+        "dialogs.refresh",
+        lambda: controller.refresh_content_dialogs(),
+        hooks=ActionHooks(failed=content_failure),
+    )
+    async_actions.connect(
+        window.content_page.connection_retry_requested,
+        "telegram.retry",
+        lambda: controller.retry_telegram_connection(),
+        hooks=ActionHooks(
+            started=lambda: window.content_page.set_connection_action_busy(True),
+            failed=content_failure,
+            finished=lambda: window.content_page.set_connection_action_busy(False),
+        ),
+    )
+    async_actions.connect(
+        login_dialog.qr_refresh_requested,
+        "login.qr.refresh",
+        lambda: controller.refresh_qr_login(),
+        hooks=login_hooks("qr.refresh"),
+    )
+    async_actions.connect(
+        login_dialog.phone_fallback_requested,
+        "login.phone",
+        lambda: controller.use_phone_fallback(),
+        hooks=login_hooks("login.phone"),
+    )
+    async_actions.connect(
+        login_dialog.credentials_edit_requested,
+        "login.credentials",
+        lambda: controller.edit_credentials(),
+        hooks=login_hooks("login.credentials"),
+    )
+    async_actions.connect(
+        login_dialog.login_cancelled,
+        "login.cancel",
+        lambda: controller.cancel_login(),
+        hooks=ActionHooks(
+            failed=lambda error: login_dialog.show_error(
+                controller._safe_error(error)
+            )
+        ),
+    )
     controller._ui_slots.extend(
         (
             scan_requested,
@@ -407,20 +435,13 @@ def create_application(root: Path):
             phone_submitted,
             code_submitted,
             password_submitted,
-            qr_refresh_requested,
-            phone_fallback_requested,
-            credentials_edit_requested,
-            login_cancelled,
             resume_requested,
             retry_requested,
-            content_activated,
             content_dialog_selected,
-            content_refresh_requested,
             content_search_requested,
             content_load_more_requested,
             content_queue_requested,
             content_preview_requested,
-            connection_retry_requested,
             open_settings,
         )
     )
@@ -446,6 +467,7 @@ def run(root: Path, instance_guard: WindowsInstanceGuard | None = None) -> int:
             loop.run_until_complete(controller.start())
             controller.window.show()
             loop.run_forever()
+            loop.run_until_complete(controller._async_actions.shutdown())
             loop.run_until_complete(controller.shutdown())
         return 0
     finally:
