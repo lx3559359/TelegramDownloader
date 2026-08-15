@@ -970,8 +970,10 @@ async def test_running_task_refreshes_window_before_download_finishes() -> None:
     task = SimpleNamespace(
         id="task-1",
         source_title="示例频道",
+        display_title=None,
         status=TaskStatus.QUEUED,
         last_error=None,
+        archived_at=None,
     )
     item = SimpleNamespace(
         status=ItemStatus.QUEUED,
@@ -981,12 +983,19 @@ async def test_running_task_refreshes_window_before_download_finishes() -> None:
     )
 
     class Repository:
-        def list_tasks(self):
-            return [task]
-
-        def list_items(self, task_id):
-            assert task_id == "task-1"
-            return [item]
+        def list_task_snapshots(self, *, include_archived=False):
+            assert include_archived is True
+            return [
+                SimpleNamespace(
+                    task=task,
+                    total_items=1,
+                    completed_items=int(item.status is ItemStatus.COMPLETED),
+                    downloaded_bytes=item.downloaded_bytes,
+                    known_size=item.expected_size,
+                    unknown_size_count=0,
+                    item_error=item.last_error,
+                )
+            ]
 
     class Scheduler:
         async def run_task(self, task_id):
@@ -1036,8 +1045,10 @@ def test_refresh_tasks_calculates_speed_and_remaining_time() -> None:
     task = SimpleNamespace(
         id="task-1",
         source_title="频道",
+        display_title=None,
         status=TaskStatus.DOWNLOADING,
         last_error=None,
+        archived_at=None,
     )
     item = SimpleNamespace(
         status=ItemStatus.DOWNLOADING,
@@ -1047,11 +1058,19 @@ def test_refresh_tasks_calculates_speed_and_remaining_time() -> None:
     )
 
     class Repository:
-        def list_tasks(self):
-            return [task]
-
-        def list_items(self, _task_id):
-            return [item]
+        def list_task_snapshots(self, *, include_archived=False):
+            assert include_archived is True
+            return [
+                SimpleNamespace(
+                    task=task,
+                    total_items=1,
+                    completed_items=0,
+                    downloaded_bytes=item.downloaded_bytes,
+                    known_size=item.expected_size,
+                    unknown_size_count=0,
+                    item_error=item.last_error,
+                )
+            ]
 
     class Window:
         def __init__(self):
@@ -1073,15 +1092,14 @@ def test_refresh_tasks_calculates_speed_and_remaining_time() -> None:
     assert summary.remaining_text == "1 秒"
 
 
-def test_search_task_uses_display_title_but_opens_source_directory(
-    tmp_path, monkeypatch
-) -> None:
+def test_search_task_uses_display_title_but_opens_source_directory(tmp_path, monkeypatch) -> None:
     task = SimpleNamespace(
         id="task-1",
         source_title="资料群",
         display_title="资料群（搜索：安装）",
         status=TaskStatus.QUEUED,
         last_error=None,
+        archived_at=None,
     )
     item = SimpleNamespace(
         status=ItemStatus.QUEUED,
@@ -1091,11 +1109,19 @@ def test_search_task_uses_display_title_but_opens_source_directory(
     )
 
     class Repository:
-        def list_tasks(self):
-            return [task]
-
-        def list_items(self, _task_id):
-            return [item]
+        def list_task_snapshots(self, *, include_archived=False):
+            assert include_archived is True
+            return [
+                SimpleNamespace(
+                    task=task,
+                    total_items=1,
+                    completed_items=0,
+                    downloaded_bytes=item.downloaded_bytes,
+                    known_size=item.expected_size,
+                    unknown_size_count=0,
+                    item_error=item.last_error,
+                )
+            ]
 
         def get_task(self, task_id):
             assert task_id == task.id
@@ -1129,6 +1155,180 @@ def test_search_task_uses_display_title_but_opens_source_directory(
     assert window.tasks[0].title == "资料群（搜索：安装）"
     assert opened == [(paths.downloads / "资料群").resolve()]
     assert not (paths.downloads / "资料群（搜索：安装）").exists()
+
+
+def test_task_detail_selection_loads_only_one_selected_task() -> None:
+    item = SimpleNamespace(
+        id="item-1",
+        original_name="video.mp4",
+        media_kind=MediaKind.VIDEO,
+        status=ItemStatus.DOWNLOADING,
+        downloaded_bytes=5,
+        expected_size=10,
+        retry_count=2,
+        last_error="safe-error",
+    )
+
+    class Repository:
+        def __init__(self):
+            self.calls = []
+
+        def list_items(self, task_id):
+            self.calls.append(task_id)
+            return [item]
+
+    class Window:
+        def __init__(self):
+            self.details = []
+
+        def set_task_items(self, task_id, items):
+            self.details.append((task_id, items))
+
+    repository = Repository()
+    window = Window()
+    controller = AppController.for_test(repository=repository, window=window)
+
+    controller.select_task_details([])
+    controller.select_task_details(["task-1", "task-2"])
+    controller.select_task_details(["task-1"])
+
+    assert repository.calls == ["task-1"]
+    task_id, summaries = window.details[-1]
+    assert task_id == "task-1"
+    assert len(summaries) == 1
+    assert summaries[0].id == item.id
+    assert summaries[0].error_text == "safe-error"
+
+
+@pytest.mark.asyncio
+async def test_task_batch_actions_deduplicate_and_skip_ineligible_tasks() -> None:
+    tasks = {
+        "run": SimpleNamespace(
+            id="run",
+            status=TaskStatus.DOWNLOADING,
+            archived_at=None,
+        ),
+        "pause": SimpleNamespace(
+            id="pause",
+            status=TaskStatus.PAUSED,
+            archived_at=None,
+        ),
+        "fail": SimpleNamespace(
+            id="fail",
+            status=TaskStatus.PARTIAL_FAILURE,
+            archived_at=None,
+        ),
+    }
+
+    class Repository:
+        def get_task(self, task_id):
+            return tasks[task_id]
+
+        def list_task_snapshots(self, *, include_archived=False):
+            assert include_archived is True
+            return []
+
+    class Scheduler:
+        def __init__(self):
+            self.paused = []
+            self.resumed = []
+
+        def pause_task(self, task_id):
+            self.paused.append(task_id)
+
+        async def resume_task(self, task_id):
+            self.resumed.append(task_id)
+
+    scheduler = Scheduler()
+    controller = AppController.for_test(repository=Repository(), scheduler=scheduler)
+
+    controller.pause_tasks(["run", "pause", "run"])
+    await controller.resume_tasks(["pause", "run", "pause"])
+    assert scheduler.paused == ["run"]
+    assert scheduler.resumed == ["pause"]
+
+    await controller.retry_failed_tasks(["fail", "run", "fail"])
+
+    assert scheduler.resumed == ["pause", "fail"]
+
+
+def test_archive_and_restore_tasks_report_repository_results() -> None:
+    class Repository:
+        def __init__(self):
+            self.archived = []
+            self.restored = []
+
+        def archive_tasks(self, task_ids):
+            self.archived.append(task_ids)
+            return {"done"}
+
+        def restore_tasks(self, task_ids):
+            self.restored.append(task_ids)
+            return {"done"}
+
+        def list_task_snapshots(self, *, include_archived=False):
+            assert include_archived is True
+            return []
+
+    repository = Repository()
+    controller = AppController.for_test(repository=repository)
+
+    controller.archive_tasks(["done", "done", "active"])
+    controller.restore_tasks(["done", "done"])
+
+    assert repository.archived == [["done", "active"]]
+    assert repository.restored == [["done"]]
+    assert "已恢复 1 个" in controller.window.message.last_message
+
+
+def test_open_media_file_requires_completed_local_existing_file(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    paths = PortablePaths(tmp_path / "app")
+    paths.ensure_layout()
+    target = paths.downloads / "channel" / "video.mp4"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"media")
+
+    class Repository:
+        def __init__(self):
+            self.item = SimpleNamespace(
+                id="item",
+                status=ItemStatus.COMPLETED,
+                target_path=target,
+            )
+
+        def get_item(self, item_id):
+            assert item_id == self.item.id
+            return self.item
+
+    repository = Repository()
+    opened = []
+    monkeypatch.setattr(
+        controller_module.os,
+        "startfile",
+        lambda path: opened.append(path),
+        raising=False,
+    )
+    controller = AppController.for_test(repository=repository, paths=paths)
+
+    controller.open_media_file("item")
+    assert opened == [target.resolve()]
+
+    target.unlink()
+    controller.open_media_file("item")
+    assert opened == [target.resolve()]
+    assert "本地文件不存在" in controller.window.message.last_message
+
+    repository.item = SimpleNamespace(
+        id="item",
+        status=ItemStatus.COMPLETED,
+        target_path=tmp_path / "outside.bin",
+    )
+    controller.open_media_file("item")
+    assert opened == [target.resolve()]
+    assert "安全" in controller.window.message.last_message
 
 
 def test_progress_refresh_is_throttled_across_concurrent_callers() -> None:
@@ -1350,9 +1550,7 @@ async def test_search_progress_is_forwarded_and_always_stops() -> None:
     await controller.search_content("-1001", query)
 
     assert window.content_page.busy == [True, False]
-    assert window.content_page.search_progress[0] == SearchProgress(
-        0, 0, "正在连接 Telegram"
-    )
+    assert window.content_page.search_progress[0] == SearchProgress(0, 0, "正在连接 Telegram")
     assert window.content_page.search_progress[-2].inspected == 20
     assert window.content_page.search_progress[-1] is None
 
@@ -1409,9 +1607,7 @@ async def test_new_search_cancels_the_running_search_before_replacement() -> Non
         content_browser=Browser(),
         window=ContentWindowFake(),
     )
-    first = asyncio.create_task(
-        controller.search_content("-1001", make_query("first"))
-    )
+    first = asyncio.create_task(controller.search_content("-1001", make_query("first")))
     await first_started.wait()
 
     await controller.search_content("-1001", make_query("second"))
@@ -1607,9 +1803,7 @@ async def test_failed_reconnect_keeps_cached_content_and_skips_search() -> None:
     assert content.search_calls == 0
     assert window.content_page.dialogs is cached_dialogs
     assert window.content_page.results is cached_results
-    assert window.content_page.connection_states[-1] == (
-        "重连失败，请检查网络或代理后重试"
-    )
+    assert window.content_page.connection_states[-1] == ("重连失败，请检查网络或代理后重试")
     assert window.content_page.busy == [True, False]
 
 
@@ -1737,9 +1931,7 @@ def test_content_link_route_normalizes_single_hint_before_task_preview() -> None
     window = Window()
     controller = AppController.for_test(window=window)
 
-    controller.route_content_link(
-        "https://t.me/Zhangzhoulao66/56156?single"
-    )
+    controller.route_content_link("https://t.me/Zhangzhoulao66/56156?single")
 
     assert window.previews == ["https://t.me/Zhangzhoulao66/56156"]
     assert window.content_page.errors == []

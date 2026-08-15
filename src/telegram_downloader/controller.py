@@ -33,7 +33,7 @@ from telegram_downloader.links import InvalidTelegramLink, parse_telegram_link
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.settings import AppSettings, ProxySettings
 from telegram_downloader.subscriptions import SubscriptionDraft
-from telegram_downloader.ui.models import TaskSummary
+from telegram_downloader.ui.models import TaskItemSummary, TaskSummary
 
 _LOGGER = logging.getLogger("telegram_downloader.controller")
 
@@ -61,8 +61,11 @@ class _MemoryVault:
 
 
 class _NullStatusBar:
-    def showMessage(self, _message: str, _timeout: int = 0) -> None:
-        pass
+    def __init__(self) -> None:
+        self.last_message = ""
+
+    def showMessage(self, message: str, _timeout: int = 0) -> None:
+        self.last_message = message
 
 
 class _NullWindow:
@@ -78,6 +81,9 @@ class _NullWindow:
 
     def set_task_summaries(self, value: list[TaskSummary]) -> None:
         self.tasks = value
+
+    def set_task_items(self, _task_id: str, _items: list[TaskItemSummary]) -> None:
+        pass
 
     def set_scan_busy(self, _busy: bool) -> None:
         pass
@@ -222,7 +228,7 @@ class _NullSubscriptionPage:
 
 
 class _NullRepository:
-    def list_tasks(self) -> list[object]:
+    def list_task_snapshots(self, *, include_archived: bool = False) -> list[object]:
         return []
 
     def list_items(self, _task_id: str, _statuses=None) -> list[object]:
@@ -230,6 +236,15 @@ class _NullRepository:
 
     def get_task(self, task_id: str):
         raise KeyError(task_id)
+
+    def get_item(self, item_id: str):
+        raise KeyError(item_id)
+
+    def archive_tasks(self, _task_ids: list[str]) -> set[str]:
+        return set()
+
+    def restore_tasks(self, _task_ids: list[str]) -> set[str]:
+        return set()
 
 
 class _NullScheduler:
@@ -332,9 +347,7 @@ class AppController:
         self.login_dialog = login_dialog
         self.content_browser = content_browser
         self.subscriptions = subscriptions or _NullSubscriptionService()
-        self.subscription_scheduler = (
-            subscription_scheduler or _NullSubscriptionScheduler()
-        )
+        self.subscription_scheduler = subscription_scheduler or _NullSubscriptionScheduler()
         self.paths = paths
         self.gateway_factory = gateway_factory
         self.service_builder = service_builder
@@ -413,11 +426,7 @@ class AppController:
 
         def attempt(value: tuple[int, int]) -> None:
             number, total = value
-            text = (
-                "正在连接 Telegram…"
-                if number == 1
-                else f"正在重连（{number}/{total}）…"
-            )
+            text = "正在连接 Telegram…" if number == 1 else f"正在重连（{number}/{total}）…"
             page.set_connection_state(text, retryable=False)
 
         try:
@@ -478,17 +487,13 @@ class AppController:
             self.show_login()
             return
         self._ensure_connection_monitor()
-        self._session_restore_task = self._spawn_background(
-            self._restore_saved_session()
-        )
+        self._session_restore_task = self._spawn_background(self._restore_saved_session())
 
     def _ensure_connection_monitor(self) -> None:
         task = self._connection_monitor_task
         if self._shutting_down or (task is not None and not task.done()):
             return
-        self._connection_monitor_task = self._spawn_background(
-            self._monitor_connection()
-        )
+        self._connection_monitor_task = self._spawn_background(self._monitor_connection())
 
     async def _restore_saved_session(self) -> None:
         if not await self.ensure_telegram_online():
@@ -837,9 +842,7 @@ class AppController:
         page = self._content_page()
         page.set_active_search(session)
         page.set_results(
-            self.content_browser.list_results(session.id)
-            if session is not None
-            else []
+            self.content_browser.list_results(session.id) if session is not None else []
         )
         if not await self.ensure_telegram_online():
             return
@@ -855,9 +858,7 @@ class AppController:
         if stale is not None and not stale(timedelta(seconds=60)):
             self._content_page().set_sync_state("同步完成", busy=False, count=0)
             return
-        self._dialog_sync_task = self._spawn_background(
-            self.refresh_content_dialogs()
-        )
+        self._dialog_sync_task = self._spawn_background(self.refresh_content_dialogs())
 
     async def refresh_content_dialogs(self) -> None:
         if self.content_browser is None:
@@ -1129,13 +1130,8 @@ class AppController:
         count, removed_bytes = self.content_browser.thumbnails.clear()
         dialog = self._settings_dialog
         if dialog is not None:
-            dialog.set_thumbnail_cache_bytes(
-                self.content_browser.thumbnails.total_bytes()
-            )
-        self._show_status(
-            f"已清理 {count} 个缩略图，共 "
-            f"{self._format_bytes(removed_bytes)}"
-        )
+            dialog.set_thumbnail_cache_bytes(self.content_browser.thumbnails.total_bytes())
+        self._show_status(f"已清理 {count} 个缩略图，共 {self._format_bytes(removed_bytes)}")
 
     async def activate_subscriptions_page(self) -> None:
         page = self._subscription_page()
@@ -1330,15 +1326,130 @@ class AppController:
         self._show_status("设置已保存；代理变更将在下次连接时生效")
 
     def pause_task(self, task_id: str) -> None:
-        self.scheduler.pause_task(task_id)
-        self.refresh_tasks()
+        self.pause_tasks([task_id])
 
     async def resume_task(self, task_id: str) -> None:
-        await self.scheduler.resume_task(task_id)
-        self.refresh_tasks()
+        await self.resume_tasks([task_id])
 
     async def retry_failed(self, task_id: str) -> None:
-        await self.resume_task(task_id)
+        await self.retry_failed_tasks([task_id])
+
+    def pause_tasks(self, task_ids: list[str]) -> None:
+        unique = self._unique_task_ids(task_ids)
+        accepted = 0
+        for task_id in unique:
+            try:
+                task = self.repository.get_task(task_id)
+            except KeyError:
+                continue
+            if task.archived_at is not None or task.status not in {
+                TaskStatus.QUEUED,
+                TaskStatus.DOWNLOADING,
+                TaskStatus.WAITING_RETRY,
+            }:
+                continue
+            self.scheduler.pause_task(task_id)
+            accepted += 1
+        self.refresh_tasks()
+        self._show_status(f"已暂停 {accepted} 个任务，跳过 {len(unique) - accepted} 个")
+
+    async def resume_tasks(self, task_ids: list[str]) -> None:
+        unique = self._unique_task_ids(task_ids)
+        accepted: list[str] = []
+        for task_id in unique:
+            try:
+                task = self.repository.get_task(task_id)
+            except KeyError:
+                continue
+            if task.archived_at is None and task.status is TaskStatus.PAUSED:
+                accepted.append(task_id)
+        if accepted:
+            await asyncio.gather(*(self.scheduler.resume_task(task_id) for task_id in accepted))
+        self.refresh_tasks()
+        self._show_status(f"已继续 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个")
+
+    async def retry_failed_tasks(self, task_ids: list[str]) -> None:
+        unique = self._unique_task_ids(task_ids)
+        accepted: list[str] = []
+        for task_id in unique:
+            try:
+                task = self.repository.get_task(task_id)
+            except KeyError:
+                continue
+            if task.archived_at is None and task.status is TaskStatus.PARTIAL_FAILURE:
+                accepted.append(task_id)
+        if accepted:
+            await asyncio.gather(*(self.scheduler.resume_task(task_id) for task_id in accepted))
+        self.refresh_tasks()
+        self._show_status(f"已重试 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个")
+
+    def archive_tasks(self, task_ids: list[str]) -> None:
+        unique = self._unique_task_ids(task_ids)
+        accepted = self.repository.archive_tasks(unique)
+        self.refresh_tasks()
+        self._show_status(
+            f"已归档 {len(accepted)} 个完成任务；下载文件已保留，"
+            f"跳过 {len(unique) - len(accepted)} 个"
+        )
+
+    def restore_tasks(self, task_ids: list[str]) -> None:
+        unique = self._unique_task_ids(task_ids)
+        accepted = self.repository.restore_tasks(unique)
+        self.refresh_tasks()
+        self._show_status(
+            f"已恢复 {len(accepted)} 个归档任务，跳过 {len(unique) - len(accepted)} 个"
+        )
+
+    def select_task_details(self, task_ids: list[str]) -> None:
+        unique = self._unique_task_ids(task_ids)
+        if len(unique) != 1:
+            return
+        task_id = unique[0]
+        try:
+            items = self.repository.list_items(task_id)
+        except KeyError:
+            return
+        summaries = [
+            TaskItemSummary(
+                item.id,
+                item.original_name,
+                item.media_kind,
+                item.status,
+                item.downloaded_bytes,
+                item.expected_size,
+                item.retry_count,
+                item.last_error or "—",
+            )
+            for item in items
+        ]
+        self.window.set_task_items(task_id, summaries)
+
+    def open_media_file(self, item_id: str) -> None:
+        if self.paths is None:
+            return
+        try:
+            item = self.repository.get_item(item_id)
+            if item.status is not ItemStatus.COMPLETED:
+                self._show_status("媒体尚未下载完成，不能打开文件")
+                return
+            target = self.paths.guard(Path(item.target_path))
+            if not target.is_file():
+                self._show_status("本地文件不存在；当前操作不会修改任务记录")
+                return
+            startfile = getattr(os, "startfile", None)
+            if startfile is not None:
+                startfile(target)
+        except ValueError:
+            self._show_status("安全限制：文件路径不在应用目录内")
+        except KeyError:
+            self._show_status("媒体记录不存在，任务列表已刷新")
+            self.refresh_tasks()
+        except OSError:
+            self._show_status("Windows 无法打开该文件")
+
+    @staticmethod
+    def _unique_task_ids(task_ids: list[str]) -> list[str]:
+        return list(dict.fromkeys(str(value) for value in task_ids if value))
 
     def open_task_directory(self, task_id: str) -> None:
         if self.paths is None:
@@ -1386,43 +1497,45 @@ class AppController:
         sampled_at = monotonic_clock() if now is None else now
         summaries: list[TaskSummary] = []
         active_ids: set[str] = set()
-        for task in self.repository.list_tasks():
-            items = self.repository.list_items(task.id)
-            completed = sum(item.status is ItemStatus.COMPLETED for item in items)
-            downloaded = sum(item.downloaded_bytes for item in items)
-            known_size = sum(item.expected_size or 0 for item in items)
-            unknown = any(item.expected_size is None for item in items)
-            total_bytes = None if unknown else known_size
-            speed = self._sample_speed(task.id, task.status, downloaded, sampled_at)
+        snapshots = self.repository.list_task_snapshots(include_archived=True)
+        for snapshot in snapshots:
+            task = snapshot.task
+            archived = task.archived_at is not None
+            total_bytes = None if snapshot.unknown_size_count else snapshot.known_size
+            speed = self._sample_speed(
+                task.id,
+                task.status if not archived else TaskStatus.COMPLETED,
+                snapshot.downloaded_bytes,
+                sampled_at,
+            )
             remaining_seconds = None
             if total_bytes is not None and speed > 0:
                 remaining_seconds = max(
                     0,
-                    round((total_bytes - downloaded) / speed),
+                    round((total_bytes - snapshot.downloaded_bytes) / speed),
                 )
-            error_text = task.last_error or next(
-                (item.last_error for item in items if item.last_error),
-                "—",
-            )
+            error_text = task.last_error or snapshot.item_error or "—"
             summaries.append(
                 TaskSummary(
                     task.id,
                     getattr(task, "display_title", None) or task.source_title,
                     task.status,
-                    f"{completed} / {len(items)}",
-                    self._format_bytes(known_size) + (" + 未知" if unknown else ""),
+                    f"{snapshot.completed_items} / {snapshot.total_items}",
+                    self._format_bytes(snapshot.known_size)
+                    + (" + 未知" if snapshot.unknown_size_count else ""),
                     self._format_rate(speed),
                     self._format_duration(remaining_seconds),
                     error_text,
-                    completed,
-                    len(items),
-                    downloaded,
+                    snapshot.completed_items,
+                    snapshot.total_items,
+                    snapshot.downloaded_bytes,
                     total_bytes,
                     speed,
                     remaining_seconds,
+                    archived,
                 )
             )
-            if task.status is TaskStatus.DOWNLOADING:
+            if not archived and task.status is TaskStatus.DOWNLOADING:
                 active_ids.add(task.id)
         for task_id in set(self._progress_samples) - active_ids:
             self._progress_samples.pop(task_id, None)
@@ -1617,9 +1730,7 @@ class AppController:
             *self._thumbnail_tasks.values(),
         ]
         pending = [
-            task
-            for task in tracked
-            if task is not None and task is not current and not task.done()
+            task for task in tracked if task is not None and task is not current and not task.done()
         ]
         for task in pending:
             task.cancel()
