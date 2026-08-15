@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,7 +19,11 @@ from telegram_downloader.gateway import (
 from telegram_downloader.planner import TaskPlanner
 from telegram_downloader.repository import TaskRepository
 from telegram_downloader.subscription_service import SubscriptionService
-from telegram_downloader.subscriptions import SubscriptionDraft, SubscriptionState
+from telegram_downloader.subscriptions import (
+    SubscriptionDraft,
+    SubscriptionProbeProgress,
+    SubscriptionState,
+)
 
 NOW = datetime(2026, 8, 15, 9, 0, tzinfo=UTC)
 
@@ -73,6 +78,10 @@ class Gateway:
         self.incremental_error: Exception | None = None
         self.albums: dict[int, tuple[RemoteSearchHit, ...]] = {}
         self.incremental_calls: list[tuple[int, int, int]] = []
+        self.recent: tuple[RemoteMessage, ...] = ()
+        self.recent_calls: list[tuple[str, int]] = []
+        self.recent_started: asyncio.Event | None = None
+        self.recent_release: asyncio.Event | None = None
 
     async def latest_message_id(self, _peer_ref: str) -> int:
         if self.latest_error is not None:
@@ -95,6 +104,19 @@ class Gateway:
             for item in self.messages
             if after_id < item.message_id <= through_id
         )[:limit]
+
+    async def recent_messages(
+        self,
+        peer_ref: str,
+        *,
+        limit: int,
+    ) -> tuple[RemoteMessage, ...]:
+        self.recent_calls.append((peer_ref, limit))
+        if self.recent_started is not None:
+            self.recent_started.set()
+        if self.recent_release is not None:
+            await self.recent_release.wait()
+        return self.recent[:limit]
 
     async def expand_album(
         self,
@@ -303,6 +325,148 @@ async def test_matching_album_is_expanded_and_duplicate_rerun_is_idempotent(
     assert second_report.task_ids == ()
     assert second_report.run.queued == 0
     assert second_report.run.duplicate == 2
+
+
+@pytest.mark.asyncio
+async def test_probe_rule_reports_matches_without_side_effects(tmp_path: Path) -> None:
+    service, gateway, catalog, tasks = build_service(tmp_path)
+    saved = await service.create_rule(
+        SubscriptionDraft("-1001", "美女", frozenset({MediaKind.PHOTO}))
+    )
+    gateway.recent = (
+        message(40, "普通", remote(40)),
+        message(41, "美女写真", remote(41)),
+        message(42, "美女视频", remote(42, MediaKind.VIDEO)),
+    )
+    before_rule = service.get_rule(saved.id)
+    before_runs = catalog.list_subscription_runs("a1", saved.id)
+    before_tasks = tasks.list_tasks()
+    progress: list[SubscriptionProbeProgress] = []
+
+    report = await service.probe_rule(saved.id, on_progress=progress.append)
+
+    assert (report.inspected, report.keyword_hits, report.matched) == (3, 2, 1)
+    assert report.duplicate == 0
+    assert [sample.message_id for sample in report.samples] == [41]
+    assert gateway.recent_calls == [("-1001", 100)]
+    assert [item.inspected for item in progress] == sorted(
+        item.inspected for item in progress
+    )
+    assert progress[0].inspected == 0
+    assert progress[-1].phase == "测试完成"
+    assert service.get_rule(saved.id) == before_rule
+    assert catalog.list_subscription_runs("a1", saved.id) == before_runs
+    assert tasks.list_tasks() == before_tasks
+
+
+@pytest.mark.asyncio
+async def test_probe_expands_album_marks_duplicates_and_matches_formal_run(
+    tmp_path: Path,
+) -> None:
+    service, gateway, catalog, tasks = build_service(tmp_path)
+    first_rule = await service.create_rule(
+        SubscriptionDraft("-1001", "美女", frozenset({MediaKind.PHOTO}))
+    )
+    trigger = replace(remote(43), grouped_id=900)
+    second = replace(remote(44), grouped_id=900)
+    excluded = replace(remote(45, MediaKind.VIDEO), grouped_id=900)
+    album_message = message(43, "美女相册", trigger, grouped_id=900)
+    gateway.latest_id = 45
+    gateway.messages = (album_message,)
+    gateway.albums[900] = (
+        RemoteSearchHit(trigger, "美女相册", "t1"),
+        RemoteSearchHit(second, "", "t2"),
+        RemoteSearchHit(excluded, "", "t3"),
+        RemoteSearchHit(second, "重复", "t2-duplicate"),
+    )
+    first_run = await service.run_rule(first_rule.id)
+    assert first_run.run.matched == 2
+
+    gateway.latest_id = 42
+    parity_rule = await service.create_rule(
+        SubscriptionDraft("-1001", "相册", frozenset({MediaKind.PHOTO}))
+    )
+    gateway.latest_id = 45
+    gateway.recent = (album_message,)
+    before_rule = service.get_rule(parity_rule.id)
+    before_runs = catalog.list_subscription_runs("a1", parity_rule.id)
+    before_tasks = tasks.list_tasks()
+
+    probe = await service.probe_rule(parity_rule.id)
+
+    assert (probe.keyword_hits, probe.matched, probe.duplicate) == (1, 2, 2)
+    assert [sample.message_id for sample in probe.samples] == [44, 43]
+    assert all(sample.already_queued for sample in probe.samples)
+    assert service.get_rule(parity_rule.id) == before_rule
+    assert catalog.list_subscription_runs("a1", parity_rule.id) == before_runs
+    assert tasks.list_tasks() == before_tasks
+
+    formal = await service.run_rule(parity_rule.id)
+    assert (
+        formal.run.keyword_hits,
+        formal.run.matched,
+        formal.run.duplicate,
+    ) == (probe.keyword_hits, probe.matched, probe.duplicate)
+
+
+@pytest.mark.asyncio
+async def test_probe_limits_samples_and_excerpt_length(tmp_path: Path) -> None:
+    service, gateway, _catalog, _tasks = build_service(tmp_path)
+    saved = await service.create_rule(
+        SubscriptionDraft("-1001", "资料", frozenset({MediaKind.PHOTO}))
+    )
+    gateway.recent = tuple(
+        message(value, "资料" + "长" * 100, remote(value))
+        for value in range(43, 68)
+    )
+
+    report = await service.probe_rule(saved.id)
+
+    assert report.matched == 25
+    assert len(report.samples) == 20
+    assert all(len(sample.excerpt) <= 80 for sample in report.samples)
+
+
+@pytest.mark.asyncio
+async def test_probe_cancellation_leaves_rule_cursor_history_and_tasks_unchanged(
+    tmp_path: Path,
+) -> None:
+    service, gateway, catalog, tasks = build_service(tmp_path)
+    saved = await service.create_rule(
+        SubscriptionDraft("-1001", "资料", frozenset({MediaKind.PHOTO}))
+    )
+    gateway.recent_started = asyncio.Event()
+    gateway.recent_release = asyncio.Event()
+    before_rule = service.get_rule(saved.id)
+    before_runs = catalog.list_subscription_runs("a1", saved.id)
+    before_tasks = tasks.list_tasks()
+    running = asyncio.create_task(service.probe_rule(saved.id))
+    await gateway.recent_started.wait()
+
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    assert service.get_rule(saved.id) == before_rule
+    assert catalog.list_subscription_runs("a1", saved.id) == before_runs
+    assert tasks.list_tasks() == before_tasks
+
+
+@pytest.mark.asyncio
+async def test_list_runs_is_account_scoped_and_bounded(tmp_path: Path) -> None:
+    service, gateway, _catalog, _tasks = build_service(tmp_path)
+    saved = await service.create_rule(
+        SubscriptionDraft("-1001", "资料", frozenset({MediaKind.PHOTO}))
+    )
+    gateway.latest_id = 43
+    gateway.messages = (message(43, "资料", remote(43)),)
+    await service.run_rule(saved.id)
+
+    assert len(service.list_runs(saved.id, limit=1)) == 1
+    with pytest.raises(ValueError, match="1 到 100"):
+        service.list_runs(saved.id, limit=101)
+    with pytest.raises(KeyError):
+        service.list_runs("missing")
 
 
 @pytest.mark.asyncio

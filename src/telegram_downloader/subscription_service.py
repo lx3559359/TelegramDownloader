@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from telegram_downloader.catalog import CatalogRepository
 from telegram_downloader.content import AccountProfile
-from telegram_downloader.gateway import RemoteMedia, TelegramGateway
+from telegram_downloader.gateway import RemoteMedia, RemoteMessage, TelegramGateway
 from telegram_downloader.planner import EmptyScanError, TaskPlanner
 from telegram_downloader.subscriptions import (
     SubscriptionDraft,
+    SubscriptionProbeProgress,
+    SubscriptionProbeReport,
+    SubscriptionProbeSample,
     SubscriptionProgress,
     SubscriptionRule,
     SubscriptionRun,
@@ -23,6 +26,29 @@ from telegram_downloader.subscriptions import (
 
 class SubscriptionUnavailableError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class _MatchedCandidate:
+    remote: RemoteMedia
+    message_id: int
+    message_date_utc: datetime
+    excerpt: str
+
+
+@dataclass(frozen=True, slots=True)
+class _MatchResult:
+    inspected: int
+    keyword_hits: int
+    candidates: tuple[_MatchedCandidate, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _MatchStep:
+    inspected: int
+    keyword_hits: int
+    matched: int
+    phase: str
 
 
 class SubscriptionService:
@@ -68,6 +94,18 @@ class SubscriptionService:
     def latest_runs(self) -> dict[str, SubscriptionRun]:
         account = self._require_account()
         return self.catalog.latest_subscription_runs(account.account_id)
+
+    def list_runs(
+        self,
+        rule_id: str,
+        *,
+        limit: int = 20,
+    ) -> list[SubscriptionRun]:
+        if not 1 <= limit <= 100:
+            raise ValueError("订阅运行记录数量必须在 1 到 100 之间")
+        account = self._require_account()
+        self.catalog.get_subscription(account.account_id, rule_id)
+        return self.catalog.list_subscription_runs(account.account_id, rule_id)[:limit]
 
     def resume_after_connection(self) -> int:
         account = self._require_account()
@@ -213,6 +251,67 @@ class SubscriptionService:
             now=self.clock(),
         )
 
+    async def probe_rule(
+        self,
+        rule_id: str,
+        *,
+        on_progress: Callable[[SubscriptionProbeProgress], None] | None = None,
+    ) -> SubscriptionProbeReport:
+        rule = self.get_rule(rule_id)
+        gateway, planner = self._require_online()
+        self._probe_progress(
+            on_progress,
+            rule.id,
+            0,
+            0,
+            0,
+            "正在读取最近消息",
+        )
+        messages = await gateway.recent_messages(rule.peer_ref, limit=100)
+
+        def emit(step: _MatchStep) -> None:
+            self._probe_progress(
+                on_progress,
+                rule.id,
+                step.inspected,
+                step.keyword_hits,
+                step.matched,
+                step.phase,
+            )
+
+        matched = await self._match_messages(rule, messages, emit)
+        keys = {self._media_key(item.remote) for item in matched.candidates}
+        existing = planner.existing_media_keys(keys)
+        samples = tuple(
+            SubscriptionProbeSample(
+                item.message_id,
+                item.message_date_utc,
+                item.remote.kind,
+                item.remote.original_name,
+                item.remote.expected_size,
+                self._media_key(item.remote) in existing,
+                item.excerpt[:80],
+            )
+            for item in matched.candidates[:20]
+        )
+        self._probe_progress(
+            on_progress,
+            rule.id,
+            matched.inspected,
+            matched.keyword_hits,
+            len(matched.candidates),
+            "测试完成",
+        )
+        return SubscriptionProbeReport(
+            rule.id,
+            matched.inspected,
+            matched.keyword_hits,
+            len(matched.candidates),
+            len(existing),
+            samples,
+            self.clock(),
+        )
+
     async def run_rule(
         self,
         rule_id: str,
@@ -278,74 +377,28 @@ class SubscriptionService:
                 through_id=max(after_id, snapshot_id),
                 limit=self.PAGE_LIMIT,
             )
-            inspected = len(messages)
-            remotes: list[RemoteMedia] = []
-            expanded_groups: set[int] = set()
-            for index, item in enumerate(messages, start=1):
-                if rule.normalized_keyword not in self._normalize(item.text):
-                    self._progress(
-                        on_progress,
-                        rule_id,
-                        index,
-                        keyword_hits,
-                        len(remotes),
-                        queued,
-                        duplicate,
-                        "正在筛选新消息",
-                    )
-                    continue
-                keyword_hits += 1
-                if item.media is None:
-                    self._progress(
-                        on_progress,
-                        rule_id,
-                        index,
-                        keyword_hits,
-                        len(remotes),
-                        queued,
-                        duplicate,
-                        "正在筛选新消息",
-                    )
-                    continue
-                if item.grouped_id is not None:
-                    if item.grouped_id in expanded_groups:
-                        self._progress(
-                            on_progress,
-                            rule_id,
-                            index,
-                            keyword_hits,
-                            len(remotes),
-                            queued,
-                            duplicate,
-                            "正在筛选新消息",
-                        )
-                        continue
-                    expanded_groups.add(item.grouped_id)
-                    album = await gateway.expand_album(
-                        rule.peer_ref,
-                        item.message_id,
-                        item.grouped_id,
-                    )
-                    remotes.extend(
-                        hit.remote
-                        for hit in album
-                        if hit.remote.kind in rule.media_kinds
-                    )
-                elif item.media.kind in rule.media_kinds:
-                    remotes.append(item.media)
+
+            def emit(step: _MatchStep) -> None:
+                nonlocal inspected, keyword_hits, matched
+                inspected = step.inspected
+                keyword_hits = step.keyword_hits
+                matched = step.matched
                 self._progress(
                     on_progress,
                     rule_id,
-                    index,
-                    keyword_hits,
-                    len(remotes),
+                    step.inspected,
+                    step.keyword_hits,
+                    step.matched,
                     queued,
                     duplicate,
-                    "正在筛选新消息",
+                    step.phase,
                 )
 
-            unique = self._deduplicate(remotes)
-            matched = len(unique)
+            match = await self._match_messages(rule, messages, emit)
+            inspected = match.inspected
+            keyword_hits = match.keyword_hits
+            matched = len(match.candidates)
+            unique = [item.remote for item in match.candidates]
             keys = {self._media_key(item) for item in unique}
             existing = planner.existing_media_keys(keys)
             duplicate = len(existing)
@@ -517,16 +570,60 @@ class SubscriptionService:
     def _media_key(item: RemoteMedia) -> tuple[str, int, str]:
         return item.peer_ref, item.message_id, item.media_id
 
-    @classmethod
-    def _deduplicate(cls, values: list[RemoteMedia]) -> list[RemoteMedia]:
-        found: dict[tuple[str, int, str], RemoteMedia] = {}
-        for item in values:
-            found.setdefault(cls._media_key(item), item)
-        return sorted(
-            found.values(),
-            key=lambda item: (item.message_date_utc, item.message_id, item.media_id),
-            reverse=True,
+    async def _match_messages(
+        self,
+        rule: SubscriptionRule,
+        messages: tuple[RemoteMessage, ...],
+        on_step: Callable[[_MatchStep], None] | None = None,
+    ) -> _MatchResult:
+        gateway, _planner = self._require_online()
+        keyword_hits = 0
+        candidates: dict[tuple[str, int, str], _MatchedCandidate] = {}
+        expanded_groups: set[int] = set()
+        phase = "正在筛选消息"
+
+        def add_candidate(remote: RemoteMedia, excerpt: str) -> None:
+            candidates.setdefault(
+                self._media_key(remote),
+                _MatchedCandidate(
+                    remote,
+                    remote.message_id,
+                    remote.message_date_utc,
+                    excerpt,
+                ),
+            )
+
+        for index, item in enumerate(messages, start=1):
+            if rule.normalized_keyword in self._normalize(item.text):
+                keyword_hits += 1
+                if item.media is not None and item.grouped_id is not None:
+                    if item.grouped_id not in expanded_groups:
+                        expanded_groups.add(item.grouped_id)
+                        album = await gateway.expand_album(
+                            rule.peer_ref,
+                            item.message_id,
+                            item.grouped_id,
+                        )
+                        for hit in album:
+                            if hit.remote.kind in rule.media_kinds:
+                                add_candidate(hit.remote, hit.excerpt or item.text)
+                elif item.media is not None and item.media.kind in rule.media_kinds:
+                    add_candidate(item.media, item.text)
+            if on_step is not None:
+                on_step(_MatchStep(index, keyword_hits, len(candidates), phase))
+
+        ordered = tuple(
+            sorted(
+                candidates.values(),
+                key=lambda item: (
+                    item.message_date_utc,
+                    item.message_id,
+                    item.remote.media_id,
+                ),
+                reverse=True,
+            )
         )
+        return _MatchResult(len(messages), keyword_hits, ordered)
 
     @staticmethod
     def _progress(
@@ -548,6 +645,26 @@ class SubscriptionService:
                     matched,
                     queued,
                     duplicate,
+                    phase,
+                )
+            )
+
+    @staticmethod
+    def _probe_progress(
+        callback: Callable[[SubscriptionProbeProgress], None] | None,
+        rule_id: str,
+        inspected: int,
+        keyword_hits: int,
+        matched: int,
+        phase: str,
+    ) -> None:
+        if callback is not None:
+            callback(
+                SubscriptionProbeProgress(
+                    rule_id,
+                    inspected,
+                    keyword_hits,
+                    matched,
                     phase,
                 )
             )
