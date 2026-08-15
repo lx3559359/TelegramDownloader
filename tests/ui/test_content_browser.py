@@ -359,6 +359,32 @@ def test_result_preview_double_click_emits_result_id(qtbot) -> None:
     assert caught.args == ["r1"]
 
 
+def test_real_mouse_double_click_on_preview_emits_result_id(qtbot) -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    page = ContentBrowserPage()
+    page.resize(900, 620)
+    qtbot.addWidget(page)
+    page.show()
+    page.set_results([result(now, "r1", 1)])
+    qtbot.wait(20)
+    index = page.result_model.index(0, 1)
+    point = page.result_table.visualRect(index).center()
+
+    with qtbot.waitSignal(page.preview_requested, timeout=500) as caught:
+        qtbot.mouseClick(
+            page.result_table.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=point,
+        )
+        qtbot.mouseDClick(
+            page.result_table.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=point,
+        )
+
+    assert caught.args == ["r1"]
+
+
 def test_nonblocking_preview_is_retained_until_closed(qtbot) -> None:
     now = datetime(2026, 8, 15, tzinfo=UTC)
     page = ContentBrowserPage()
