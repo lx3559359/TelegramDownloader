@@ -173,19 +173,19 @@ Write only boolean outcomes, counts, durations, byte deltas and error class name
 - Test: `tests/ui/test_content_browser.py`
 - Test: `tests/update/`
 
-- [ ] **Step 1: Re-run the real GUI journey in a new evidence directory**
+- [x] **Step 1: Re-run the real GUI journey in a new evidence directory**
 
 Use `.build-temp\manual-qa\round-2` and assert that refresh, search and queue buttons expose busy feedback and return to their normal state. Run the focused async-action and content-browser tests after the journey.
 
 Expected: the second session restore also avoids QR login; no action remains in the controller's active-key set.
 
-- [ ] **Step 2: Crash only the dedicated probe process during real download**
+- [x] **Step 2: Crash only the dedicated probe process during real download**
 
 Run `crash_probe.py` with the project-local runtime and capture its last JSON line. Accept exit code 23 only when `session_restored`, `resume_started` and `progressed` are true and `bytes_after` is greater than `bytes_before`.
 
 Expected: the main application is not running; only the probe process exits abnormally.
 
-- [ ] **Step 3: Restart and verify recovery plus graceful shutdown**
+- [x] **Step 3: Restart and verify recovery plus graceful shutdown**
 
 Run:
 
@@ -195,13 +195,13 @@ Run:
 
 Expected: interrupted work is recovered to queue, automatically resumes, preserves bytes, settles to paused during shutdown, leaves zero borrowed senders, zero scheduler-active tasks, a disconnected gateway and an empty `pending_after_shutdown` list.
 
-- [ ] **Step 4: Exercise update failure policies and installer preservation again**
+- [x] **Step 4: Exercise update failure policies and installer preservation again**
 
 Run all tests under `tests/update`, the real update probe, and `smoke-installer.ps1` against the existing setup.
 
 Expected: valid older releases remain no-update, one unavailable source can degrade safely, invalid or contradictory signed data blocks, minimum-updater policy blocks incompatible newer versions, and installer smoke ends with `INSTALLER_SMOKE_OK`.
 
-- [ ] **Step 5: Record pass-two aggregate evidence**
+- [x] **Step 5: Record pass-two aggregate evidence**
 
 Record process exit code, byte delta, recovered statuses, pending-task count, shutdown duration, source statuses and installer result without external identifiers.
 
