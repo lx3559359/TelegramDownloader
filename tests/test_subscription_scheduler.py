@@ -62,6 +62,7 @@ def report(value: SubscriptionRule) -> SubscriptionRunReport:
         1,
         1,
         1,
+        1,
         0,
     )
     return SubscriptionRunReport(run, (f"task-{value.id}",), 11, False)

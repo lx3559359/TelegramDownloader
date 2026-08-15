@@ -227,6 +227,7 @@ class SubscriptionService:
 
         started_at = self.clock()
         inspected = 0
+        keyword_hits = 0
         matched = 0
         queued = 0
         duplicate = 0
@@ -241,7 +242,7 @@ class SubscriptionService:
             last_error=None,
             failure_count=rule.failure_count,
         )
-        self._progress(on_progress, rule_id, 0, 0, 0, 0, "正在读取新消息")
+        self._progress(on_progress, rule_id, 0, 0, 0, 0, 0, "正在读取新消息")
         try:
             snapshot_id = await gateway.latest_message_id(rule.peer_ref)
             if rule.last_message_id is None:
@@ -251,6 +252,7 @@ class SubscriptionService:
                     started_at,
                     last_processed_id,
                     inspected,
+                    keyword_hits,
                     matched,
                     queued,
                     duplicate,
@@ -260,6 +262,7 @@ class SubscriptionService:
                 self._progress(
                     on_progress,
                     rule_id,
+                    0,
                     0,
                     0,
                     0,
@@ -284,16 +287,38 @@ class SubscriptionService:
                         on_progress,
                         rule_id,
                         index,
+                        keyword_hits,
                         len(remotes),
                         queued,
                         duplicate,
                         "正在筛选新消息",
                     )
                     continue
+                keyword_hits += 1
                 if item.media is None:
+                    self._progress(
+                        on_progress,
+                        rule_id,
+                        index,
+                        keyword_hits,
+                        len(remotes),
+                        queued,
+                        duplicate,
+                        "正在筛选新消息",
+                    )
                     continue
                 if item.grouped_id is not None:
                     if item.grouped_id in expanded_groups:
+                        self._progress(
+                            on_progress,
+                            rule_id,
+                            index,
+                            keyword_hits,
+                            len(remotes),
+                            queued,
+                            duplicate,
+                            "正在筛选新消息",
+                        )
                         continue
                     expanded_groups.add(item.grouped_id)
                     album = await gateway.expand_album(
@@ -312,6 +337,7 @@ class SubscriptionService:
                     on_progress,
                     rule_id,
                     index,
+                    keyword_hits,
                     len(remotes),
                     queued,
                     duplicate,
@@ -348,6 +374,7 @@ class SubscriptionService:
                 started_at,
                 last_processed_id,
                 inspected,
+                keyword_hits,
                 matched,
                 queued,
                 duplicate,
@@ -358,6 +385,7 @@ class SubscriptionService:
                 on_progress,
                 rule_id,
                 inspected,
+                keyword_hits,
                 matched,
                 queued,
                 duplicate,
@@ -370,6 +398,7 @@ class SubscriptionService:
                 started_at,
                 SubscriptionRunStatus.CANCELLED,
                 inspected,
+                keyword_hits,
                 matched,
                 queued,
                 duplicate,
@@ -382,6 +411,7 @@ class SubscriptionService:
                 started_at,
                 SubscriptionRunStatus.FAILED,
                 inspected,
+                keyword_hits,
                 matched,
                 queued,
                 duplicate,
@@ -395,6 +425,7 @@ class SubscriptionService:
         started_at: datetime,
         last_processed_id: int,
         inspected: int,
+        keyword_hits: int,
         matched: int,
         queued: int,
         duplicate: int,
@@ -416,6 +447,7 @@ class SubscriptionService:
             finished_at,
             SubscriptionRunStatus.COMPLETED,
             inspected,
+            keyword_hits,
             matched,
             queued,
             duplicate,
@@ -443,6 +475,7 @@ class SubscriptionService:
         started_at: datetime,
         status: SubscriptionRunStatus,
         inspected: int,
+        keyword_hits: int,
         matched: int,
         queued: int,
         duplicate: int,
@@ -458,6 +491,7 @@ class SubscriptionService:
                 finished_at,
                 status,
                 inspected,
+                keyword_hits,
                 matched,
                 queued,
                 duplicate,
@@ -499,6 +533,7 @@ class SubscriptionService:
         callback: Callable[[SubscriptionProgress], None] | None,
         rule_id: str,
         inspected: int,
+        keyword_hits: int,
         matched: int,
         queued: int,
         duplicate: int,
@@ -509,6 +544,7 @@ class SubscriptionService:
                 SubscriptionProgress(
                     rule_id,
                     inspected,
+                    keyword_hits,
                     matched,
                     queued,
                     duplicate,

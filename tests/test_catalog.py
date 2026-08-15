@@ -94,6 +94,65 @@ def subscription(
     )
 
 
+def create_v2_catalog_with_run(database: Path, now: datetime) -> None:
+    with sqlite3.connect(database) as connection:
+        connection.executescript(catalog_module._SCHEMA_V1)
+        connection.executescript(catalog_module._SCHEMA_V2_MIGRATION)
+        connection.execute(
+            "INSERT INTO accounts(account_id, display_name, last_used_at) VALUES(?, ?, ?)",
+            ("a1", "旧账号", now.isoformat()),
+        )
+        connection.execute(
+            "INSERT INTO dialogs(account_id, peer_ref, title, username, kind, archived, "
+            "available, last_synced_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            ("a1", "-1001", "旧群组", "", "group", 0, 1, now.isoformat()),
+        )
+        connection.execute(
+            "INSERT INTO subscription_rules("
+            "id, account_id, peer_ref, dialog_title, keyword, normalized_keyword, "
+            "media_kinds, interval_minutes, enabled, state, last_message_id, "
+            "next_run_at, last_run_at, last_error, failure_count, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "r1",
+                "a1",
+                "-1001",
+                "旧群组",
+                "资料",
+                "资料",
+                "photo,video",
+                30,
+                1,
+                "waiting",
+                10,
+                now.isoformat(),
+                None,
+                None,
+                0,
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO subscription_runs("
+            "id, rule_id, account_id, started_at, finished_at, status, inspected, "
+            "matched, queued, duplicate, error) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "run-old",
+                "r1",
+                "a1",
+                now.isoformat(),
+                now.isoformat(),
+                "completed",
+                5,
+                2,
+                1,
+                1,
+                None,
+            ),
+        )
+
+
 def test_dialog_sync_is_account_scoped_and_marks_missing_unavailable(
     tmp_path: Path,
 ) -> None:
@@ -146,13 +205,13 @@ def test_most_recent_account_supports_offline_history(tmp_path: Path) -> None:
 def test_initialize_rejects_unknown_newer_schema(tmp_path: Path) -> None:
     database = tmp_path / "catalog.sqlite3"
     with sqlite3.connect(database) as connection:
-        connection.execute("PRAGMA user_version=3")
+        connection.execute("PRAGMA user_version=4")
 
     with pytest.raises(CatalogError, match="版本"):
         CatalogRepository(database).initialize()
 
 
-def test_catalog_schema_v2_keeps_existing_search_tables(tmp_path: Path) -> None:
+def test_catalog_schema_v3_keeps_existing_search_tables(tmp_path: Path) -> None:
     now = datetime(2026, 8, 14, tzinfo=UTC)
     database = tmp_path / "catalog.sqlite3"
     repo = CatalogRepository(database)
@@ -168,7 +227,7 @@ def test_catalog_schema_v2_keeps_existing_search_tables(tmp_path: Path) -> None:
     reopened.initialize()
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
     assert reopened.list_sessions("a1")[0].query.keyword == "资料"
 
 
@@ -187,7 +246,7 @@ def test_catalog_migrates_existing_v1_database_without_losing_accounts(
     repo = CatalogRepository(database)
     repo.initialize()
 
-    assert repo.schema_version() == 2
+    assert repo.schema_version() == 3
     assert repo.most_recent_account() == AccountProfile("a1", "旧账号")
     assert repo.list_subscriptions("a1") == []
 
@@ -285,6 +344,7 @@ def test_subscription_run_history_is_trimmed_per_rule(tmp_path: Path) -> None:
                 number,
                 number,
                 number,
+                number,
                 0,
             ),
             retain=2,
@@ -297,6 +357,47 @@ def test_subscription_run_history_is_trimmed_per_rule(tmp_path: Path) -> None:
         "run-3",
         "run-2",
     ]
+
+
+def test_catalog_migrates_v2_subscription_runs_to_v3(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    database = tmp_path / "catalog.sqlite3"
+    create_v2_catalog_with_run(database, now)
+
+    repository = CatalogRepository(database)
+    repository.initialize()
+
+    assert repository.schema_version() == 3
+    run = repository.list_subscription_runs("a1", "r1")[0]
+    assert run.keyword_hits == 0
+    assert (run.inspected, run.matched, run.queued, run.duplicate) == (5, 2, 1, 1)
+
+
+def test_subscription_run_round_trip_includes_keyword_hits(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    repository = CatalogRepository(tmp_path / "catalog.sqlite3")
+    repository.initialize()
+    repository.upsert_account(AccountProfile("a1", "账号"), now)
+    repository.replace_dialogs("a1", [dialog("a1", "-1001", "群-a1", now)], now)
+    saved = subscription("a1", "-1001", now)
+    repository.save_subscription(saved)
+    run = SubscriptionRun(
+        "run-keywords",
+        saved.id,
+        "a1",
+        now,
+        now,
+        SubscriptionRunStatus.COMPLETED,
+        5,
+        3,
+        2,
+        1,
+        1,
+    )
+
+    repository.save_subscription_run(run)
+
+    assert repository.list_subscription_runs("a1", saved.id) == [run]
 
 
 def test_search_refresh_preserves_selection_and_removes_stale_after_success(

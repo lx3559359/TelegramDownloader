@@ -111,10 +111,20 @@ class SubscriptionRule:
 class SubscriptionProgress:
     rule_id: str
     inspected: int
+    keyword_hits: int
     matched: int
     queued: int
     duplicate: int
     phase: str
+
+    def __post_init__(self) -> None:
+        _validate_diagnostic_counts(
+            self.inspected,
+            self.keyword_hits,
+            self.matched,
+            self.duplicate,
+            queued=self.queued,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,10 +136,75 @@ class SubscriptionRun:
     finished_at: datetime
     status: SubscriptionRunStatus
     inspected: int
+    keyword_hits: int
     matched: int
     queued: int
     duplicate: int
     error: str | None = None
+
+    def __post_init__(self) -> None:
+        _validate_diagnostic_counts(
+            self.inspected,
+            self.keyword_hits,
+            self.matched,
+            self.duplicate,
+            queued=self.queued,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionProbeProgress:
+    rule_id: str
+    inspected: int
+    keyword_hits: int
+    matched: int
+    phase: str
+
+    def __post_init__(self) -> None:
+        _validate_diagnostic_counts(
+            self.inspected,
+            self.keyword_hits,
+            self.matched,
+            0,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionProbeSample:
+    message_id: int
+    message_date_utc: datetime
+    media_kind: MediaKind
+    original_name: str
+    expected_size: int | None
+    already_queued: bool
+    excerpt: str
+
+    def __post_init__(self) -> None:
+        if self.message_id <= 0:
+            raise ValueError("探测样本消息标识必须大于零")
+        if self.expected_size is not None and self.expected_size < 0:
+            raise ValueError("探测样本文件大小不能为负数")
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionProbeReport:
+    rule_id: str
+    inspected: int
+    keyword_hits: int
+    matched: int
+    duplicate: int
+    samples: tuple[SubscriptionProbeSample, ...]
+    finished_at: datetime
+
+    def __post_init__(self) -> None:
+        _validate_diagnostic_counts(
+            self.inspected,
+            self.keyword_hits,
+            self.matched,
+            self.duplicate,
+        )
+        if len(self.samples) > 20:
+            raise ValueError("探测样本最多保留 20 项")
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,3 +213,22 @@ class SubscriptionRunReport:
     task_ids: tuple[str, ...]
     last_processed_id: int
     has_more: bool
+
+
+def _validate_diagnostic_counts(
+    inspected: int,
+    keyword_hits: int,
+    matched: int,
+    duplicate: int,
+    *,
+    queued: int | None = None,
+) -> None:
+    values = (inspected, keyword_hits, matched, duplicate)
+    if any(value < 0 for value in values) or (queued is not None and queued < 0):
+        raise ValueError("订阅诊断计数不能为负数")
+    if keyword_hits > inspected:
+        raise ValueError("关键词命中数不能大于扫描消息数")
+    if duplicate > matched:
+        raise ValueError("重复媒体数不能大于匹配媒体数")
+    if queued is not None and queued > matched:
+        raise ValueError("新增任务数不能大于匹配媒体数")

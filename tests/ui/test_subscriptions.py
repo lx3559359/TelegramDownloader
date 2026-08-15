@@ -68,6 +68,7 @@ def test_subscription_model_exposes_status_schedule_and_rule_id(qtbot) -> None:
         SubscriptionRunStatus.COMPLETED,
         20,
         5,
+        5,
         3,
         2,
     )
@@ -128,7 +129,7 @@ def test_page_emits_run_pause_resume_and_tracks_busy_progress(qtbot) -> None:
     assert page.run_button.isEnabled() is False
     assert page.busy_label.text() == "正在立即检查…"
 
-    page.set_progress(SubscriptionProgress("rule-1", 20, 3, 2, 1, "正在筛选"))
+    page.set_progress(SubscriptionProgress("rule-1", 20, 5, 3, 2, 1, "正在筛选"))
     assert "已扫描 20 条" in page.progress_label.text()
     assert "新增 2 项" in page.progress_label.text()
 
@@ -157,7 +158,7 @@ def test_automatic_progress_locks_actions_until_run_finishes(qtbot) -> None:
     page.set_rules([rule()])
     page.rule_table.selectRow(0)
 
-    page.set_progress(SubscriptionProgress("rule-1", 1, 0, 0, 0, "正在读取"))
+    page.set_progress(SubscriptionProgress("rule-1", 1, 0, 0, 0, 0, "正在读取"))
 
     assert page.new_button.isEnabled() is False
     assert page.edit_button.isEnabled() is False

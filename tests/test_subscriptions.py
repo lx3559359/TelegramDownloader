@@ -8,7 +8,13 @@ import pytest
 from telegram_downloader.domain import MediaKind
 from telegram_downloader.subscriptions import (
     SubscriptionDraft,
+    SubscriptionProbeProgress,
+    SubscriptionProbeReport,
+    SubscriptionProbeSample,
+    SubscriptionProgress,
     SubscriptionRule,
+    SubscriptionRun,
+    SubscriptionRunStatus,
     SubscriptionState,
 )
 
@@ -72,3 +78,67 @@ def test_subscription_draft_trims_keyword_and_validates_fields() -> None:
 
     with pytest.raises(ValueError, match="群组"):
         SubscriptionDraft("", "美女", frozenset({MediaKind.PHOTO}), 15)
+
+
+def test_subscription_counters_reject_impossible_keyword_totals() -> None:
+    with pytest.raises(ValueError, match="关键词命中"):
+        SubscriptionProbeProgress("rule-1", 2, 3, 0, "正在筛选")
+
+    with pytest.raises(ValueError, match="关键词命中"):
+        SubscriptionProgress("rule-1", 2, 3, 0, 0, 0, "正在筛选")
+
+    with pytest.raises(ValueError, match="关键词命中"):
+        SubscriptionRun(
+            "run-1",
+            "rule-1",
+            "account-1",
+            NOW,
+            NOW,
+            SubscriptionRunStatus.COMPLETED,
+            2,
+            3,
+            0,
+            0,
+            0,
+        )
+
+
+def test_probe_report_rejects_invalid_counts_and_limits_samples() -> None:
+    with pytest.raises(ValueError, match="关键词命中"):
+        SubscriptionProbeReport("rule-1", 2, 3, 0, 0, (), NOW)
+
+    sample = SubscriptionProbeSample(
+        1,
+        NOW,
+        MediaKind.PHOTO,
+        "photo.jpg",
+        10,
+        False,
+        "摘要",
+    )
+    with pytest.raises(ValueError, match="20"):
+        SubscriptionProbeReport("rule-1", 21, 21, 21, 0, (sample,) * 21, NOW)
+
+
+@pytest.mark.parametrize(
+    ("message_id", "expected_size", "message"),
+    [
+        (0, 10, "消息"),
+        (1, -1, "大小"),
+    ],
+)
+def test_probe_sample_rejects_invalid_media_metadata(
+    message_id: int,
+    expected_size: int,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        SubscriptionProbeSample(
+            message_id,
+            NOW,
+            MediaKind.PHOTO,
+            "photo.jpg",
+            expected_size,
+            False,
+            "摘要",
+        )

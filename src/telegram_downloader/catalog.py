@@ -142,6 +142,12 @@ CREATE INDEX idx_subscription_runs_rule_started
 PRAGMA user_version=2;
 """
 
+_SCHEMA_V3_MIGRATION = """
+ALTER TABLE subscription_runs
+    ADD COLUMN keyword_hits INTEGER NOT NULL DEFAULT 0 CHECK(keyword_hits >= 0);
+PRAGMA user_version=3;
+"""
+
 
 class CatalogRepository:
     def __init__(self, database: Path) -> None:
@@ -170,7 +176,11 @@ class CatalogRepository:
                 version = 1
             if version == 1:
                 connection.executescript(_SCHEMA_V2_MIGRATION)
-            elif version != 2:
+                version = 2
+            if version == 2:
+                connection.executescript(_SCHEMA_V3_MIGRATION)
+                version = 3
+            if version != 3:
                 raise CatalogError(f"不支持的内容目录版本：{version}")
 
     def schema_version(self) -> int:
@@ -830,8 +840,8 @@ class CatalogRepository:
             connection.execute(
                 "INSERT INTO subscription_runs("
                 "id, rule_id, account_id, started_at, finished_at, status, "
-                "inspected, matched, queued, duplicate, error) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "inspected, keyword_hits, matched, queued, duplicate, error) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run.id,
                     run.rule_id,
@@ -840,6 +850,7 @@ class CatalogRepository:
                     run.finished_at.isoformat(),
                     run.status.value,
                     run.inspected,
+                    run.keyword_hits,
                     run.matched,
                     run.queued,
                     run.duplicate,
@@ -989,6 +1000,7 @@ class CatalogRepository:
             finished_at=datetime.fromisoformat(str(row["finished_at"])),
             status=SubscriptionRunStatus(str(row["status"])),
             inspected=int(row["inspected"]),
+            keyword_hits=int(row["keyword_hits"]),
             matched=int(row["matched"]),
             queued=int(row["queued"]),
             duplicate=int(row["duplicate"]),
