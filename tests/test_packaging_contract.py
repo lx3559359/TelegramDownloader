@@ -47,6 +47,10 @@ def test_chinese_guide_documents_portable_data_and_security() -> None:
         "仅订阅启用后的新消息",
         "5、15、30、60 或 180 分钟",
         "最多检查 500 条新消息",
+        "最近 20 次运行",
+        "只读测试最近 100 条",
+        "最多展示 20 个样本",
+        "不会推进订阅游标",
     ):
         assert required in readme
 
@@ -57,6 +61,8 @@ def test_subscription_modules_do_not_escape_project_local_storage() -> None:
         root / "src/telegram_downloader/subscriptions.py",
         root / "src/telegram_downloader/subscription_service.py",
         root / "src/telegram_downloader/subscription_scheduler.py",
+        root / "src/telegram_downloader/subscription_diagnostics.py",
+        root / "src/telegram_downloader/ui/subscription_diagnostics.py",
         root / "src/telegram_downloader/ui/subscriptions.py",
     )
     forbidden = (
@@ -73,8 +79,20 @@ def test_subscription_modules_do_not_escape_project_local_storage() -> None:
         source = module.read_text(encoding="utf-8").casefold()
         assert all(value not in source for value in forbidden), module.name
 
+    diagnostic_modules = modules[3:5]
+    diagnostic_forbidden = (
+        "catalogrepository",
+        "taskplanner",
+        "telethongateway",
+        "subscriptionservice",
+        "subscriptionscheduler",
+    )
+    for module in diagnostic_modules:
+        source = module.read_text(encoding="utf-8").casefold()
+        assert all(value not in source for value in diagnostic_forbidden), module.name
 
-def test_v050_version_and_content_runtime_contract_are_consistent() -> None:
+
+def test_v060_version_and_content_runtime_contract_are_consistent() -> None:
     root = Path(__file__).parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     package_init = (root / "src/telegram_downloader/__init__.py").read_text(
@@ -87,13 +105,15 @@ def test_v050_version_and_content_runtime_contract_are_consistent() -> None:
     spec = (root / "TelegramDownloader.spec").read_text(encoding="utf-8")
     app = (root / "src/telegram_downloader/app.py").read_text(encoding="utf-8")
 
-    assert project["project"]["version"] == "0.5.0"
-    assert '__version__ = "0.5.0"' in package_init
-    assert '#define AppVersion "0.5.0"' in installer
+    assert project["project"]["version"] == "0.6.0"
+    assert '__version__ = "0.6.0"' in package_init
+    assert '#define AppVersion "0.6.0"' in installer
     assert "qrcode==8.2" in requirements
     assert '"qrcode"' in spec
     assert "app_version=__version__" in gateway
     assert 'f"v{__version__} · stable"' in main
+    assert '"telegram_downloader.subscription_diagnostics"' in spec
+    assert '"telegram_downloader.ui.subscription_diagnostics"' in spec
     assert "v0.1.0 · stable" not in main
     for component in (
         "ContentBrowserService",

@@ -17,6 +17,8 @@ a = Analysis(
         "python_socks",
         "qrcode",
         "telethon.sessions.string",
+        "telegram_downloader.subscription_diagnostics",
+        "telegram_downloader.ui.subscription_diagnostics",
     ],
     hookspath=[],
     runtime_hooks=[],
