@@ -170,6 +170,48 @@ def test_recover_delegates_to_repository() -> None:
     assert repo.recovered is True
 
 
+def test_shutdown_grace_defaults_to_thirty_seconds_and_must_be_positive() -> None:
+    scheduler = DownloadScheduler(Repo(), object())
+
+    assert scheduler.shutdown_grace_seconds == 30.0
+    with pytest.raises(ValueError, match="关闭等待时间"):
+        DownloadScheduler(Repo(), object(), shutdown_grace_seconds=0)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_lets_pause_aware_download_settle_within_grace() -> None:
+    entered = asyncio.Event()
+    cancelled = False
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            nonlocal cancelled
+            entered.set()
+            try:
+                await asyncio.sleep(0.02)
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            if should_pause():
+                raise DownloadPaused("paused")
+
+    repo = Repo()
+    scheduler = DownloadScheduler(
+        repo,
+        Downloader(),
+        shutdown_grace_seconds=0.1,
+    )
+    task = asyncio.create_task(scheduler.run_task("t"))
+    await entered.wait()
+
+    await scheduler.shutdown()
+    await task
+
+    assert cancelled is False
+    assert repo.items[0].status is ItemStatus.PAUSED
+    assert repo.task_updates[-1] is TaskStatus.PAUSED
+
+
 @pytest.mark.asyncio
 async def test_unknown_download_error_does_not_persist_exception_text() -> None:
     class Downloader:

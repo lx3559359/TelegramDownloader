@@ -70,12 +70,16 @@ class DownloadScheduler:
         concurrency: int = 3,
         retry: RetryPolicy | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        shutdown_grace_seconds: float = 30.0,
     ) -> None:
+        if shutdown_grace_seconds <= 0:
+            raise ValueError("关闭等待时间必须大于零")
         self.repository = repository
         self.downloader = downloader
         self.concurrency = min(5, max(1, concurrency))
         self.retry = retry or RetryPolicy()
         self.sleep = sleep or asyncio.sleep
+        self.shutdown_grace_seconds = float(shutdown_grace_seconds)
         self._semaphore = asyncio.Semaphore(self.concurrency)
         self._pause_flags: dict[str, asyncio.Event] = {}
         self._active: dict[str, asyncio.Task[None]] = {}
@@ -121,7 +125,7 @@ class DownloadScheduler:
         try:
             await asyncio.wait_for(
                 asyncio.gather(*active, return_exceptions=True),
-                timeout=5,
+                timeout=self.shutdown_grace_seconds,
             )
         except TimeoutError:
             for task in active:
