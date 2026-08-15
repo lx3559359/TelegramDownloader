@@ -19,6 +19,7 @@ a = Analysis(
         "telethon.sessions.string",
         "telegram_downloader.subscription_diagnostics",
         "telegram_downloader.ui.subscription_diagnostics",
+        "telegram_downloader.ui.models",
     ],
     hookspath=[],
     runtime_hooks=[],

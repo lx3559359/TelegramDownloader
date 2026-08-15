@@ -51,6 +51,9 @@ def test_chinese_guide_documents_portable_data_and_security() -> None:
         "只读测试最近 100 条",
         "最多展示 20 个样本",
         "不会推进订阅游标",
+        "归档所选",
+        "下载文件和去重记录都会保留",
+        "一次 SQLite 聚合查询",
     ):
         assert required in readme
 
@@ -92,7 +95,7 @@ def test_subscription_modules_do_not_escape_project_local_storage() -> None:
         assert all(value not in source for value in diagnostic_forbidden), module.name
 
 
-def test_v060_version_and_content_runtime_contract_are_consistent() -> None:
+def test_v070_version_and_content_runtime_contract_are_consistent() -> None:
     root = Path(__file__).parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     package_init = (root / "src/telegram_downloader/__init__.py").read_text(
@@ -105,15 +108,16 @@ def test_v060_version_and_content_runtime_contract_are_consistent() -> None:
     spec = (root / "TelegramDownloader.spec").read_text(encoding="utf-8")
     app = (root / "src/telegram_downloader/app.py").read_text(encoding="utf-8")
 
-    assert project["project"]["version"] == "0.6.0"
-    assert '__version__ = "0.6.0"' in package_init
-    assert '#define AppVersion "0.6.0"' in installer
+    assert project["project"]["version"] == "0.7.0"
+    assert '__version__ = "0.7.0"' in package_init
+    assert '#define AppVersion "0.7.0"' in installer
     assert "qrcode==8.2" in requirements
     assert '"qrcode"' in spec
     assert "app_version=__version__" in gateway
     assert 'f"v{__version__} · stable"' in main
     assert '"telegram_downloader.subscription_diagnostics"' in spec
     assert '"telegram_downloader.ui.subscription_diagnostics"' in spec
+    assert '"telegram_downloader.ui.models"' in spec
     assert "v0.1.0 · stable" not in main
     for component in (
         "ContentBrowserService",
