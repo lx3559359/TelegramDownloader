@@ -24,6 +24,8 @@ from telegram_downloader.repository import TaskRepository
 from telegram_downloader.scheduler import DownloadScheduler
 from telegram_downloader.security import SecretsError, SecretsVault
 from telegram_downloader.settings import AppSettings, SettingsError, SettingsStore
+from telegram_downloader.subscription_scheduler import SubscriptionScheduler
+from telegram_downloader.subscription_service import SubscriptionService
 from telegram_downloader.thumbnail_cache import ThumbnailCache
 from telegram_downloader.update import HttpBytesClient, UpdateCoordinator
 from telegram_downloader.update_contract import load_trusted_keys
@@ -187,6 +189,7 @@ def create_application(root: Path):
         catalog_error = error
     thumbnails = ThumbnailCache(paths.thumbnail_cache)
     content_browser = ContentBrowserService(catalog, thumbnails)
+    subscriptions = SubscriptionService(catalog)
     window = MainWindow()
     if catalog_error is not None:
         window.content_page.show_error(
@@ -208,6 +211,7 @@ def create_application(root: Path):
         downloader = MediaDownloader(gateway, repository, paths)
         scheduler = DownloadScheduler(repository, downloader, concurrency=concurrency)
         content_browser.bind_online(gateway, planner)
+        subscriptions.bind_online(gateway, planner)
         return planner, scheduler, content_browser
 
     gateway = None
@@ -278,6 +282,27 @@ def create_application(root: Path):
     def confirm_update(manifest) -> bool:
         return UpdateDialog(manifest, window).exec() == UpdateDialog.DialogCode.Accepted
 
+    controller_ref: dict[str, AppController] = {}
+    subscription_scheduler = SubscriptionScheduler(
+        subscriptions,
+        foreground_busy=lambda: (
+            controller_ref["controller"].foreground_telegram_busy()
+            if "controller" in controller_ref
+            else True
+        ),
+        on_rules_changed=lambda: (
+            controller_ref["controller"]._reload_subscriptions()
+            if "controller" in controller_ref
+            else None
+        ),
+        on_task_created=lambda task_id: (
+            controller_ref["controller"].subscription_task_created(task_id)
+            if "controller" in controller_ref
+            else None
+        ),
+        on_progress=window.subscriptions_page.set_progress,
+    )
+
     controller = AppController(
         gateway=gateway,
         planner=planner,
@@ -288,6 +313,8 @@ def create_application(root: Path):
         window=window,
         login_dialog=login_dialog,
         content_browser=content_browser,
+        subscriptions=subscriptions,
+        subscription_scheduler=subscription_scheduler,
         paths=paths,
         gateway_factory=gateway_factory,
         service_builder=build_services,
@@ -298,6 +325,7 @@ def create_application(root: Path):
         settings=settings,
         secrets=secrets,
     )
+    controller_ref["controller"] = controller
     async_actions = AsyncActionBridge()
     controller._async_actions = async_actions
 
@@ -384,6 +412,14 @@ def create_application(root: Path):
     async def content_preview_requested(result_id: str) -> None:
         await controller.open_content_preview(result_id)
 
+    @qasync.asyncSlot(object)
+    async def subscription_create_requested(draft: object) -> None:
+        await controller.create_subscription(draft)
+
+    @qasync.asyncSlot(str, object)
+    async def subscription_update_requested(rule_id: str, draft: object) -> None:
+        await controller.update_subscription(rule_id, draft)
+
     def open_settings() -> None:
         dialog = SettingsDialog(
             controller.settings,
@@ -435,6 +471,21 @@ def create_application(root: Path):
     window.content_page.history_clear_requested.connect(
         controller.clear_content_history
     )
+    window.subscriptions_page.create_requested.connect(
+        subscription_create_requested
+    )
+    window.subscriptions_page.update_requested.connect(
+        subscription_update_requested
+    )
+    window.subscriptions_page.run_requested.connect(
+        controller.run_subscription_now
+    )
+    window.subscriptions_page.enabled_requested.connect(
+        controller.set_subscription_enabled
+    )
+    window.subscriptions_page.delete_requested.connect(
+        controller.delete_subscription
+    )
     login_dialog.credentials_submitted.connect(credentials_submitted)
     login_dialog.phone_submitted.connect(phone_submitted)
     login_dialog.code_submitted.connect(code_submitted)
@@ -456,6 +507,16 @@ def create_application(root: Path):
         "content.activate",
         lambda: controller.activate_content_page(),
         hooks=ActionHooks(failed=content_failure),
+    )
+    async_actions.connect(
+        window.subscriptions_activated,
+        "subscriptions.activate",
+        lambda: controller.activate_subscriptions_page(),
+        hooks=ActionHooks(
+            failed=lambda error: window.subscriptions_page.show_error(
+                controller._safe_error(error)
+            )
+        ),
     )
     async_actions.connect(
         window.content_page.refresh_requested,
@@ -515,6 +576,8 @@ def create_application(root: Path):
             content_load_more_requested,
             content_queue_requested,
             content_preview_requested,
+            subscription_create_requested,
+            subscription_update_requested,
             open_settings,
         )
     )

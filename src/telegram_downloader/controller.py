@@ -32,6 +32,7 @@ from telegram_downloader.gateway import (
 from telegram_downloader.links import InvalidTelegramLink, parse_telegram_link
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.settings import AppSettings, ProxySettings
+from telegram_downloader.subscriptions import SubscriptionDraft
 from telegram_downloader.ui.models import TaskSummary
 
 _LOGGER = logging.getLogger("telegram_downloader.controller")
@@ -70,6 +71,7 @@ class _NullWindow:
         self.tasks = []
         self.message = _NullStatusBar()
         self.content_page = _NullContentPage()
+        self.subscriptions_page = _NullSubscriptionPage()
 
     def set_account(self, value: str | None) -> None:
         self.account = value
@@ -174,6 +176,28 @@ class _NullLoginDialog:
         pass
 
 
+class _NullSubscriptionPage:
+    def set_logged_in(self, _value: bool) -> None:
+        pass
+
+    def set_dialogs(self, _value: list[object]) -> None:
+        pass
+
+    def set_rules(self, _value: list[object]) -> None:
+        pass
+
+    def set_rule_busy(
+        self,
+        _rule_id: str | None,
+        _busy: bool,
+        _text: str = "",
+    ) -> None:
+        pass
+
+    def show_error(self, _message: str) -> None:
+        pass
+
+
 class _NullRepository:
     def list_tasks(self) -> list[object]:
         return []
@@ -199,6 +223,33 @@ class _NullScheduler:
         pass
 
 
+class _NullSubscriptionService:
+    account = None
+
+    def set_account(self, account: object | None) -> None:
+        self.account = account
+
+    def list_rules(self) -> list[object]:
+        return []
+
+    def go_offline(self) -> None:
+        pass
+
+
+class _NullSubscriptionScheduler:
+    def start(self) -> None:
+        pass
+
+    def set_account(self, _account_id: str | None) -> None:
+        pass
+
+    def wake(self, _rule_id: str | None = None) -> None:
+        pass
+
+    async def shutdown(self) -> None:
+        pass
+
+
 class AppController:
     def __init__(
         self,
@@ -212,6 +263,8 @@ class AppController:
         window: Any,
         login_dialog: Any,
         content_browser: Any | None = None,
+        subscriptions: Any | None = None,
+        subscription_scheduler: Any | None = None,
         paths: PortablePaths | None = None,
         gateway_factory: Callable[..., TelegramGateway] | None = None,
         service_builder: Callable[
@@ -243,6 +296,10 @@ class AppController:
         self.window = window
         self.login_dialog = login_dialog
         self.content_browser = content_browser
+        self.subscriptions = subscriptions or _NullSubscriptionService()
+        self.subscription_scheduler = (
+            subscription_scheduler or _NullSubscriptionScheduler()
+        )
         self.paths = paths
         self.gateway_factory = gateway_factory
         self.service_builder = service_builder
@@ -286,6 +343,8 @@ class AppController:
             window=dependencies.pop("window", _NullWindow()),
             login_dialog=dependencies.pop("login_dialog", _NullLoginDialog()),
             content_browser=dependencies.pop("content_browser", None),
+            subscriptions=dependencies.pop("subscriptions", None),
+            subscription_scheduler=dependencies.pop("subscription_scheduler", None),
             paths=dependencies.pop("paths", None),
             gateway_factory=dependencies.pop("gateway_factory", None),
             service_builder=dependencies.pop("service_builder", None),
@@ -425,6 +484,8 @@ class AppController:
                 go_offline = getattr(self.content_browser, "go_offline", None)
                 if go_offline is not None:
                     go_offline()
+            self.subscriptions.go_offline()
+            self.subscription_scheduler.set_account(None)
             if self.gateway is not None:
                 await self.gateway.disconnect()
             updated_settings = replace(self.settings, api_id=api_id, proxy=proxy)
@@ -658,8 +719,16 @@ class AppController:
         if self.content_browser is None:
             return
         try:
-            _profile, dialogs = await self.content_browser.activate_cached_account()
+            profile, dialogs = await self.content_browser.activate_cached_account()
             page.set_dialogs(dialogs)
+            self.subscriptions.set_account(profile)
+            self.subscription_scheduler.set_account(
+                profile.account_id if profile is not None else None
+            )
+            subscription_page = self._subscription_page()
+            subscription_page.set_logged_in(False)
+            subscription_page.set_dialogs(dialogs)
+            self._reload_subscriptions()
             self._reload_content_history()
         except Exception as error:
             page.show_error(self._safe_error(error))
@@ -673,6 +742,14 @@ class AppController:
             page = self._content_page()
             page.set_logged_in(True)
             page.set_dialogs(dialogs)
+            self.subscriptions.set_account(profile)
+            subscription_page = self._subscription_page()
+            subscription_page.set_logged_in(True)
+            subscription_page.set_dialogs(dialogs)
+            self._reload_subscriptions()
+            self.subscription_scheduler.set_account(profile.account_id)
+            self.subscription_scheduler.start()
+            self.subscription_scheduler.wake()
             self._reload_content_history()
             self._schedule_content_dialog_sync_if_stale()
         except SessionExpiredError:
@@ -753,6 +830,7 @@ class AppController:
                 return
             dialogs = await self.content_browser.sync_dialogs(on_progress=progress)
             page.set_dialogs(dialogs)
+            self._subscription_page().set_dialogs(dialogs)
             discovered = len(dialogs)
             page.set_sync_state(
                 f"刚刚同步，共 {discovered} 个",
@@ -1002,6 +1080,106 @@ class AppController:
             f"{self._format_bytes(removed_bytes)}"
         )
 
+    async def activate_subscriptions_page(self) -> None:
+        page = self._subscription_page()
+        account = getattr(self.subscriptions, "account", None)
+        if account is None:
+            cached = getattr(self.content_browser, "account", None)
+            if cached is not None:
+                self.subscriptions.set_account(cached)
+                account = cached
+        if self.content_browser is not None:
+            page.set_dialogs(self.content_browser.list_dialogs())
+        self._reload_subscriptions()
+        online = await self.ensure_telegram_online()
+        page.set_logged_in(online)
+        if online and account is None:
+            await self.activate_content_account()
+
+    async def create_subscription(self, draft: SubscriptionDraft) -> None:
+        page = self._subscription_page()
+        page.set_rule_busy(None, True, "正在建立订阅基线…")
+        try:
+            saved = await self.subscriptions.create_rule(draft)
+            self._reload_subscriptions()
+            self.subscription_scheduler.wake()
+            title = getattr(saved, "dialog_title", "")
+            keyword = getattr(saved, "keyword", "")
+            self._show_status(f"已创建自动订阅：{title} {keyword}".strip())
+        except Exception as error:
+            page.show_error(self._safe_error(error))
+        finally:
+            page.set_rule_busy(None, False)
+
+    async def update_subscription(
+        self,
+        rule_id: str,
+        draft: SubscriptionDraft,
+    ) -> None:
+        page = self._subscription_page()
+        page.set_rule_busy(rule_id, True, "正在更新订阅…")
+        try:
+            await self.subscriptions.update_rule(rule_id, draft)
+            self._reload_subscriptions()
+            self.subscription_scheduler.wake()
+            self._show_status("自动订阅已更新")
+        except Exception as error:
+            page.show_error(self._safe_error(error))
+        finally:
+            page.set_rule_busy(None, False)
+
+    def set_subscription_enabled(self, rule_id: str, enabled: bool) -> None:
+        page = self._subscription_page()
+        try:
+            self.subscriptions.set_enabled(rule_id, enabled)
+            self._reload_subscriptions()
+            if enabled:
+                self.subscription_scheduler.wake(rule_id)
+            self._show_status("自动订阅已继续" if enabled else "自动订阅已暂停")
+        except Exception as error:
+            page.show_error(self._safe_error(error))
+        finally:
+            page.set_rule_busy(None, False)
+
+    def run_subscription_now(self, rule_id: str) -> None:
+        page = self._subscription_page()
+        try:
+            self.subscriptions.get_rule(rule_id)
+            self.subscription_scheduler.wake(rule_id)
+            self._show_status("已安排立即检查")
+        except Exception as error:
+            page.show_error(self._safe_error(error))
+        finally:
+            page.set_rule_busy(None, False)
+
+    def delete_subscription(self, rule_id: str) -> None:
+        page = self._subscription_page()
+        try:
+            self.subscriptions.delete_rule(rule_id)
+            self._reload_subscriptions()
+            self._show_status("自动订阅已删除；已有任务和文件已保留")
+        except Exception as error:
+            page.show_error(self._safe_error(error))
+        finally:
+            page.set_rule_busy(None, False)
+
+    def subscription_task_created(self, task_id: str) -> None:
+        self.refresh_tasks()
+        self._start_task(task_id)
+
+    def foreground_telegram_busy(self) -> bool:
+        if self._shutting_down or self.connection_recovery.active:
+            return True
+        return any(
+            task is not None and not task.done()
+            for task in (
+                self._dialog_sync_task,
+                self._content_search_task,
+                self._qr_wait_task,
+                self._session_restore_task,
+            )
+        )
+
     async def test_proxy(self, proxy: ProxySettings, password: str) -> None:
         api_hash = self.secrets.get("api_hash", "")
         if self.gateway_factory is None or self.settings.api_id <= 0 or not api_hash:
@@ -1057,6 +1235,7 @@ class AppController:
         await self._cancel_connection_monitor()
         await self._cancel_qr_wait()
         await self._cancel_content_operations()
+        await self.subscription_scheduler.shutdown()
         await self.connection_recovery.cancel()
         await self.scheduler.shutdown()
         pending = tuple(task for task in self._background if not task.done())
@@ -1068,6 +1247,8 @@ class AppController:
             go_offline = getattr(self.content_browser, "go_offline", None)
             if go_offline is not None:
                 go_offline()
+        self.subscriptions.go_offline()
+        self.subscription_scheduler.set_account(None)
 
     async def _cancel_connection_monitor(self) -> None:
         task = self._connection_monitor_task
@@ -1205,6 +1386,8 @@ class AppController:
             go_offline = getattr(self.content_browser, "go_offline", None)
             if go_offline is not None:
                 go_offline()
+        self.subscriptions.go_offline()
+        self.subscription_scheduler.set_account(None)
 
         self.secrets.pop("session", None)
         self.vault.save(self.secrets)
@@ -1254,6 +1437,20 @@ class AppController:
 
     def _content_page(self):
         return getattr(self.window, "content_page", _NullContentPage())
+
+    def _subscription_page(self):
+        return getattr(
+            self.window,
+            "subscriptions_page",
+            _NullSubscriptionPage(),
+        )
+
+    def _reload_subscriptions(self) -> None:
+        page = self._subscription_page()
+        try:
+            page.set_rules(self.subscriptions.list_rules())
+        except Exception as error:
+            page.show_error(self._safe_error(error))
 
     def _reload_content_history(self) -> None:
         if self.content_browser is None:

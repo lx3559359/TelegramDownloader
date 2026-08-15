@@ -8,6 +8,8 @@ from PySide6.QtWidgets import QMessageBox
 from telegram_downloader import app
 from telegram_downloader.connectivity import ConnectionRecovery
 from telegram_downloader.content_browser import ContentBrowserService
+from telegram_downloader.subscription_scheduler import SubscriptionScheduler
+from telegram_downloader.subscription_service import SubscriptionService
 
 
 def test_standard_button_selection_accepts_pyside_integer_result() -> None:
@@ -119,13 +121,20 @@ def test_create_application_initializes_project_local_content_services(
             == (tmp_path / "data" / "cache" / "thumbnails").resolve()
         )
         assert controller.window.content_page is not None
+        assert isinstance(controller.subscriptions, SubscriptionService)
+        assert (
+            controller.subscriptions.catalog.database
+            == (tmp_path / "data" / "database" / "catalog.sqlite3").resolve()
+        )
+        assert isinstance(controller.subscription_scheduler, SubscriptionScheduler)
+        assert controller.window.subscriptions_page is not None
         assert isinstance(controller.connection_recovery, ConnectionRecovery)
         slot_names = {
             getattr(slot, "__name__", "") for slot in controller._ui_slots
         }
         assert "content_preview_requested" in slot_names
         assert controller._async_actions.active_keys == frozenset()
-        assert len(controller._async_actions._slots) == 7
+        assert len(controller._async_actions._slots) == 8
         controller.window.content_page.link_requested.emit(
             "https://t.me/example/1#fragment"
         )
@@ -188,6 +197,7 @@ def test_zero_argument_ui_signals_schedule_each_controller_action_once(
 
     actions = {
         "activate_content_page": "content.activate",
+        "activate_subscriptions_page": "subscriptions.activate",
         "refresh_content_dialogs": "dialogs.refresh",
         "retry_telegram_connection": "telegram.retry",
         "refresh_qr_login": "login.qr.refresh",
@@ -204,6 +214,7 @@ def test_zero_argument_ui_signals_schedule_each_controller_action_once(
 
     async def emit_actions() -> None:
         controller.window.content_activated.emit()
+        controller.window.subscriptions_activated.emit()
         controller.window.content_page.refresh_requested.emit()
         controller.window.content_page.connection_retry_requested.emit()
         controller.login_dialog.qr_refresh_requested.emit()
