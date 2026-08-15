@@ -67,5 +67,7 @@ def test_inno_compiler_arguments_preserve_project_paths_with_spaces() -> None:
     ).read_text(encoding="utf-8")
 
     assert "[Diagnostics.ProcessStartInfo]::new()" in build
-    assert ".ArgumentList.Add(" in build
+    assert "$compilerStart.Arguments =" in build
+    assert ".ArgumentList.Add(" not in build
+    assert "$compilerArguments" in build
     assert "$sourceDefinition" not in build

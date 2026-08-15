@@ -98,10 +98,13 @@ $compilerStart.UseShellExecute = $false
 $compilerStart.CreateNoWindow = $true
 $compilerStart.RedirectStandardOutput = $true
 $compilerStart.RedirectStandardError = $true
-$compilerStart.ArgumentList.Add("/DAppVersion=$version")
-$compilerStart.ArgumentList.Add("/DSourceDir=$appDir")
-$compilerStart.ArgumentList.Add("/DOutputDir=$releaseDir")
-$compilerStart.ArgumentList.Add((Join-Path $projectRoot 'installer\TelegramDownloader.iss'))
+$compilerArguments = @(
+    "/DAppVersion=$version",
+    "/DSourceDir=$appDir",
+    "/DOutputDir=$releaseDir",
+    (Join-Path $projectRoot 'installer\TelegramDownloader.iss')
+) | ForEach-Object { '"' + $_ + '"' }
+$compilerStart.Arguments = $compilerArguments -join ' '
 $compilerProcess = [Diagnostics.Process]::new()
 $compilerProcess.StartInfo = $compilerStart
 if (-not $compilerProcess.Start()) {
