@@ -56,6 +56,15 @@ class RemoteSearchPage:
 
 
 @dataclass(frozen=True, slots=True)
+class RemoteMessage:
+    message_id: int
+    grouped_id: int | None
+    message_date_utc: datetime
+    text: str
+    media: RemoteMedia | None
+
+
+@dataclass(frozen=True, slots=True)
 class QrLoginInfo:
     url: str
     expires_at: datetime
@@ -151,6 +160,17 @@ class TelegramGateway(Protocol):
         *,
         on_progress: Callable[[SearchProgress], None] | None = None,
     ) -> RemoteSearchPage: ...
+
+    async def latest_message_id(self, entity_ref: str) -> int: ...
+
+    async def incremental_messages(
+        self,
+        entity_ref: str,
+        *,
+        after_id: int,
+        through_id: int,
+        limit: int,
+    ) -> tuple[RemoteMessage, ...]: ...
 
     async def expand_album(
         self,
@@ -589,6 +609,66 @@ class TelethonGateway:
             else SearchCursor(last_inspected_id)
         )
         return RemoteSearchPage(tuple(items), next_cursor, exhausted)
+
+    async def latest_message_id(self, entity_ref: str) -> int:
+        try:
+            entity = await self._resolve_entity(entity_ref)
+            async for message in self._client.iter_messages(entity, limit=1):
+                message_id = getattr(message, "id", None)
+                return int(message_id) if isinstance(message_id, int) else 0
+            return 0
+        except Exception as exc:
+            self._raise_mapped(exc)
+
+    async def incremental_messages(
+        self,
+        entity_ref: str,
+        *,
+        after_id: int,
+        through_id: int,
+        limit: int,
+    ) -> tuple[RemoteMessage, ...]:
+        if after_id < 0 or through_id < after_id:
+            raise ValueError("无效的增量消息边界")
+        if not 1 <= limit <= 500:
+            raise ValueError("增量消息数量必须在 1 到 500 之间")
+        if after_id == through_id:
+            return ()
+
+        found: dict[int, RemoteMessage] = {}
+        try:
+            entity = await self._resolve_entity(entity_ref)
+            title = self._entity_title(entity, entity_ref)
+            messages = self._client.iter_messages(
+                entity,
+                min_id=after_id,
+                max_id=through_id + 1,
+                reverse=True,
+                limit=limit,
+            )
+            async for message in messages:
+                message_id = getattr(message, "id", None)
+                if not isinstance(message_id, int):
+                    continue
+                if not after_id < message_id <= through_id:
+                    continue
+                message_date = self._utc_datetime(getattr(message, "date", None))
+                if message_date is None:
+                    continue
+                remote = self.remote_media_from_message(entity_ref, message, title)
+                grouped_id = getattr(message, "grouped_id", None)
+                found[message_id] = RemoteMessage(
+                    message_id=message_id,
+                    grouped_id=(
+                        int(grouped_id) if isinstance(grouped_id, int) else None
+                    ),
+                    message_date_utc=message_date,
+                    text=self._message_excerpt(message),
+                    media=remote,
+                )
+        except Exception as exc:
+            self._raise_mapped(exc)
+        return tuple(found[message_id] for message_id in sorted(found))
 
     async def expand_album(
         self,
