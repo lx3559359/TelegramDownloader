@@ -50,6 +50,12 @@ class SubscriptionPage:
         self.latest_runs = {}
         self.busy = []
         self.errors = []
+        self.detail_rule = None
+        self.detail_runs = []
+        self.probe_busy = False
+        self.probe_progress = []
+        self.probe_reports = []
+        self.cancelled_messages = 0
 
     def set_logged_in(self, value):
         self.logged_in.append(value)
@@ -63,6 +69,24 @@ class SubscriptionPage:
 
     def set_rule_busy(self, rule_id, busy, text=""):
         self.busy.append((rule_id, busy, text))
+
+    def set_selected_rule_details(self, rule, runs):
+        self.detail_rule = rule
+        self.detail_runs = list(runs)
+
+    def set_probe_busy(self, _rule_id, busy):
+        self.probe_busy = busy
+
+    def set_probe_progress(self, progress):
+        self.probe_progress.append(progress)
+
+    def set_probe_result(self, report):
+        self.probe_reports.append(report)
+        self.probe_busy = False
+
+    def show_probe_cancelled(self):
+        self.cancelled_messages += 1
+        self.probe_busy = False
 
     def show_error(self, message):
         self.errors.append(message)
@@ -111,6 +135,8 @@ class Subscriptions:
         self.rules = []
         self.calls = []
         self.resume_count = 0
+        self.runs = []
+        self.list_run_limits = []
 
     def set_account(self, account):
         self.account = account
@@ -128,6 +154,11 @@ class Subscriptions:
 
     def get_rule(self, rule_id):
         return next(item for item in self.rules if item.id == rule_id)
+
+    def list_runs(self, rule_id, *, limit=20):
+        self.get_rule(rule_id)
+        self.list_run_limits.append(limit)
+        return self.runs[:limit]
 
     async def create_rule(self, draft):
         self.calls.append(("create", draft))
@@ -317,3 +348,167 @@ async def test_shutdown_stops_subscription_scheduler_before_download_and_gateway
     await controller.shutdown()
 
     assert order == ["subscriptions", "downloads", "gateway"]
+
+
+@pytest.mark.asyncio
+async def test_probe_is_foreground_and_repeated_request_is_deduplicated() -> None:
+    class ProbeSubscriptions(Subscriptions):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rules = [SimpleNamespace(id="rule-1")]
+            self.probe_started = asyncio.Event()
+            self.probe_release = asyncio.Event()
+            self.probe_calls = []
+
+        async def probe_rule(self, rule_id, *, on_progress=None):
+            self.probe_calls.append(rule_id)
+            self.probe_started.set()
+            await self.probe_release.wait()
+            return SimpleNamespace(rule_id=rule_id)
+
+    subscriptions = ProbeSubscriptions()
+    page_window = Window()
+    controller = AppController.for_test(
+        subscriptions=subscriptions,
+        subscription_scheduler=SubscriptionScheduler(),
+        window=page_window,
+    )
+
+    first = asyncio.create_task(controller.probe_subscription("rule-1"))
+    await subscriptions.probe_started.wait()
+    assert controller.foreground_telegram_busy()
+
+    await controller.probe_subscription("rule-1")
+    assert subscriptions.probe_calls == ["rule-1"]
+
+    subscriptions.probe_release.set()
+    await first
+    assert controller.foreground_telegram_busy() is False
+    assert page_window.subscriptions_page.probe_reports[-1].rule_id == "rule-1"
+
+
+@pytest.mark.asyncio
+async def test_probe_cancel_restores_page_without_recording_failure() -> None:
+    class ProbeSubscriptions(Subscriptions):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rules = [SimpleNamespace(id="rule-1")]
+            self.probe_started = asyncio.Event()
+
+        async def probe_rule(self, rule_id, *, on_progress=None):
+            self.probe_started.set()
+            await asyncio.Event().wait()
+
+    subscriptions = ProbeSubscriptions()
+    page_window = Window()
+    controller = AppController.for_test(
+        subscriptions=subscriptions,
+        subscription_scheduler=SubscriptionScheduler(),
+        window=page_window,
+    )
+    running = asyncio.create_task(controller.probe_subscription("rule-1"))
+    await subscriptions.probe_started.wait()
+
+    controller.cancel_subscription_probe()
+    await running
+
+    page = page_window.subscriptions_page
+    assert page.cancelled_messages == 1
+    assert page.probe_busy is False
+    assert controller._subscription_probe_task is None
+
+
+@pytest.mark.asyncio
+async def test_account_switch_cancels_probe_before_rebinding_service() -> None:
+    class ProbeSubscriptions(Subscriptions):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rules = [SimpleNamespace(id="rule-1")]
+            self.probe_started = asyncio.Event()
+            self.events = []
+
+        async def probe_rule(self, rule_id, *, on_progress=None):
+            self.probe_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.events.append("probe-cancelled")
+                raise
+
+        def set_account(self, account):
+            self.events.append(f"account:{getattr(account, 'account_id', None)}")
+            super().set_account(account)
+
+    subscriptions = ProbeSubscriptions()
+    controller = AppController.for_test(
+        subscriptions=subscriptions,
+        subscription_scheduler=SubscriptionScheduler(),
+        window=Window(),
+    )
+    running = asyncio.create_task(controller.probe_subscription("rule-1"))
+    await subscriptions.probe_started.wait()
+
+    await controller._cancel_subscription_probe()
+    subscriptions.set_account(AccountProfile("a2", "账号二"))
+    await running
+
+    assert subscriptions.events[:2] == ["probe-cancelled", "account:a2"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_awaits_probe_before_gateway_disconnect() -> None:
+    events = []
+
+    class ProbeSubscriptions(Subscriptions):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rules = [SimpleNamespace(id="rule-1")]
+            self.probe_started = asyncio.Event()
+
+        async def probe_rule(self, rule_id, *, on_progress=None):
+            self.probe_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                events.append("probe-stopped")
+
+        def go_offline(self):
+            events.append("subscriptions-offline")
+
+    class Gateway:
+        async def disconnect(self):
+            events.append("gateway-disconnected")
+
+    subscriptions = ProbeSubscriptions()
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        subscriptions=subscriptions,
+        subscription_scheduler=SubscriptionScheduler(),
+        window=Window(),
+    )
+    running = asyncio.create_task(controller.probe_subscription("rule-1"))
+    await subscriptions.probe_started.wait()
+
+    await controller.shutdown()
+    await running
+
+    assert events.index("probe-stopped") < events.index("gateway-disconnected")
+
+
+def test_rule_selection_loads_only_latest_twenty_runs() -> None:
+    subscriptions = Subscriptions()
+    selected = SimpleNamespace(id="rule-1")
+    subscriptions.rules = [selected]
+    subscriptions.runs = [SimpleNamespace(id=f"run-{index}") for index in range(25)]
+    page_window = Window()
+    controller = AppController.for_test(
+        subscriptions=subscriptions,
+        subscription_scheduler=SubscriptionScheduler(),
+        window=page_window,
+    )
+
+    controller.show_subscription_details("rule-1")
+
+    assert subscriptions.list_run_limits == [20]
+    assert page_window.subscriptions_page.detail_rule == selected
+    assert len(page_window.subscriptions_page.detail_runs) == 20

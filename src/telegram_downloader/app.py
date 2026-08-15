@@ -424,6 +424,17 @@ def create_application(root: Path):
     async def subscription_update_requested(rule_id: str, draft: object) -> None:
         await controller.update_subscription(rule_id, draft)
 
+    def subscription_probe_requested(rule_id: str) -> None:
+        async_actions.start(
+            "subscriptions.probe",
+            lambda: controller.probe_subscription(rule_id),
+            hooks=ActionHooks(
+                failed=lambda error: window.subscriptions_page.show_error(
+                    controller._safe_error(error)
+                )
+            ),
+        )
+
     def open_settings() -> None:
         dialog = SettingsDialog(
             controller.settings,
@@ -489,6 +500,15 @@ def create_application(root: Path):
     )
     window.subscriptions_page.delete_requested.connect(
         controller.delete_subscription
+    )
+    window.subscriptions_page.rule_selected.connect(
+        controller.show_subscription_details
+    )
+    window.subscriptions_page.probe_requested.connect(
+        subscription_probe_requested
+    )
+    window.subscriptions_page.probe_cancel_requested.connect(
+        controller.cancel_subscription_probe
     )
     login_dialog.credentials_submitted.connect(credentials_submitted)
     login_dialog.phone_submitted.connect(phone_submitted)
@@ -582,6 +602,7 @@ def create_application(root: Path):
             content_preview_requested,
             subscription_create_requested,
             subscription_update_requested,
+            subscription_probe_requested,
             open_settings,
         )
     )

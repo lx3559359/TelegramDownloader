@@ -139,6 +139,7 @@ def test_create_application_initializes_project_local_content_services(
             getattr(slot, "__name__", "") for slot in controller._ui_slots
         }
         assert "content_preview_requested" in slot_names
+        assert "subscription_probe_requested" in slot_names
         assert controller._async_actions.active_keys == frozenset()
         assert len(controller._async_actions._slots) == 8
         controller.window.content_page.link_requested.emit(
@@ -147,6 +148,21 @@ def test_create_application_initializes_project_local_content_services(
         assert controller.window.content_page.error_label.text() == (
             "请输入有效的 t.me 链接"
         )
+
+        probe_calls: list[str] = []
+
+        async def record_probe(rule_id: str) -> None:
+            probe_calls.append(rule_id)
+
+        controller.probe_subscription = record_probe
+
+        async def emit_probe() -> None:
+            controller.window.subscriptions_page.probe_requested.emit("rule-1")
+            await controller._async_actions.wait_idle()
+
+        loop.run_until_complete(emit_probe())
+        assert probe_calls == ["rule-1"]
+        assert controller._async_actions.active_keys == frozenset()
 
         report = app.run_self_test(tmp_path)
         for value in report["writable_paths"].values():

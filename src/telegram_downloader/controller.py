@@ -198,6 +198,25 @@ class _NullSubscriptionPage:
     ) -> None:
         pass
 
+    def set_selected_rule_details(
+        self,
+        _rule: object | None,
+        _runs: list[object],
+    ) -> None:
+        pass
+
+    def set_probe_busy(self, _rule_id: str | None, _busy: bool) -> None:
+        pass
+
+    def set_probe_progress(self, _progress: object | None) -> None:
+        pass
+
+    def set_probe_result(self, _report: object | None) -> None:
+        pass
+
+    def show_probe_cancelled(self) -> None:
+        pass
+
     def show_error(self, _message: str) -> None:
         pass
 
@@ -238,6 +257,12 @@ class _NullSubscriptionService:
 
     def latest_runs(self) -> dict[str, object]:
         return {}
+
+    def get_rule(self, rule_id: str) -> object:
+        raise KeyError(rule_id)
+
+    def list_runs(self, _rule_id: str, *, limit: int = 20) -> list[object]:
+        return []
 
     def resume_after_connection(self) -> int:
         return 0
@@ -334,6 +359,7 @@ class AppController:
         self._settings_dialog: Any | None = None
         self._dialog_sync_task: asyncio.Task[Any] | None = None
         self._content_search_task: asyncio.Task[Any] | None = None
+        self._subscription_probe_task: asyncio.Task[Any] | None = None
         self._subscription_actions_active = 0
         self._thumbnail_tasks: dict[str, asyncio.Task[Any]] = {}
         self._progress_refresh_interval = progress_refresh_interval
@@ -503,6 +529,7 @@ class AppController:
     ) -> None:
         try:
             await self._cancel_qr_wait()
+            await self._cancel_subscription_probe()
             await self._cancel_content_operations()
             await self.connection_recovery.cancel()
             if self.content_browser is not None:
@@ -591,6 +618,7 @@ class AppController:
 
     async def edit_credentials(self) -> None:
         await self._cancel_qr_wait()
+        await self._cancel_subscription_probe()
         await self.connection_recovery.cancel()
         if self.gateway is not None:
             await self.gateway.disconnect()
@@ -601,6 +629,7 @@ class AppController:
 
     async def cancel_login(self) -> None:
         await self._cancel_qr_wait()
+        await self._cancel_subscription_probe()
         if self.gateway is not None:
             await self.gateway.disconnect()
 
@@ -744,6 +773,7 @@ class AppController:
         if self.content_browser is None:
             return
         try:
+            await self._cancel_subscription_probe()
             profile, dialogs = await self.content_browser.activate_cached_account()
             page.set_dialogs(dialogs)
             self.subscriptions.set_account(profile)
@@ -762,6 +792,7 @@ class AppController:
         if self.content_browser is None:
             return
         try:
+            await self._cancel_subscription_probe()
             profile, dialogs = await self.content_browser.activate_account()
             self.window.set_account(profile.display_name)
             page = self._content_page()
@@ -1122,6 +1153,62 @@ class AppController:
         if online and account is None:
             await self.activate_content_account()
 
+    def show_subscription_details(self, rule_id: str) -> None:
+        page = self._subscription_page()
+        try:
+            rule = self.subscriptions.get_rule(rule_id)
+            runs = self.subscriptions.list_runs(rule_id, limit=20)
+            page.set_selected_rule_details(rule, runs)
+        except Exception as error:
+            page.set_selected_rule_details(None, [])
+            page.show_error(self._safe_error(error))
+
+    async def probe_subscription(self, rule_id: str) -> None:
+        current = asyncio.current_task()
+        if current is None:
+            return
+        existing = self._subscription_probe_task
+        if existing is not None and existing is not current and not existing.done():
+            return
+
+        page = self._subscription_page()
+        self._subscription_probe_task = current
+        page.set_probe_busy(rule_id, True)
+        page.set_probe_progress(None)
+        try:
+            report = await self.subscriptions.probe_rule(
+                rule_id,
+                on_progress=page.set_probe_progress,
+            )
+            page.set_probe_result(report)
+            self._show_status("订阅规则只读测试完成")
+        except asyncio.CancelledError:
+            page.show_probe_cancelled()
+        except SessionExpiredError as error:
+            await self._handle_session_expired(error)
+        except Exception as error:
+            page.show_error(self._safe_error(error))
+        finally:
+            if self._subscription_probe_task is current:
+                self._subscription_probe_task = None
+            page.set_probe_progress(None)
+            page.set_probe_busy(None, False)
+            if not self._shutting_down:
+                self.show_subscription_details(rule_id)
+
+    def cancel_subscription_probe(self) -> None:
+        task = self._subscription_probe_task
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _cancel_subscription_probe(self) -> None:
+        task = self._subscription_probe_task
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
     async def create_subscription(self, draft: SubscriptionDraft) -> None:
         page = self._subscription_page()
         page.set_rule_busy(None, True, "正在建立订阅基线…")
@@ -1209,6 +1296,7 @@ class AppController:
             for task in (
                 self._dialog_sync_task,
                 self._content_search_task,
+                self._subscription_probe_task,
                 self._qr_wait_task,
                 self._session_restore_task,
             )
@@ -1268,6 +1356,7 @@ class AppController:
         self._shutting_down = True
         await self._cancel_connection_monitor()
         await self._cancel_qr_wait()
+        await self._cancel_subscription_probe()
         await self._cancel_content_operations()
         await self.subscription_scheduler.shutdown()
         await self.connection_recovery.cancel()
@@ -1414,6 +1503,7 @@ class AppController:
 
     async def _handle_session_expired(self, error: SessionExpiredError) -> None:
         await self.connection_recovery.cancel()
+        await self._cancel_subscription_probe()
         await self._cancel_content_operations()
         page = self._content_page()
         if self.content_browser is not None:
