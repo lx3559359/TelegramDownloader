@@ -2,9 +2,9 @@
 
 ## 正式版下载
 
-当前公开正式版：`v0.3.1`（Windows 10/11 x64）：
+Windows 10/11 x64 正式版请从以下稳定发布入口获取：
 
-- [GitHub Release（安装包与便携包）](https://github.com/lx3559359/TelegramDownloader/releases/tag/v0.3.1)
+- [GitHub 最新 Release（安装包与便携包）](https://github.com/lx3559359/TelegramDownloader/releases/latest)
 - [魔搭镜像仓库](https://modelscope.cn/models/lx3559359/TelegramDownloader)
 - 安装包会拒绝安装到 C 盘；便携包请解压到 D、E 等非 C 盘目录后运行。
 - Windows 可能因未购买商业 Authenticode 证书显示 SmartScreen“未知发布者”；在线更新仍会强制验证 Ed25519 签名和 SHA-256。
@@ -20,6 +20,7 @@
 - 在选定群组/频道内使用 Telegram 服务端关键词搜索（关键词必填），首批显示后可继续“加载更多”。
 - 搜索结果支持相册完整补齐后逐项选择、全选/反选和选择性加入下载队列；已存在任务会自动跳过并报告。
 - 搜索记录和勾选状态可在重启后恢复；离线时仍可查看缓存记录，但同步、搜索和加入队列需要重新联网。
+- 为已加入的群组或频道创建自动订阅，按关键词、媒体类型和检查间隔增量发现新媒体并加入现有下载队列。
 - 首次配置个人 API ID/API Hash 后，默认使用 Telegram App 扫二维码登录；保留手机号验证码备用入口。
 - 频道/群组按包含式日期范围、图片、视频、音频、语音、文档、压缩包和数量上限扫描。
 - 专业三栏任务工作台，显示状态、进度、大小、速度、剩余时间和持久错误原因。
@@ -89,6 +90,12 @@ API Hash、代理密码和 Telethon StringSession 会写入 `data/config/secrets
 
 粘贴类似 `https://t.me/example/42` 或 `https://t.me/c/123456/99` 的链接，点击“扫描预览”。如果消息属于相册，程序会把同组媒体一起列入预览。用户确认后才创建下载任务。`t.me/c/...` 是私有频道/群组链接，当前登录账号必须已经加入；程序不会自动加入或绕过权限。v0.2.0 会在重启后从账号已有对话中恢复这类私有实体。
 
+### 自动订阅新媒体
+
+打开左侧“自动订阅”，选择当前账号已加入的群组或频道，填写关键词、媒体类型和检查间隔即可创建规则。检查间隔支持 5、15、30、60 或 180 分钟。新规则会先记录当前最新消息作为基线，因此仅订阅启用后的新消息，不会意外补抓全部历史。规则支持立即检查、暂停、继续、编辑和删除；删除规则不会删除已经生成的任务或已下载文件。
+
+自动检查仅在程序运行且 Telegram 已连接时执行。每次最多检查 500 条新消息，仍有积压时保存安全游标并在短暂让出前台后继续。手动登录、刷新群组和搜索拥有更高优先级；网络中断时规则会自动退避重试，程序异常退出后会在下次启动恢复。规则、游标和最近运行统计都保存在 `data/database/catalog.sqlite3`，不会创建 Windows 服务、计划任务或额外的系统目录数据。
+
 ### 频道或群组批量任务
 
 粘贴频道/群组链接，选择开始日期、结束日期（含当天）、媒体类型和数量上限。筛选在数量限制前执行，结果按从新到旧保留最新匹配项。默认上限为 500，不会无提示抓取全部历史。
@@ -141,8 +148,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1
 
 ```text
 dist/TelegramDownloader/TelegramDownloader.exe
-dist/TelegramDownloader-0.3.1-win-x64-portable.zip
-dist/release/TelegramDownloader-0.3.1-win-x64-setup.exe
+dist/TelegramDownloader-<版本>-win-x64-portable.zip
+dist/release/TelegramDownloader-<版本>-win-x64-setup.exe
 ```
 
 安装器构建会把 Inno Setup 7.0.2 以便携方式放在项目 `.tool-cache` 中，并在使用前核对官方固定 SHA-256 和 Authenticode 发布者；编译、安装及卸载冒烟测试的临时目录和日志都位于 `.build-temp`。安装验收会真实验证 C 盘拒绝、D 盘安装、自检、原位升级、在线更新运行时文件存在，以及普通卸载后用户数据仍保留。
