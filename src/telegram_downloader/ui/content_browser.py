@@ -78,6 +78,9 @@ class ContentBrowserPage(QWidget):
         self._logged_in = False
         self._sync_busy = False
         self._search_busy = False
+        self._connection_action_busy = False
+        self._connection_retryable = False
+        self._queue_busy = False
         self._thumbnail_requested_ids: set[str] = set()
         self._preview_dialogs: set[MediaPreviewDialog] = set()
         self._build_ui()
@@ -342,7 +345,16 @@ class ContentBrowserPage(QWidget):
 
     def set_connection_state(self, text: str, *, retryable: bool = False) -> None:
         self.empty_hint.setText(text)
-        self.connection_retry_button.setVisible(retryable)
+        self._connection_retryable = retryable
+        self.connection_retry_button.setVisible(
+            retryable or self._connection_action_busy
+        )
+
+    def set_connection_action_busy(self, busy: bool) -> None:
+        self._connection_action_busy = busy
+        self.connection_retry_button.setText("重连中…" if busy else "重新连接")
+        self.connection_retry_button.setVisible(busy or self._connection_retryable)
+        self._refresh_actions()
 
     def set_dialogs(self, dialogs: list[ContentDialog]) -> None:
         selected_peer = self._current_peer_ref()
@@ -393,6 +405,16 @@ class ContentBrowserPage(QWidget):
         self._search_busy = busy
         self.search_state_label.setVisible(busy)
         self.search_progress.setVisible(busy)
+        self._refresh_actions()
+
+    def set_queue_busy(self, busy: bool) -> None:
+        self._queue_busy = busy
+        selected = sum(
+            item.selected and item.available and not item.queued for item in self.results
+        )
+        self.queue_button.setText(
+            f"正在准备已选 {selected} 项…" if busy else "加入下载队列"
+        )
         self._refresh_actions()
 
     def set_search_progress(self, progress: SearchProgress | None) -> None:
@@ -537,6 +559,7 @@ class ContentBrowserPage(QWidget):
 
     def _emit_queue(self) -> None:
         if self.active_search_id is not None:
+            self.set_queue_busy(True)
             self.queue_requested.emit(self.active_search_id)
 
     def _emit_load_more(self) -> None:
@@ -610,6 +633,7 @@ class ContentBrowserPage(QWidget):
             for item in self.results
         )
         self.refresh_button.setEnabled(not self._sync_busy)
+        self.connection_retry_button.setEnabled(not self._connection_action_busy)
         self.search_button.setEnabled(form_ready)
         self.keyword_input.setEnabled(form_ready)
         self.cancel_button.setVisible(self._search_busy)
@@ -624,6 +648,7 @@ class ContentBrowserPage(QWidget):
             and dialog_available
             and self.active_search_id is not None
             and selectable
+            and not self._queue_busy
         )
         can_load = (
             self.active_session is not None

@@ -130,6 +130,34 @@ def test_connection_retry_button_emits_retry_signal(qtbot) -> None:
         )
 
 
+def test_connection_and_queue_busy_states_disable_duplicate_actions(qtbot) -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    page = ContentBrowserPage()
+    qtbot.addWidget(page)
+    page.set_logged_in(True)
+    page.set_dialogs([dialog(now)])
+    page.dialog_list.setCurrentIndex(page.dialog_model.index(0, 0))
+    page.set_active_search(session(now))
+    page.set_results([replace(result(now, "r1", 1), selected=True)])
+    page.set_connection_state("离线，点击重试", retryable=True)
+
+    page.set_connection_action_busy(True)
+    assert page.connection_retry_button.text() == "重连中…"
+    assert page.connection_retry_button.isEnabled() is False
+    page.set_connection_state("正在重连（1/3）…", retryable=False)
+    assert page.connection_retry_button.isHidden() is False
+    page.set_connection_action_busy(False)
+    assert page.connection_retry_button.text() == "重新连接"
+    assert page.connection_retry_button.isEnabled() is True
+
+    page.set_queue_busy(True)
+    assert page.queue_button.text() == "正在准备已选 1 项…"
+    assert page.queue_button.isEnabled() is False
+    page.set_queue_busy(False)
+    assert page.queue_button.text() == "加入下载队列"
+    assert page.queue_button.isEnabled() is True
+
+
 def test_logged_out_page_keeps_query_editable_and_history_visible(
     qtbot,
 ) -> None:
@@ -257,6 +285,8 @@ def test_selection_summary_and_queue_signal_skip_unavailable_and_queued(
     with qtbot.waitSignal(page.queue_requested, timeout=500) as caught:
         qtbot.mouseClick(page.queue_button, Qt.MouseButton.LeftButton)
     assert caught.args == ["search-1"]
+    assert page.queue_button.text() == "正在准备已选 2 项…"
+    assert page.queue_button.isEnabled() is False
 
 
 def test_history_open_delete_and_clear_emit_independent_signals(qtbot) -> None:

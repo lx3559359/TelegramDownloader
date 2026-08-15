@@ -55,6 +55,7 @@ class LoginDialog(QDialog):
         self.setModal(True)
         self.setMinimumWidth(520)
         self._qr_expires_at: datetime | None = None
+        self._busy_action: str | None = None
         self.qr_countdown_timer = QTimer(self)
         self.qr_countdown_timer.setInterval(1000)
         self.qr_countdown_timer.timeout.connect(self._tick_qr_countdown)
@@ -272,6 +273,24 @@ class LoginDialog(QDialog):
     def show_error(self, text: str) -> None:
         self.error_label.setText(text)
         self.error_label.setVisible(True)
+
+    def set_action_busy(self, action: str, busy: bool) -> None:
+        if busy:
+            self._busy_action = action
+        elif self._busy_action == action:
+            self._busy_action = None
+        labels = {
+            "qr.refresh": (self.qr_refresh, "正在刷新…", "刷新二维码"),
+            "login.phone": (self.phone_fallback, "正在切换…", "改用手机号登录"),
+            "login.credentials": (
+                self.credentials_edit,
+                "正在打开…",
+                "修改 API/代理设置",
+            ),
+        }
+        for key, (button, running_text, idle_text) in labels.items():
+            button.setText(running_text if self._busy_action == key else idle_text)
+            button.setEnabled(self._busy_action is None)
 
     def set_saved_credentials(
         self,

@@ -103,6 +103,23 @@ def test_qr_page_renders_in_memory_and_exposes_login_choices(qtbot) -> None:
         qtbot.mouseClick(dialog.credentials_edit, Qt.MouseButton.LeftButton)
 
 
+def test_qr_actions_show_scoped_busy_state_and_recover(qtbot) -> None:
+    dialog = LoginDialog()
+    qtbot.addWidget(dialog)
+
+    dialog.set_action_busy("qr.refresh", True)
+    assert dialog.qr_refresh.text() == "正在刷新…"
+    assert dialog.qr_refresh.isEnabled() is False
+    assert dialog.phone_fallback.isEnabled() is False
+    assert dialog.credentials_edit.isEnabled() is False
+
+    dialog.set_action_busy("qr.refresh", False)
+    assert dialog.qr_refresh.text() == "刷新二维码"
+    assert dialog.qr_refresh.isEnabled() is True
+    assert dialog.phone_fallback.isEnabled() is True
+    assert dialog.credentials_edit.isEnabled() is True
+
+
 def test_qr_page_uses_fixed_viewport_and_preserves_complete_pixmap(qtbot) -> None:
     dialog = LoginDialog()
     qtbot.addWidget(dialog)
