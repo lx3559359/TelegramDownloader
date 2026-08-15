@@ -145,7 +145,11 @@ Run:
 
 Expected: session restores, resume starts, downloaded byte count increases or the task reaches a terminal state, and the task is paused before shutdown.
 
-- [ ] **Step 4: Recheck online update and installer behavior**
+- [ ] **Step 4: Run the first independent crash/recovery cycle**
+
+Run `crash_probe.py` and accept exit code 23 only after its safe JSON confirms session restore, resume start and byte growth. Immediately run `recovery_probe.py` and require queued recovery, auto-resume, preserved bytes, paused settlement, disconnected gateway, zero scheduler-active tasks and an empty pending-task list.
+
+- [ ] **Step 5: Recheck online update and installer behavior**
 
 Run the update probe, then:
 
@@ -155,7 +159,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke-installer.ps1 -SetupPath 
 
 Expected: both update sources are valid and installer output ends with `INSTALLER_SMOKE_OK`.
 
-- [ ] **Step 5: Record pass-one aggregate evidence**
+- [ ] **Step 6: Record pass-one aggregate evidence**
 
 Write only boolean outcomes, counts, durations, byte deltas and error class names to the verification record. Do not record Telegram names, usernames, keywords, links, captions or credentials.
 
@@ -241,11 +245,15 @@ Commit the regression test and minimal production fix together. Restart the curr
 
 Use `.build-temp\manual-qa\round-3`, then run `download_probe.py` and `update_probe.py` again. Require a third QR-free session restore, completed refresh/search/preview/queue-state path, real download progress or terminal completion, successful pause, and two valid update sources.
 
-- [ ] **Step 2: Snapshot runtime data immediately before rebuilding**
+- [ ] **Step 2: Run the third independent crash/recovery cycle**
+
+Run `crash_probe.py` and `recovery_probe.py` once more. Require new byte growth before the controlled exit and the same complete recovery/shutdown invariants as passes one and two.
+
+- [ ] **Step 3: Snapshot runtime data immediately before rebuilding**
 
 Create a second path/size/SHA-256 inventory under `.build-temp\manual-qa`. Ensure no `TelegramDownloader.exe` process is running before invoking build scripts.
 
-- [ ] **Step 3: Rebuild both deliverables**
+- [ ] **Step 4: Rebuild both deliverables**
 
 Run:
 
@@ -256,15 +264,15 @@ powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1 -SkipAppBui
 
 Expected: full tests and Ruff pass inside the build, `PACKAGED_SMOKE_OK` and `INSTALLER_SMOKE_OK` are printed, and the portable ZIP and setup exist with version `0.4.2`.
 
-- [ ] **Step 4: Verify data preservation, package privacy and direct EXE startup**
+- [ ] **Step 5: Verify data preservation, package privacy and direct EXE startup**
 
 Compare the immediate pre-build inventory with restored `data` and `downloads`; verify no existing file disappeared or changed. Inspect the ZIP entry list for zero `data/` and `downloads/` entries. Start the packaged EXE, wait for a visible window titled `Telegram 下载器`, close it normally, require exit code 0 and confirm no new error log lines or remaining process.
 
-- [ ] **Step 5: Run final full verification and compute artifact hashes**
+- [ ] **Step 6: Run final full verification and compute artifact hashes**
 
 Run full pytest, Ruff and `git diff --check`. Record byte size and SHA-256 for the EXE, portable ZIP and setup. All commands must exit zero.
 
-- [ ] **Step 6: Commit privacy-safe verification evidence**
+- [ ] **Step 7: Commit privacy-safe verification evidence**
 
 The final checklist must contain one table row per required subsystem for each of the three passes, each marked with direct evidence. It must also state project-local data paths, artifact hashes, test count, no-publication boundary and any diagnosed/fixed defects.
 
