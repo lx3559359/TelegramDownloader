@@ -605,7 +605,6 @@ class MainWindow(QMainWindow):
         if self._restoring_task_selection:
             return
         tasks = self._selected_task_summaries()
-        self.task_selection_changed.emit([task.id for task in tasks])
         if len(tasks) == 1:
             task = tasks[0]
             if self._detail_task_id != task.id:
@@ -620,6 +619,7 @@ class MainWindow(QMainWindow):
             )
         else:
             self._clear_task_details("任务详情", "请选择一个任务查看媒体明细")
+        self.task_selection_changed.emit([task.id for task in tasks])
         self._update_action_state()
 
     def _clear_task_details(self, title: str, hint: str) -> None:

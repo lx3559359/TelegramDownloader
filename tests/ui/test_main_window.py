@@ -371,6 +371,45 @@ def test_single_task_selection_loads_details_and_emits_open_media(qtbot) -> None
     assert caught.args == ["media"]
 
 
+def test_synchronous_detail_result_is_not_overwritten_by_loading_hint(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.set_task_summaries(
+        [
+            TaskSummary(
+                "done",
+                "Completed task",
+                TaskStatus.COMPLETED,
+                "1 / 1",
+                "10 B",
+                "—",
+                "—",
+                "—",
+            )
+        ]
+    )
+    detail = TaskItemSummary(
+        "media",
+        "video.mp4",
+        MediaKind.VIDEO,
+        ItemStatus.COMPLETED,
+        10,
+        10,
+        0,
+        "—",
+    )
+
+    def load_details(task_ids) -> None:
+        if task_ids == ["done"]:
+            window.set_task_items("done", [detail])
+
+    window.task_selection_changed.connect(load_details)
+    window.task_table.selectRow(0)
+
+    assert window.task_item_model.rowCount() == 1
+    assert window.task_detail_hint.text() == "共 1 个媒体文件"
+
+
 def test_archive_and_restore_actions_require_confirmation(
     qtbot,
     monkeypatch,
