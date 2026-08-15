@@ -283,7 +283,7 @@ The final checklist must contain one table row per required subsystem for each o
 **Files:**
 - Review: all changes from `main..codex/three-pass-qa-v042`
 
-- [ ] **Step 1: Perform pre-merge review**
+- [x] **Step 1: Perform pre-merge review**
 
 Inspect the complete source/test/document diff for security, data-path escapes, incorrect state transitions, missing regression coverage and accidental secret inclusion. Resolve every critical or important finding before continuing.
 
