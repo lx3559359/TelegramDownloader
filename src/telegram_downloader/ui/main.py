@@ -27,6 +27,7 @@ from telegram_downloader import __version__
 from telegram_downloader.domain import MediaKind, TaskStatus
 from telegram_downloader.ui.content_browser import ContentBrowserPage
 from telegram_downloader.ui.models import TaskSummary, TaskTableModel
+from telegram_downloader.ui.subscriptions import SubscriptionPage
 from telegram_downloader.ui.theme import DARK_STYLESHEET, ensure_cjk_font
 
 _MEDIA_LABELS = {
@@ -42,6 +43,7 @@ _MEDIA_LABELS = {
 class MainWindow(QMainWindow):
     scan_requested = Signal(str)
     content_activated = Signal()
+    subscriptions_activated = Signal()
     pause_requested = Signal(str)
     resume_requested = Signal(str)
     retry_failed_requested = Signal(str)
@@ -64,9 +66,11 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(self._build_navigation())
         self.task_page = self._build_workspace()
         self.content_page = ContentBrowserPage()
+        self.subscriptions_page = SubscriptionPage()
         self.page_stack = QStackedWidget()
         self.page_stack.addWidget(self.task_page)
         self.page_stack.addWidget(self.content_page)
+        self.page_stack.addWidget(self.subscriptions_page)
         root_layout.addWidget(self.page_stack, 1)
         self.statistics_panel = self._build_statistics()
         root_layout.addWidget(self.statistics_panel)
@@ -91,6 +95,9 @@ class MainWindow(QMainWindow):
         )
         self.tasks_nav_button.clicked.connect(lambda: self.show_page("tasks"))
         self.content_nav_button.clicked.connect(lambda: self.show_page("content"))
+        self.subscriptions_nav_button.clicked.connect(
+            lambda: self.show_page("subscriptions")
+        )
         self._update_action_state()
 
     def _build_navigation(self) -> QWidget:
@@ -122,12 +129,14 @@ class MainWindow(QMainWindow):
 
         self.tasks_nav_button = self._nav_button("任务中心", active=True)
         self.content_nav_button = self._nav_button("账号内容")
+        self.subscriptions_nav_button = self._nav_button("自动订阅")
         self.login_nav_button = self._nav_button("账号登录")
         self.settings_nav_button = self._nav_button("设置")
         self.login_nav_button.clicked.connect(self.login_requested.emit)
         self.settings_nav_button.clicked.connect(self.settings_requested.emit)
         layout.addWidget(self.tasks_nav_button)
         layout.addWidget(self.content_nav_button)
+        layout.addWidget(self.subscriptions_nav_button)
         layout.addWidget(self.login_nav_button)
         layout.addWidget(self.settings_nav_button)
         layout.addStretch()
@@ -455,18 +464,32 @@ class MainWindow(QMainWindow):
         self.account_badge.style().unpolish(self.account_badge)
         self.account_badge.style().polish(self.account_badge)
         self.content_page.set_logged_in(bool(display_name))
+        self.subscriptions_page.set_logged_in(bool(display_name))
 
     def show_page(self, name: str) -> None:
         content = name == "content"
-        self.page_stack.setCurrentWidget(
-            self.content_page if content else self.task_page
+        subscriptions = name == "subscriptions"
+        page = (
+            self.content_page
+            if content
+            else self.subscriptions_page
+            if subscriptions
+            else self.task_page
         )
-        self.statistics_panel.setVisible(not content)
-        self._set_nav_active(
-            self.content_nav_button if content else self.tasks_nav_button
+        self.page_stack.setCurrentWidget(page)
+        self.statistics_panel.setVisible(not (content or subscriptions))
+        active = (
+            self.content_nav_button
+            if content
+            else self.subscriptions_nav_button
+            if subscriptions
+            else self.tasks_nav_button
         )
+        self._set_nav_active(active)
         if content:
             self.content_activated.emit()
+        elif subscriptions:
+            self.subscriptions_activated.emit()
 
     def open_link_preview(self, link: str) -> None:
         self.link_input.setText(link)
@@ -474,7 +497,11 @@ class MainWindow(QMainWindow):
         self.scan_requested.emit(link)
 
     def _set_nav_active(self, active_button: QPushButton) -> None:
-        for button in (self.tasks_nav_button, self.content_nav_button):
+        for button in (
+            self.tasks_nav_button,
+            self.content_nav_button,
+            self.subscriptions_nav_button,
+        ):
             button.setProperty("active", button is active_button)
             button.style().unpolish(button)
             button.style().polish(button)

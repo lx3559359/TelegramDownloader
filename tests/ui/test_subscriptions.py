@@ -1,0 +1,176 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QDialogButtonBox, QMessageBox
+
+from telegram_downloader.content import ContentDialog, DialogKind
+from telegram_downloader.domain import MediaKind
+from telegram_downloader.subscriptions import (
+    SubscriptionProgress,
+    SubscriptionRule,
+    SubscriptionState,
+)
+from telegram_downloader.ui.subscription_models import SubscriptionTableModel
+from telegram_downloader.ui.subscriptions import (
+    SubscriptionEditorDialog,
+    SubscriptionPage,
+)
+
+NOW = datetime(2026, 8, 15, 9, 0, tzinfo=UTC)
+
+
+def dialog() -> ContentDialog:
+    return ContentDialog(
+        "a1",
+        "-1001",
+        "资料群",
+        "docs",
+        DialogKind.GROUP,
+        False,
+        True,
+        NOW,
+    )
+
+
+def rule(*, enabled: bool = True) -> SubscriptionRule:
+    return SubscriptionRule(
+        "rule-1",
+        "a1",
+        "-1001",
+        "资料群",
+        "美女",
+        frozenset({MediaKind.PHOTO, MediaKind.VIDEO}),
+        30,
+        enabled,
+        SubscriptionState.WAITING if enabled else SubscriptionState.PAUSED,
+        42,
+        NOW + timedelta(minutes=30) if enabled else None,
+        NOW,
+        None,
+        0,
+        NOW,
+        NOW,
+    )
+
+
+def test_subscription_model_exposes_status_schedule_and_rule_id(qtbot) -> None:
+    model = SubscriptionTableModel()
+    model.set_rules([rule()])
+
+    assert model.columnCount() == 5
+    assert model.data(model.index(0, 0), Qt.ItemDataRole.UserRole) == "rule-1"
+    assert model.data(model.index(0, 2), Qt.ItemDataRole.DisplayRole) == "等待检查"
+    assert "2026-08-15" in model.data(
+        model.index(0, 4),
+        Qt.ItemDataRole.DisplayRole,
+    )
+
+
+def test_rule_editor_validates_then_returns_trimmed_draft(qtbot) -> None:
+    editor = SubscriptionEditorDialog([dialog()])
+    qtbot.addWidget(editor)
+    editor.show()
+    save = editor.buttons.button(QDialogButtonBox.StandardButton.Save)
+
+    qtbot.mouseClick(save, Qt.MouseButton.LeftButton)
+    assert editor.isVisible()
+    assert "关键词" in editor.error_label.text()
+
+    editor.keyword_input.setText("  美女  ")
+    with qtbot.waitSignal(editor.accepted, timeout=500):
+        qtbot.mouseClick(save, Qt.MouseButton.LeftButton)
+
+    draft = editor.draft()
+    assert draft.peer_ref == "-1001"
+    assert draft.keyword == "美女"
+    assert draft.media_kinds == frozenset(MediaKind)
+    assert draft.interval_minutes == 30
+
+
+def test_page_emits_run_pause_resume_and_tracks_busy_progress(qtbot) -> None:
+    page = SubscriptionPage()
+    qtbot.addWidget(page)
+    page.set_logged_in(True)
+    page.set_dialogs([dialog()])
+    page.set_rules([rule()])
+    page.rule_table.selectRow(0)
+
+    with qtbot.waitSignal(page.run_requested, timeout=500) as run_signal:
+        qtbot.mouseClick(page.run_button, Qt.MouseButton.LeftButton)
+    assert run_signal.args == ["rule-1"]
+    assert page.run_button.isEnabled() is False
+    page.set_rule_busy(None, False)
+
+    with qtbot.waitSignal(page.enabled_requested, timeout=500) as pause_signal:
+        qtbot.mouseClick(page.toggle_button, Qt.MouseButton.LeftButton)
+    assert pause_signal.args == ["rule-1", False]
+
+    page.set_rule_busy("rule-1", True, "正在立即检查…")
+    assert page.run_button.isEnabled() is False
+    assert page.busy_label.text() == "正在立即检查…"
+
+    page.set_progress(SubscriptionProgress("rule-1", 20, 3, 2, 1, "正在筛选"))
+    assert "已扫描 20 条" in page.progress_label.text()
+    assert "新增 2 项" in page.progress_label.text()
+
+    page.set_rule_busy(None, False)
+    assert page.run_button.isEnabled() is True
+
+
+def test_offline_page_keeps_rules_visible_but_disables_online_actions(qtbot) -> None:
+    page = SubscriptionPage()
+    qtbot.addWidget(page)
+    page.set_rules([rule(enabled=False)])
+    page.rule_table.selectRow(0)
+    page.set_logged_in(False)
+
+    assert page.rule_model.rowCount() == 1
+    assert page.new_button.isEnabled() is False
+    assert page.run_button.isEnabled() is False
+    assert "登录" in page.connection_label.text()
+
+
+def test_page_create_edit_and_confirmed_delete_emit_complete_payloads(
+    qtbot,
+    monkeypatch,
+) -> None:
+    page = SubscriptionPage()
+    qtbot.addWidget(page)
+    page.set_logged_in(True)
+    page.set_dialogs([dialog()])
+    page.set_rules([rule()])
+    page.rule_table.selectRow(0)
+
+    qtbot.mouseClick(page.new_button, Qt.MouseButton.LeftButton)
+    create_editor = next(iter(page._editors))
+    create_editor.keyword_input.setText("写真")
+    with qtbot.waitSignal(page.create_requested, timeout=500) as created:
+        qtbot.mouseClick(
+            create_editor.buttons.button(QDialogButtonBox.StandardButton.Save),
+            Qt.MouseButton.LeftButton,
+        )
+    assert created.args[0].keyword == "写真"
+
+    page.set_rule_busy(None, False)
+    qtbot.mouseClick(page.edit_button, Qt.MouseButton.LeftButton)
+    edit_editor = next(iter(page._editors))
+    edit_editor.keyword_input.setText("视频")
+    with qtbot.waitSignal(page.update_requested, timeout=500) as updated:
+        qtbot.mouseClick(
+            edit_editor.buttons.button(QDialogButtonBox.StandardButton.Save),
+            Qt.MouseButton.LeftButton,
+        )
+    assert updated.args[0] == "rule-1"
+    assert updated.args[1].keyword == "视频"
+
+    page.set_rule_busy(None, False)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    with qtbot.waitSignal(page.delete_requested, timeout=500) as deleted:
+        qtbot.mouseClick(page.delete_button, Qt.MouseButton.LeftButton)
+    assert deleted.args == ["rule-1"]
