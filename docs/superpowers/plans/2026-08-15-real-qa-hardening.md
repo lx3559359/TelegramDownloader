@@ -100,7 +100,37 @@ Expected: all main-window tests pass.
 
 Run: `git add tests/ui/test_main_window.py src/telegram_downloader/ui/main.py && git commit -m "fix: match task actions to task status"`
 
-### Task 4: Verify the integrated candidate and real restart path
+### Task 4: Treat signed older releases as no update
+
+**Files:**
+- Modify: `tests/update/test_update_coordinator.py`
+- Modify: `src/telegram_downloader/update.py`
+
+- [ ] **Step 1: Write the failing coordinator tests**
+
+Create signed dual-source documents for version `0.3.1` with current version `0.4.2`. Assert `check_for_update()` returns no manifest, `blocked` is false, and both sources remain available. Add a newer `0.5.0` manifest requiring updater `0.4.3` and assert startup remains blocked.
+
+- [ ] **Step 2: Run the focused tests and verify RED**
+
+Run: `.\.venv\Scripts\python.exe -m pytest tests/update/test_update_coordinator.py -q`
+
+Expected: the older-release case raises source reconciliation failure because both valid signed sources are prematurely classified as invalid.
+
+- [ ] **Step 3: Separate source verification from install policy**
+
+Verify each source without `installed_version`. After `reconcile_sources()`, return no update for older/equal releases as it already specifies; for a selected newer manifest, raise `UpdatePolicyError` if the current version is lower than `minimum_updater_version`.
+
+- [ ] **Step 4: Run update tests and verify GREEN**
+
+Run: `.\.venv\Scripts\python.exe -m pytest tests/update tests/ui/test_update_dialog.py -q`
+
+Expected: all update and update-dialog tests pass.
+
+- [ ] **Step 5: Commit the update discovery fix**
+
+Run: `git add tests/update/test_update_coordinator.py src/telegram_downloader/update.py && git commit -m "fix: treat older signed releases as no update"`
+
+### Task 5: Verify the integrated candidate and real restart path
 
 **Files:**
 - Modify: `docs/verification/2026-08-15-session-performance-content-ux-checklist.md`
