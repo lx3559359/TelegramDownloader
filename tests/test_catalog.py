@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from telegram_downloader import catalog as catalog_module
 from telegram_downloader.catalog import CatalogError, CatalogRepository, StaleSearchError
 from telegram_downloader.content import (
     AccountProfile,
@@ -16,6 +17,12 @@ from telegram_downloader.content import (
     SearchStatus,
 )
 from telegram_downloader.domain import MediaKind, ScanFilters
+from telegram_downloader.subscriptions import (
+    SubscriptionRule,
+    SubscriptionRun,
+    SubscriptionRunStatus,
+    SubscriptionState,
+)
 
 
 def dialog(account: str, peer: str, title: str, now: datetime) -> ContentDialog:
@@ -53,6 +60,37 @@ def result(
         now,
         "安装教程",
         f"thumb-{message_id}",
+    )
+
+
+def subscription(
+    account_id: str,
+    peer_ref: str,
+    now: datetime,
+    *,
+    rule_id: str = "rule-1",
+    enabled: bool = True,
+    state: SubscriptionState = SubscriptionState.WAITING,
+    last_message_id: int | None = 10,
+    next_run_at: datetime | None = None,
+) -> SubscriptionRule:
+    return SubscriptionRule(
+        rule_id,
+        account_id,
+        peer_ref,
+        f"群-{account_id}",
+        "美女",
+        frozenset({MediaKind.PHOTO, MediaKind.VIDEO}),
+        30,
+        enabled,
+        state,
+        last_message_id,
+        next_run_at if next_run_at is not None else now,
+        None,
+        None,
+        0,
+        now,
+        now,
     )
 
 
@@ -108,10 +146,157 @@ def test_most_recent_account_supports_offline_history(tmp_path: Path) -> None:
 def test_initialize_rejects_unknown_newer_schema(tmp_path: Path) -> None:
     database = tmp_path / "catalog.sqlite3"
     with sqlite3.connect(database) as connection:
-        connection.execute("PRAGMA user_version=2")
+        connection.execute("PRAGMA user_version=3")
 
     with pytest.raises(CatalogError, match="版本"):
         CatalogRepository(database).initialize()
+
+
+def test_catalog_schema_v2_keeps_existing_search_tables(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    database = tmp_path / "catalog.sqlite3"
+    repo = CatalogRepository(database)
+    repo.initialize()
+    repo.upsert_account(AccountProfile("a1", "账号"), now)
+    query = ContentSearchQuery(
+        "资料",
+        ScanFilters(now, now, frozenset(MediaKind), 10),
+    )
+    repo.begin_search("search", "a1", "-1001", "群", query, now)
+
+    reopened = CatalogRepository(database)
+    reopened.initialize()
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert reopened.list_sessions("a1")[0].query.keyword == "资料"
+
+
+def test_catalog_migrates_existing_v1_database_without_losing_accounts(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    database = tmp_path / "catalog.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(catalog_module._SCHEMA_V1)
+        connection.execute(
+            "INSERT INTO accounts(account_id, display_name, last_used_at) VALUES(?, ?, ?)",
+            ("a1", "旧账号", now.isoformat()),
+        )
+
+    repo = CatalogRepository(database)
+    repo.initialize()
+
+    assert repo.schema_version() == 2
+    assert repo.most_recent_account() == AccountProfile("a1", "旧账号")
+    assert repo.list_subscriptions("a1") == []
+
+
+def test_subscription_crud_and_due_queries_are_account_scoped(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    repo = CatalogRepository(tmp_path / "catalog.sqlite3")
+    repo.initialize()
+    for account, peer in (("a1", "-1001"), ("a2", "-1002")):
+        repo.upsert_account(AccountProfile(account, account), now)
+        repo.replace_dialogs(
+            account,
+            [dialog(account, peer, f"群-{account}", now)],
+            now,
+        )
+    first = subscription("a1", "-1001", now)
+    second = subscription(
+        "a2",
+        "-1002",
+        now,
+        rule_id="rule-2",
+        next_run_at=now + timedelta(hours=1),
+    )
+    repo.save_subscription(first)
+    repo.save_subscription(second)
+
+    assert repo.list_subscriptions("a1") == [first]
+    assert repo.list_due_subscriptions("a1", now) == [first]
+    assert repo.list_due_subscriptions("a2", now) == []
+    with pytest.raises(KeyError):
+        repo.get_subscription("a1", "rule-2")
+
+    changed = replace(first, interval_minutes=60, updated_at=now + timedelta(minutes=1))
+    repo.save_subscription(changed)
+    assert repo.get_subscription("a1", first.id) == changed
+    repo.delete_subscription("a1", first.id)
+    assert repo.list_subscriptions("a1") == []
+    assert repo.list_subscriptions("a2") == [second]
+
+
+def test_subscription_cursor_is_monotonic_and_runtime_is_recoverable(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    repo = CatalogRepository(tmp_path / "catalog.sqlite3")
+    repo.initialize()
+    repo.upsert_account(AccountProfile("a1", "账号"), now)
+    repo.replace_dialogs("a1", [dialog("a1", "-1001", "群-a1", now)], now)
+    saved = subscription("a1", "-1001", now)
+    repo.save_subscription(saved)
+
+    repo.advance_subscription("a1", saved.id, 15, now)
+    with pytest.raises(ValueError, match="倒退"):
+        repo.advance_subscription("a1", saved.id, 14, now)
+
+    repo.update_subscription_runtime(
+        "a1",
+        saved.id,
+        state=SubscriptionState.RUNNING,
+        next_run_at=None,
+        last_run_at=now,
+        last_error=None,
+        failure_count=0,
+        now=now,
+    )
+    assert repo.recover_interrupted_subscriptions(now + timedelta(minutes=1)) == 1
+    recovered = repo.get_subscription("a1", saved.id)
+    assert recovered.state is SubscriptionState.WAITING
+    assert recovered.last_message_id == 15
+    assert recovered.next_run_at == now + timedelta(minutes=1)
+    assert recovered.last_error == "上次自动检查未正常结束"
+
+
+def test_subscription_run_history_is_trimmed_per_rule(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    repo = CatalogRepository(tmp_path / "catalog.sqlite3")
+    repo.initialize()
+    repo.upsert_account(AccountProfile("a1", "账号"), now)
+    repo.replace_dialogs("a1", [dialog("a1", "-1001", "群-a1", now)], now)
+    saved = subscription("a1", "-1001", now)
+    repo.save_subscription(saved)
+
+    for number in range(4):
+        finished = now + timedelta(seconds=number)
+        repo.save_subscription_run(
+            SubscriptionRun(
+                f"run-{number}",
+                saved.id,
+                "a1",
+                finished,
+                finished,
+                SubscriptionRunStatus.COMPLETED,
+                number,
+                number,
+                number,
+                0,
+            ),
+            retain=2,
+        )
+
+    latest = repo.latest_subscription_runs("a1")
+    assert latest[saved.id].id == "run-3"
+
+    assert [item.id for item in repo.list_subscription_runs("a1", saved.id)] == [
+        "run-3",
+        "run-2",
+    ]
 
 
 def test_search_refresh_preserves_selection_and_removes_stale_after_success(

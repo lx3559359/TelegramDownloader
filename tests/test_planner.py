@@ -183,6 +183,37 @@ def test_plan_selected_rejects_empty_and_fully_existing_input(tmp_path: Path) ->
     assert repo.saved is None
 
 
+def test_plan_subscription_uses_automatic_title_and_archive_layout(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    remote = RemoteMedia(
+        "-1001",
+        "资料群",
+        12,
+        None,
+        "m12",
+        MediaKind.PHOTO,
+        "photo.jpg",
+        20,
+        now,
+    )
+    planner = TaskPlanner(
+        FakeGateway([]),
+        FakeRepository(),
+        tmp_path,
+        uuid_factory=iter(["task", "item"]).__next__,
+        clock=lambda: now,
+    )
+
+    preview = planner.plan_subscription("-1001", "资料群", "美女", [remote])
+
+    assert preview.task.display_title == "资料群（自动订阅：美女）"
+    assert preview.task.source_url == "telegram://peer/-1001"
+    assert preview.task.filters.media_kinds == frozenset({MediaKind.PHOTO})
+    assert preview.items[0].target_path.is_relative_to(tmp_path / "资料群")
+
+
 def test_commit_selected_accepts_remaining_items_after_a_race(tmp_path: Path) -> None:
     now = datetime(2026, 8, 14, tzinfo=UTC)
     repo = TaskRepository(tmp_path / "tasks.sqlite3")

@@ -104,6 +104,34 @@ class TaskPlanner:
             skip_existing=True,
         )
 
+    def plan_subscription(
+        self,
+        source_ref: str,
+        source_title: str,
+        keyword: str,
+        selected: list[RemoteMedia],
+    ) -> ScanPreview:
+        if not selected:
+            raise EmptyScanError("订阅匹配媒体已全部存在于下载队列")
+        dates = [item.message_date_utc for item in selected]
+        filters = ScanFilters(
+            min(dates),
+            max(dates),
+            frozenset(item.kind for item in selected),
+            len(selected),
+        )
+        return self._build_preview(
+            source_kind=SourceKind.CHANNEL_OR_GROUP,
+            source_ref=source_ref,
+            source_title=source_title,
+            source_url=f"telegram://peer/{source_ref}",
+            filters=filters,
+            remote=selected,
+            display_title=f"{source_title}（自动订阅：{keyword}）",
+            empty_message="订阅匹配媒体已全部存在于下载队列",
+            skip_existing=True,
+        )
+
     def existing_media_keys(
         self,
         keys: set[tuple[str, int, str]],

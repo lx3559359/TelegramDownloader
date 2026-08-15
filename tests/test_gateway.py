@@ -771,6 +771,99 @@ async def test_search_media_page_marks_short_page_exhausted_without_cursor() -> 
 
 
 @pytest.mark.asyncio
+async def test_latest_message_id_returns_zero_for_empty_dialog() -> None:
+    class Client:
+        async def get_entity(self, entity):
+            assert entity == -1001
+            return SimpleNamespace(title="资料群")
+
+        def iter_messages(self, entity, **kwargs):
+            assert entity.title == "资料群"
+            assert kwargs == {"limit": 1}
+
+            async def generate():
+                if False:
+                    yield None
+
+            return generate()
+
+    gateway = TelethonGateway.from_client_for_test(Client())
+
+    assert await gateway.latest_message_id("-1001") == 0
+
+
+@pytest.mark.asyncio
+async def test_incremental_messages_are_oldest_first_and_bounded() -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    media = media_message(12, now, kind="video")
+    media.message = "美女 视频"
+    plain = SimpleNamespace(
+        id=11,
+        date=now - timedelta(minutes=1),
+        grouped_id=None,
+        media=None,
+        message="普通消息",
+    )
+
+    class Client:
+        def __init__(self):
+            self.calls: list[dict[str, object]] = []
+
+        async def get_entity(self, entity):
+            assert entity == -1001
+            return SimpleNamespace(title="资料群")
+
+        def iter_messages(self, entity, **kwargs):
+            self.calls.append(kwargs)
+
+            async def generate():
+                yield media
+                yield plain
+
+            return generate()
+
+    client = Client()
+    gateway = TelethonGateway.from_client_for_test(client)
+
+    values = await gateway.incremental_messages(
+        "-1001",
+        after_id=10,
+        through_id=12,
+        limit=500,
+    )
+
+    assert client.calls == [
+        {"min_id": 10, "max_id": 13, "reverse": True, "limit": 500}
+    ]
+    assert [item.message_id for item in values] == [11, 12]
+    assert values[0].media is None
+    assert values[0].text == "普通消息"
+    assert values[1].media is not None
+    assert values[1].media.source_title == "资料群"
+    assert values[1].text == "美女 视频"
+
+
+@pytest.mark.asyncio
+async def test_incremental_message_bounds_are_validated_before_network() -> None:
+    gateway = TelethonGateway.from_client_for_test(object())
+
+    with pytest.raises(ValueError, match="消息边界"):
+        await gateway.incremental_messages(
+            "-1001",
+            after_id=12,
+            through_id=11,
+            limit=100,
+        )
+    with pytest.raises(ValueError, match="数量"):
+        await gateway.incremental_messages(
+            "-1001",
+            after_id=0,
+            through_id=1,
+            limit=501,
+        )
+
+
+@pytest.mark.asyncio
 async def test_search_progress_finishes_with_real_scanned_and_matched_counts() -> None:
     now = datetime(2026, 8, 15, tzinfo=UTC)
     messages = [media_message(value, now) for value in range(25, 0, -1)]

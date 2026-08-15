@@ -43,11 +43,38 @@ def test_chinese_guide_documents_portable_data_and_security() -> None:
         "GitHub",
         "魔搭",
         "C 盘",
+        "自动订阅",
+        "仅订阅启用后的新消息",
+        "5、15、30、60 或 180 分钟",
+        "最多检查 500 条新消息",
     ):
         assert required in readme
 
 
-def test_v042_version_and_content_runtime_contract_are_consistent() -> None:
+def test_subscription_modules_do_not_escape_project_local_storage() -> None:
+    root = Path(__file__).parents[1]
+    modules = (
+        root / "src/telegram_downloader/subscriptions.py",
+        root / "src/telegram_downloader/subscription_service.py",
+        root / "src/telegram_downloader/subscription_scheduler.py",
+        root / "src/telegram_downloader/ui/subscriptions.py",
+    )
+    forbidden = (
+        "appdata",
+        "localappdata",
+        "qsettings",
+        "tempfile",
+        "schtasks",
+        "taskscheduler",
+        "win32service",
+    )
+
+    for module in modules:
+        source = module.read_text(encoding="utf-8").casefold()
+        assert all(value not in source for value in forbidden), module.name
+
+
+def test_v050_version_and_content_runtime_contract_are_consistent() -> None:
     root = Path(__file__).parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     package_init = (root / "src/telegram_downloader/__init__.py").read_text(
@@ -60,9 +87,9 @@ def test_v042_version_and_content_runtime_contract_are_consistent() -> None:
     spec = (root / "TelegramDownloader.spec").read_text(encoding="utf-8")
     app = (root / "src/telegram_downloader/app.py").read_text(encoding="utf-8")
 
-    assert project["project"]["version"] == "0.4.2"
-    assert '__version__ = "0.4.2"' in package_init
-    assert '#define AppVersion "0.4.2"' in installer
+    assert project["project"]["version"] == "0.5.0"
+    assert '__version__ = "0.5.0"' in package_init
+    assert '#define AppVersion "0.5.0"' in installer
     assert "qrcode==8.2" in requirements
     assert '"qrcode"' in spec
     assert "app_version=__version__" in gateway
@@ -72,6 +99,8 @@ def test_v042_version_and_content_runtime_contract_are_consistent() -> None:
         "ContentBrowserService",
         "CatalogRepository",
         "ThumbnailCache",
+        "SubscriptionService",
+        "SubscriptionScheduler",
     ):
         assert f"import {component}" in app
         assert f"{component}(" in app

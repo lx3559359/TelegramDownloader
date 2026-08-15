@@ -19,7 +19,7 @@ def test_workbench_contains_required_controls(qtbot) -> None:
     assert window.limit_input.value() == 500
     assert window.task_table.model().columnCount() == 7
     assert window.account_badge.text() == "未登录"
-    assert window.version_label.text() == "v0.4.2 · stable"
+    assert window.version_label.text() == "v0.5.0 · stable"
     assert set(window.media_checks) == set(MediaKind)
     assert all(check.isChecked() for check in window.media_checks.values())
 
@@ -247,3 +247,19 @@ def test_content_navigation_emits_activation_and_link_preview_routes_to_tasks(
     assert window.page_stack.currentWidget() is window.task_page
     assert window.link_input.text() == "https://t.me/Zhangzhoulao66/56156"
     assert caught.args == ["https://t.me/Zhangzhoulao66/56156"]
+
+
+def test_subscription_navigation_switches_page_and_emits_activation(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+
+    with qtbot.waitSignal(window.subscriptions_activated, timeout=500):
+        qtbot.mouseClick(
+            window.subscriptions_nav_button,
+            Qt.MouseButton.LeftButton,
+        )
+
+    assert window.page_stack.currentWidget() is window.subscriptions_page
+    assert window.statistics_panel.isHidden() is True
+    assert window.subscriptions_nav_button.property("active") is True
