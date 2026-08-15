@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import batched
 from pathlib import Path
@@ -32,7 +33,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     last_error TEXT,
-    display_title TEXT
+    display_title TEXT,
+    archived_at TEXT
 );
 CREATE TABLE IF NOT EXISTS media_items (
     id TEXT PRIMARY KEY,
@@ -58,7 +60,17 @@ CREATE INDEX IF NOT EXISTS idx_items_task_status ON media_items(task_id, status)
 _TASK_COLUMNS = """
 id, source_kind, source_ref, source_title, source_url,
 date_from_utc, date_to_utc, media_kinds, item_limit, status,
-created_at, updated_at, last_error, display_title
+created_at, updated_at, last_error, display_title, archived_at
+"""
+
+_QUALIFIED_TASK_COLUMNS = """
+t.id AS id, t.source_kind AS source_kind, t.source_ref AS source_ref,
+t.source_title AS source_title, t.source_url AS source_url,
+t.date_from_utc AS date_from_utc, t.date_to_utc AS date_to_utc,
+t.media_kinds AS media_kinds, t.item_limit AS item_limit,
+t.status AS status, t.created_at AS created_at, t.updated_at AS updated_at,
+t.last_error AS last_error, t.display_title AS display_title,
+t.archived_at AS archived_at
 """
 
 _ITEM_COLUMNS = """
@@ -70,6 +82,17 @@ downloaded_bytes, status, retry_count, last_error
 
 class AllMediaAlreadyExists(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class TaskSnapshot:
+    task: TaskRecord
+    total_items: int
+    completed_items: int
+    downloaded_bytes: int
+    known_size: int
+    unknown_size_count: int
+    item_error: str | None
 
 
 class TaskRepository:
@@ -100,6 +123,8 @@ class TaskRepository:
             }
             if "display_title" not in columns:
                 connection.execute("ALTER TABLE tasks ADD COLUMN display_title TEXT")
+            if "archived_at" not in columns:
+                connection.execute("ALTER TABLE tasks ADD COLUMN archived_at TEXT")
 
     def create_task(self, task: TaskRecord, items: list[MediaItem]) -> None:
         with self._connection() as connection:
@@ -182,12 +207,114 @@ class TaskRepository:
             raise KeyError(task_id)
         return self._task_from_row(row)
 
-    def list_tasks(self) -> list[TaskRecord]:
+    def get_item(self, item_id: str) -> MediaItem:
+        with self._connection() as connection:
+            row = connection.execute(
+                f"SELECT {_ITEM_COLUMNS} FROM media_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(item_id)
+        return self._item_from_row(row)
+
+    def list_tasks(self, *, include_archived: bool = False) -> list[TaskRecord]:
+        where = "" if include_archived else "WHERE archived_at IS NULL"
         with self._connection() as connection:
             rows = connection.execute(
-                f"SELECT {_TASK_COLUMNS} FROM tasks ORDER BY created_at DESC, id"
+                f"SELECT {_TASK_COLUMNS} FROM tasks {where} "
+                "ORDER BY created_at DESC, id"
             ).fetchall()
         return [self._task_from_row(row) for row in rows]
+
+    def list_task_snapshots(
+        self,
+        *,
+        include_archived: bool = False,
+    ) -> list[TaskSnapshot]:
+        where = "" if include_archived else "WHERE t.archived_at IS NULL"
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT {_QUALIFIED_TASK_COLUMNS},
+                       COUNT(i.id) AS total_items,
+                       COALESCE(
+                           SUM(CASE WHEN i.status = ? THEN 1 ELSE 0 END),
+                           0
+                       ) AS completed_items,
+                       COALESCE(SUM(i.downloaded_bytes), 0) AS downloaded_bytes,
+                       COALESCE(SUM(COALESCE(i.expected_size, 0)), 0) AS known_size,
+                       COALESCE(
+                           SUM(
+                               CASE
+                                   WHEN i.id IS NOT NULL AND i.expected_size IS NULL
+                                   THEN 1 ELSE 0
+                               END
+                           ),
+                           0
+                       ) AS unknown_size_count,
+                       (
+                           SELECT e.last_error
+                           FROM media_items AS e
+                           WHERE e.task_id = t.id AND e.last_error IS NOT NULL
+                           ORDER BY e.message_date_utc DESC, e.message_id DESC, e.id
+                           LIMIT 1
+                       ) AS item_error
+                FROM tasks AS t
+                LEFT JOIN media_items AS i ON i.task_id = t.id
+                {where}
+                GROUP BY t.id
+                ORDER BY t.created_at DESC, t.id
+                """,
+                (ItemStatus.COMPLETED.value,),
+            ).fetchall()
+        return [self._snapshot_from_row(row) for row in rows]
+
+    def archive_tasks(self, task_ids: list[str]) -> set[str]:
+        ids = tuple(dict.fromkeys(task_ids))
+        if not ids:
+            return set()
+        placeholders = ",".join("?" for _ in ids)
+        now = datetime.now(UTC).isoformat()
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT id FROM tasks WHERE id IN ({placeholders}) "
+                "AND status = ? AND archived_at IS NULL",
+                (*ids, TaskStatus.COMPLETED.value),
+            ).fetchall()
+            accepted = {str(row[0]) for row in rows}
+            if accepted:
+                selected = tuple(sorted(accepted))
+                marks = ",".join("?" for _ in selected)
+                connection.execute(
+                    f"UPDATE tasks SET archived_at = ?, updated_at = ? "
+                    f"WHERE id IN ({marks}) AND status = ? "
+                    "AND archived_at IS NULL",
+                    (now, now, *selected, TaskStatus.COMPLETED.value),
+                )
+        return accepted
+
+    def restore_tasks(self, task_ids: list[str]) -> set[str]:
+        ids = tuple(dict.fromkeys(task_ids))
+        if not ids:
+            return set()
+        placeholders = ",".join("?" for _ in ids)
+        now = datetime.now(UTC).isoformat()
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT id FROM tasks WHERE id IN ({placeholders}) "
+                "AND archived_at IS NOT NULL",
+                ids,
+            ).fetchall()
+            accepted = {str(row[0]) for row in rows}
+            if accepted:
+                selected = tuple(sorted(accepted))
+                marks = ",".join("?" for _ in selected)
+                connection.execute(
+                    f"UPDATE tasks SET archived_at = NULL, updated_at = ? "
+                    f"WHERE id IN ({marks}) AND archived_at IS NOT NULL",
+                    (now, *selected),
+                )
+        return accepted
 
     def list_items(
         self,
@@ -275,7 +402,7 @@ class TaskRepository:
     def _insert_task(connection: sqlite3.Connection, task: TaskRecord) -> None:
         connection.execute(
             f"INSERT INTO tasks ({_TASK_COLUMNS}) "
-            f"VALUES ({','.join('?' for _ in range(14))})",
+            f"VALUES ({','.join('?' for _ in range(15))})",
             TaskRepository._task_values(task),
         )
 
@@ -324,6 +451,7 @@ class TaskRepository:
             task.updated_at.isoformat(),
             task.last_error,
             task.display_title,
+            task.archived_at.isoformat() if task.archived_at is not None else None,
         )
 
     @staticmethod
@@ -349,6 +477,23 @@ class TaskRepository:
             datetime.fromisoformat(row["updated_at"]),
             row["last_error"],
             row["display_title"],
+            (
+                datetime.fromisoformat(row["archived_at"])
+                if row["archived_at"] is not None
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _snapshot_from_row(row: sqlite3.Row) -> TaskSnapshot:
+        return TaskSnapshot(
+            TaskRepository._task_from_row(row),
+            int(row["total_items"]),
+            int(row["completed_items"]),
+            int(row["downloaded_bytes"]),
+            int(row["known_size"]),
+            int(row["unknown_size_count"]),
+            row["item_error"],
         )
 
     @staticmethod
