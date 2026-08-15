@@ -1,5 +1,8 @@
+from dataclasses import replace
+
 import pytest
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QItemSelectionModel, Qt
+from PySide6.QtWidgets import QAbstractItemView, QMessageBox
 
 from telegram_downloader.domain import ItemStatus, MediaKind, TaskStatus
 from telegram_downloader.ui.main import MainWindow
@@ -294,6 +297,119 @@ def test_live_refresh_preserves_selected_task(qtbot) -> None:
 
     assert window.selected_task_id() == "task-1"
     assert window.pause_button.isEnabled() is True
+
+
+def test_task_workspace_filters_and_emits_stable_multiselect_batches(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.set_task_summaries(
+        [
+            TaskSummary("run", "Running", TaskStatus.DOWNLOADING, "0 / 1", "1 B", "—", "—", "—"),
+            TaskSummary("pause", "Paused", TaskStatus.PAUSED, "0 / 1", "1 B", "—", "—", "—"),
+            TaskSummary("done", "Done", TaskStatus.COMPLETED, "1 / 1", "1 B", "—", "—", "—"),
+        ]
+    )
+    selection = window.task_table.selectionModel()
+    flags = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+    selection.select(window.task_model.index(0, 0), flags)
+    selection.select(window.task_model.index(1, 0), flags)
+
+    assert window.task_table.selectionMode() is QAbstractItemView.SelectionMode.ExtendedSelection
+    assert window.selected_task_ids() == ["run", "pause"]
+    assert window.open_button.isEnabled() is False
+    with qtbot.waitSignal(window.pause_tasks_requested, timeout=500) as caught:
+        qtbot.mouseClick(window.pause_button, Qt.MouseButton.LeftButton)
+    assert caught.args == [["run", "pause"]]
+
+    window.task_search.setText("Done")
+
+    assert window.task_model.rowCount() == 1
+    assert window.task_model.task_at(0).id == "done"
+    assert window.task_filter.currentText().startswith("全部 (1)")
+
+
+def test_single_task_selection_loads_details_and_emits_open_media(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.set_task_summaries(
+        [
+            TaskSummary(
+                "done",
+                "Completed task",
+                TaskStatus.COMPLETED,
+                "1 / 1",
+                "10 B",
+                "—",
+                "—",
+                "—",
+            )
+        ]
+    )
+    window.task_table.selectRow(0)
+    window.set_task_items(
+        "done",
+        [
+            TaskItemSummary(
+                "media",
+                "video.mp4",
+                MediaKind.VIDEO,
+                ItemStatus.COMPLETED,
+                10,
+                10,
+                0,
+                "—",
+            )
+        ],
+    )
+
+    assert window.task_detail_title.text() == "Completed task"
+    assert window.task_item_model.rowCount() == 1
+    window.task_item_table.selectRow(0)
+    assert window.open_file_button.isEnabled() is True
+    with qtbot.waitSignal(window.open_media_requested, timeout=500) as caught:
+        window.task_item_table.doubleClicked.emit(window.task_item_model.index(0, 0))
+    assert caught.args == ["media"]
+
+
+def test_archive_and_restore_actions_require_confirmation(
+    qtbot,
+    monkeypatch,
+) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    completed = TaskSummary(
+        "done",
+        "Done",
+        TaskStatus.COMPLETED,
+        "1 / 1",
+        "1 B",
+        "—",
+        "—",
+        "—",
+    )
+    window.set_task_summaries([completed])
+    window.task_table.selectRow(0)
+
+    assert window.archive_button.isEnabled() is True
+    assert window.restore_button.isEnabled() is False
+    with qtbot.waitSignal(window.archive_tasks_requested, timeout=500) as caught:
+        qtbot.mouseClick(window.archive_button, Qt.MouseButton.LeftButton)
+    assert caught.args == [["done"]]
+
+    window.set_task_summaries([replace(completed, archived=True)])
+    window.task_filter.setCurrentIndex(window.task_filter.findData(TaskFilter.ARCHIVED))
+    window.task_table.selectRow(0)
+
+    assert window.archive_button.isEnabled() is False
+    assert window.restore_button.isEnabled() is True
+    with qtbot.waitSignal(window.restore_tasks_requested, timeout=500) as caught:
+        qtbot.mouseClick(window.restore_button, Qt.MouseButton.LeftButton)
+    assert caught.args == [["done"]]
 
 
 def test_content_navigation_switches_page_and_hides_statistics(qtbot) -> None:

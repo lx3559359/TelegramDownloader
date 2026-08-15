@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from PySide6.QtCore import QDate, Qt, Signal
+from PySide6.QtCore import QDate, QItemSelectionModel, QSignalBlocker, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QDateEdit,
     QFrame,
     QHBoxLayout,
@@ -13,10 +14,12 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QSizePolicy,
     QSpinBox,
+    QSplitter,
     QStackedWidget,
     QTableView,
     QVBoxLayout,
@@ -24,9 +27,15 @@ from PySide6.QtWidgets import (
 )
 
 from telegram_downloader import __version__
-from telegram_downloader.domain import MediaKind, TaskStatus
+from telegram_downloader.domain import ItemStatus, MediaKind, TaskStatus
 from telegram_downloader.ui.content_browser import ContentBrowserPage
-from telegram_downloader.ui.models import TaskSummary, TaskTableModel
+from telegram_downloader.ui.models import (
+    TaskFilter,
+    TaskItemSummary,
+    TaskItemTableModel,
+    TaskSummary,
+    TaskTableModel,
+)
 from telegram_downloader.ui.subscriptions import SubscriptionPage
 from telegram_downloader.ui.theme import DARK_STYLESHEET, ensure_cjk_font
 
@@ -39,6 +48,15 @@ _MEDIA_LABELS = {
     MediaKind.ARCHIVE: "压缩包",
 }
 
+_TASK_FILTER_LABELS = {
+    TaskFilter.ALL: "全部",
+    TaskFilter.ACTIVE: "进行中",
+    TaskFilter.PAUSED: "已暂停",
+    TaskFilter.FAILED: "部分失败",
+    TaskFilter.COMPLETED: "已完成",
+    TaskFilter.ARCHIVED: "已归档",
+}
+
 
 class MainWindow(QMainWindow):
     scan_requested = Signal(str)
@@ -48,11 +66,20 @@ class MainWindow(QMainWindow):
     resume_requested = Signal(str)
     retry_failed_requested = Signal(str)
     open_directory_requested = Signal(str)
+    task_selection_changed = Signal(object)
+    pause_tasks_requested = Signal(object)
+    resume_tasks_requested = Signal(object)
+    retry_tasks_requested = Signal(object)
+    archive_tasks_requested = Signal(object)
+    restore_tasks_requested = Signal(object)
+    open_media_requested = Signal(str)
     settings_requested = Signal()
     login_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
+        self._restoring_task_selection = False
+        self._detail_task_id: str | None = None
         self.setWindowTitle("Telegram 下载器")
         self.setMinimumSize(1180, 720)
         self.resize(1280, 780)
@@ -79,26 +106,39 @@ class MainWindow(QMainWindow):
 
         self.scan_button.clicked.connect(self._emit_scan)
         self.pause_button.clicked.connect(
-            lambda: self._emit_for_selected(self.pause_requested.emit)
+            lambda: self._emit_task_batch(
+                self.pause_tasks_requested.emit,
+                self.pause_requested.emit,
+            )
         )
         self.resume_button.clicked.connect(
-            lambda: self._emit_for_selected(self.resume_requested.emit)
+            lambda: self._emit_task_batch(
+                self.resume_tasks_requested.emit,
+                self.resume_requested.emit,
+            )
         )
         self.retry_button.clicked.connect(
-            lambda: self._emit_for_selected(self.retry_failed_requested.emit)
+            lambda: self._emit_task_batch(
+                self.retry_tasks_requested.emit,
+                self.retry_failed_requested.emit,
+            )
         )
         self.open_button.clicked.connect(
             lambda: self._emit_for_selected(self.open_directory_requested.emit)
         )
-        self.task_table.selectionModel().selectionChanged.connect(
-            self._update_action_state
-        )
+        self.archive_button.clicked.connect(self._confirm_archive)
+        self.restore_button.clicked.connect(self._confirm_restore)
+        self.open_file_button.clicked.connect(self._emit_selected_media)
+        self.task_search.textChanged.connect(self._apply_task_filter)
+        self.task_filter.currentIndexChanged.connect(self._apply_task_filter)
+        self.task_table.selectionModel().selectionChanged.connect(self._task_selection_changed)
+        self.task_item_table.selectionModel().selectionChanged.connect(self._update_open_file_state)
+        self.task_item_table.doubleClicked.connect(self._emit_open_media)
         self.tasks_nav_button.clicked.connect(lambda: self.show_page("tasks"))
         self.content_nav_button.clicked.connect(lambda: self.show_page("content"))
-        self.subscriptions_nav_button.clicked.connect(
-            lambda: self.show_page("subscriptions")
-        )
+        self.subscriptions_nav_button.clicked.connect(lambda: self.show_page("subscriptions"))
         self._update_action_state()
+        self._update_task_filter_labels()
 
     def _build_navigation(self) -> QWidget:
         rail = QWidget()
@@ -183,12 +223,25 @@ class MainWindow(QMainWindow):
         queue_header.addWidget(hint)
         layout.addLayout(queue_header)
 
+        task_filters = QHBoxLayout()
+        task_filters.setSpacing(9)
+        self.task_search = QLineEdit()
+        self.task_search.setPlaceholderText("筛选任务名称")
+        self.task_search.setClearButtonEnabled(True)
+        self.task_filter = QComboBox()
+        self.task_filter.setMinimumWidth(132)
+        for selected in TaskFilter:
+            self.task_filter.addItem(_TASK_FILTER_LABELS[selected], selected.value)
+        task_filters.addWidget(self.task_search, 1)
+        task_filters.addWidget(self.task_filter)
+        layout.addLayout(task_filters)
+
         self.task_model = TaskTableModel()
         self.task_table = QTableView()
         self.task_table.setModel(self.task_model)
         self.task_table.setAlternatingRowColors(True)
         self.task_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.task_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.task_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.task_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.task_table.setShowGrid(False)
         self.task_table.verticalHeader().hide()
@@ -197,17 +250,76 @@ class MainWindow(QMainWindow):
         header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         for column in range(1, self.task_model.columnCount()):
             header_view.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-        layout.addWidget(self.task_table, 1)
+
+        task_panel = QWidget()
+        task_panel_layout = QVBoxLayout(task_panel)
+        task_panel_layout.setContentsMargins(0, 0, 0, 0)
+        task_panel_layout.setSpacing(5)
+        self.task_empty_hint = QLabel("尚无下载任务")
+        self.task_empty_hint.setObjectName("muted")
+        self.task_empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        task_panel_layout.addWidget(self.task_table, 1)
+        task_panel_layout.addWidget(self.task_empty_hint)
+
+        detail_panel = QFrame()
+        detail_panel.setObjectName("card")
+        detail_layout = QVBoxLayout(detail_panel)
+        detail_layout.setContentsMargins(12, 9, 12, 10)
+        detail_layout.setSpacing(7)
+        detail_header = QHBoxLayout()
+        self.task_detail_title = QLabel("任务详情")
+        self.task_detail_title.setObjectName("sectionTitle")
+        self.task_detail_hint = QLabel("请选择一个任务查看媒体明细")
+        self.task_detail_hint.setObjectName("muted")
+        detail_header.addWidget(self.task_detail_title)
+        detail_header.addSpacing(8)
+        detail_header.addWidget(self.task_detail_hint)
+        detail_header.addStretch()
+        self.open_file_button = QPushButton("打开文件")
+        detail_header.addWidget(self.open_file_button)
+        detail_layout.addLayout(detail_header)
+
+        self.task_item_model = TaskItemTableModel()
+        self.task_item_table = QTableView()
+        self.task_item_table.setModel(self.task_item_model)
+        self.task_item_table.setAlternatingRowColors(True)
+        self.task_item_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.task_item_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.task_item_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.task_item_table.setShowGrid(False)
+        self.task_item_table.verticalHeader().hide()
+        self.task_item_table.verticalHeader().setDefaultSectionSize(36)
+        item_header = self.task_item_table.horizontalHeader()
+        item_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for column in range(1, self.task_item_model.columnCount()):
+            item_header.setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.ResizeToContents,
+            )
+        detail_layout.addWidget(self.task_item_table, 1)
+
+        self.task_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.task_splitter.setChildrenCollapsible(False)
+        self.task_splitter.addWidget(task_panel)
+        self.task_splitter.addWidget(detail_panel)
+        self.task_splitter.setStretchFactor(0, 3)
+        self.task_splitter.setStretchFactor(1, 2)
+        self.task_splitter.setSizes([300, 190])
+        layout.addWidget(self.task_splitter, 1)
 
         actions = QHBoxLayout()
         self.pause_button = QPushButton("暂停")
         self.resume_button = QPushButton("继续")
         self.retry_button = QPushButton("重试失败项")
+        self.archive_button = QPushButton("归档所选")
+        self.restore_button = QPushButton("恢复所选")
         self.open_button = QPushButton("打开目录")
         for button in (
             self.pause_button,
             self.resume_button,
             self.retry_button,
+            self.archive_button,
+            self.restore_button,
             self.open_button,
         ):
             actions.addWidget(button)
@@ -362,56 +474,88 @@ class MainWindow(QMainWindow):
         if task_id is not None:
             callback(task_id)
 
+    def _emit_task_batch(
+        self,
+        batch_callback: Callable[[list[str]], None],
+        legacy_callback: Callable[[str], None],
+    ) -> None:
+        task_ids = self.selected_task_ids()
+        if not task_ids:
+            return
+        batch_callback(task_ids)
+        if len(task_ids) == 1:
+            legacy_callback(task_ids[0])
+
     def _update_action_state(self, *_args) -> None:
-        task = self._selected_task_summary()
-        status = task.status if task is not None else None
+        tasks = self._selected_task_summaries()
         self.pause_button.setEnabled(
-            status
-            in {
-                TaskStatus.QUEUED,
-                TaskStatus.DOWNLOADING,
-                TaskStatus.WAITING_RETRY,
-            }
+            any(
+                not task.archived
+                and task.status
+                in {
+                    TaskStatus.QUEUED,
+                    TaskStatus.DOWNLOADING,
+                    TaskStatus.WAITING_RETRY,
+                }
+                for task in tasks
+            )
         )
-        self.resume_button.setEnabled(status is TaskStatus.PAUSED)
-        self.retry_button.setEnabled(status is TaskStatus.PARTIAL_FAILURE)
-        self.open_button.setEnabled(task is not None)
+        self.resume_button.setEnabled(
+            any(not task.archived and task.status is TaskStatus.PAUSED for task in tasks)
+        )
+        self.retry_button.setEnabled(
+            any(not task.archived and task.status is TaskStatus.PARTIAL_FAILURE for task in tasks)
+        )
+        self.archive_button.setEnabled(
+            bool(tasks)
+            and all(not task.archived and task.status is TaskStatus.COMPLETED for task in tasks)
+        )
+        self.restore_button.setEnabled(bool(tasks) and all(task.archived for task in tasks))
+        self.open_button.setEnabled(len(tasks) == 1)
+        self._update_open_file_state()
 
     def _selected_task_summary(self) -> TaskSummary | None:
-        rows = self.task_table.selectionModel().selectedRows()
-        if not rows:
-            return None
-        return self.task_model.task_at(rows[0].row())
+        tasks = self._selected_task_summaries()
+        return tasks[0] if tasks else None
+
+    def _selected_task_summaries(self) -> list[TaskSummary]:
+        tasks: list[TaskSummary] = []
+        for row in self._selected_task_rows():
+            task = self.task_model.task_at(row)
+            if task is not None:
+                tasks.append(task)
+        return tasks
+
+    def _selected_task_rows(self) -> list[int]:
+        return sorted({index.row() for index in self.task_table.selectionModel().selectedRows()})
+
+    def selected_task_ids(self) -> list[str]:
+        return [task.id for task in self._selected_task_summaries()]
 
     def selected_task_id(self) -> str | None:
-        rows = self.task_table.selectionModel().selectedRows()
-        if not rows:
-            return None
-        value = self.task_model.data(rows[0], Qt.ItemDataRole.UserRole)
-        return str(value) if value else None
+        task_ids = self.selected_task_ids()
+        return task_ids[0] if task_ids else None
 
     def selected_media_kinds(self) -> frozenset[MediaKind]:
         return frozenset(kind for kind, check in self.media_checks.items() if check.isChecked())
 
     def set_task_summaries(self, tasks: list[TaskSummary]) -> None:
-        selected_task_id = self.selected_task_id()
-        self.task_model.set_tasks(tasks)
-        if selected_task_id is not None:
-            selected_row = next(
-                (row for row, task in enumerate(tasks) if task.id == selected_task_id),
-                None,
-            )
-            if selected_row is not None:
-                self.task_table.selectRow(selected_row)
-        self._update_action_state()
+        selected_task_ids = self.selected_task_ids()
+        self._restoring_task_selection = True
+        try:
+            self.task_model.set_tasks(tasks)
+            self._restore_task_selection(selected_task_ids)
+        finally:
+            self._restoring_task_selection = False
+        self._update_task_filter_labels()
+        self._task_selection_changed()
 
+        active_tasks = [task for task in tasks if not task.archived]
         total_speed = sum(
-            task.speed_bps for task in tasks if task.status is TaskStatus.DOWNLOADING
+            task.speed_bps for task in active_tasks if task.status is TaskStatus.DOWNLOADING
         )
-        completed = sum(task.completed_items for task in tasks)
-        remaining = sum(
-            max(0, task.total_items - task.completed_items) for task in tasks
-        )
+        completed = sum(task.completed_items for task in active_tasks)
+        remaining = sum(max(0, task.total_items - task.completed_items) for task in active_tasks)
         self.speed_value.setText(self._format_rate(total_speed))
         self.completed_value.setText(str(completed))
         self.remaining_value.setText(str(remaining))
@@ -419,7 +563,7 @@ class MainWindow(QMainWindow):
         active = next(
             (
                 task
-                for task in tasks
+                for task in active_tasks
                 if task.status in {TaskStatus.DOWNLOADING, TaskStatus.WAITING_RETRY}
             ),
             None,
@@ -443,6 +587,131 @@ class MainWindow(QMainWindow):
             detail += f" · 剩余 {active.remaining_text}"
         self.current_detail.setText(detail)
 
+    def set_task_items(
+        self,
+        task_id: str,
+        items: list[TaskItemSummary],
+    ) -> None:
+        tasks = self._selected_task_summaries()
+        if len(tasks) != 1 or tasks[0].id != task_id:
+            return
+        self._detail_task_id = task_id
+        self.task_detail_title.setText(tasks[0].title)
+        self.task_detail_hint.setText(f"共 {len(items)} 个媒体文件")
+        self.task_item_model.set_items(items)
+        self._update_open_file_state()
+
+    def _task_selection_changed(self, *_args) -> None:
+        if self._restoring_task_selection:
+            return
+        tasks = self._selected_task_summaries()
+        self.task_selection_changed.emit([task.id for task in tasks])
+        if len(tasks) == 1:
+            task = tasks[0]
+            if self._detail_task_id != task.id:
+                self._detail_task_id = task.id
+                self.task_item_model.set_items([])
+            self.task_detail_title.setText(task.title)
+            self.task_detail_hint.setText("正在加载媒体明细…")
+        elif tasks:
+            self._clear_task_details(
+                "批量选择",
+                f"已选 {len(tasks)} 个任务，可使用下方批量操作",
+            )
+        else:
+            self._clear_task_details("任务详情", "请选择一个任务查看媒体明细")
+        self._update_action_state()
+
+    def _clear_task_details(self, title: str, hint: str) -> None:
+        self._detail_task_id = None
+        self.task_detail_title.setText(title)
+        self.task_detail_hint.setText(hint)
+        self.task_item_model.set_items([])
+        self._update_open_file_state()
+
+    def _restore_task_selection(self, task_ids: list[str]) -> None:
+        selection = self.task_table.selectionModel()
+        flags = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+        for task_id in task_ids:
+            row = self.task_model.row_for_task_id(task_id)
+            if row is not None:
+                selection.select(self.task_model.index(row, 0), flags)
+
+    def _apply_task_filter(self, *_args) -> None:
+        selected_task_ids = self.selected_task_ids()
+        selected = TaskFilter(str(self.task_filter.currentData()))
+        self._restoring_task_selection = True
+        try:
+            self.task_model.set_filter(selected, self.task_search.text())
+            self._restore_task_selection(selected_task_ids)
+        finally:
+            self._restoring_task_selection = False
+        self._update_task_filter_labels()
+        self._task_selection_changed()
+
+    def _update_task_filter_labels(self) -> None:
+        counts = self.task_model.filter_counts()
+        blocker = QSignalBlocker(self.task_filter)
+        try:
+            for index, selected in enumerate(TaskFilter):
+                self.task_filter.setItemText(
+                    index,
+                    f"{_TASK_FILTER_LABELS[selected]} ({counts[selected]})",
+                )
+        finally:
+            del blocker
+        self.task_empty_hint.setVisible(self.task_model.rowCount() == 0)
+        self.task_empty_hint.setText(
+            "尚无下载任务"
+            if not self.task_search.text().strip()
+            and TaskFilter(str(self.task_filter.currentData())) is TaskFilter.ALL
+            else "没有符合当前筛选的任务"
+        )
+
+    def _confirm_archive(self) -> None:
+        task_ids = self.selected_task_ids()
+        if not task_ids:
+            return
+        answer = QMessageBox.question(
+            self,
+            "归档完成任务",
+            f"归档所选 {len(task_ids)} 个任务？下载文件会保留，可随时恢复。",
+        )
+        if answer is QMessageBox.StandardButton.Yes:
+            self.archive_tasks_requested.emit(task_ids)
+
+    def _confirm_restore(self) -> None:
+        task_ids = self.selected_task_ids()
+        if not task_ids:
+            return
+        answer = QMessageBox.question(
+            self,
+            "恢复归档任务",
+            f"恢复所选 {len(task_ids)} 个任务到任务队列？",
+        )
+        if answer is QMessageBox.StandardButton.Yes:
+            self.restore_tasks_requested.emit(task_ids)
+
+    def _selected_media_summary(self) -> TaskItemSummary | None:
+        rows = self.task_item_table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        return self.task_item_model.item_at(rows[0].row())
+
+    def _update_open_file_state(self, *_args) -> None:
+        item = self._selected_media_summary()
+        self.open_file_button.setEnabled(item is not None and item.status is ItemStatus.COMPLETED)
+
+    def _emit_selected_media(self) -> None:
+        item = self._selected_media_summary()
+        if item is not None and item.status is ItemStatus.COMPLETED:
+            self.open_media_requested.emit(item.id)
+
+    def _emit_open_media(self, index) -> None:
+        item = self.task_item_model.item_at(index.row())
+        if item is not None and item.status is ItemStatus.COMPLETED:
+            self.open_media_requested.emit(item.id)
+
     @staticmethod
     def _format_rate(value: float) -> str:
         if value <= 0:
@@ -450,11 +719,7 @@ class MainWindow(QMainWindow):
         amount = value
         for unit in ("B/s", "KB/s", "MB/s", "GB/s", "TB/s"):
             if amount < 1024 or unit == "TB/s":
-                return (
-                    f"{amount:.0f} {unit}"
-                    if unit == "B/s"
-                    else f"{amount:.1f} {unit}"
-                )
+                return f"{amount:.0f} {unit}" if unit == "B/s" else f"{amount:.1f} {unit}"
             amount /= 1024
         return "0 B/s"
 
