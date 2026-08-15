@@ -6,6 +6,7 @@ import json
 import os
 import sys
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +89,7 @@ def run_self_test(root: Path) -> dict[str, object]:
     repository.recover_interrupted()
     catalog = CatalogRepository(paths.catalog_database)
     catalog.initialize()
+    catalog.recover_interrupted_subscriptions(datetime.now(UTC))
     ThumbnailCache(paths.thumbnail_cache)
 
     writable = {
@@ -185,6 +187,7 @@ def create_application(root: Path):
     catalog_error: Exception | None = None
     try:
         catalog.initialize()
+        catalog.recover_interrupted_subscriptions(datetime.now(UTC))
     except Exception as error:
         catalog_error = error
     thumbnails = ThumbnailCache(paths.thumbnail_cache)

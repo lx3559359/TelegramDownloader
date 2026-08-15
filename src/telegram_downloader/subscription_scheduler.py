@@ -92,7 +92,7 @@ class SubscriptionScheduler:
         while not self._closing:
             self._wake_event.clear()
             selected = self._next_rule()
-            if selected is not None and not self.foreground_busy():
+            if selected is not None:
                 await self._execute(selected)
                 continue
             try:

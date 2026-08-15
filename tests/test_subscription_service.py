@@ -67,12 +67,15 @@ def message(
 class Gateway:
     def __init__(self) -> None:
         self.latest_id = 42
+        self.latest_error: Exception | None = None
         self.messages: tuple[RemoteMessage, ...] = ()
         self.incremental_error: Exception | None = None
         self.albums: dict[int, tuple[RemoteSearchHit, ...]] = {}
         self.incremental_calls: list[tuple[int, int, int]] = []
 
     async def latest_message_id(self, _peer_ref: str) -> int:
+        if self.latest_error is not None:
+            raise self.latest_error
         return self.latest_id
 
     async def incremental_messages(
@@ -162,6 +165,34 @@ async def test_create_rule_establishes_baseline_without_queueing(
     assert tasks.list_tasks() == []
     assert catalog.get_subscription("a1", saved.id) == saved
     assert gateway.incremental_calls == []
+
+
+@pytest.mark.asyncio
+async def test_failed_initial_baseline_is_retryable_without_recreating_rule(
+    tmp_path: Path,
+) -> None:
+    service, gateway, catalog, tasks = build_service(tmp_path)
+    gateway.latest_error = TransientNetworkError("offline")
+
+    with pytest.raises(TransientNetworkError):
+        await service.create_rule(
+            SubscriptionDraft("-1001", "美女", frozenset({MediaKind.PHOTO}))
+        )
+
+    [failed] = service.list_rules()
+    assert failed.state is SubscriptionState.FAILED
+    assert failed.last_message_id is None
+    assert failed.next_run_at == NOW
+    assert failed.failure_count == 1
+
+    gateway.latest_error = None
+    report = await service.run_rule(failed.id)
+
+    assert report.run.queued == 0
+    assert tasks.list_tasks() == []
+    recovered = catalog.get_subscription("a1", failed.id)
+    assert recovered.state is SubscriptionState.WAITING
+    assert recovered.last_message_id == 42
 
 
 @pytest.mark.asyncio

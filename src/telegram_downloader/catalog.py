@@ -842,6 +842,22 @@ class CatalogRepository:
             ).fetchall()
         return [self._subscription_run_from_row(row) for row in rows]
 
+    def latest_subscription_runs(
+        self,
+        account_id: str,
+    ) -> dict[str, SubscriptionRun]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM subscription_runs WHERE account_id=? "
+                "ORDER BY finished_at DESC, id DESC",
+                (account_id,),
+            ).fetchall()
+        latest: dict[str, SubscriptionRun] = {}
+        for row in rows:
+            run = self._subscription_run_from_row(row)
+            latest.setdefault(run.rule_id, run)
+        return latest
+
     @staticmethod
     def _dialog_from_row(row: sqlite3.Row) -> ContentDialog:
         return ContentDialog(

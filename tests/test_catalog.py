@@ -269,6 +269,9 @@ def test_subscription_run_history_is_trimmed_per_rule(tmp_path: Path) -> None:
             retain=2,
         )
 
+    latest = repo.latest_subscription_runs("a1")
+    assert latest[saved.id].id == "run-3"
+
     assert [item.id for item in repo.list_subscription_runs("a1", saved.id)] == [
         "run-3",
         "run-2",

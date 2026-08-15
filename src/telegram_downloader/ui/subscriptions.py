@@ -28,6 +28,7 @@ from telegram_downloader.subscriptions import (
     SubscriptionDraft,
     SubscriptionProgress,
     SubscriptionRule,
+    SubscriptionRun,
 )
 from telegram_downloader.ui.subscription_models import SubscriptionTableModel
 
@@ -274,9 +275,13 @@ class SubscriptionPage(QWidget):
         self._dialogs = list(dialogs)
         self._refresh_actions()
 
-    def set_rules(self, rules: list[SubscriptionRule]) -> None:
+    def set_rules(
+        self,
+        rules: list[SubscriptionRule],
+        latest_runs: dict[str, SubscriptionRun] | None = None,
+    ) -> None:
         selected = self._selected_rule_id()
-        self.rule_model.set_rules(rules)
+        self.rule_model.set_rules(rules, latest_runs)
         if selected is not None:
             for row in range(self.rule_model.rowCount()):
                 if self.rule_model.rule_at(row).id == selected:

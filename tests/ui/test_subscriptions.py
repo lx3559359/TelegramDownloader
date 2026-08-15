@@ -10,6 +10,8 @@ from telegram_downloader.domain import MediaKind
 from telegram_downloader.subscriptions import (
     SubscriptionProgress,
     SubscriptionRule,
+    SubscriptionRun,
+    SubscriptionRunStatus,
     SubscriptionState,
 )
 from telegram_downloader.ui.subscription_models import SubscriptionTableModel
@@ -57,11 +59,26 @@ def rule(*, enabled: bool = True) -> SubscriptionRule:
 
 def test_subscription_model_exposes_status_schedule_and_rule_id(qtbot) -> None:
     model = SubscriptionTableModel()
-    model.set_rules([rule()])
+    latest = SubscriptionRun(
+        "run-1",
+        "rule-1",
+        "a1",
+        NOW,
+        NOW,
+        SubscriptionRunStatus.COMPLETED,
+        20,
+        5,
+        3,
+        2,
+    )
+    model.set_rules([rule()], {"rule-1": latest})
 
     assert model.columnCount() == 5
     assert model.data(model.index(0, 0), Qt.ItemDataRole.UserRole) == "rule-1"
     assert model.data(model.index(0, 2), Qt.ItemDataRole.DisplayRole) == "等待检查"
+    assert model.data(model.index(0, 3), Qt.ItemDataRole.DisplayRole) == (
+        "扫描 20 · 匹配 5 · 新增 3 · 重复 2"
+    )
     assert "2026-08-15" in model.data(
         model.index(0, 4),
         Qt.ItemDataRole.DisplayRole,

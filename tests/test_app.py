@@ -1,4 +1,5 @@
 import asyncio
+from datetime import UTC, datetime
 from inspect import getsource, isawaitable
 from types import SimpleNamespace
 
@@ -6,10 +7,15 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QMessageBox
 
 from telegram_downloader import app
+from telegram_downloader.catalog import CatalogRepository
 from telegram_downloader.connectivity import ConnectionRecovery
+from telegram_downloader.content import AccountProfile, ContentDialog, DialogKind
 from telegram_downloader.content_browser import ContentBrowserService
+from telegram_downloader.domain import MediaKind
+from telegram_downloader.paths import PortablePaths
 from telegram_downloader.subscription_scheduler import SubscriptionScheduler
 from telegram_downloader.subscription_service import SubscriptionService
+from telegram_downloader.subscriptions import SubscriptionRule, SubscriptionState
 
 
 def test_standard_button_selection_accepts_pyside_integer_result() -> None:
@@ -145,6 +151,63 @@ def test_create_application_initializes_project_local_content_services(
         report = app.run_self_test(tmp_path)
         for value in report["writable_paths"].values():
             assert str(value).startswith(str(tmp_path.resolve()))
+    finally:
+        loop.run_until_complete(controller._async_actions.shutdown())
+        controller.window.close()
+        loop.close()
+        application.processEvents()
+
+
+def test_create_application_recovers_interrupted_subscription(tmp_path) -> None:
+    now = datetime(2026, 8, 15, 9, 0, tzinfo=UTC)
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    catalog = CatalogRepository(paths.catalog_database)
+    catalog.initialize()
+    catalog.upsert_account(AccountProfile("a1", "账号"), now)
+    catalog.replace_dialogs(
+        "a1",
+        [
+            ContentDialog(
+                "a1",
+                "-1001",
+                "资料群",
+                "",
+                DialogKind.GROUP,
+                False,
+                True,
+                now,
+            )
+        ],
+        now,
+    )
+    catalog.save_subscription(
+        SubscriptionRule(
+            "rule-1",
+            "a1",
+            "-1001",
+            "资料群",
+            "美女",
+            frozenset({MediaKind.PHOTO}),
+            30,
+            True,
+            SubscriptionState.RUNNING,
+            42,
+            None,
+            now,
+            None,
+            0,
+            now,
+            now,
+        )
+    )
+
+    application, loop, controller = app.create_application(tmp_path)
+    try:
+        recovered = catalog.get_subscription("a1", "rule-1")
+        assert recovered.state is SubscriptionState.WAITING
+        assert recovered.next_run_at is not None
+        assert recovered.last_error == "上次自动检查未正常结束"
     finally:
         loop.run_until_complete(controller._async_actions.shutdown())
         controller.window.close()

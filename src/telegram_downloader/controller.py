@@ -183,7 +183,11 @@ class _NullSubscriptionPage:
     def set_dialogs(self, _value: list[object]) -> None:
         pass
 
-    def set_rules(self, _value: list[object]) -> None:
+    def set_rules(
+        self,
+        _value: list[object],
+        _latest_runs: dict[str, object] | None = None,
+    ) -> None:
         pass
 
     def set_rule_busy(
@@ -231,6 +235,9 @@ class _NullSubscriptionService:
 
     def list_rules(self) -> list[object]:
         return []
+
+    def latest_runs(self) -> dict[str, object]:
+        return {}
 
     def go_offline(self) -> None:
         pass
@@ -1448,7 +1455,10 @@ class AppController:
     def _reload_subscriptions(self) -> None:
         page = self._subscription_page()
         try:
-            page.set_rules(self.subscriptions.list_rules())
+            page.set_rules(
+                self.subscriptions.list_rules(),
+                self.subscriptions.latest_runs(),
+            )
         except Exception as error:
             page.show_error(self._safe_error(error))
 

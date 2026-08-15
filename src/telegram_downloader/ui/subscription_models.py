@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 
-from telegram_downloader.subscriptions import SubscriptionRule, SubscriptionState
+from telegram_downloader.subscriptions import (
+    SubscriptionRule,
+    SubscriptionRun,
+    SubscriptionState,
+)
 
 _INVALID_INDEX = QModelIndex()
 
@@ -22,6 +26,7 @@ class SubscriptionTableModel(QAbstractTableModel):
     def __init__(self) -> None:
         super().__init__()
         self._rules: tuple[SubscriptionRule, ...] = ()
+        self._latest_runs: dict[str, SubscriptionRun] = {}
 
     def rowCount(self, parent: QModelIndex = _INVALID_INDEX) -> int:
         return 0 if parent.isValid() else len(self._rules)
@@ -67,13 +72,18 @@ class SubscriptionTableModel(QAbstractTableModel):
             f"{item.keyword} · 每 {item.interval_minutes} 分钟",
             item.dialog_title,
             self.STATUS_LABELS[item.state],
-            self._last_result(item),
+            self._last_result(item, self._latest_runs.get(item.id)),
             self._next_run(item),
         )
         return values[index.column()]
 
-    def set_rules(self, rules: list[SubscriptionRule]) -> None:
+    def set_rules(
+        self,
+        rules: list[SubscriptionRule],
+        latest_runs: dict[str, SubscriptionRun] | None = None,
+    ) -> None:
         self.beginResetModel()
+        self._latest_runs = dict(latest_runs or {})
         self._rules = tuple(
             sorted(
                 rules,
@@ -93,9 +103,17 @@ class SubscriptionTableModel(QAbstractTableModel):
         return self._rules[row]
 
     @staticmethod
-    def _last_result(item: SubscriptionRule) -> str:
+    def _last_result(
+        item: SubscriptionRule,
+        latest_run: SubscriptionRun | None,
+    ) -> str:
         if item.last_error:
             return item.last_error
+        if latest_run is not None:
+            return (
+                f"扫描 {latest_run.inspected} · 匹配 {latest_run.matched} · "
+                f"新增 {latest_run.queued} · 重复 {latest_run.duplicate}"
+            )
         if item.last_run_at is None:
             return "尚未检查"
         return item.last_run_at.astimezone().strftime("完成于 %Y-%m-%d %H:%M")

@@ -46,6 +46,7 @@ class SubscriptionPage:
         self.logged_in: list[bool] = []
         self.dialogs = []
         self.rules = []
+        self.latest_runs = {}
         self.busy = []
         self.errors = []
 
@@ -55,8 +56,9 @@ class SubscriptionPage:
     def set_dialogs(self, value):
         self.dialogs = value
 
-    def set_rules(self, value):
+    def set_rules(self, value, latest_runs=None):
         self.rules = value
+        self.latest_runs = latest_runs or {}
 
     def set_rule_busy(self, rule_id, busy, text=""):
         self.busy.append((rule_id, busy, text))
@@ -114,6 +116,9 @@ class Subscriptions:
 
     def list_rules(self):
         return self.rules
+
+    def latest_runs(self):
+        return {"rule-1": "latest"} if self.rules else {}
 
     def get_rule(self, rule_id):
         return next(item for item in self.rules if item.id == rule_id)

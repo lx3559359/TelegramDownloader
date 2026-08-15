@@ -65,6 +65,10 @@ class SubscriptionService:
         account = self._require_account()
         return self.catalog.list_due_subscriptions(account.account_id, now)
 
+    def latest_runs(self) -> dict[str, SubscriptionRun]:
+        account = self._require_account()
+        return self.catalog.latest_subscription_runs(account.account_id)
+
     def get_rule(self, rule_id: str) -> SubscriptionRule:
         account = self._require_account()
         return self.catalog.get_subscription(account.account_id, rule_id)
@@ -95,7 +99,21 @@ class SubscriptionService:
             updated_at=now,
         )
         self.catalog.save_subscription(rule)
-        baseline = await gateway.latest_message_id(dialog.peer_ref)
+        try:
+            baseline = await gateway.latest_message_id(dialog.peer_ref)
+        except Exception as error:
+            failed_at = self.clock()
+            self.catalog.save_subscription(
+                replace(
+                    rule,
+                    state=SubscriptionState.FAILED,
+                    next_run_at=failed_at,
+                    last_error=f"自动建立基线失败（{type(error).__name__}）",
+                    failure_count=1,
+                    updated_at=failed_at,
+                )
+            )
+            raise
         ready = replace(
             rule,
             state=SubscriptionState.WAITING,

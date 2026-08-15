@@ -215,6 +215,30 @@ async def test_foreground_busy_defers_without_recording_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_foreground_state_change_does_not_drop_manual_wake() -> None:
+    checks = iter((False, True))
+
+    def foreground_busy() -> bool:
+        return next(checks, False)
+
+    service = Service(rule("r1", next_run_at=NOW + timedelta(hours=1)))
+    scheduler = SubscriptionScheduler(
+        service,
+        clock=lambda: NOW,
+        foreground_busy=foreground_busy,
+        idle_delay=0.01,
+    )
+    scheduler.set_account("a1")
+    scheduler.wake("r1")
+    scheduler.start()
+
+    await wait_until(lambda: service.run_calls == ["r1"])
+    await scheduler.shutdown()
+
+    assert service.run_calls == ["r1"]
+
+
+@pytest.mark.asyncio
 async def test_transient_and_flood_failures_use_safe_backoff() -> None:
     service = Service(rule("r1"))
     service.outcomes = [
