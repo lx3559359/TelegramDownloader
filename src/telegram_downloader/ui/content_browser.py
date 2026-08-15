@@ -442,6 +442,11 @@ class ContentBrowserPage(QWidget):
         )
         dialog.open()
 
+    def update_preview(self, result_id: str, path: Path) -> None:
+        for dialog in tuple(self._preview_dialogs):
+            if dialog.result_id == result_id:
+                dialog.set_preview(path)
+
     def show_error(self, message: str) -> None:
         self.error_label.setText(message)
         self.error_label.setVisible(bool(message))

@@ -35,6 +35,7 @@ class MediaPreviewDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self.result_id = result.id
         self.setWindowTitle(f"媒体预览 · {result.original_name}")
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.resize(780, 620)
@@ -72,6 +73,15 @@ class MediaPreviewDialog(QDialog):
         self.close_button.clicked.connect(self.reject)
         layout.activate()
         self._render_preview(result)
+
+    def set_preview(self, path: Path) -> None:
+        pixmap = self._load_pixmap(path)
+        if pixmap is None:
+            return
+        self._source_pixmap = pixmap
+        self.preview_label.clear()
+        self.size_button.setEnabled(True)
+        self._apply_pixmap()
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)

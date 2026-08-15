@@ -1169,6 +1169,7 @@ class ContentPageFake:
         self.queue_busy = []
         self.thumbnails = {}
         self.previews = []
+        self.preview_updates = []
         self.errors = []
 
     def set_logged_in(self, value):
@@ -1207,6 +1208,9 @@ class ContentPageFake:
 
     def show_preview(self, result, path):
         self.previews.append((result, path))
+
+    def update_preview(self, result_id, path):
+        self.preview_updates.append((result_id, path))
 
     def show_error(self, message):
         self.errors.append(message)
@@ -1475,7 +1479,47 @@ async def test_content_preview_uses_scoped_metadata_and_loaded_thumbnail(
 
     await controller.open_content_preview(result.id)
 
-    assert window.content_page.previews == [(result, path)]
+    assert window.content_page.previews == [(result, None)]
+    assert window.content_page.thumbnails == {result.id: path}
+    assert window.content_page.preview_updates == [(result.id, path)]
+
+
+@pytest.mark.asyncio
+async def test_content_preview_opens_before_network_thumbnail_finishes(
+    tmp_path,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    result = SimpleNamespace(id="result-1")
+    path = tmp_path / "preview.jpg"
+
+    class Browser:
+        def get_result(self, result_id):
+            assert result_id == result.id
+            return result
+
+        async def load_thumbnail(self, result_id):
+            assert result_id == result.id
+            entered.set()
+            await release.wait()
+            return path
+
+    window = ContentWindowFake()
+    controller = AppController.for_test(
+        content_browser=Browser(),
+        window=window,
+    )
+
+    opening = asyncio.create_task(controller.open_content_preview(result.id))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+
+    assert opening.done() is False
+    assert window.content_page.previews == [(result, None)]
+
+    release.set()
+    await opening
+
+    assert window.content_page.preview_updates == [(result.id, path)]
 
 
 @pytest.mark.asyncio

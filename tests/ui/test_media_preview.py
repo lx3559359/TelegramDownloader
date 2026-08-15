@@ -53,3 +53,23 @@ def test_non_image_preview_shows_metadata_without_crashing(qtbot) -> None:
 
     assert "视频" in dialog.metadata_label.text()
     assert "暂无可用预览" in dialog.preview_label.text()
+
+
+def test_placeholder_preview_can_be_upgraded_when_thumbnail_arrives(
+    qtbot,
+    tmp_path,
+) -> None:
+    path = tmp_path / "preview.png"
+    image = QImage(400, 200, QImage.Format.Format_RGB32)
+    image.fill(Qt.GlobalColor.cyan)
+    assert image.save(str(path))
+    dialog = MediaPreviewDialog(
+        result(datetime(2026, 8, 15, tzinfo=UTC), "r1", 1),
+        None,
+    )
+    qtbot.addWidget(dialog)
+
+    dialog.set_preview(path)
+
+    assert dialog.preview_label.pixmap() is not None
+    assert dialog.size_button.isEnabled() is True

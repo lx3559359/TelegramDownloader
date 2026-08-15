@@ -951,8 +951,11 @@ class AppController:
         page = self._content_page()
         try:
             result = self.content_browser.get_result(result_id)
+            page.show_preview(result, None)
             path = await self.content_browser.load_thumbnail(result_id)
-            page.show_preview(result, path)
+            if path is not None:
+                page.set_thumbnail(result_id, path)
+                page.update_preview(result_id, path)
         except asyncio.CancelledError:
             raise
         except Exception as error:

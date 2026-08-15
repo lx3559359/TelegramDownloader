@@ -2,6 +2,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime
 
 from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import QImage
 
 from telegram_downloader.content import (
     ContentDialog,
@@ -369,3 +370,19 @@ def test_nonblocking_preview_is_retained_until_closed(qtbot) -> None:
     preview = next(iter(page._preview_dialogs))
     preview.reject()
     qtbot.waitUntil(lambda: not page._preview_dialogs, timeout=500)
+
+
+def test_open_preview_is_updated_when_thumbnail_arrives(qtbot, tmp_path) -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    preview_path = tmp_path / "preview.png"
+    image = QImage(400, 200, QImage.Format.Format_RGB32)
+    image.fill(Qt.GlobalColor.cyan)
+    assert image.save(str(preview_path))
+    page = ContentBrowserPage()
+    qtbot.addWidget(page)
+    page.show_preview(result(now, "r1", 1), None)
+
+    page.update_preview("r1", preview_path)
+
+    preview = next(iter(page._preview_dialogs))
+    assert preview.preview_label.pixmap() is not None
