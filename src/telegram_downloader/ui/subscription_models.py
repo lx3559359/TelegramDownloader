@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 
+from telegram_downloader.subscription_diagnostics import explain_run
 from telegram_downloader.subscriptions import (
     SubscriptionRule,
     SubscriptionRun,
@@ -110,10 +111,7 @@ class SubscriptionTableModel(QAbstractTableModel):
         if item.last_error:
             return item.last_error
         if latest_run is not None:
-            return (
-                f"扫描 {latest_run.inspected} · 匹配 {latest_run.matched} · "
-                f"新增 {latest_run.queued} · 重复 {latest_run.duplicate}"
-            )
+            return explain_run(latest_run)
         if item.last_run_at is None:
             return "尚未检查"
         return item.last_run_at.astimezone().strftime("完成于 %Y-%m-%d %H:%M")

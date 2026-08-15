@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSplitter,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -23,12 +24,19 @@ from PySide6.QtWidgets import (
 
 from telegram_downloader.content import ContentDialog
 from telegram_downloader.domain import MediaKind
+from telegram_downloader.subscription_diagnostics import explain_probe
 from telegram_downloader.subscriptions import (
     SUPPORTED_INTERVAL_MINUTES,
     SubscriptionDraft,
+    SubscriptionProbeProgress,
+    SubscriptionProbeReport,
     SubscriptionProgress,
     SubscriptionRule,
     SubscriptionRun,
+)
+from telegram_downloader.ui.subscription_diagnostics import (
+    SubscriptionProbeSampleModel,
+    SubscriptionRunHistoryModel,
 )
 from telegram_downloader.ui.subscription_models import SubscriptionTableModel
 
@@ -151,14 +159,23 @@ class SubscriptionPage(QWidget):
     run_requested = Signal(str)
     enabled_requested = Signal(str, bool)
     delete_requested = Signal(str)
+    rule_selected = Signal(str)
+    probe_requested = Signal(str)
+    probe_cancel_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self.rule_model = SubscriptionTableModel()
+        self.run_history_model = SubscriptionRunHistoryModel()
+        self.probe_sample_model = SubscriptionProbeSampleModel()
         self._logged_in = False
         self._dialogs: list[ContentDialog] = []
         self._busy_rule_id: str | None = None
         self._busy = False
+        self._detail_rule: SubscriptionRule | None = None
+        self._probe_busy = False
+        self._probe_rule_id: str | None = None
+        self._probe_report: SubscriptionProbeReport | None = None
         self._editors: set[SubscriptionEditorDialog] = set()
         self._build_ui()
         self._connect_signals()
@@ -195,6 +212,14 @@ class SubscriptionPage(QWidget):
         header.addWidget(self.new_button)
         card_layout.addLayout(header)
 
+        self.detail_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.detail_splitter.setChildrenCollapsible(False)
+
+        rules_panel = QWidget()
+        rules_layout = QVBoxLayout(rules_panel)
+        rules_layout.setContentsMargins(0, 0, 0, 0)
+        rules_layout.setSpacing(8)
+
         self.rule_table = QTableView()
         self.rule_table.setModel(self.rule_model)
         self.rule_table.setSelectionBehavior(
@@ -211,26 +236,29 @@ class SubscriptionPage(QWidget):
         header_view = self.rule_table.horizontalHeader()
         header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for column in (2, 3, 4):
+        header_view.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        for column in (2, 4):
             header_view.setSectionResizeMode(
                 column,
                 QHeaderView.ResizeMode.ResizeToContents,
             )
-        card_layout.addWidget(self.rule_table, 1)
+        self.rule_table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.rule_table.setMinimumHeight(120)
+        rules_layout.addWidget(self.rule_table, 1)
 
         self.progress_label = QLabel("")
         self.progress_label.setObjectName("muted")
         self.progress_label.hide()
-        card_layout.addWidget(self.progress_label)
+        rules_layout.addWidget(self.progress_label)
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setTextVisible(False)
         self.progress_bar.hide()
-        card_layout.addWidget(self.progress_bar)
+        rules_layout.addWidget(self.progress_bar)
         self.busy_label = QLabel("")
         self.busy_label.setObjectName("muted")
         self.busy_label.hide()
-        card_layout.addWidget(self.busy_label)
+        rules_layout.addWidget(self.busy_label)
 
         actions = QHBoxLayout()
         self.edit_button = QPushButton("编辑")
@@ -242,7 +270,94 @@ class SubscriptionPage(QWidget):
         actions.addWidget(self.toggle_button)
         actions.addWidget(self.delete_button)
         actions.addStretch()
-        card_layout.addLayout(actions)
+        rules_layout.addLayout(actions)
+        self.detail_splitter.addWidget(rules_panel)
+
+        detail_panel = QFrame()
+        detail_panel.setObjectName("subCard")
+        detail_panel.setMinimumHeight(210)
+        detail_layout = QVBoxLayout(detail_panel)
+        detail_layout.setContentsMargins(10, 10, 10, 10)
+        detail_layout.setSpacing(7)
+
+        detail_header = QHBoxLayout()
+        detail_title = QLabel("规则诊断")
+        detail_title.setObjectName("sectionTitle")
+        detail_header.addWidget(detail_title)
+        detail_header.addStretch()
+        self.probe_button = QPushButton("测试最近 100 条")
+        self.probe_button.setObjectName("primaryButton")
+        self.probe_cancel_button = QPushButton("取消测试")
+        self.probe_cancel_button.hide()
+        detail_header.addWidget(self.probe_button)
+        detail_header.addWidget(self.probe_cancel_button)
+        detail_layout.addLayout(detail_header)
+
+        self.detail_summary = QLabel("请选择订阅规则查看配置与运行历史")
+        self.detail_summary.setObjectName("muted")
+        self.detail_summary.setWordWrap(True)
+        detail_layout.addWidget(self.detail_summary)
+
+        diagnostics = QSplitter(Qt.Orientation.Horizontal)
+        diagnostics.setChildrenCollapsible(False)
+
+        history_panel = QWidget()
+        history_layout = QVBoxLayout(history_panel)
+        history_layout.setContentsMargins(0, 0, 4, 0)
+        history_layout.setSpacing(5)
+        history_layout.addWidget(QLabel("最近 20 次运行"))
+        self.run_history_table = QTableView()
+        self.run_history_table.setModel(self.run_history_model)
+        self._configure_read_only_table(self.run_history_table)
+        history_header = self.run_history_table.horizontalHeader()
+        history_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for column in (0, 2, 3, 4, 5, 6):
+            history_header.setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.ResizeToContents,
+            )
+        history_layout.addWidget(self.run_history_table, 1)
+        diagnostics.addWidget(history_panel)
+
+        probe_panel = QWidget()
+        probe_layout = QVBoxLayout(probe_panel)
+        probe_layout.setContentsMargins(4, 0, 0, 0)
+        probe_layout.setSpacing(5)
+        self.probe_progress_label = QLabel("")
+        self.probe_progress_label.setObjectName("muted")
+        self.probe_progress_label.hide()
+        probe_layout.addWidget(self.probe_progress_label)
+        self.probe_progress_bar = QProgressBar()
+        self.probe_progress_bar.setRange(0, 100)
+        self.probe_progress_bar.setTextVisible(False)
+        self.probe_progress_bar.hide()
+        probe_layout.addWidget(self.probe_progress_bar)
+        self.probe_result_label = QLabel("点击测试可只读检查最近消息，不会改变游标或队列")
+        self.probe_result_label.setObjectName("muted")
+        self.probe_result_label.setWordWrap(True)
+        probe_layout.addWidget(self.probe_result_label)
+        self.probe_sample_table = QTableView()
+        self.probe_sample_table.setModel(self.probe_sample_model)
+        self._configure_read_only_table(self.probe_sample_table)
+        sample_header = self.probe_sample_table.horizontalHeader()
+        sample_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        sample_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        for column in (0, 1, 3, 5):
+            sample_header.setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.ResizeToContents,
+            )
+        probe_layout.addWidget(self.probe_sample_table, 1)
+        diagnostics.addWidget(probe_panel)
+        diagnostics.setStretchFactor(0, 1)
+        diagnostics.setStretchFactor(1, 1)
+        detail_layout.addWidget(diagnostics, 1)
+
+        self.detail_splitter.addWidget(detail_panel)
+        self.detail_splitter.setStretchFactor(0, 1)
+        self.detail_splitter.setStretchFactor(1, 1)
+        self.detail_splitter.setSizes([260, 260])
+        card_layout.addWidget(self.detail_splitter, 1)
         layout.addWidget(card, 1)
 
         self.error_label = QLabel("")
@@ -257,9 +372,11 @@ class SubscriptionPage(QWidget):
         self.run_button.clicked.connect(self._emit_run)
         self.toggle_button.clicked.connect(self._emit_toggle)
         self.delete_button.clicked.connect(self._confirm_delete)
+        self.probe_button.clicked.connect(self._emit_probe)
+        self.probe_cancel_button.clicked.connect(self.probe_cancel_requested.emit)
         self.rule_table.doubleClicked.connect(lambda _index: self._open_edit())
         self.rule_table.selectionModel().selectionChanged.connect(
-            self._refresh_actions
+            self._selection_changed
         )
 
     def set_logged_in(self, logged_in: bool) -> None:
@@ -287,7 +404,75 @@ class SubscriptionPage(QWidget):
                 if self.rule_model.rule_at(row).id == selected:
                     self.rule_table.selectRow(row)
                     break
+        if self._selected_rule() is None:
+            self.set_selected_rule_details(None, [])
         self._refresh_actions()
+
+    def set_selected_rule_details(
+        self,
+        rule: SubscriptionRule | None,
+        runs: list[SubscriptionRun],
+    ) -> None:
+        self._detail_rule = rule
+        self.run_history_model.set_runs(runs[:20])
+        self.detail_summary.setText(
+            self._format_rule_summary(rule)
+            if rule is not None
+            else "请选择订阅规则查看配置与运行历史"
+        )
+        self._refresh_actions()
+
+    def set_probe_busy(self, rule_id: str | None, busy: bool) -> None:
+        self._probe_rule_id = rule_id if busy else None
+        self._probe_busy = busy
+        self.probe_cancel_button.setVisible(busy)
+        if busy:
+            self.probe_progress_bar.show()
+        elif not self.probe_progress_label.text():
+            self.probe_progress_bar.hide()
+        self._refresh_actions()
+
+    def set_probe_progress(
+        self,
+        progress: SubscriptionProbeProgress | None,
+    ) -> None:
+        if progress is None:
+            self.probe_progress_label.clear()
+            self.probe_progress_label.hide()
+            if not self._probe_busy:
+                self.probe_progress_bar.hide()
+            self._refresh_actions()
+            return
+        self._probe_rule_id = progress.rule_id
+        self._probe_busy = True
+        self.probe_progress_label.setText(
+            f"已扫描 {progress.inspected} 条 · 关键词 {progress.keyword_hits} 条 · "
+            f"匹配 {progress.matched} 项 · {progress.phase}"
+        )
+        self.probe_progress_label.show()
+        self.probe_progress_bar.setValue(min(100, progress.inspected))
+        self.probe_progress_bar.show()
+        self.probe_cancel_button.show()
+        self._refresh_actions()
+
+    def set_probe_result(self, report: SubscriptionProbeReport | None) -> None:
+        self._probe_report = report
+        self.probe_result_label.setText(
+            "点击测试可只读检查最近消息，不会改变游标或队列"
+            if report is None
+            else explain_probe(report)
+        )
+        self.probe_sample_model.set_samples(() if report is None else report.samples)
+        self.set_probe_progress(None)
+        self.set_probe_busy(None, False)
+
+    def show_probe_cancelled(self) -> None:
+        self.probe_result_label.setText(
+            "测试已取消；规则、游标和下载队列均未改变"
+        )
+        self.probe_sample_model.set_samples(())
+        self.set_probe_progress(None)
+        self.set_probe_busy(None, False)
 
     def set_rule_busy(
         self,
@@ -316,7 +501,8 @@ class SubscriptionPage(QWidget):
         self._busy_rule_id = progress.rule_id
         self._busy = True
         self.progress_label.setText(
-            f"已扫描 {progress.inspected} 条 · 匹配 {progress.matched} 项 · "
+            f"已扫描 {progress.inspected} 条 · 关键词 {progress.keyword_hits} 条 · "
+            f"匹配 {progress.matched} 项 · "
             f"新增 {progress.queued} 项 · 重复 {progress.duplicate} 项 · "
             f"{progress.phase}"
         )
@@ -369,6 +555,16 @@ class SubscriptionPage(QWidget):
         self.set_rule_busy(current.id, True, "正在准备立即检查…")
         self.run_requested.emit(current.id)
 
+    def _emit_probe(self) -> None:
+        current = self._selected_rule()
+        if current is None or self._probe_busy or self._busy or not self._logged_in:
+            return
+        self._probe_report = None
+        self.probe_sample_model.set_samples(())
+        self.probe_result_label.setText("正在只读测试最近消息…")
+        self.set_probe_busy(current.id, True)
+        self.probe_requested.emit(current.id)
+
     def _emit_toggle(self) -> None:
         current = self._selected_rule()
         if current is None:
@@ -405,9 +601,27 @@ class SubscriptionPage(QWidget):
         current = self._selected_rule()
         return current.id if current is not None else None
 
+    def _selection_changed(self, *_args) -> None:
+        current = self._selected_rule()
+        self._detail_rule = current
+        self.run_history_model.set_runs([])
+        self._probe_report = None
+        self.probe_sample_model.set_samples(())
+        self.probe_result_label.setText(
+            "点击测试可只读检查最近消息，不会改变游标或队列"
+        )
+        self.detail_summary.setText(
+            self._format_rule_summary(current)
+            if current is not None
+            else "请选择订阅规则查看配置与运行历史"
+        )
+        self._refresh_actions()
+        if current is not None:
+            self.rule_selected.emit(current.id)
+
     def _refresh_actions(self, *_args) -> None:
         current = self._selected_rule()
-        online_ready = self._logged_in and not self._busy
+        online_ready = self._logged_in and not self._busy and not self._probe_busy
         has_dialog = any(item.available for item in self._dialogs)
         self.new_button.setEnabled(online_ready and has_dialog)
         self.edit_button.setEnabled(online_ready and current is not None)
@@ -416,6 +630,38 @@ class SubscriptionPage(QWidget):
         )
         self.toggle_button.setEnabled(online_ready and current is not None)
         self.delete_button.setEnabled(online_ready and current is not None)
+        self.probe_button.setEnabled(online_ready and current is not None)
         self.toggle_button.setText(
             "暂停" if current is None or current.enabled else "继续"
         )
+
+    @staticmethod
+    def _configure_read_only_table(table: QTableView) -> None:
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.setShowGrid(False)
+        table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        table.verticalHeader().hide()
+        table.verticalHeader().setDefaultSectionSize(34)
+
+    @staticmethod
+    def _format_rule_summary(rule: SubscriptionRule) -> str:
+        kinds = "、".join(
+            _MEDIA_LABELS[kind]
+            for kind in sorted(rule.media_kinds, key=lambda item: item.value)
+        )
+        state = SubscriptionTableModel.STATUS_LABELS[rule.state]
+        next_run = (
+            rule.next_run_at.astimezone().strftime("%Y-%m-%d %H:%M")
+            if rule.next_run_at is not None
+            else "暂无"
+        )
+        summary = (
+            f"{rule.dialog_title} · 关键词：{rule.keyword} · {kinds} · "
+            f"每 {rule.interval_minutes} 分钟 · {state} · 下次：{next_run}"
+        )
+        if rule.last_error:
+            summary += f" · 最近错误：{rule.last_error}"
+        return summary

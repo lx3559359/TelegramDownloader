@@ -8,6 +8,9 @@ from PySide6.QtWidgets import QDialogButtonBox, QMessageBox
 from telegram_downloader.content import ContentDialog, DialogKind
 from telegram_downloader.domain import MediaKind
 from telegram_downloader.subscriptions import (
+    SubscriptionProbeProgress,
+    SubscriptionProbeReport,
+    SubscriptionProbeSample,
     SubscriptionProgress,
     SubscriptionRule,
     SubscriptionRun,
@@ -57,9 +60,8 @@ def rule(*, enabled: bool = True) -> SubscriptionRule:
     )
 
 
-def test_subscription_model_exposes_status_schedule_and_rule_id(qtbot) -> None:
-    model = SubscriptionTableModel()
-    latest = SubscriptionRun(
+def run() -> SubscriptionRun:
+    return SubscriptionRun(
         "run-1",
         "rule-1",
         "a1",
@@ -72,13 +74,42 @@ def test_subscription_model_exposes_status_schedule_and_rule_id(qtbot) -> None:
         3,
         2,
     )
+
+
+def probe_report() -> SubscriptionProbeReport:
+    sample = SubscriptionProbeSample(
+        42,
+        NOW,
+        MediaKind.PHOTO,
+        "photo.jpg",
+        1024,
+        False,
+        "美女写真",
+    )
+    return SubscriptionProbeReport("rule-1", 20, 2, 1, 0, (sample,), NOW)
+
+
+def ready_page(qtbot) -> SubscriptionPage:
+    page = SubscriptionPage()
+    qtbot.addWidget(page)
+    page.set_logged_in(True)
+    page.set_dialogs([dialog()])
+    page.set_rules([rule()])
+    page.rule_table.selectRow(0)
+    page.set_selected_rule_details(rule(), [run()])
+    return page
+
+
+def test_subscription_model_exposes_status_schedule_and_rule_id(qtbot) -> None:
+    model = SubscriptionTableModel()
+    latest = run()
     model.set_rules([rule()], {"rule-1": latest})
 
     assert model.columnCount() == 5
     assert model.data(model.index(0, 0), Qt.ItemDataRole.UserRole) == "rule-1"
     assert model.data(model.index(0, 2), Qt.ItemDataRole.DisplayRole) == "等待检查"
     assert model.data(model.index(0, 3), Qt.ItemDataRole.DisplayRole) == (
-        "扫描 20 · 匹配 5 · 新增 3 · 重复 2"
+        "新增 3 项，另有 2 项已在队列"
     )
     assert "2026-08-15" in model.data(
         model.index(0, 4),
@@ -214,3 +245,91 @@ def test_page_create_edit_and_confirmed_delete_emit_complete_payloads(
     with qtbot.waitSignal(page.delete_requested, timeout=500) as deleted:
         qtbot.mouseClick(page.delete_button, Qt.MouseButton.LeftButton)
     assert deleted.args == ["rule-1"]
+
+
+def test_selecting_rule_emits_history_request(qtbot) -> None:
+    page = SubscriptionPage()
+    qtbot.addWidget(page)
+    page.set_rules([rule()])
+
+    with qtbot.waitSignal(page.rule_selected, timeout=500) as emitted:
+        page.rule_table.selectRow(0)
+
+    assert emitted.args == ["rule-1"]
+
+
+def test_probe_button_emits_selected_rule_and_locks_conflicting_actions(
+    qtbot,
+) -> None:
+    page = ready_page(qtbot)
+
+    with qtbot.waitSignal(page.probe_requested, timeout=500) as emitted:
+        qtbot.mouseClick(page.probe_button, Qt.MouseButton.LeftButton)
+
+    assert emitted.args == ["rule-1"]
+    assert page.probe_button.isEnabled() is False
+    assert page.edit_button.isEnabled() is False
+    assert page.run_button.isEnabled() is False
+
+
+def test_probe_progress_shows_counts_and_cancel(qtbot) -> None:
+    page = ready_page(qtbot)
+    page.show()
+    qtbot.waitExposed(page)
+    page.set_probe_busy("rule-1", True)
+    page.set_probe_progress(
+        SubscriptionProbeProgress("rule-1", 12, 3, 2, "正在筛选")
+    )
+
+    assert "已扫描 12" in page.probe_progress_label.text()
+    assert "关键词 3" in page.probe_progress_label.text()
+    assert page.probe_cancel_button.isVisible()
+    with qtbot.waitSignal(page.probe_cancel_requested, timeout=500):
+        qtbot.mouseClick(page.probe_cancel_button, Qt.MouseButton.LeftButton)
+
+
+def test_probe_report_explains_result_and_populates_samples(qtbot) -> None:
+    page = ready_page(qtbot)
+    page.set_probe_busy("rule-1", True)
+
+    page.set_probe_result(probe_report())
+
+    assert page.probe_sample_model.rowCount() == 1
+    assert "匹配 1 项" in page.probe_result_label.text()
+    assert page.probe_button.isEnabled()
+    assert page.edit_button.isEnabled()
+
+
+def test_offline_history_remains_visible_but_probe_is_disabled(qtbot) -> None:
+    page = ready_page(qtbot)
+    page.set_logged_in(False)
+
+    assert page.run_history_model.rowCount() == 1
+    assert page.probe_button.isEnabled() is False
+    assert page.detail_summary.text()
+
+
+def test_probe_repeated_click_emits_once_and_cancelled_state_recovers(qtbot) -> None:
+    page = ready_page(qtbot)
+    emissions: list[str] = []
+    page.probe_requested.connect(emissions.append)
+
+    qtbot.mouseClick(page.probe_button, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(page.probe_button, Qt.MouseButton.LeftButton)
+
+    assert emissions == ["rule-1"]
+    page.show_probe_cancelled()
+    assert "规则、游标和下载队列均未改变" in page.probe_result_label.text()
+    assert page.probe_button.isEnabled()
+
+
+def test_rule_table_and_diagnostics_remain_readable_at_1024x720(qtbot) -> None:
+    page = ready_page(qtbot)
+    page.resize(1024, 720)
+    page.show()
+    qtbot.waitExposed(page)
+
+    assert page.detail_splitter.sizes()[1] >= 180
+    assert page.probe_button.isVisible()
+    assert page.run_history_table.viewport().width() > 0
+    assert page.probe_sample_table.viewport().width() > 0
