@@ -17,7 +17,7 @@
 - Read: `src/telegram_downloader/update.py`
 - Read: `src/telegram_downloader/update_contract.py`
 
-- [ ] **Step 1: Record the clean source and runtime baseline**
+- [x] **Step 1: Record the clean source and runtime baseline**
 
 Run:
 
@@ -29,13 +29,13 @@ Get-Process -Name TelegramDownloader -ErrorAction SilentlyContinue
 
 Expected: branch is `codex/three-pass-qa-v042`, no tracked changes, and no packaged application process is running.
 
-- [ ] **Step 2: Fingerprint project-local runtime data without reading contents**
+- [x] **Step 2: Fingerprint project-local runtime data without reading contents**
 
 Run a PowerShell block that enumerates files below `dist\TelegramDownloader\data` and `dist\TelegramDownloader\downloads`, hashes each file, and writes only relative path, size, and SHA-256 into `.build-temp\manual-qa\baseline-data.json`. The output path and every enumerated file must resolve below the worktree root.
 
 Expected: JSON contains no credential values or message text and every source path starts with the worktree root.
 
-- [ ] **Step 3: Create the ignored real-source update probe**
+- [x] **Step 3: Create the ignored real-source update probe**
 
 Create `.build-temp/manual-qa/update_probe.py` with this behavior:
 
@@ -96,7 +96,7 @@ if __name__ == "__main__":
     print(json.dumps(asyncio.run(probe(Path(sys.argv[1]).resolve())), sort_keys=True))
 ```
 
-- [ ] **Step 4: Verify the update probe against both real sources**
+- [x] **Step 4: Verify the update probe against both real sources**
 
 Run:
 
