@@ -287,7 +287,7 @@ The final checklist must contain one table row per required subsystem for each o
 
 Inspect the complete source/test/document diff for security, data-path escapes, incorrect state transitions, missing regression coverage and accidental secret inclusion. Resolve every critical or important finding before continuing.
 
-- [ ] **Step 2: Re-run completion gates after the final commit**
+- [x] **Step 2: Re-run completion gates after the final commit**
 
 Run full pytest, Ruff, `git diff --check`, artifact hash checks and package privacy checks from the healthy worktree. Require a clean worktree.
 
