@@ -1123,6 +1123,7 @@ class ContentPageFake:
         self.sync_states = []
         self.connection_states = []
         self.connection_retryable = []
+        self.queue_busy = []
         self.thumbnails = {}
         self.previews = []
         self.errors = []
@@ -1154,6 +1155,9 @@ class ContentPageFake:
     def set_connection_state(self, text, *, retryable=False):
         self.connection_states.append(text)
         self.connection_retryable.append(retryable)
+
+    def set_queue_busy(self, busy):
+        self.queue_busy.append(busy)
 
     def set_thumbnail(self, result_id, path):
         self.thumbnails[result_id] = path
@@ -1855,6 +1859,28 @@ async def test_content_search_selection_and_queue_flow() -> None:
     assert ("commit", "preview") in calls
     assert ("finalize", "search-1", 2) in calls
     assert window.message == "选择 4 项，加入 2 项，跳过重复 1 项，不可用 1 项"
+    assert window.content_page.queue_busy == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_queue_confirmation_restores_action_state() -> None:
+    class ContentService:
+        def prepare_download(self, search_id):
+            return SimpleNamespace(preview="preview")
+
+    window = ContentWindowFake()
+    controller = AppController.for_test(
+        gateway=ConnectedGateway(),
+        content_browser=ContentService(),
+        planner=object(),
+        window=window,
+        confirm_preview=lambda _preview: False,
+    )
+
+    await controller.queue_content_selection("search-1")
+
+    assert window.content_page.queue_busy == [True, False]
+    assert window.message == "已取消创建任务"
 
 
 @pytest.mark.asyncio

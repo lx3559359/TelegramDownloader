@@ -122,6 +122,9 @@ class _NullContentPage:
     ) -> None:
         pass
 
+    def set_queue_busy(self, _busy: bool) -> None:
+        pass
+
     def set_thumbnail(self, _result_id: str, _path: object) -> None:
         pass
 
@@ -877,10 +880,13 @@ class AppController:
         self._content_page().set_results(results)
 
     async def queue_content_selection(self, search_id: str) -> None:
-        if self.content_browser is None or self.planner is None:
-            self._show_error("请先连接 Telegram 账号")
-            return
+        page = self._content_page()
+        page.show_error("")
+        page.set_queue_busy(True)
         try:
+            if self.content_browser is None or self.planner is None:
+                self._show_error("请先连接 Telegram 账号")
+                return
             preparation = self.content_browser.prepare_download(search_id)
             if not self.confirm_preview(preparation.preview):
                 self._show_status("已取消创建任务")
@@ -906,7 +912,9 @@ class AppController:
                 f"不可用 {error.unavailable_count} 项"
             )
         except Exception as error:
-            self._content_page().show_error(self._safe_error(error))
+            page.show_error(self._safe_error(error))
+        finally:
+            page.set_queue_busy(False)
 
     def request_thumbnail(self, result_id: str) -> None:
         if self.content_browser is None:
