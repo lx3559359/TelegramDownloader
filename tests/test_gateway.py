@@ -864,6 +864,91 @@ async def test_incremental_message_bounds_are_validated_before_network() -> None
 
 
 @pytest.mark.asyncio
+async def test_recent_messages_returns_oldest_first_with_limit() -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    newest = media_message(13, now, kind="video")
+    newest.message = "最新视频"
+    middle = SimpleNamespace(
+        id=12,
+        date=(now - timedelta(minutes=1)).replace(tzinfo=None),
+        grouped_id=None,
+        media=None,
+        message="普通消息",
+    )
+    oldest = media_message(11, now - timedelta(minutes=2), kind="video")
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def get_entity(self, entity):
+            assert entity == -1001
+            return SimpleNamespace(title="资料群")
+
+        def iter_messages(self, entity, **kwargs):
+            self.calls.append(kwargs)
+
+            async def generate():
+                for message in (newest, middle, oldest)[: kwargs["limit"]]:
+                    yield message
+
+            return generate()
+
+    client = Client()
+    gateway = TelethonGateway.from_client_for_test(client)
+
+    values = await gateway.recent_messages("-1001", limit=2)
+
+    assert client.calls == [{"limit": 2}]
+    assert [item.message_id for item in values] == [12, 13]
+    assert values[0].message_date_utc.tzinfo is UTC
+    assert values[0].media is None
+    assert values[1].media is not None
+    assert values[1].media.source_title == "资料群"
+
+
+@pytest.mark.asyncio
+async def test_recent_messages_rejects_limit_before_network_access() -> None:
+    gateway = TelethonGateway.from_client_for_test(object())
+
+    for limit in (0, 101):
+        with pytest.raises(ValueError, match="1 到 100"):
+            await gateway.recent_messages("-1001", limit=limit)
+
+
+@pytest.mark.asyncio
+async def test_recent_messages_empty_and_access_errors_are_mapped() -> None:
+    class AccessError(Exception):
+        pass
+
+    class EmptyClient:
+        async def get_entity(self, _entity):
+            return SimpleNamespace(title="空群组")
+
+        def iter_messages(self, _entity, **_kwargs):
+            async def generate():
+                if False:
+                    yield None
+
+            return generate()
+
+    empty_gateway = TelethonGateway.from_client_for_test(EmptyClient())
+    assert await empty_gateway.recent_messages("-1001", limit=100) == ()
+
+    class DeniedClient(EmptyClient):
+        def iter_messages(self, _entity, **_kwargs):
+            raise AccessError("private server detail")
+
+    denied_gateway = TelethonGateway.from_client_for_test(
+        DeniedClient(),
+        access_errors=(AccessError,),
+    )
+    with pytest.raises(AccessDeniedError) as caught:
+        await denied_gateway.recent_messages("-1001", limit=100)
+    assert "private server detail" not in str(caught.value)
+
+
+@pytest.mark.asyncio
 async def test_search_progress_finishes_with_real_scanned_and_matched_counts() -> None:
     now = datetime(2026, 8, 15, tzinfo=UTC)
     messages = [media_message(value, now) for value in range(25, 0, -1)]

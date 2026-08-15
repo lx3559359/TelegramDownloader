@@ -163,6 +163,13 @@ class TelegramGateway(Protocol):
 
     async def latest_message_id(self, entity_ref: str) -> int: ...
 
+    async def recent_messages(
+        self,
+        entity_ref: str,
+        *,
+        limit: int,
+    ) -> tuple[RemoteMessage, ...]: ...
+
     async def incremental_messages(
         self,
         entity_ref: str,
@@ -620,6 +627,32 @@ class TelethonGateway:
         except Exception as exc:
             self._raise_mapped(exc)
 
+    async def recent_messages(
+        self,
+        entity_ref: str,
+        *,
+        limit: int,
+    ) -> tuple[RemoteMessage, ...]:
+        if not 1 <= limit <= 100:
+            raise ValueError("最近消息数量必须在 1 到 100 之间")
+
+        found: dict[int, RemoteMessage] = {}
+        try:
+            entity = await self._resolve_entity(entity_ref)
+            title = self._entity_title(entity, entity_ref)
+            async for message in self._client.iter_messages(entity, limit=limit):
+                remote_message = self._remote_message(entity_ref, title, message)
+                if remote_message is not None:
+                    found[remote_message.message_id] = remote_message
+        except Exception as exc:
+            self._raise_mapped(exc)
+        return tuple(
+            sorted(
+                found.values(),
+                key=lambda item: (item.message_id, item.message_date_utc),
+            )
+        )
+
     async def incremental_messages(
         self,
         entity_ref: str,
@@ -647,25 +680,13 @@ class TelethonGateway:
                 limit=limit,
             )
             async for message in messages:
-                message_id = getattr(message, "id", None)
-                if not isinstance(message_id, int):
+                remote_message = self._remote_message(entity_ref, title, message)
+                if remote_message is None:
                     continue
+                message_id = remote_message.message_id
                 if not after_id < message_id <= through_id:
                     continue
-                message_date = self._utc_datetime(getattr(message, "date", None))
-                if message_date is None:
-                    continue
-                remote = self.remote_media_from_message(entity_ref, message, title)
-                grouped_id = getattr(message, "grouped_id", None)
-                found[message_id] = RemoteMessage(
-                    message_id=message_id,
-                    grouped_id=(
-                        int(grouped_id) if isinstance(grouped_id, int) else None
-                    ),
-                    message_date_utc=message_date,
-                    text=self._message_excerpt(message),
-                    media=remote,
-                )
+                found[message_id] = remote_message
         except Exception as exc:
             self._raise_mapped(exc)
         return tuple(found[message_id] for message_id in sorted(found))
@@ -737,6 +758,28 @@ class TelethonGateway:
             char for char in raw if char.isprintable() or char in "\n\t"
         )
         return " ".join(visible.split())[:500]
+
+    @classmethod
+    def _remote_message(
+        cls,
+        peer_ref: str,
+        source_title: str,
+        message: object,
+    ) -> RemoteMessage | None:
+        message_id = getattr(message, "id", None)
+        if not isinstance(message_id, int) or message_id <= 0:
+            return None
+        message_date = cls._utc_datetime(getattr(message, "date", None))
+        if message_date is None:
+            return None
+        grouped_id = getattr(message, "grouped_id", None)
+        return RemoteMessage(
+            message_id=message_id,
+            grouped_id=int(grouped_id) if isinstance(grouped_id, int) else None,
+            message_date_utc=message_date,
+            text=cls._message_excerpt(message),
+            media=cls.remote_media_from_message(peer_ref, message, source_title),
+        )
 
     @staticmethod
     def _account_display_name(account: object) -> str:
