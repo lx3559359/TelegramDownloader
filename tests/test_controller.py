@@ -889,6 +889,49 @@ async def test_scan_requires_user_confirmation_before_commit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_scan_waits_for_async_user_confirmation() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class Planner:
+        committed = False
+
+        async def scan(self, source, filters):
+            return "preview"
+
+        def commit(self, preview):
+            self.committed = True
+
+    async def confirm_preview(_preview):
+        entered.set()
+        await release.wait()
+        return False
+
+    planner = Planner()
+    controller = AppController.for_test(
+        gateway=ConnectedGateway(),
+        planner=planner,
+        confirm_preview=confirm_preview,
+    )
+
+    scan = asyncio.create_task(
+        controller.scan_link(
+            "https://t.me/example/42",
+            controller.default_filters(datetime(2026, 8, 13, tzinfo=UTC)),
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1)
+
+    assert scan.done() is False
+    assert planner.committed is False
+
+    release.set()
+    await scan
+
+    assert planner.committed is False
+
+
+@pytest.mark.asyncio
 async def test_confirmed_scan_starts_persisted_task() -> None:
     class Planner:
         async def scan(self, source, filters):
@@ -1878,6 +1921,42 @@ async def test_cancelled_queue_confirmation_restores_action_state() -> None:
     )
 
     await controller.queue_content_selection("search-1")
+
+    assert window.content_page.queue_busy == [True, False]
+    assert window.message == "已取消创建任务"
+
+
+@pytest.mark.asyncio
+async def test_queue_selection_waits_for_async_user_confirmation() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class ContentService:
+        def prepare_download(self, search_id):
+            return SimpleNamespace(preview="preview")
+
+    async def confirm_preview(_preview):
+        entered.set()
+        await release.wait()
+        return False
+
+    window = ContentWindowFake()
+    controller = AppController.for_test(
+        gateway=ConnectedGateway(),
+        content_browser=ContentService(),
+        planner=object(),
+        window=window,
+        confirm_preview=confirm_preview,
+    )
+
+    queue = asyncio.create_task(controller.queue_content_selection("search-1"))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+
+    assert queue.done() is False
+    assert window.content_page.queue_busy == [True]
+
+    release.set()
+    await queue
 
     assert window.content_page.queue_busy == [True, False]
     assert window.message == "已取消创建任务"

@@ -177,21 +177,44 @@ def create_application(root: Path):
             settings.concurrency,
         )
 
-    def confirm_preview(preview: ScanPreview) -> bool:
+    async def confirm_preview(preview: ScanPreview) -> bool:
         known = AppController._format_bytes(preview.known_bytes)
         unknown = (
             f"，另有 {preview.unknown_size_count} 项大小未知"
             if preview.unknown_size_count
             else ""
         )
-        answer = QMessageBox.question(
-            window,
-            "确认下载任务",
-            f"扫描到 {len(preview.items)} 项媒体，已知大小 {known}{unknown}。\n\n加入下载队列？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
+        dialog = QMessageBox(window)
+        dialog.setWindowTitle("确认下载任务")
+        dialog.setText(
+            f"扫描到 {len(preview.items)} 项媒体，已知大小 {known}{unknown}。"
+            "\n\n加入下载队列？"
         )
-        return _standard_button_selected(answer, QMessageBox.StandardButton.Yes)
+        dialog.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        dialog.setDefaultButton(QMessageBox.StandardButton.Yes)
+        loop = asyncio.get_running_loop()
+        finished: asyncio.Future[bool] = loop.create_future()
+
+        def resolve(answer: int) -> None:
+            if not finished.done():
+                finished.set_result(
+                    _standard_button_selected(
+                        answer,
+                        QMessageBox.StandardButton.Yes,
+                    )
+                )
+
+        dialog.finished.connect(resolve)
+        dialog.open()
+        try:
+            return await finished
+        except asyncio.CancelledError:
+            dialog.reject()
+            raise
+        finally:
+            dialog.deleteLater()
 
     trusted_keys = load_trusted_keys(Path(__file__).with_name("trusted_update_keys.json"))
     update_coordinator = UpdateCoordinator(

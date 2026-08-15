@@ -1,3 +1,7 @@
+from inspect import isawaitable
+from types import SimpleNamespace
+
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QMessageBox
 
 from telegram_downloader import app
@@ -9,6 +13,31 @@ def test_standard_button_selection_accepts_pyside_integer_result() -> None:
     yes = QMessageBox.StandardButton.Yes
 
     assert app._standard_button_selected(yes.value, yes) is True
+
+
+def test_download_confirmation_is_nonblocking_and_awaitable(tmp_path) -> None:
+    application, loop, controller = app.create_application(tmp_path)
+
+    def reject_confirmation() -> None:
+        for widget in application.topLevelWidgets():
+            if isinstance(widget, QMessageBox):
+                widget.done(QMessageBox.StandardButton.No.value)
+                return
+        QTimer.singleShot(1, reject_confirmation)
+
+    try:
+        QTimer.singleShot(0, reject_confirmation)
+        confirmation = controller.confirm_preview(
+            SimpleNamespace(items=(), known_bytes=0, unknown_size_count=0)
+        )
+
+        assert isawaitable(confirmation)
+        assert loop.run_until_complete(confirmation) is False
+    finally:
+        loop.run_until_complete(controller._async_actions.shutdown())
+        controller.window.close()
+        loop.close()
+        application.processEvents()
 
 
 def test_duplicate_instance_exits_before_application_construction(

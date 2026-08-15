@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 from collections.abc import Awaitable, Callable
@@ -218,7 +219,7 @@ class AppController:
             tuple[Any, Any, Any],
         ]
         | None = None,
-        confirm_preview: Callable[[Any], bool] | None = None,
+        confirm_preview: Callable[[Any], bool | Awaitable[bool]] | None = None,
         update_coordinator: Any | None = None,
         update_prompt: Callable[[Any], bool] | None = None,
         update_shutdown: Callable[[], None] | None = None,
@@ -623,7 +624,7 @@ class AppController:
                 return
             source = parse_telegram_link(link)
             preview = await self.planner.scan(source, filters)
-            if not self.confirm_preview(preview):
+            if not await self._confirm_download_preview(preview):
                 self._show_status("已取消创建任务")
                 return
             task = self.planner.commit(preview)
@@ -888,7 +889,7 @@ class AppController:
                 self._show_error("请先连接 Telegram 账号")
                 return
             preparation = self.content_browser.prepare_download(search_id)
-            if not self.confirm_preview(preparation.preview):
+            if not await self._confirm_download_preview(preparation.preview):
                 self._show_status("已取消创建任务")
                 return
             committed = self.planner.commit_selected(preparation.preview)
@@ -915,6 +916,12 @@ class AppController:
             page.show_error(self._safe_error(error))
         finally:
             page.set_queue_busy(False)
+
+    async def _confirm_download_preview(self, preview: Any) -> bool:
+        confirmation = self.confirm_preview(preview)
+        if inspect.isawaitable(confirmation):
+            confirmation = await confirmation
+        return bool(confirmation)
 
     def request_thumbnail(self, result_id: str) -> None:
         if self.content_browser is None:
