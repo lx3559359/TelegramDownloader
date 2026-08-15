@@ -115,7 +115,7 @@ Expected: both `github` and `modelscope` are `valid`; for local `0.4.2` and remo
 - Use (ignored): `.build-temp/manual-qa/update_probe.py`
 - Test: `tests/`
 
-- [ ] **Step 1: Run the complete automated baseline**
+- [x] **Step 1: Run the complete automated baseline**
 
 Run:
 
@@ -125,7 +125,7 @@ powershell -ExecutionPolicy Bypass -File scripts\test.ps1
 
 Expected: all tests pass and Ruff reports no errors.
 
-- [ ] **Step 2: Run the first real GUI journey**
+- [x] **Step 2: Run the first real GUI journey**
 
 Run with `PYTHONPATH=src`, `QT_QPA_PLATFORM=offscreen`, runtime root `dist\TelegramDownloader`, and screenshot folder `.build-temp\manual-qa\round-1`:
 
@@ -135,7 +135,7 @@ Run with `PYTHONPATH=src`, `QT_QPA_PLATFORM=offscreen`, runtime root `dist\Teleg
 
 Expected: saved session restores without login dialog; public-link scan, content activation, group refresh, search, preview and queue-state recovery finish; no step times out.
 
-- [ ] **Step 3: Run the first real download/pause cycle**
+- [x] **Step 3: Run the first real download/pause cycle**
 
 Run:
 
@@ -145,11 +145,11 @@ Run:
 
 Expected: session restores, resume starts, downloaded byte count increases or the task reaches a terminal state, and the task is paused before shutdown.
 
-- [ ] **Step 4: Run the first independent crash/recovery cycle**
+- [x] **Step 4: Run the first independent crash/recovery cycle**
 
 Run `crash_probe.py` and accept exit code 23 only after its safe JSON confirms session restore, resume start and byte growth. Immediately run `recovery_probe.py` and require queued recovery, auto-resume, preserved bytes, paused settlement, disconnected gateway, zero scheduler-active tasks and an empty pending-task list.
 
-- [ ] **Step 5: Recheck online update and installer behavior**
+- [x] **Step 5: Recheck online update and installer behavior**
 
 Run the update probe, then:
 
@@ -159,7 +159,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke-installer.ps1 -SetupPath 
 
 Expected: both update sources are valid and installer output ends with `INSTALLER_SMOKE_OK`.
 
-- [ ] **Step 6: Record pass-one aggregate evidence**
+- [x] **Step 6: Record pass-one aggregate evidence**
 
 Write only boolean outcomes, counts, durations, byte deltas and error class names to the verification record. Do not record Telegram names, usernames, keywords, links, captions or credentials.
 
