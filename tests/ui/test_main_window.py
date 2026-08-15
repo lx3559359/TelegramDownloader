@@ -1,9 +1,15 @@
 import pytest
 from PySide6.QtCore import Qt
 
-from telegram_downloader.domain import MediaKind, TaskStatus
+from telegram_downloader.domain import ItemStatus, MediaKind, TaskStatus
 from telegram_downloader.ui.main import MainWindow
-from telegram_downloader.ui.models import TaskSummary, TaskTableModel
+from telegram_downloader.ui.models import (
+    TaskFilter,
+    TaskItemSummary,
+    TaskItemTableModel,
+    TaskSummary,
+    TaskTableModel,
+)
 
 
 def test_workbench_contains_required_controls(qtbot) -> None:
@@ -120,9 +126,84 @@ def test_task_model_exposes_chinese_status_and_id_role(qtbot) -> None:
     assert model.data(model.index(0, 0), Qt.ItemDataRole.UserRole) == "t"
     assert model.headerData(6, Qt.Orientation.Horizontal) == "错误"
     assert model.data(model.index(0, 6), Qt.ItemDataRole.DisplayRole) == "Telegram 网络连接失败"
-    assert "Telegram 网络连接失败" in model.data(
-        model.index(0, 0), Qt.ItemDataRole.ToolTipRole
+    assert "Telegram 网络连接失败" in model.data(model.index(0, 0), Qt.ItemDataRole.ToolTipRole)
+
+
+def test_task_model_filters_search_status_and_archives() -> None:
+    model = TaskTableModel()
+    model.set_tasks(
+        [
+            TaskSummary("a", "Alpha", TaskStatus.DOWNLOADING, "0 / 1", "1 B", "—", "—", "—"),
+            TaskSummary("b", "Beta", TaskStatus.PAUSED, "0 / 1", "1 B", "—", "—", "—"),
+            TaskSummary("c", "Gamma", TaskStatus.PARTIAL_FAILURE, "0 / 1", "1 B", "—", "—", "safe"),
+            TaskSummary("d", "Done", TaskStatus.COMPLETED, "1 / 1", "1 B", "—", "—", "—"),
+            TaskSummary(
+                "e", "Old", TaskStatus.COMPLETED, "1 / 1", "1 B", "—", "—", "—", archived=True
+            ),
+        ]
     )
+
+    assert model.filter_counts() == {
+        TaskFilter.ALL: 4,
+        TaskFilter.ACTIVE: 1,
+        TaskFilter.PAUSED: 1,
+        TaskFilter.FAILED: 1,
+        TaskFilter.COMPLETED: 1,
+        TaskFilter.ARCHIVED: 1,
+    }
+    assert model.rowCount() == 4
+    assert model.row_for_task_id("e") is None
+
+    model.set_filter(TaskFilter.FAILED, "amm")
+
+    assert model.rowCount() == 1
+    assert model.task_at(0).id == "c"
+    assert model.row_for_task_id("c") == 0
+
+    model.set_filter(TaskFilter.ARCHIVED, "")
+
+    assert model.rowCount() == 1
+    assert model.task_at(0).id == "e"
+
+
+def test_task_item_model_formats_status_progress_size_and_id() -> None:
+    model = TaskItemTableModel()
+    model.set_items(
+        [
+            TaskItemSummary(
+                "item",
+                "video.mp4",
+                MediaKind.VIDEO,
+                ItemStatus.COMPLETED,
+                10,
+                10,
+                2,
+                "—",
+            ),
+            TaskItemSummary(
+                "unknown",
+                "document.bin",
+                MediaKind.DOCUMENT,
+                ItemStatus.DOWNLOADING,
+                3,
+                None,
+                0,
+                "—",
+            ),
+        ]
+    )
+
+    assert model.headerData(0, Qt.Orientation.Horizontal) == "文件"
+    assert model.data(model.index(0, 0), Qt.ItemDataRole.UserRole) == "item"
+    assert model.data(model.index(0, 1)) == "视频"
+    assert model.data(model.index(0, 2)) == "已完成"
+    assert model.data(model.index(0, 3)) == "100%"
+    assert model.data(model.index(0, 4)) == "10 B / 10 B"
+    assert model.data(model.index(0, 5)) == "2"
+    assert model.data(model.index(1, 3)) == "—"
+    assert model.data(model.index(1, 4)) == "3 B / 未知"
+    assert model.item_at(0).id == "item"
+    assert model.item_at(99) is None
 
 
 def test_scan_busy_state_disables_source_controls(qtbot) -> None:

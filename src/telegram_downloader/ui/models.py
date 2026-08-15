@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QColor
 
-from telegram_downloader.domain import TaskStatus
+from telegram_downloader.domain import ItemStatus, MediaKind, TaskStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +25,28 @@ class TaskSummary:
     total_bytes: int | None = None
     speed_bps: float = 0.0
     remaining_seconds: int | None = None
+    archived: bool = False
+
+
+class TaskFilter(StrEnum):
+    ALL = "all"
+    ACTIVE = "active"
+    PAUSED = "paused"
+    FAILED = "failed"
+    COMPLETED = "completed"
+    ARCHIVED = "archived"
+
+
+@dataclass(frozen=True, slots=True)
+class TaskItemSummary:
+    id: str
+    name: str
+    kind: MediaKind
+    status: ItemStatus
+    downloaded_bytes: int
+    expected_size: int | None
+    retry_count: int
+    error_text: str
 
 
 _STATUS_LABELS = {
@@ -44,6 +67,32 @@ _STATUS_COLORS = {
     TaskStatus.PAUSED: QColor("#c4b5fd"),
     TaskStatus.PARTIAL_FAILURE: QColor("#fb923c"),
 }
+
+_ITEM_STATUS_LABELS = {
+    ItemStatus.QUEUED: "等待中",
+    ItemStatus.DOWNLOADING: "下载中",
+    ItemStatus.PAUSED: "已暂停",
+    ItemStatus.WAITING_RETRY: "等待重试",
+    ItemStatus.COMPLETED: "已完成",
+    ItemStatus.FAILED: "失败",
+}
+
+_ITEM_STATUS_COLORS = {
+    ItemStatus.DOWNLOADING: QColor("#67e8f9"),
+    ItemStatus.COMPLETED: QColor("#5eead4"),
+    ItemStatus.WAITING_RETRY: QColor("#fbbf24"),
+    ItemStatus.PAUSED: QColor("#c4b5fd"),
+    ItemStatus.FAILED: QColor("#fb923c"),
+}
+
+_MEDIA_LABELS = {
+    MediaKind.PHOTO: "图片",
+    MediaKind.VIDEO: "视频",
+    MediaKind.AUDIO: "音频",
+    MediaKind.VOICE: "语音",
+    MediaKind.DOCUMENT: "文档",
+    MediaKind.ARCHIVE: "压缩包",
+}
 _INVALID_INDEX = QModelIndex()
 
 
@@ -52,7 +101,10 @@ class TaskTableModel(QAbstractTableModel):
 
     def __init__(self) -> None:
         super().__init__()
+        self._all_tasks: list[TaskSummary] = []
         self._tasks: list[TaskSummary] = []
+        self._filter = TaskFilter.ALL
+        self._search = ""
 
     def rowCount(self, parent: QModelIndex = _INVALID_INDEX) -> int:
         return 0 if parent.isValid() else len(self._tasks)
@@ -102,8 +154,156 @@ class TaskTableModel(QAbstractTableModel):
 
     def set_tasks(self, tasks: list[TaskSummary]) -> None:
         self.beginResetModel()
-        self._tasks = list(tasks)
+        self._all_tasks = list(tasks)
+        self._tasks = self._filtered_tasks()
         self.endResetModel()
+
+    def set_filter(self, selected: TaskFilter, search: str = "") -> None:
+        normalized = search.strip().casefold()
+        if selected is self._filter and normalized == self._search:
+            return
+        self.beginResetModel()
+        self._filter = selected
+        self._search = normalized
+        self._tasks = self._filtered_tasks()
+        self.endResetModel()
+
+    def filter_counts(self) -> dict[TaskFilter, int]:
+        matching_search = [task for task in self._all_tasks if self._matches_search(task)]
+        return {
+            selected: sum(self._matches_filter(task, selected) for task in matching_search)
+            for selected in TaskFilter
+        }
 
     def task_at(self, row: int) -> TaskSummary | None:
         return self._tasks[row] if 0 <= row < len(self._tasks) else None
+
+    def row_for_task_id(self, task_id: str) -> int | None:
+        return next(
+            (row for row, task in enumerate(self._tasks) if task.id == task_id),
+            None,
+        )
+
+    def _filtered_tasks(self) -> list[TaskSummary]:
+        return [
+            task
+            for task in self._all_tasks
+            if self._matches_search(task) and self._matches_filter(task, self._filter)
+        ]
+
+    def _matches_search(self, task: TaskSummary) -> bool:
+        return not self._search or self._search in task.title.casefold()
+
+    @staticmethod
+    def _matches_filter(task: TaskSummary, selected: TaskFilter) -> bool:
+        if selected is TaskFilter.ARCHIVED:
+            return task.archived
+        if task.archived:
+            return False
+        if selected is TaskFilter.ALL:
+            return True
+        if selected is TaskFilter.ACTIVE:
+            return task.status in {
+                TaskStatus.SCANNING,
+                TaskStatus.QUEUED,
+                TaskStatus.DOWNLOADING,
+                TaskStatus.WAITING_RETRY,
+            }
+        if selected is TaskFilter.PAUSED:
+            return task.status is TaskStatus.PAUSED
+        if selected is TaskFilter.FAILED:
+            return task.status is TaskStatus.PARTIAL_FAILURE
+        if selected is TaskFilter.COMPLETED:
+            return task.status is TaskStatus.COMPLETED
+        return False
+
+
+class TaskItemTableModel(QAbstractTableModel):
+    HEADERS = ("文件", "类型", "状态", "进度", "大小", "重试", "错误")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._items: list[TaskItemSummary] = []
+
+    def rowCount(self, parent: QModelIndex = _INVALID_INDEX) -> int:
+        return 0 if parent.isValid() else len(self._items)
+
+    def columnCount(self, parent: QModelIndex = _INVALID_INDEX) -> int:
+        return 0 if parent.isValid() else len(self.HEADERS)
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or not 0 <= index.row() < len(self._items):
+            return None
+        item = self._items[index.row()]
+        if role == Qt.ItemDataRole.UserRole:
+            return item.id
+        if role == Qt.ItemDataRole.DisplayRole:
+            values = (
+                item.name,
+                _MEDIA_LABELS[item.kind],
+                _ITEM_STATUS_LABELS[item.status],
+                self._progress_text(item),
+                self._size_text(item),
+                str(item.retry_count),
+                item.error_text,
+            )
+            return values[index.column()]
+        if role == Qt.ItemDataRole.ForegroundRole and index.column() == 2:
+            return _ITEM_STATUS_COLORS.get(item.status)
+        if role == Qt.ItemDataRole.TextAlignmentRole and index.column() > 0:
+            return int(Qt.AlignmentFlag.AlignCenter)
+        if role == Qt.ItemDataRole.ToolTipRole:
+            summary = f"{item.name} · {_ITEM_STATUS_LABELS[item.status]}"
+            return summary if item.error_text == "—" else f"{summary} · {item.error_text}"
+        return None
+
+    def headerData(
+        self,
+        section: int,
+        orientation: Qt.Orientation,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ):
+        if (
+            orientation == Qt.Orientation.Horizontal
+            and role == Qt.ItemDataRole.DisplayRole
+            and 0 <= section < len(self.HEADERS)
+        ):
+            return self.HEADERS[section]
+        return super().headerData(section, orientation, role)
+
+    def set_items(self, items: list[TaskItemSummary]) -> None:
+        self.beginResetModel()
+        self._items = list(items)
+        self.endResetModel()
+
+    def item_at(self, row: int) -> TaskItemSummary | None:
+        return self._items[row] if 0 <= row < len(self._items) else None
+
+    @staticmethod
+    def _progress_text(item: TaskItemSummary) -> str:
+        if item.status is ItemStatus.COMPLETED:
+            return "100%"
+        if item.expected_size is None or item.expected_size <= 0:
+            return "—"
+        progress = round(item.downloaded_bytes * 100 / item.expected_size)
+        return f"{max(0, min(100, progress))}%"
+
+    @classmethod
+    def _size_text(cls, item: TaskItemSummary) -> str:
+        downloaded = cls._format_bytes(item.downloaded_bytes)
+        expected = (
+            cls._format_bytes(item.expected_size) if item.expected_size is not None else "未知"
+        )
+        return f"{downloaded} / {expected}"
+
+    @staticmethod
+    def _format_bytes(value: int) -> str:
+        amount = float(max(0, value))
+        units = ("B", "KB", "MB", "GB", "TB")
+        for unit in units:
+            if amount < 1024 or unit == units[-1]:
+                if unit == "B":
+                    return f"{round(amount)} B"
+                return f"{amount:.1f} {unit}"
+            amount /= 1024
+        return "0 B"
