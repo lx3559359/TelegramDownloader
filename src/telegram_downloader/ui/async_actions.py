@@ -9,6 +9,7 @@ from typing import Any
 _LOGGER = logging.getLogger("telegram_downloader.ui.async_actions")
 
 ActionFactory = Callable[[], Awaitable[Any]]
+PayloadAction = Callable[[Any], Awaitable[Any]]
 Callback = Callable[[], None]
 FailureCallback = Callable[[Exception], None]
 
@@ -44,6 +45,21 @@ class AsyncActionBridge:
     ) -> Callable[[], None]:
         def trigger() -> None:
             self.start(key, action, hooks=hooks)
+
+        signal.connect(trigger)
+        self._slots.append(trigger)
+        return trigger
+
+    def connect_payload(
+        self,
+        signal: Any,
+        key: str,
+        action: PayloadAction,
+        *,
+        hooks: ActionHooks = _NO_HOOKS,
+    ) -> Callable[[Any], None]:
+        def trigger(value: Any) -> None:
+            self.start(key, lambda: action(value), hooks=hooks)
 
         signal.connect(trigger)
         self._slots.append(trigger)

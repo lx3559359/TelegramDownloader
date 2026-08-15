@@ -5,6 +5,18 @@ import pytest
 from telegram_downloader.ui.async_actions import ActionHooks, AsyncActionBridge
 
 
+class FakeSignal:
+    def __init__(self) -> None:
+        self.slot = None
+
+    def connect(self, slot) -> None:
+        self.slot = slot
+
+    def emit(self, value) -> None:
+        assert self.slot is not None
+        self.slot(value)
+
+
 @pytest.mark.asyncio
 async def test_same_action_key_runs_once_and_restores_state() -> None:
     started = asyncio.Event()
@@ -77,4 +89,29 @@ async def test_shutdown_cancels_running_actions_and_calls_cleanup() -> None:
     await bridge.shutdown()
 
     assert events == ["cancelled", "finished"]
+    assert bridge.active_keys == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_payload_signal_forwards_value_and_deduplicates_running_key() -> None:
+    signal = FakeSignal()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    values: list[list[str]] = []
+
+    async def action(value) -> None:
+        values.append(value)
+        started.set()
+        await release.wait()
+
+    bridge = AsyncActionBridge()
+    bridge.connect_payload(signal, "tasks.resume", action)
+
+    signal.emit(["first"])
+    await started.wait()
+    signal.emit(["second"])
+    release.set()
+    await bridge.wait_idle()
+
+    assert values == [["first"]]
     assert bridge.active_keys == frozenset()

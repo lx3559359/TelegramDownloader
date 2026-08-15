@@ -126,9 +126,9 @@ def run_self_test(root: Path) -> dict[str, object]:
     }
     report_path = paths.guard(paths.log.parent / "self-test.json")
     temporary = paths.guard(report_path.with_suffix(".json.tmp"))
-    content = (
-        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    ).encode("utf-8")
+    content = (json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
     with temporary.open("wb") as stream:
         stream.write(content)
         stream.flush()
@@ -196,9 +196,7 @@ def create_application(root: Path):
     subscriptions = SubscriptionService(catalog)
     window = MainWindow()
     if catalog_error is not None:
-        window.content_page.show_error(
-            f"内容目录不可用（{type(catalog_error).__name__}）"
-        )
+        window.content_page.show_error(f"内容目录不可用（{type(catalog_error).__name__}）")
     login_dialog = LoginDialog(window)
 
     def gateway_factory(
@@ -238,19 +236,14 @@ def create_application(root: Path):
     async def confirm_preview(preview: ScanPreview) -> bool:
         known = AppController._format_bytes(preview.known_bytes)
         unknown = (
-            f"，另有 {preview.unknown_size_count} 项大小未知"
-            if preview.unknown_size_count
-            else ""
+            f"，另有 {preview.unknown_size_count} 项大小未知" if preview.unknown_size_count else ""
         )
         dialog = QMessageBox(window)
         dialog.setWindowTitle("确认下载任务")
         dialog.setText(
-            f"扫描到 {len(preview.items)} 项媒体，已知大小 {known}{unknown}。"
-            "\n\n加入下载队列？"
+            f"扫描到 {len(preview.items)} 项媒体，已知大小 {known}{unknown}。\n\n加入下载队列？"
         )
-        dialog.setStandardButtons(
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
+        dialog.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         dialog.setDefaultButton(QMessageBox.StandardButton.Yes)
         loop = asyncio.get_running_loop()
         finished: asyncio.Future[bool] = loop.create_future()
@@ -371,13 +364,31 @@ def create_application(root: Path):
     async def password_submitted(password: str) -> None:
         await controller.submit_password(password)
 
-    @qasync.asyncSlot(str)
-    async def resume_requested(task_id: str) -> None:
-        await controller.resume_task(task_id)
+    def _task_ids(value: object) -> list[str]:
+        if not isinstance(value, (list, tuple, set)):
+            return []
+        return list(dict.fromkeys(str(item) for item in value if item))
 
-    @qasync.asyncSlot(str)
-    async def retry_requested(task_id: str) -> None:
-        await controller.retry_failed(task_id)
+    def task_selection_changed(value: object) -> None:
+        controller.select_task_details(_task_ids(value))
+
+    def pause_tasks_requested(value: object) -> None:
+        controller.pause_tasks(_task_ids(value))
+
+    async def resume_tasks_requested(value: object) -> None:
+        await controller.resume_tasks(_task_ids(value))
+
+    async def retry_tasks_requested(value: object) -> None:
+        await controller.retry_failed_tasks(_task_ids(value))
+
+    def archive_tasks_requested(value: object) -> None:
+        controller.archive_tasks(_task_ids(value))
+
+    def restore_tasks_requested(value: object) -> None:
+        controller.restore_tasks(_task_ids(value))
+
+    def open_media_requested(item_id: str) -> None:
+        controller.open_media_file(item_id)
 
     @qasync.asyncSlot(str)
     async def content_dialog_selected(peer_ref: str) -> None:
@@ -452,77 +463,52 @@ def create_application(root: Path):
             controller.apply_settings(dialog.values(), dialog.proxy_password.text())
 
         dialog.test_proxy_requested.connect(proxy_test_requested)
-        dialog.thumbnail_cache_clear_requested.connect(
-            controller.clear_thumbnail_cache
-        )
+        dialog.thumbnail_cache_clear_requested.connect(controller.clear_thumbnail_cache)
         dialog.accepted.connect(save_settings)
         controller._ui_slots.extend((proxy_test_requested, save_settings))
         dialog.open()
 
     window.scan_requested.connect(scan_requested)
-    window.pause_requested.connect(controller.pause_task)
-    window.resume_requested.connect(resume_requested)
-    window.retry_failed_requested.connect(retry_requested)
+    window.task_selection_changed.connect(task_selection_changed)
+    window.pause_tasks_requested.connect(pause_tasks_requested)
+    window.archive_tasks_requested.connect(archive_tasks_requested)
+    window.restore_tasks_requested.connect(restore_tasks_requested)
+    window.open_media_requested.connect(open_media_requested)
     window.open_directory_requested.connect(controller.open_task_directory)
     window.settings_requested.connect(open_settings)
     window.login_requested.connect(controller.show_login)
     window.content_page.dialog_selected.connect(content_dialog_selected)
     window.content_page.link_requested.connect(controller.route_content_link)
     window.content_page.search_requested.connect(content_search_requested)
-    window.content_page.cancel_search_requested.connect(
-        controller.cancel_content_search
-    )
+    window.content_page.cancel_search_requested.connect(controller.cancel_content_search)
     window.content_page.load_more_requested.connect(content_load_more_requested)
     window.content_page.selection_changed.connect(controller.set_content_selected)
     window.content_page.queue_requested.connect(content_queue_requested)
     window.content_page.thumbnail_requested.connect(controller.request_thumbnail)
     window.content_page.preview_requested.connect(content_preview_requested)
-    window.content_page.history_open_requested.connect(
-        controller._reload_content_search
-    )
-    window.content_page.history_delete_requested.connect(
-        controller.delete_content_history
-    )
-    window.content_page.history_clear_requested.connect(
-        controller.clear_content_history
-    )
-    window.subscriptions_page.create_requested.connect(
-        subscription_create_requested
-    )
-    window.subscriptions_page.update_requested.connect(
-        subscription_update_requested
-    )
-    window.subscriptions_page.run_requested.connect(
-        controller.run_subscription_now
-    )
-    window.subscriptions_page.enabled_requested.connect(
-        controller.set_subscription_enabled
-    )
-    window.subscriptions_page.delete_requested.connect(
-        controller.delete_subscription
-    )
-    window.subscriptions_page.rule_selected.connect(
-        controller.show_subscription_details
-    )
-    window.subscriptions_page.probe_requested.connect(
-        subscription_probe_requested
-    )
-    window.subscriptions_page.probe_cancel_requested.connect(
-        controller.cancel_subscription_probe
-    )
+    window.content_page.history_open_requested.connect(controller._reload_content_search)
+    window.content_page.history_delete_requested.connect(controller.delete_content_history)
+    window.content_page.history_clear_requested.connect(controller.clear_content_history)
+    window.subscriptions_page.create_requested.connect(subscription_create_requested)
+    window.subscriptions_page.update_requested.connect(subscription_update_requested)
+    window.subscriptions_page.run_requested.connect(controller.run_subscription_now)
+    window.subscriptions_page.enabled_requested.connect(controller.set_subscription_enabled)
+    window.subscriptions_page.delete_requested.connect(controller.delete_subscription)
+    window.subscriptions_page.rule_selected.connect(controller.show_subscription_details)
+    window.subscriptions_page.probe_requested.connect(subscription_probe_requested)
+    window.subscriptions_page.probe_cancel_requested.connect(controller.cancel_subscription_probe)
     login_dialog.credentials_submitted.connect(credentials_submitted)
     login_dialog.phone_submitted.connect(phone_submitted)
     login_dialog.code_submitted.connect(code_submitted)
     login_dialog.password_submitted.connect(password_submitted)
+
     def content_failure(error: Exception) -> None:
         window.content_page.show_error(controller._safe_error(error))
 
     def login_hooks(action: str) -> ActionHooks:
         return ActionHooks(
             started=lambda: login_dialog.set_action_busy(action, True),
-            failed=lambda error: login_dialog.show_error(
-                controller._safe_error(error)
-            ),
+            failed=lambda error: login_dialog.show_error(controller._safe_error(error)),
             finished=lambda: login_dialog.set_action_busy(action, False),
         )
 
@@ -537,10 +523,24 @@ def create_application(root: Path):
         "subscriptions.activate",
         lambda: controller.activate_subscriptions_page(),
         hooks=ActionHooks(
-            failed=lambda error: window.subscriptions_page.show_error(
-                controller._safe_error(error)
-            )
+            failed=lambda error: window.subscriptions_page.show_error(controller._safe_error(error))
         ),
+    )
+
+    def task_failure(error: Exception) -> None:
+        window.statusBar().showMessage(controller._safe_error(error), 0)
+
+    async_actions.connect_payload(
+        window.resume_tasks_requested,
+        "tasks.resume",
+        resume_tasks_requested,
+        hooks=ActionHooks(failed=task_failure),
+    )
+    async_actions.connect_payload(
+        window.retry_tasks_requested,
+        "tasks.retry",
+        retry_tasks_requested,
+        hooks=ActionHooks(failed=task_failure),
     )
     async_actions.connect(
         window.content_page.refresh_requested,
@@ -581,9 +581,7 @@ def create_application(root: Path):
         "login.cancel",
         lambda: controller.cancel_login(),
         hooks=ActionHooks(
-            failed=lambda error: login_dialog.show_error(
-                controller._safe_error(error)
-            )
+            failed=lambda error: login_dialog.show_error(controller._safe_error(error))
         ),
     )
     controller._ui_slots.extend(
@@ -593,8 +591,13 @@ def create_application(root: Path):
             phone_submitted,
             code_submitted,
             password_submitted,
-            resume_requested,
-            retry_requested,
+            task_selection_changed,
+            pause_tasks_requested,
+            resume_tasks_requested,
+            retry_tasks_requested,
+            archive_tasks_requested,
+            restore_tasks_requested,
+            open_media_requested,
             content_dialog_selected,
             content_search_requested,
             content_load_more_requested,
@@ -629,6 +632,7 @@ def run(root: Path, instance_guard: WindowsInstanceGuard | None = None) -> int:
         )
         application.aboutToQuit.connect(loop.stop)
         with loop:
+
             async def start_application() -> None:
                 await controller.start()
                 controller.window.show()
@@ -646,9 +650,7 @@ def run(root: Path, instance_guard: WindowsInstanceGuard | None = None) -> int:
             loop.run_until_complete(controller.shutdown())
             if not startup_task.done():
                 startup_task.cancel()
-                loop.run_until_complete(
-                    asyncio.gather(startup_task, return_exceptions=True)
-                )
+                loop.run_until_complete(asyncio.gather(startup_task, return_exceptions=True))
             if not startup_task.cancelled():
                 startup_task.result()
         del close_filter

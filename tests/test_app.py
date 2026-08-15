@@ -87,9 +87,7 @@ def test_run_keeps_startup_inside_the_continuous_event_loop() -> None:
     assert "loop.create_task(start_application())" in source
 
 
-def test_duplicate_instance_exits_before_application_construction(
-    tmp_path, monkeypatch
-) -> None:
+def test_duplicate_instance_exits_before_application_construction(tmp_path, monkeypatch) -> None:
     class Guard:
         def acquire(self) -> bool:
             return False
@@ -135,19 +133,13 @@ def test_create_application_initializes_project_local_content_services(
         assert isinstance(controller.subscription_scheduler, SubscriptionScheduler)
         assert controller.window.subscriptions_page is not None
         assert isinstance(controller.connection_recovery, ConnectionRecovery)
-        slot_names = {
-            getattr(slot, "__name__", "") for slot in controller._ui_slots
-        }
+        slot_names = {getattr(slot, "__name__", "") for slot in controller._ui_slots}
         assert "content_preview_requested" in slot_names
         assert "subscription_probe_requested" in slot_names
         assert controller._async_actions.active_keys == frozenset()
-        assert len(controller._async_actions._slots) == 8
-        controller.window.content_page.link_requested.emit(
-            "https://t.me/example/1#fragment"
-        )
-        assert controller.window.content_page.error_label.text() == (
-            "请输入有效的 t.me 链接"
-        )
+        assert len(controller._async_actions._slots) == 10
+        controller.window.content_page.link_requested.emit("https://t.me/example/1#fragment")
+        assert controller.window.content_page.error_label.text() == ("请输入有效的 t.me 链接")
 
         probe_calls: list[str] = []
 
@@ -313,6 +305,103 @@ def test_zero_argument_ui_signals_schedule_each_controller_action_once(
         bridge = getattr(controller, "_async_actions", None)
         if bridge is not None:
             loop.run_until_complete(bridge.shutdown())
+        controller.window.close()
+        loop.close()
+        application.processEvents()
+
+
+def test_task_management_signals_route_sync_and_async_actions(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    application, loop, controller = app.create_application(tmp_path)
+    calls: list[tuple[str, object]] = []
+
+    def record_sync(name):
+        return lambda value: calls.append((name, value))
+
+    async def record_async(name, value):
+        calls.append((name, value))
+
+    monkeypatch.setattr(controller, "select_task_details", record_sync("select"))
+    monkeypatch.setattr(controller, "pause_tasks", record_sync("pause"))
+    monkeypatch.setattr(controller, "archive_tasks", record_sync("archive"))
+    monkeypatch.setattr(controller, "restore_tasks", record_sync("restore"))
+    monkeypatch.setattr(controller, "open_media_file", record_sync("open"))
+    monkeypatch.setattr(
+        controller,
+        "resume_tasks",
+        lambda value: record_async("resume", value),
+    )
+    monkeypatch.setattr(
+        controller,
+        "retry_failed_tasks",
+        lambda value: record_async("retry", value),
+    )
+
+    async def emit_actions() -> None:
+        controller.window.task_selection_changed.emit(["one"])
+        controller.window.pause_tasks_requested.emit(["one", "two"])
+        controller.window.archive_tasks_requested.emit(["done"])
+        controller.window.restore_tasks_requested.emit(["old"])
+        controller.window.open_media_requested.emit("media")
+        controller.window.resume_tasks_requested.emit(["paused"])
+        controller.window.retry_tasks_requested.emit(["failed"])
+        await controller._async_actions.wait_idle()
+
+    try:
+        loop.run_until_complete(emit_actions())
+
+        assert calls == [
+            ("select", ["one"]),
+            ("pause", ["one", "two"]),
+            ("archive", ["done"]),
+            ("restore", ["old"]),
+            ("open", "media"),
+            ("resume", ["paused"]),
+            ("retry", ["failed"]),
+        ]
+        slot_names = {getattr(slot, "__name__", "") for slot in controller._ui_slots}
+        assert "task_selection_changed" in slot_names
+        assert "resume_tasks_requested" in slot_names
+        assert "retry_tasks_requested" in slot_names
+    finally:
+        loop.run_until_complete(controller._async_actions.shutdown())
+        controller.window.close()
+        loop.close()
+        application.processEvents()
+
+
+def test_repeated_task_resume_clicks_share_one_async_action(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    application, loop, controller = app.create_application(tmp_path)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[list[str]] = []
+
+    async def resume(task_ids):
+        calls.append(task_ids)
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(controller, "resume_tasks", resume)
+
+    async def emit_actions() -> None:
+        controller.window.resume_tasks_requested.emit(["paused"])
+        await started.wait()
+        controller.window.resume_tasks_requested.emit(["paused"])
+        assert controller._async_actions.active_keys == frozenset({"tasks.resume"})
+        release.set()
+        await controller._async_actions.wait_idle()
+
+    try:
+        loop.run_until_complete(emit_actions())
+        assert calls == [["paused"]]
+        assert controller._async_actions.active_keys == frozenset()
+    finally:
+        loop.run_until_complete(controller._async_actions.shutdown())
         controller.window.close()
         loop.close()
         application.processEvents()
