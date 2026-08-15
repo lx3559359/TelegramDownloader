@@ -291,7 +291,7 @@ Inspect the complete source/test/document diff for security, data-path escapes, 
 
 Run full pytest, Ruff, `git diff --check`, artifact hash checks and package privacy checks from the healthy worktree. Require a clean worktree.
 
-- [ ] **Step 3: Fast-forward local `main`**
+- [x] **Step 3: Fast-forward local `main`**
 
 From `D:\Codex Project\Telegram下载器`, run:
 
@@ -301,6 +301,6 @@ git merge --ff-only codex/three-pass-qa-v042
 
 Do not pull, push, tag, publish or update remote manifests.
 
-- [ ] **Step 4: Verify the merged commit without removing runtime data**
+- [x] **Step 4: Verify the merged commit without removing runtime data**
 
 Confirm `main` and the linked worktree resolve to the same commit, tests and Ruff still pass from the healthy worktree, both Git statuses are clean, and no packaged process remains. Preserve the linked worktree because it owns the real project-local session and download data.
