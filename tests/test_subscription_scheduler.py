@@ -201,6 +201,31 @@ async def test_manual_wake_deduplicates_the_same_rule() -> None:
 
 
 @pytest.mark.asyncio
+async def test_manual_wake_during_active_run_does_not_queue_duplicate_run() -> None:
+    service = Service(rule("r1", next_run_at=NOW + timedelta(hours=1)))
+    service.block = asyncio.Event()
+    scheduler = SubscriptionScheduler(
+        service,
+        clock=lambda: NOW,
+        foreground_busy=lambda: False,
+        idle_delay=0.01,
+    )
+    scheduler.set_account("a1")
+    scheduler.wake("r1")
+    scheduler.start()
+    await asyncio.wait_for(service.started.wait(), timeout=1)
+
+    scheduler.wake("r1")
+    scheduler.wake("r1")
+    service.block.set()
+    await wait_until(lambda: service.run_calls == ["r1"])
+    await asyncio.sleep(0.03)
+    await scheduler.shutdown()
+
+    assert service.run_calls == ["r1"]
+
+
+@pytest.mark.asyncio
 async def test_foreground_busy_defers_without_recording_failure() -> None:
     busy = True
     service = Service(rule("r1"))

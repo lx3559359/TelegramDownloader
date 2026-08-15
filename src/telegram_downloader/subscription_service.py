@@ -152,6 +152,7 @@ class SubscriptionService:
             else current.last_message_id
         )
         now = self.clock()
+        enabled = current.enabled
         updated = replace(
             current,
             peer_ref=draft.peer_ref,
@@ -159,10 +160,12 @@ class SubscriptionService:
             keyword=draft.keyword,
             media_kinds=draft.media_kinds,
             interval_minutes=draft.interval_minutes,
-            enabled=True,
-            state=SubscriptionState.WAITING,
+            enabled=enabled,
+            state=(SubscriptionState.WAITING if enabled else SubscriptionState.PAUSED),
             last_message_id=baseline,
-            next_run_at=now + timedelta(minutes=draft.interval_minutes),
+            next_run_at=(
+                now + timedelta(minutes=draft.interval_minutes) if enabled else None
+            ),
             last_error=None,
             failure_count=0,
             updated_at=now,

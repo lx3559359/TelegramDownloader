@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -152,8 +153,10 @@ class SubscriptionScheduler:
         self.wakes = []
         self.started = 0
         self.order = order
+        self.account_id = None
 
     def set_account(self, account_id):
+        self.account_id = account_id
         self.account_ids.append(account_id)
 
     def start(self):
@@ -222,6 +225,63 @@ async def test_subscription_actions_restore_busy_state_and_refresh_rules() -> No
     assert scheduler.wakes == [None, None, "rule-1"]
     assert window.subscriptions_page.rules == []
     assert window.subscriptions_page.busy[-1][1] is False
+
+
+@pytest.mark.asyncio
+async def test_subscription_baseline_action_has_foreground_priority() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingSubscriptions(Subscriptions):
+        async def create_rule(self, draft):
+            entered.set()
+            await release.wait()
+            return await super().create_rule(draft)
+
+    subscriptions = BlockingSubscriptions()
+    subscriptions.set_account(AccountProfile("a1", "账号一"))
+    controller = AppController.for_test(
+        subscriptions=subscriptions,
+        subscription_scheduler=SubscriptionScheduler(),
+        window=Window(),
+    )
+    draft = SubscriptionDraft("-1001", "美女", frozenset({MediaKind.PHOTO}))
+
+    task = asyncio.create_task(controller.create_subscription(draft))
+    await entered.wait()
+    assert controller.foreground_telegram_busy() is True
+    release.set()
+    await task
+    assert controller.foreground_telegram_busy() is False
+
+
+@pytest.mark.asyncio
+async def test_network_recovery_wakes_connection_blocked_subscriptions() -> None:
+    class Gateway:
+        connected = False
+
+        def is_connected(self):
+            return self.connected
+
+        async def connect(self):
+            self.connected = True
+
+    subscriptions = Subscriptions()
+    subscriptions.set_account(AccountProfile("a1", "账号一"))
+    scheduler = SubscriptionScheduler()
+    scheduler.set_account("a1")
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        content_browser=ContentService(),
+        subscriptions=subscriptions,
+        subscription_scheduler=scheduler,
+        window=Window(),
+    )
+
+    assert await controller.retry_telegram_connection() is True
+
+    assert subscriptions.resume_count == 1
+    assert scheduler.wakes == [None]
 
 
 def test_subscription_created_task_enters_existing_download_scheduler() -> None:

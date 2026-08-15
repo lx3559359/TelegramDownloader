@@ -49,6 +49,7 @@ class SubscriptionScheduler:
         self._pending: deque[str] = deque()
         self._pending_set: set[str] = set()
         self._runner: asyncio.Task[None] | None = None
+        self._active_rule_id: str | None = None
         self._closing = False
 
     @property
@@ -72,7 +73,11 @@ class SubscriptionScheduler:
         self._wake_event.set()
 
     def wake(self, rule_id: str | None = None) -> None:
-        if rule_id is not None and rule_id not in self._pending_set:
+        if (
+            rule_id is not None
+            and rule_id != self._active_rule_id
+            and rule_id not in self._pending_set
+        ):
             self._pending.append(rule_id)
             self._pending_set.add(rule_id)
         self._wake_event.set()
@@ -93,7 +98,11 @@ class SubscriptionScheduler:
             self._wake_event.clear()
             selected = self._next_rule()
             if selected is not None:
-                await self._execute(selected)
+                self._active_rule_id = selected.id
+                try:
+                    await self._execute(selected)
+                finally:
+                    self._active_rule_id = None
                 continue
             try:
                 await asyncio.wait_for(

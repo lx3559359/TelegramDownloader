@@ -334,6 +334,7 @@ class AppController:
         self._settings_dialog: Any | None = None
         self._dialog_sync_task: asyncio.Task[Any] | None = None
         self._content_search_task: asyncio.Task[Any] | None = None
+        self._subscription_actions_active = 0
         self._thumbnail_tasks: dict[str, asyncio.Task[Any]] = {}
         self._progress_refresh_interval = progress_refresh_interval
         self._next_progress_refresh = 0.0
@@ -418,7 +419,21 @@ class AppController:
 
         page.set_logged_in(True)
         page.set_connection_state("连接已恢复", retryable=False)
+        self._resume_subscriptions_after_connection()
         return True
+
+    def _resume_subscriptions_after_connection(self) -> None:
+        account = getattr(self.subscriptions, "account", None)
+        if account is None:
+            return
+        if getattr(self.subscription_scheduler, "account_id", None) != account.account_id:
+            return
+        try:
+            self.subscriptions.resume_after_connection()
+            self.subscription_scheduler.wake()
+            self._reload_subscriptions()
+        except Exception as error:
+            self._subscription_page().show_error(self._safe_error(error))
 
     async def retry_telegram_connection(self) -> bool:
         return await self.ensure_telegram_online()
@@ -1110,6 +1125,7 @@ class AppController:
     async def create_subscription(self, draft: SubscriptionDraft) -> None:
         page = self._subscription_page()
         page.set_rule_busy(None, True, "正在建立订阅基线…")
+        self._subscription_actions_active += 1
         try:
             saved = await self.subscriptions.create_rule(draft)
             self._reload_subscriptions()
@@ -1120,6 +1136,7 @@ class AppController:
         except Exception as error:
             page.show_error(self._safe_error(error))
         finally:
+            self._subscription_actions_active -= 1
             page.set_rule_busy(None, False)
 
     async def update_subscription(
@@ -1129,6 +1146,7 @@ class AppController:
     ) -> None:
         page = self._subscription_page()
         page.set_rule_busy(rule_id, True, "正在更新订阅…")
+        self._subscription_actions_active += 1
         try:
             await self.subscriptions.update_rule(rule_id, draft)
             self._reload_subscriptions()
@@ -1137,6 +1155,7 @@ class AppController:
         except Exception as error:
             page.show_error(self._safe_error(error))
         finally:
+            self._subscription_actions_active -= 1
             page.set_rule_busy(None, False)
 
     def set_subscription_enabled(self, rule_id: str, enabled: bool) -> None:
@@ -1179,7 +1198,11 @@ class AppController:
         self._start_task(task_id)
 
     def foreground_telegram_busy(self) -> bool:
-        if self._shutting_down or self.connection_recovery.active:
+        if (
+            self._shutting_down
+            or self.connection_recovery.active
+            or self._subscription_actions_active > 0
+        ):
             return True
         return any(
             task is not None and not task.done()

@@ -362,3 +362,21 @@ async def test_successful_reconnection_makes_blocked_rule_due_immediately(
     assert resumed.state is SubscriptionState.WAITING
     assert resumed.next_run_at == NOW
     assert resumed.last_error == "Telegram 登录已失效"
+
+
+@pytest.mark.asyncio
+async def test_editing_paused_rule_does_not_resume_it(tmp_path: Path) -> None:
+    service, _gateway, _catalog, _tasks = build_service(tmp_path)
+    saved = await service.create_rule(
+        SubscriptionDraft("-1001", "美女", frozenset({MediaKind.PHOTO}), 30)
+    )
+    service.set_enabled(saved.id, False)
+
+    changed = await service.update_rule(
+        saved.id,
+        SubscriptionDraft("-1001", "美女", frozenset({MediaKind.VIDEO}), 60),
+    )
+
+    assert changed.enabled is False
+    assert changed.state is SubscriptionState.PAUSED
+    assert changed.next_run_at is None

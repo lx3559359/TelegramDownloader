@@ -149,6 +149,28 @@ def test_offline_page_keeps_rules_visible_but_disables_online_actions(qtbot) -> 
     assert "登录" in page.connection_label.text()
 
 
+def test_automatic_progress_locks_actions_until_run_finishes(qtbot) -> None:
+    page = SubscriptionPage()
+    qtbot.addWidget(page)
+    page.set_logged_in(True)
+    page.set_dialogs([dialog()])
+    page.set_rules([rule()])
+    page.rule_table.selectRow(0)
+
+    page.set_progress(SubscriptionProgress("rule-1", 1, 0, 0, 0, "正在读取"))
+
+    assert page.new_button.isEnabled() is False
+    assert page.edit_button.isEnabled() is False
+    assert page.run_button.isEnabled() is False
+    assert page.toggle_button.isEnabled() is False
+    assert page.delete_button.isEnabled() is False
+
+    page.set_progress(None)
+
+    assert page.new_button.isEnabled() is True
+    assert page.run_button.isEnabled() is True
+
+
 def test_page_create_edit_and_confirmed_delete_emit_complete_payloads(
     qtbot,
     monkeypatch,

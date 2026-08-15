@@ -305,10 +305,16 @@ class SubscriptionPage(QWidget):
 
     def set_progress(self, progress: SubscriptionProgress | None) -> None:
         if progress is None:
+            if self._busy_rule_id is not None:
+                self._busy_rule_id = None
+                self._busy = False
             self.progress_label.clear()
             self.progress_label.hide()
             self.progress_bar.hide()
+            self._refresh_actions()
             return
+        self._busy_rule_id = progress.rule_id
+        self._busy = True
         self.progress_label.setText(
             f"已扫描 {progress.inspected} 条 · 匹配 {progress.matched} 项 · "
             f"新增 {progress.queued} 项 · 重复 {progress.duplicate} 项 · "
@@ -316,6 +322,7 @@ class SubscriptionPage(QWidget):
         )
         self.progress_label.show()
         self.progress_bar.show()
+        self._refresh_actions()
 
     def show_error(self, message: str) -> None:
         self.error_label.setText(message)
