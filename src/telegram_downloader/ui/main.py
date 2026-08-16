@@ -31,6 +31,7 @@ from telegram_downloader.domain import IntegrityStatus, ItemStatus, MediaKind, T
 from telegram_downloader.file_integrity import IntegrityProgress
 from telegram_downloader.ui.content_browser import ContentBrowserPage
 from telegram_downloader.ui.diagnostics import DiagnosticsPage
+from telegram_downloader.ui.effects import ElevationLevel, apply_elevation
 from telegram_downloader.ui.models import (
     TaskFilter,
     TaskItemSummary,
@@ -39,7 +40,7 @@ from telegram_downloader.ui.models import (
     TaskTableModel,
 )
 from telegram_downloader.ui.subscriptions import SubscriptionPage
-from telegram_downloader.ui.theme import DARK_STYLESHEET, ensure_cjk_font
+from telegram_downloader.ui.theme import APP_STYLESHEET, ensure_cjk_font
 
 _MEDIA_LABELS = {
     MediaKind.PHOTO: "图片",
@@ -102,13 +103,15 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1180, 720)
         self.resize(1280, 780)
         ensure_cjk_font()
-        self.setStyleSheet(DARK_STYLESHEET)
+        self.setStyleSheet(APP_STYLESHEET)
 
         root = QWidget()
         root_layout = QHBoxLayout(root)
-        root_layout.setContentsMargins(0, 0, 0, 0)
-        root_layout.setSpacing(0)
-        root_layout.addWidget(self._build_navigation())
+        root_layout.setContentsMargins(12, 12, 12, 12)
+        root_layout.setSpacing(12)
+        self.navigation_panel = self._build_navigation()
+        apply_elevation(self.navigation_panel, ElevationLevel.SECONDARY)
+        root_layout.addWidget(self.navigation_panel)
         self.task_page = self._build_workspace()
         self.content_page = ContentBrowserPage()
         self.subscriptions_page = SubscriptionPage()
@@ -120,6 +123,7 @@ class MainWindow(QMainWindow):
         self.page_stack.addWidget(self.diagnostics_page)
         root_layout.addWidget(self.page_stack, 1)
         self.statistics_panel = self._build_statistics()
+        apply_elevation(self.statistics_panel, ElevationLevel.SECONDARY)
         root_layout.addWidget(self.statistics_panel)
         self.setCentralWidget(root)
         self.statusBar().showMessage("准备就绪")
@@ -245,7 +249,16 @@ class MainWindow(QMainWindow):
         header.addWidget(self.account_badge, 0, Qt.AlignmentFlag.AlignTop)
         layout.addLayout(header)
 
-        layout.addWidget(self._build_source_card())
+        self.source_card = self._build_source_card()
+        apply_elevation(self.source_card, ElevationLevel.MAJOR)
+        layout.addWidget(self.source_card)
+
+        self.task_queue_card = QFrame()
+        self.task_queue_card.setObjectName("elevatedCard")
+        apply_elevation(self.task_queue_card, ElevationLevel.MAJOR)
+        task_queue_layout = QVBoxLayout(self.task_queue_card)
+        task_queue_layout.setContentsMargins(14, 12, 14, 14)
+        task_queue_layout.setSpacing(9)
 
         queue_header = QHBoxLayout()
         queue_header.addWidget(self._section_label("任务队列"))
@@ -253,7 +266,7 @@ class MainWindow(QMainWindow):
         hint = QLabel("支持暂停、断网与程序重启后续传")
         hint.setObjectName("muted")
         queue_header.addWidget(hint)
-        layout.addLayout(queue_header)
+        task_queue_layout.addLayout(queue_header)
 
         task_filters = QHBoxLayout()
         task_filters.setSpacing(9)
@@ -266,7 +279,7 @@ class MainWindow(QMainWindow):
             self.task_filter.addItem(_TASK_FILTER_LABELS[selected], selected.value)
         task_filters.addWidget(self.task_search, 1)
         task_filters.addWidget(self.task_filter)
-        layout.addLayout(task_filters)
+        task_queue_layout.addLayout(task_filters)
 
         self.task_model = TaskTableModel()
         self.task_table = QTableView()
@@ -283,19 +296,39 @@ class MainWindow(QMainWindow):
         for column in range(1, self.task_model.columnCount()):
             header_view.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
 
-        task_panel = QWidget()
-        task_panel_layout = QVBoxLayout(task_panel)
-        task_panel_layout.setContentsMargins(0, 0, 0, 0)
-        task_panel_layout.setSpacing(5)
         self.task_empty_hint = QLabel("尚无下载任务")
         self.task_empty_hint.setObjectName("muted")
         self.task_empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        task_panel_layout.addWidget(self.task_table, 1)
-        task_panel_layout.addWidget(self.task_empty_hint)
+        task_queue_layout.addWidget(self.task_table, 1)
+        task_queue_layout.addWidget(self.task_empty_hint)
 
-        detail_panel = QFrame()
-        detail_panel.setObjectName("card")
-        detail_layout = QVBoxLayout(detail_panel)
+        actions = QHBoxLayout()
+        self.pause_button = QPushButton("暂停")
+        self.resume_button = QPushButton("继续")
+        self.prioritize_button = QPushButton("优先下载")
+        self.retry_button = QPushButton("重试失败项")
+        self.verify_tasks_button = QPushButton("校验文件")
+        self.archive_button = QPushButton("归档所选")
+        self.restore_button = QPushButton("恢复所选")
+        self.open_button = QPushButton("打开目录")
+        for button in (
+            self.pause_button,
+            self.resume_button,
+            self.prioritize_button,
+            self.retry_button,
+            self.verify_tasks_button,
+            self.archive_button,
+            self.restore_button,
+            self.open_button,
+        ):
+            actions.addWidget(button)
+        actions.addStretch()
+        task_queue_layout.addLayout(actions)
+
+        self.task_detail_card = QFrame()
+        self.task_detail_card.setObjectName("elevatedCard")
+        apply_elevation(self.task_detail_card, ElevationLevel.MAJOR)
+        detail_layout = QVBoxLayout(self.task_detail_card)
         detail_layout.setContentsMargins(12, 9, 12, 10)
         detail_layout.setSpacing(7)
         detail_header = QHBoxLayout()
@@ -315,9 +348,11 @@ class MainWindow(QMainWindow):
         detail_header.addWidget(self.open_file_button)
         detail_layout.addLayout(detail_header)
 
-        self.integrity_progress_panel = QWidget()
+        self.integrity_progress_panel = QFrame()
+        self.integrity_progress_panel.setObjectName("elevatedSubCard")
+        apply_elevation(self.integrity_progress_panel, ElevationLevel.SECONDARY)
         integrity_progress_layout = QHBoxLayout(self.integrity_progress_panel)
-        integrity_progress_layout.setContentsMargins(0, 0, 0, 0)
+        integrity_progress_layout.setContentsMargins(8, 7, 8, 7)
         integrity_progress_layout.setSpacing(8)
         self.integrity_progress_label = QLabel("正在准备校验…")
         self.integrity_progress_label.setObjectName("muted")
@@ -352,40 +387,17 @@ class MainWindow(QMainWindow):
 
         self.task_splitter = QSplitter(Qt.Orientation.Vertical)
         self.task_splitter.setChildrenCollapsible(False)
-        self.task_splitter.addWidget(task_panel)
-        self.task_splitter.addWidget(detail_panel)
+        self.task_splitter.addWidget(self.task_queue_card)
+        self.task_splitter.addWidget(self.task_detail_card)
         self.task_splitter.setStretchFactor(0, 3)
         self.task_splitter.setStretchFactor(1, 2)
         self.task_splitter.setSizes([300, 190])
         layout.addWidget(self.task_splitter, 1)
-
-        actions = QHBoxLayout()
-        self.pause_button = QPushButton("暂停")
-        self.resume_button = QPushButton("继续")
-        self.prioritize_button = QPushButton("优先下载")
-        self.retry_button = QPushButton("重试失败项")
-        self.verify_tasks_button = QPushButton("校验文件")
-        self.archive_button = QPushButton("归档所选")
-        self.restore_button = QPushButton("恢复所选")
-        self.open_button = QPushButton("打开目录")
-        for button in (
-            self.pause_button,
-            self.resume_button,
-            self.prioritize_button,
-            self.retry_button,
-            self.verify_tasks_button,
-            self.archive_button,
-            self.restore_button,
-            self.open_button,
-        ):
-            actions.addWidget(button)
-        actions.addStretch()
-        layout.addLayout(actions)
         return workspace
 
     def _build_source_card(self) -> QFrame:
         card = QFrame()
-        card.setObjectName("card")
+        card.setObjectName("elevatedCard")
         layout = QVBoxLayout(card)
         layout.setContentsMargins(16, 14, 16, 15)
         layout.setSpacing(11)
@@ -450,12 +462,18 @@ class MainWindow(QMainWindow):
         speed_card, self.speed_value = self._stat_card("总速度", "0 B/s", accent=True)
         completed_card, self.completed_value = self._stat_card("已完成", "0")
         remaining_card, self.remaining_value = self._stat_card("队列剩余", "0")
+        self.stat_cards = (speed_card, completed_card, remaining_card)
+        for card in self.stat_cards:
+            card.setObjectName("elevatedSubCard")
+            apply_elevation(card, ElevationLevel.SECONDARY)
         layout.addWidget(speed_card)
         layout.addWidget(completed_card)
         layout.addWidget(remaining_card)
 
         current = QFrame()
-        current.setObjectName("card")
+        self.current_task_card = current
+        self.current_task_card.setObjectName("elevatedSubCard")
+        apply_elevation(self.current_task_card, ElevationLevel.SECONDARY)
         current_layout = QVBoxLayout(current)
         current_layout.setContentsMargins(13, 13, 13, 14)
         current_layout.setSpacing(9)
@@ -507,7 +525,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _stat_card(title: str, value: str, *, accent: bool = False) -> tuple[QFrame, QLabel]:
         card = QFrame()
-        card.setObjectName("statCard")
+        card.setObjectName("elevatedSubCard")
         layout = QVBoxLayout(card)
         layout.setContentsMargins(13, 12, 13, 13)
         layout.setSpacing(5)

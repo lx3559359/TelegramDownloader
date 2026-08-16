@@ -3,10 +3,15 @@ from datetime import UTC, datetime
 
 import pytest
 from PySide6.QtCore import QItemSelectionModel, Qt
-from PySide6.QtWidgets import QAbstractItemView, QMessageBox
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QGraphicsDropShadowEffect,
+    QMessageBox,
+)
 
 from telegram_downloader.domain import IntegrityStatus, ItemStatus, MediaKind, TaskStatus
 from telegram_downloader.file_integrity import IntegrityProgress
+from telegram_downloader.ui.effects import ElevationLevel
 from telegram_downloader.ui.main import MainWindow
 from telegram_downloader.ui.models import (
     TaskFilter,
@@ -15,6 +20,61 @@ from telegram_downloader.ui.models import (
     TaskSummary,
     TaskTableModel,
 )
+
+
+def test_main_shell_and_task_cards_use_confirmed_elevation_hierarchy(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+
+    for panel in (window.navigation_panel, window.statistics_panel):
+        assert isinstance(panel.graphicsEffect(), QGraphicsDropShadowEffect)
+        assert panel.property("elevation") == ElevationLevel.SECONDARY.value
+
+    for card in (
+        window.source_card,
+        window.task_queue_card,
+        window.task_detail_card,
+    ):
+        assert card.objectName() == "elevatedCard"
+        assert card.property("elevation") == ElevationLevel.MAJOR.value
+
+    for card in (
+        *window.stat_cards,
+        window.current_task_card,
+        window.integrity_progress_panel,
+    ):
+        assert card.objectName() == "elevatedSubCard"
+        assert card.property("elevation") == ElevationLevel.SECONDARY.value
+    assert window.task_queue_card.isAncestorOf(window.task_empty_hint)
+    assert window.task_queue_card.isAncestorOf(window.task_table)
+    assert window.task_detail_card.isAncestorOf(window.task_item_table)
+
+
+def test_task_center_actions_stay_inside_cards_at_minimum_size(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.resize(1180, 720)
+    window.show()
+    qtbot.wait(20)
+
+    assert window.task_queue_card.height() > 0
+    assert window.task_detail_card.height() > 0
+    for button in (
+        window.pause_button,
+        window.resume_button,
+        window.prioritize_button,
+        window.retry_button,
+        window.verify_tasks_button,
+        window.archive_button,
+        window.restore_button,
+        window.open_button,
+    ):
+        assert button.isVisible()
+        bottom_right = button.mapTo(
+            window.task_queue_card,
+            button.rect().bottomRight(),
+        )
+        assert window.task_queue_card.rect().contains(bottom_right)
 
 
 def test_workbench_contains_required_controls(qtbot) -> None:
