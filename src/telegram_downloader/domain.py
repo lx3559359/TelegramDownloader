@@ -46,6 +46,7 @@ class IntegrityStatus(StrEnum):
     MISSING = "missing"
     SIZE_MISMATCH = "size_mismatch"
     HASH_MISMATCH = "hash_mismatch"
+    READ_ERROR = "read_error"
 
 
 @dataclass(frozen=True, slots=True)

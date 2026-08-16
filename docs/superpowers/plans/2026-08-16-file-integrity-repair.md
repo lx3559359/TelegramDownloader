@@ -74,6 +74,7 @@ class IntegrityStatus(StrEnum):
     MISSING = "missing"
     SIZE_MISMATCH = "size_mismatch"
     HASH_MISMATCH = "hash_mismatch"
+    READ_ERROR = "read_error"
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +101,7 @@ def prepare_integrity_repair(self, item_id: str) -> MediaItem: ...
 def recompute_task_status(self, task_id: str) -> TaskStatus: ...
 ```
 
-`record_integrity_failure` accepts only missing/size/hash mismatch, changes the item to failed, and changes its task to partial failure. `prepare_integrity_repair` accepts one integrity-failed row, resets it to queued/0 retries/0 bytes/unverified, clears hash/time/error, and returns the pre-reset record. The service deliberately invokes this atomic repository operation per successfully quarantined item so an unrelated file failure cannot partially reset a batch.
+`record_integrity_failure` accepts only missing/size/hash/read errors, changes the item to failed, and changes its task to partial failure. `prepare_integrity_repair` accepts one integrity-failed row, resets it to queued/0 retries/0 bytes/unverified, clears hash/time/error, and returns the pre-reset record. The service deliberately invokes this atomic repository operation per successfully quarantined item so an unrelated file failure cannot partially reset a batch.
 
 - [x] **Step 4: Run repository tests and confirm GREEN**
 
@@ -194,7 +195,7 @@ git commit -m "feat: hash completed media files"
 - Create: `src/telegram_downloader/file_integrity.py`
 - Create: `tests/test_file_integrity.py`
 
-- [ ] **Step 1: Write failing service tests**
+- [x] **Step 1: Write failing service tests**
 
 Cover baseline creation, successful recheck, missing, known-size mismatch, same-size hash mismatch, path escape, read failure, deduplicated IDs, progress order, and cancellation. Use a real `TaskRepository` in temporary project roots.
 
@@ -211,13 +212,13 @@ async def test_same_size_change_is_hash_mismatch(tmp_path: Path) -> None:
     assert repository.get_item(item.id).integrity_status is IntegrityStatus.HASH_MISMATCH
 ```
 
-- [ ] **Step 2: Run the new test file and confirm RED**
+- [x] **Step 2: Run the new test file and confirm RED**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_file_integrity.py -q`
 
 Expected: import failure for `telegram_downloader.file_integrity`.
 
-- [ ] **Step 3: Implement service types and verification**
+- [x] **Step 3: Implement service types and verification**
 
 Create immutable progress/result types and a cancel token:
 
@@ -238,23 +239,24 @@ class IntegritySummary:
     missing: int = 0
     size_mismatch: int = 0
     hash_mismatch: int = 0
+    read_error: int = 0
     skipped: int = 0
     cancelled: int = 0
 ```
 
 `FileIntegrityService.verify(item_ids, progress=None, cancelled=None)` guards paths, checks existence/size, and calls a `to_thread` hash helper that checks a `threading.Event` between 1 MiB blocks. Each item catches `OSError` and records the fixed safe error `无法读取本地文件` without exposing the path.
 
-- [ ] **Step 4: Implement safe quarantine preparation**
+- [x] **Step 4: Implement safe quarantine preparation**
 
 Add `prepare_repairs(item_ids)` that deduplicates IDs and handles each selected row independently: validate the record and every path, move existing final/part files with `_next_corrupt_path`, then call `repository.prepare_integrity_repair(item.id)`. If either move fails, restore any move already completed for that row and do not reset it. If the repository reset fails, restore both quarantined files before propagating the failure. Continue after expected per-row filesystem failures and return accepted IDs plus skipped count; never leave a row queued while its quarantine step is incomplete.
 
-- [ ] **Step 5: Run service tests and confirm GREEN**
+- [x] **Step 5: Run service tests and confirm GREEN**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_file_integrity.py -q`
 
 Expected: all integrity service tests pass and no test path escapes its temporary root.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```powershell
 git add src/telegram_downloader/file_integrity.py tests/test_file_integrity.py

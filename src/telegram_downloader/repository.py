@@ -91,6 +91,7 @@ _INTEGRITY_FAILURES = frozenset(
         IntegrityStatus.MISSING,
         IntegrityStatus.SIZE_MISMATCH,
         IntegrityStatus.HASH_MISMATCH,
+        IntegrityStatus.READ_ERROR,
     }
 )
 
