@@ -30,6 +30,7 @@ from telegram_downloader.file_integrity import (
     RepairPreparation,
 )
 from telegram_downloader.gateway import (
+    AuthorizationFailureReason,
     AuthState,
     GatewayError,
     SessionExpiredError,
@@ -461,6 +462,11 @@ class AppController:
         self._progress_refresh_interval = progress_refresh_interval
         self._next_progress_refresh = 0.0
         self._progress_samples: dict[str, tuple[float, int]] = {}
+        self._session_expiry_lock = asyncio.Lock()
+        self._session_expiry_handled = False
+        self._last_authorization_failure_reason: (
+            AuthorizationFailureReason | None
+        ) = None
 
     @classmethod
     def for_test(cls, **dependencies) -> AppController:
@@ -505,31 +511,40 @@ class AppController:
             self.show_login()
             return False
 
-        if self._gateway_is_connected(self.gateway):
-            page.set_logged_in(True)
-            page.set_connection_state("连接正常", retryable=False)
-            return True
+        recovered = False
 
         def attempt(value: tuple[int, int]) -> None:
             number, total = value
             text = "正在连接 Telegram…" if number == 1 else f"正在重连（{number}/{total}）…"
             page.set_connection_state(text, retryable=False)
 
+        if not self._gateway_is_connected(self.gateway):
+            try:
+                await self.connection_recovery.ensure_connected(
+                    self.gateway,
+                    attempt,
+                )
+                recovered = True
+            except SessionExpiredError as error:
+                await self._handle_session_expired(error)
+                return False
+            except TransientNetworkError:
+                self._show_connection_retryable(page)
+                return False
+            except Exception as error:
+                safe = self._safe_error(error)
+                page.set_logged_in(False)
+                page.set_connection_state(f"连接失败：{safe}", retryable=True)
+                self._show_status(f"Telegram 连接失败：{safe}")
+                return False
+
         try:
-            await self.connection_recovery.ensure_connected(
-                self.gateway,
-                attempt,
-            )
+            await self._verify_gateway_authorized(self.gateway)
         except SessionExpiredError as error:
             await self._handle_session_expired(error)
             return False
         except TransientNetworkError:
-            page.set_logged_in(False)
-            page.set_connection_state(
-                "重连失败，请检查网络或代理后重试",
-                retryable=True,
-            )
-            self._show_status("Telegram 重连失败，请检查网络或代理")
+            self._show_connection_retryable(page)
             return False
         except Exception as error:
             safe = self._safe_error(error)
@@ -539,9 +554,27 @@ class AppController:
             return False
 
         page.set_logged_in(True)
-        page.set_connection_state("连接已恢复", retryable=False)
-        self._resume_subscriptions_after_connection()
+        page.set_connection_state(
+            "连接已恢复" if recovered else "连接正常",
+            retryable=False,
+        )
+        if recovered:
+            self._resume_subscriptions_after_connection()
         return True
+
+    @staticmethod
+    async def _verify_gateway_authorized(gateway: object) -> None:
+        method = getattr(gateway, "test_connection", None)
+        if callable(method):
+            await method()
+
+    def _show_connection_retryable(self, page: object) -> None:
+        page.set_logged_in(False)
+        page.set_connection_state(
+            "重连失败，请检查网络或代理后重试",
+            retryable=True,
+        )
+        self._show_status("Telegram 重连失败，请检查网络或代理")
 
     def _resume_subscriptions_after_connection(self) -> None:
         account = getattr(self.subscriptions, "account", None)
@@ -1991,6 +2024,8 @@ class AppController:
         self.secrets["session"] = session
         self.vault.save(self.secrets)
         name = await self._account_name() or "已登录"
+        self._session_expiry_handled = False
+        self._last_authorization_failure_reason = None
         self.window.set_account(name)
         self.phone = ""
         self.phone_code_hash = ""
@@ -2006,62 +2041,87 @@ class AppController:
         return await method()
 
     async def _handle_session_expired(self, error: SessionExpiredError) -> None:
-        await self.connection_recovery.cancel()
-        await self._cancel_subscription_probe()
-        await self._cancel_content_operations()
-        page = self._content_page()
-        if self.content_browser is not None:
-            go_offline = getattr(self.content_browser, "go_offline", None)
-            if go_offline is not None:
-                go_offline()
-        self.subscriptions.go_offline()
-        self.subscription_scheduler.set_account(None)
-
-        self.secrets.pop("session", None)
-        self.vault.save(self.secrets)
-        self.window.set_account(None)
-        page.set_logged_in(False)
-        page.show_error(str(error))
-
-        previous_scheduler = self.scheduler
-        previous_gateway = self.gateway
-        self.gateway = None
-        self.planner = None
-        self.scheduler = _NullScheduler()
-        with suppress(Exception):
-            await previous_scheduler.shutdown()
-        if previous_gateway is not None:
-            with suppress(Exception):
-                await previous_gateway.disconnect()
-
-        api_hash = self.secrets.get("api_hash", "")
-        if self.gateway_factory is not None and self.settings.api_id > 0 and api_hash:
-            fresh_gateway = self.gateway_factory(
-                self.settings.api_id,
-                api_hash,
-                "",
-                self.settings.proxy,
-                self.secrets.get("proxy_password", ""),
+        self._last_authorization_failure_reason = error.reason
+        async with self._session_expiry_lock:
+            if self._session_expiry_handled:
+                return
+            self._session_expiry_handled = True
+            _LOGGER.warning(
+                "Telegram authorization expired (reason=%s)",
+                error.reason.value,
             )
-            self.gateway = fresh_gateway
-            try:
-                await fresh_gateway.connect()
-            except Exception as reconnect_error:
-                _LOGGER.warning(
-                    "fresh Telegram connection failed (%s)",
-                    type(reconnect_error).__name__,
-                )
-            if self.service_builder is not None:
-                services = self.service_builder(
-                    fresh_gateway,
-                    self.settings,
-                )
-                if len(services) == 3:
-                    self.planner, self.scheduler, self.content_browser = services
-                else:
-                    self.planner, self.scheduler = services
+            await self.connection_recovery.cancel()
+            await self._cancel_subscription_probe()
+            await self._cancel_content_operations()
+            page = self._content_page()
+            subscription_page = self._subscription_page()
+            if self.content_browser is not None:
+                go_offline = getattr(self.content_browser, "go_offline", None)
+                if go_offline is not None:
+                    go_offline()
+            self.subscriptions.go_offline()
+            self.subscription_scheduler.set_account(None)
 
-        self.show_login()
+            self.secrets.pop("session", None)
+            self.vault.save(self.secrets)
+            self.window.set_account(None)
+            page.set_logged_in(False)
+            page.set_connection_state(
+                "Telegram 登录已失效，请重新登录",
+                retryable=False,
+            )
+            subscription_page.set_logged_in(False)
+            page.show_error("Telegram 登录已失效，请重新扫码登录")
+
+            previous_scheduler = self.scheduler
+            previous_gateway = self.gateway
+            self.gateway = None
+            self.planner = None
+            self.scheduler = _NullScheduler()
+            with suppress(Exception):
+                await previous_scheduler.shutdown()
+            if previous_gateway is not None:
+                with suppress(Exception):
+                    await previous_gateway.disconnect()
+
+            api_hash = self.secrets.get("api_hash", "")
+            if (
+                self.gateway_factory is not None
+                and self.settings.api_id > 0
+                and api_hash
+            ):
+                fresh_gateway = self.gateway_factory(
+                    self.settings.api_id,
+                    api_hash,
+                    "",
+                    self.settings.proxy,
+                    self.secrets.get("proxy_password", ""),
+                )
+                self.gateway = fresh_gateway
+                try:
+                    await fresh_gateway.connect()
+                except Exception as reconnect_error:
+                    _LOGGER.warning(
+                        "fresh Telegram connection failed (%s)",
+                        type(reconnect_error).__name__,
+                    )
+                if self.service_builder is not None:
+                    services = self.service_builder(
+                        fresh_gateway,
+                        self.settings,
+                    )
+                    if len(services) == 3:
+                        self.planner, self.scheduler, self.content_browser = services
+                    else:
+                        self.planner, self.scheduler = services
+
+            self.show_login()
+
+    @property
+    def last_authorization_failure_reason(
+        self,
+    ) -> AuthorizationFailureReason | None:
+        return self._last_authorization_failure_reason
 
     def _content_page(self):
         return getattr(self.window, "content_page", _NullContentPage())

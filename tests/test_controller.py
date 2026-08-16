@@ -35,6 +35,7 @@ from telegram_downloader.file_integrity import (
 )
 from telegram_downloader.gateway import (
     AccessDeniedError,
+    AuthorizationFailureReason,
     AuthState,
     GatewayError,
     QrLoginInfo,
@@ -128,6 +129,120 @@ async def test_transient_offline_state_keeps_session_and_never_opens_login() -> 
 
 
 @pytest.mark.asyncio
+async def test_connected_transport_requires_authorized_account() -> None:
+    class Gateway:
+        def is_connected(self) -> bool:
+            return True
+
+        async def test_connection(self) -> None:
+            raise SessionExpiredError(
+                reason=AuthorizationFailureReason.AUTH_KEY_INVALID
+            )
+
+        async def disconnect(self) -> None:
+            pass
+
+    vault = Vault()
+    vault.value = {"session": "saved", "api_hash": "hash"}
+    window = ContentWindowFake()
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        vault=vault,
+        secrets=vault.load(),
+        window=window,
+    )
+    shown: list[str] = []
+    controller.show_login = lambda: shown.append("login")
+
+    assert await controller.ensure_telegram_online() is False
+    assert "连接正常" not in window.content_page.connection_states
+    assert window.content_page.logged_in is False
+    assert "session" not in controller.secrets
+    assert shown == ["login"]
+
+
+@pytest.mark.asyncio
+async def test_authorization_check_network_failure_keeps_saved_session() -> None:
+    class Gateway:
+        def is_connected(self) -> bool:
+            return True
+
+        async def test_connection(self) -> None:
+            raise TransientNetworkError("offline")
+
+    vault = Vault()
+    vault.value = {"session": "saved", "api_hash": "hash"}
+    window = ContentWindowFake()
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        vault=vault,
+        secrets=vault.load(),
+        window=window,
+    )
+
+    assert await controller.ensure_telegram_online() is False
+    assert controller.secrets["session"] == "saved"
+    assert vault.load()["session"] == "saved"
+    assert window.content_page.connection_retryable[-1] is True
+
+
+@pytest.mark.asyncio
+async def test_concurrent_session_expiry_runs_one_relogin_flow(monkeypatch) -> None:
+    class Gateway:
+        def __init__(self) -> None:
+            self.disconnects = 0
+
+        async def disconnect(self) -> None:
+            self.disconnects += 1
+
+    class Logger:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def warning(self, template, *args) -> None:
+            self.calls.append((template, args))
+
+    logger = Logger()
+    monkeypatch.setattr(controller_module, "_LOGGER", logger)
+    gateway = Gateway()
+    vault = Vault()
+    vault.value = {"session": "saved", "api_hash": "hash"}
+    window = ContentWindowFake()
+    subscription_login_states: list[bool] = []
+    window.subscriptions_page = SimpleNamespace(
+        set_logged_in=subscription_login_states.append
+    )
+    controller = AppController.for_test(
+        gateway=gateway,
+        vault=vault,
+        secrets=vault.load(),
+        window=window,
+    )
+    shown: list[str] = []
+    controller.show_login = lambda: shown.append("login")
+    error = SessionExpiredError(
+        "private server text",
+        reason=AuthorizationFailureReason.AUTH_KEY_DUPLICATED,
+    )
+
+    await asyncio.gather(
+        controller._handle_session_expired(error),
+        controller._handle_session_expired(error),
+    )
+
+    assert gateway.disconnects == 1
+    assert shown == ["login"]
+    assert subscription_login_states == [False]
+    assert controller.last_authorization_failure_reason is (
+        AuthorizationFailureReason.AUTH_KEY_DUPLICATED
+    )
+    serialized = repr(logger.calls)
+    assert "auth-key-duplicated" in serialized
+    assert "private server text" not in serialized
+    assert "private server text" not in repr(window.content_page.errors)
+
+
+@pytest.mark.asyncio
 async def test_connection_monitor_waits_30_seconds_and_shutdown_cancels_it() -> None:
     sleeping = asyncio.Event()
     blocker = asyncio.Event()
@@ -185,12 +300,18 @@ async def test_successful_login_starts_connection_monitor_after_logged_out_start
         gateway=Gateway(),
         connection_sleeper=sleep,
     )
+    controller._session_expiry_handled = True
+    controller._last_authorization_failure_reason = (
+        AuthorizationFailureReason.SESSION_REVOKED
+    )
 
     assert controller._connection_monitor_task is None
     await controller._finish_login()
 
     task = controller._connection_monitor_task
     assert task is not None
+    assert controller._session_expiry_handled is False
+    assert controller.last_authorization_failure_reason is None
     await sleeping.wait()
     assert task.done() is False
     await controller.shutdown()
