@@ -15,6 +15,7 @@ from telegram_downloader.diagnostics import (
     DiagnosticResult,
     DiagnosticStatus,
 )
+from telegram_downloader.gateway import AuthorizationFailureReason
 from telegram_downloader.paths import PortablePaths
 
 _REPORT_KEYS = frozenset(
@@ -81,7 +82,7 @@ _ALLOWED_METRICS = {
     "credentials": frozenset(
         {"settingsReadable", "secretsPresent", "secretsDecryptable"}
     ),
-    "telegram": frozenset(),
+    "telegram": frozenset({"authorizationReason"}),
     "updates": frozenset(
         {
             "githubStatus",
@@ -119,6 +120,10 @@ _BOOLEAN_METRICS = frozenset(
 )
 _SOURCE_STATUS_METRICS = frozenset({"githubStatus", "modelscopeStatus"})
 _VERSION_METRICS = frozenset({"githubVersion", "modelscopeVersion"})
+_AUTHORIZATION_REASON_METRICS = frozenset({"authorizationReason"})
+_SAFE_AUTHORIZATION_REASONS = frozenset(
+    reason.value for reason in AuthorizationFailureReason
+)
 _SAFE_VERSION = re.compile(r"\d+\.\d+\.\d+\Z")
 _RESULT_TITLES = {
     "environment": "运行环境与路径",
@@ -563,6 +568,8 @@ def _validate_report_contract(report: DiagnosticReport) -> None:
                 }
             elif key in _VERSION_METRICS:
                 valid = isinstance(value, str) and _SAFE_VERSION.fullmatch(value) is not None
+            elif key in _AUTHORIZATION_REASON_METRICS:
+                valid = isinstance(value, str) and value in _SAFE_AUTHORIZATION_REASONS
             else:
                 valid = (
                     isinstance(value, int)

@@ -35,7 +35,11 @@ from telegram_downloader.domain import (
     TaskRecord,
     TaskStatus,
 )
-from telegram_downloader.gateway import SessionExpiredError, TransientNetworkError
+from telegram_downloader.gateway import (
+    AuthorizationFailureReason,
+    SessionExpiredError,
+    TransientNetworkError,
+)
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.repository import TaskRepository
 from telegram_downloader.update_sources import SourceCheck, SourceStatus, UpdateSourceId
@@ -398,9 +402,20 @@ class Gateway:
 async def test_telegram_probe_maps_connection_outcomes_without_error_text() -> None:
     skipped = await probe_telegram(None)
     ready = await probe_telegram(Gateway())
-    expired = await probe_telegram(Gateway(SessionExpiredError("private-session")))
+    expired = await probe_telegram(
+        Gateway(
+            SessionExpiredError(
+                "private-session",
+                reason=AuthorizationFailureReason.SESSION_REVOKED,
+            )
+        )
+    )
     offline = await probe_telegram(Gateway(TransientNetworkError("private-network")))
     broken = await probe_telegram(Gateway(RuntimeError("private-unknown")))
+    retained = await probe_telegram(
+        None,
+        authorization_reason=AuthorizationFailureReason.AUTH_KEY_DUPLICATED,
+    )
 
     assert (skipped.status, skipped.code) == (
         DiagnosticStatus.SKIPPED,
@@ -414,6 +429,8 @@ async def test_telegram_probe_maps_connection_outcomes_without_error_text() -> N
         DiagnosticStatus.FAILED,
         "telegram-session-expired",
     )
+    assert expired.metrics == {"authorizationReason": "session-revoked"}
+    assert "private-session" not in repr(dict(expired.metrics))
     assert (offline.status, offline.code) == (
         DiagnosticStatus.WARNING,
         "telegram-network-unavailable",
@@ -422,9 +439,14 @@ async def test_telegram_probe_maps_connection_outcomes_without_error_text() -> N
         DiagnosticStatus.FAILED,
         "telegram-check-failed",
     )
+    assert (retained.status, retained.code) == (
+        DiagnosticStatus.FAILED,
+        "telegram-session-expired",
+    )
+    assert retained.metrics == {"authorizationReason": "auth-key-duplicated"}
     assert all(
         "private" not in item.summary
-        for item in (skipped, ready, expired, offline, broken)
+        for item in (skipped, ready, expired, offline, broken, retained)
     )
 
 

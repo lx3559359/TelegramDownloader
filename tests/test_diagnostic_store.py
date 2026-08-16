@@ -43,6 +43,38 @@ def report(
     )
 
 
+def telegram_expired_report(reason: str) -> DiagnosticReport:
+    result = DiagnosticResult(
+        "telegram",
+        "Telegram 连接",
+        DiagnosticStatus.FAILED,
+        "telegram-session-expired",
+        "Telegram 登录会话已失效",
+        3,
+        {"authorizationReason": reason},
+    )
+    return DiagnosticReport.build(
+        "0.11.0",
+        NOW,
+        NOW + timedelta(seconds=1),
+        (result,),
+    )
+
+
+def test_report_accepts_only_whitelisted_authorization_reasons(tmp_path: Path) -> None:
+    store = DiagnosticReportStore(PortablePaths(tmp_path), secrets=set())
+
+    payload = store.serialize(telegram_expired_report("auth-key-duplicated"))
+
+    assert json.loads(payload)["results"][0]["metrics"] == {
+        "authorizationReason": "auth-key-duplicated"
+    }
+    with pytest.raises(DiagnosticPrivacyError, match="白名单"):
+        store.serialize(
+            telegram_expired_report("SessionExpiredError: private-session")
+        )
+
+
 def test_report_serialization_is_canonical_schema_one_and_round_trips(
     tmp_path: Path,
 ) -> None:

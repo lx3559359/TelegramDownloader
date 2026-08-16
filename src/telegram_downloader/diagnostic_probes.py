@@ -14,7 +14,11 @@ from typing import Protocol
 from uuid import uuid4
 
 from telegram_downloader.diagnostics import DiagnosticResult, DiagnosticStatus
-from telegram_downloader.gateway import SessionExpiredError, TransientNetworkError
+from telegram_downloader.gateway import (
+    AuthorizationFailureReason,
+    SessionExpiredError,
+    TransientNetworkError,
+)
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.update_sources import SourceCheck, SourceStatus, UpdateSourceId
 
@@ -421,7 +425,13 @@ def probe_credentials(
     )
 
 
-async def probe_telegram(gateway: ConnectionProbe | None) -> DiagnosticResult:
+async def probe_telegram(
+    gateway: ConnectionProbe | None,
+    *,
+    authorization_reason: AuthorizationFailureReason | None = None,
+) -> DiagnosticResult:
+    if authorization_reason is not None:
+        return _telegram_authorization_failure(authorization_reason)
     if gateway is None:
         return _result(
             "telegram",
@@ -434,14 +444,8 @@ async def probe_telegram(gateway: ConnectionProbe | None) -> DiagnosticResult:
         await gateway.test_connection()
     except asyncio.CancelledError:
         raise
-    except SessionExpiredError:
-        return _result(
-            "telegram",
-            "Telegram 连接",
-            DiagnosticStatus.FAILED,
-            "telegram-session-expired",
-            "Telegram 登录会话已失效",
-        )
+    except SessionExpiredError as error:
+        return _telegram_authorization_failure(error.reason)
     except TransientNetworkError:
         return _result(
             "telegram",
@@ -464,6 +468,19 @@ async def probe_telegram(gateway: ConnectionProbe | None) -> DiagnosticResult:
         DiagnosticStatus.PASSED,
         "telegram-connected",
         "Telegram 登录会话和连接正常",
+    )
+
+
+def _telegram_authorization_failure(
+    reason: AuthorizationFailureReason,
+) -> DiagnosticResult:
+    return _result(
+        "telegram",
+        "Telegram 连接",
+        DiagnosticStatus.FAILED,
+        "telegram-session-expired",
+        "Telegram 登录会话已失效",
+        {"authorizationReason": reason.value},
     )
 
 
