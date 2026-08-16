@@ -90,6 +90,23 @@ def test_page_contains_content_browser_controls(qtbot) -> None:
     assert page.result_table.verticalHeader().defaultSectionSize() == 96
 
 
+def test_account_content_card_structure_keeps_filter_minimums(qtbot) -> None:
+    page = ContentBrowserPage()
+    qtbot.addWidget(page)
+
+    assert page.objectName() == "accountContentPage"
+    assert page.dialog_card.objectName() == "accountContentCard"
+    assert page.filter_card.objectName() == "accountContentCard"
+    assert page.results_card.objectName() == "accountContentCard"
+    assert page.dialog_card.minimumWidth() == 210
+    assert page.dialog_card.maximumWidth() == 270
+    assert page.search_column.minimumWidth() >= 680
+    assert page.date_from.minimumWidth() >= 132
+    assert page.date_to.minimumWidth() >= 132
+    assert page.limit_input.minimumWidth() >= 90
+    assert page.error_label.parentWidget() is page.filter_card
+
+
 def test_progress_and_retry_widgets_show_honest_operation_state(qtbot) -> None:
     page = ContentBrowserPage()
     qtbot.addWidget(page)
