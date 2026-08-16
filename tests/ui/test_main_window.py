@@ -1,10 +1,12 @@
 from dataclasses import replace
+from datetime import UTC, datetime
 
 import pytest
 from PySide6.QtCore import QItemSelectionModel, Qt
 from PySide6.QtWidgets import QAbstractItemView, QMessageBox
 
-from telegram_downloader.domain import ItemStatus, MediaKind, TaskStatus
+from telegram_downloader.domain import IntegrityStatus, ItemStatus, MediaKind, TaskStatus
+from telegram_downloader.file_integrity import IntegrityProgress
 from telegram_downloader.ui.main import MainWindow
 from telegram_downloader.ui.models import (
     TaskFilter,
@@ -200,13 +202,54 @@ def test_task_item_model_formats_status_progress_size_and_id() -> None:
     assert model.data(model.index(0, 0), Qt.ItemDataRole.UserRole) == "item"
     assert model.data(model.index(0, 1)) == "视频"
     assert model.data(model.index(0, 2)) == "已完成"
-    assert model.data(model.index(0, 3)) == "100%"
-    assert model.data(model.index(0, 4)) == "10 B / 10 B"
-    assert model.data(model.index(0, 5)) == "2"
-    assert model.data(model.index(1, 3)) == "—"
-    assert model.data(model.index(1, 4)) == "3 B / 未知"
+    assert model.data(model.index(0, 3)) == "未校验"
+    assert model.data(model.index(0, 4)) == "100%"
+    assert model.data(model.index(0, 5)) == "10 B / 10 B"
+    assert model.data(model.index(0, 6)) == "2"
+    assert model.data(model.index(1, 4)) == "—"
+    assert model.data(model.index(1, 5)) == "3 B / 未知"
     assert model.item_at(0).id == "item"
     assert model.item_at(99) is None
+
+
+def test_task_item_model_formats_integrity_and_verified_tooltip() -> None:
+    model = TaskItemTableModel()
+    verified_at = datetime(2026, 8, 16, 8, 9, tzinfo=UTC)
+    model.set_items(
+        [
+            TaskItemSummary(
+                "verified",
+                "ok.bin",
+                MediaKind.DOCUMENT,
+                ItemStatus.COMPLETED,
+                4,
+                4,
+                0,
+                "—",
+                IntegrityStatus.VERIFIED,
+                verified_at,
+            ),
+            TaskItemSummary(
+                "broken",
+                "bad.bin",
+                MediaKind.DOCUMENT,
+                ItemStatus.FAILED,
+                4,
+                4,
+                0,
+                "本地文件哈希不一致",
+                IntegrityStatus.HASH_MISMATCH,
+            ),
+        ]
+    )
+
+    assert model.headerData(3, Qt.Orientation.Horizontal) == "完整性"
+    assert model.data(model.index(0, 3)) == "已校验"
+    assert "2026-08-16 08:09 UTC" in model.data(
+        model.index(0, 3),
+        Qt.ItemDataRole.ToolTipRole,
+    )
+    assert model.data(model.index(1, 3)) == "哈希异常"
 
 
 def test_scan_busy_state_disables_source_controls(qtbot) -> None:
@@ -369,6 +412,139 @@ def test_single_task_selection_loads_details_and_emits_open_media(qtbot) -> None
     with qtbot.waitSignal(window.open_media_requested, timeout=500) as caught:
         window.task_item_table.doubleClicked.emit(window.task_item_model.index(0, 0))
     assert caught.args == ["media"]
+
+
+def test_integrity_actions_use_stable_selected_media_ids(qtbot, monkeypatch) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.set_task_summaries(
+        [TaskSummary("done", "Done", TaskStatus.COMPLETED, "2 / 2", "8 B", "—", "—", "—")]
+    )
+    window.task_table.selectRow(0)
+    window.set_task_items(
+        "done",
+        [
+            TaskItemSummary(
+                "healthy",
+                "healthy.bin",
+                MediaKind.DOCUMENT,
+                ItemStatus.COMPLETED,
+                4,
+                4,
+                0,
+                "—",
+                IntegrityStatus.VERIFIED,
+            ),
+            TaskItemSummary(
+                "broken",
+                "broken.bin",
+                MediaKind.DOCUMENT,
+                ItemStatus.FAILED,
+                4,
+                4,
+                0,
+                "本地文件缺失",
+                IntegrityStatus.MISSING,
+            ),
+        ],
+    )
+    selection = window.task_item_table.selectionModel()
+    flags = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+    selection.select(window.task_item_model.index(0, 0), flags)
+    selection.select(window.task_item_model.index(1, 0), flags)
+
+    assert (
+        window.task_item_table.selectionMode()
+        is QAbstractItemView.SelectionMode.ExtendedSelection
+    )
+    assert window.selected_media_ids() == ["healthy", "broken"]
+    assert window.open_file_button.isEnabled() is False
+    with qtbot.waitSignal(window.verify_media_requested, timeout=500) as verify:
+        qtbot.mouseClick(window.verify_media_button, Qt.MouseButton.LeftButton)
+    assert verify.args == [["healthy", "broken"]]
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    with qtbot.waitSignal(window.repair_media_requested, timeout=500) as repair:
+        qtbot.mouseClick(window.repair_media_button, Qt.MouseButton.LeftButton)
+    assert repair.args == [["broken"]]
+
+
+def test_integrity_busy_progress_and_cancel_feedback(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_task_summaries(
+        [TaskSummary("done", "Done", TaskStatus.COMPLETED, "1 / 1", "4 B", "—", "—", "—")]
+    )
+    window.task_table.selectRow(0)
+    window.set_task_items(
+        "done",
+        [
+            TaskItemSummary(
+                "media",
+                "file.bin",
+                MediaKind.DOCUMENT,
+                ItemStatus.COMPLETED,
+                4,
+                4,
+                0,
+                "—",
+            )
+        ],
+    )
+    window.task_item_table.selectRow(0)
+
+    window.set_integrity_busy(True)
+    window.set_integrity_progress(
+        IntegrityProgress(1, 3, "media", "file.bin", IntegrityStatus.VERIFIED)
+    )
+
+    assert window.integrity_progress_panel.isVisibleTo(window) is True
+    assert window.integrity_progress.value() == 1
+    assert window.integrity_progress.maximum() == 3
+    assert "file.bin" in window.integrity_progress_label.text()
+    assert window.verify_media_button.isEnabled() is False
+    assert window.repair_media_button.isEnabled() is False
+    assert window.verify_tasks_button.isEnabled() is False
+    with qtbot.waitSignal(window.integrity_cancel_requested, timeout=500):
+        qtbot.mouseClick(window.integrity_cancel_button, Qt.MouseButton.LeftButton)
+
+    window.set_integrity_busy(False)
+    assert window.integrity_progress_panel.isHidden() is True
+    assert window.verify_media_button.isEnabled() is True
+
+
+def test_task_level_verify_emits_completed_and_partial_task_ids(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.set_task_summaries(
+        [
+            TaskSummary("done", "Done", TaskStatus.COMPLETED, "1 / 1", "4 B", "—", "—", "—"),
+            TaskSummary(
+                "partial",
+                "Partial",
+                TaskStatus.PARTIAL_FAILURE,
+                "0 / 1",
+                "4 B",
+                "—",
+                "—",
+                "缺失",
+            ),
+        ]
+    )
+    selection = window.task_table.selectionModel()
+    flags = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+    selection.select(window.task_model.index(0, 0), flags)
+    selection.select(window.task_model.index(1, 0), flags)
+
+    with qtbot.waitSignal(window.verify_tasks_requested, timeout=500) as signal:
+        qtbot.mouseClick(window.verify_tasks_button, Qt.MouseButton.LeftButton)
+
+    assert signal.args == [["done", "partial"]]
 
 
 def test_synchronous_detail_result_is_not_overwritten_by_loading_hint(qtbot) -> None:

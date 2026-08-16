@@ -317,7 +317,7 @@ git commit -m "feat: run selected media repairs"
 - Modify: `tests/ui/test_main_window.py`
 - Modify: `tests/ui/test_content_models.py` only if shared helpers require it
 
-- [ ] **Step 1: Write failing model and interaction tests**
+- [x] **Step 1: Write failing model and interaction tests**
 
 Assert the new “完整性” column text and verified-time tooltip. Assert detail table extended selection, stable selected media IDs, verify/repair signal payloads, confirmation for repair, button enable rules, busy progress text, cancellation signal, and unchanged double-click open behavior.
 
@@ -337,17 +337,17 @@ def test_integrity_actions_use_selected_media_ids(qtbot, monkeypatch) -> None:
     assert repair.args == [["b"]]
 ```
 
-- [ ] **Step 2: Run UI tests and confirm RED**
+- [x] **Step 2: Run UI tests and confirm RED**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/ui/test_main_window.py -k "integrity or selected_media" -q`
 
 Expected: missing summary fields, signals, buttons, and progress widgets.
 
-- [ ] **Step 3: Extend summaries and table model**
+- [x] **Step 3: Extend summaries and table model**
 
 Add `integrity_status` and `verified_at` defaults to `TaskItemSummary`; add the column after status. Map enum values to fixed Chinese labels and expose the UTC timestamp only through `Qt.ToolTipRole`.
 
-- [ ] **Step 4: Add multi-select actions and progress UI**
+- [x] **Step 4: Add multi-select actions and progress UI**
 
 Use `ExtendedSelection`. Add signals:
 
@@ -360,13 +360,13 @@ integrity_cancel_requested = Signal()
 
 Add `校验所选`, `重新下载所选`, and task-level `校验文件`; add a hidden progress row with label, determinate progress bar, and `取消校验`. Implement `set_integrity_progress(progress_or_none)` and `set_integrity_busy(busy)` without disabling navigation or close.
 
-- [ ] **Step 5: Run UI tests and minimum-size offscreen layout test**
+- [x] **Step 5: Run UI tests and minimum-size offscreen layout test**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/ui/test_main_window.py tests/ui/test_content_models.py -q`
 
 Expected: all pass at existing 1180×720 and 1280×780 coverage.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```powershell
 git add src/telegram_downloader/ui/models.py src/telegram_downloader/ui/main.py tests/ui/test_main_window.py tests/ui/test_content_models.py

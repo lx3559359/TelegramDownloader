@@ -27,7 +27,8 @@ from PySide6.QtWidgets import (
 )
 
 from telegram_downloader import __version__
-from telegram_downloader.domain import ItemStatus, MediaKind, TaskStatus
+from telegram_downloader.domain import IntegrityStatus, ItemStatus, MediaKind, TaskStatus
+from telegram_downloader.file_integrity import IntegrityProgress
 from telegram_downloader.ui.content_browser import ContentBrowserPage
 from telegram_downloader.ui.models import (
     TaskFilter,
@@ -57,6 +58,15 @@ _TASK_FILTER_LABELS = {
     TaskFilter.ARCHIVED: "已归档",
 }
 
+_INTEGRITY_FAILURES = frozenset(
+    {
+        IntegrityStatus.MISSING,
+        IntegrityStatus.SIZE_MISMATCH,
+        IntegrityStatus.HASH_MISMATCH,
+        IntegrityStatus.READ_ERROR,
+    }
+)
+
 
 class MainWindow(QMainWindow):
     scan_requested = Signal(str)
@@ -73,6 +83,10 @@ class MainWindow(QMainWindow):
     archive_tasks_requested = Signal(object)
     restore_tasks_requested = Signal(object)
     open_media_requested = Signal(str)
+    verify_media_requested = Signal(object)
+    repair_media_requested = Signal(object)
+    verify_tasks_requested = Signal(object)
+    integrity_cancel_requested = Signal()
     settings_requested = Signal()
     login_requested = Signal()
 
@@ -80,6 +94,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._restoring_task_selection = False
         self._detail_task_id: str | None = None
+        self._integrity_busy = False
         self.setWindowTitle("Telegram 下载器")
         self.setMinimumSize(1180, 720)
         self.resize(1280, 780)
@@ -129,10 +144,16 @@ class MainWindow(QMainWindow):
         self.archive_button.clicked.connect(self._confirm_archive)
         self.restore_button.clicked.connect(self._confirm_restore)
         self.open_file_button.clicked.connect(self._emit_selected_media)
+        self.verify_media_button.clicked.connect(self._emit_verify_media)
+        self.repair_media_button.clicked.connect(self._confirm_repair_media)
+        self.verify_tasks_button.clicked.connect(self._emit_verify_tasks)
+        self.integrity_cancel_button.clicked.connect(self._emit_integrity_cancel)
         self.task_search.textChanged.connect(self._apply_task_filter)
         self.task_filter.currentIndexChanged.connect(self._apply_task_filter)
         self.task_table.selectionModel().selectionChanged.connect(self._task_selection_changed)
-        self.task_item_table.selectionModel().selectionChanged.connect(self._update_open_file_state)
+        self.task_item_table.selectionModel().selectionChanged.connect(
+            self._update_media_action_state
+        )
         self.task_item_table.doubleClicked.connect(self._emit_open_media)
         self.tasks_nav_button.clicked.connect(lambda: self.show_page("tasks"))
         self.content_nav_button.clicked.connect(lambda: self.show_page("content"))
@@ -275,16 +296,36 @@ class MainWindow(QMainWindow):
         detail_header.addSpacing(8)
         detail_header.addWidget(self.task_detail_hint)
         detail_header.addStretch()
+        self.verify_media_button = QPushButton("校验所选")
+        self.repair_media_button = QPushButton("重新下载所选")
         self.open_file_button = QPushButton("打开文件")
+        detail_header.addWidget(self.verify_media_button)
+        detail_header.addWidget(self.repair_media_button)
         detail_header.addWidget(self.open_file_button)
         detail_layout.addLayout(detail_header)
+
+        self.integrity_progress_panel = QWidget()
+        integrity_progress_layout = QHBoxLayout(self.integrity_progress_panel)
+        integrity_progress_layout.setContentsMargins(0, 0, 0, 0)
+        integrity_progress_layout.setSpacing(8)
+        self.integrity_progress_label = QLabel("正在准备校验…")
+        self.integrity_progress_label.setObjectName("muted")
+        self.integrity_progress = QProgressBar()
+        self.integrity_progress.setTextVisible(True)
+        self.integrity_progress.setMinimumWidth(180)
+        self.integrity_cancel_button = QPushButton("取消校验")
+        integrity_progress_layout.addWidget(self.integrity_progress_label)
+        integrity_progress_layout.addWidget(self.integrity_progress, 1)
+        integrity_progress_layout.addWidget(self.integrity_cancel_button)
+        self.integrity_progress_panel.hide()
+        detail_layout.addWidget(self.integrity_progress_panel)
 
         self.task_item_model = TaskItemTableModel()
         self.task_item_table = QTableView()
         self.task_item_table.setModel(self.task_item_model)
         self.task_item_table.setAlternatingRowColors(True)
         self.task_item_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.task_item_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.task_item_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.task_item_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.task_item_table.setShowGrid(False)
         self.task_item_table.verticalHeader().hide()
@@ -311,6 +352,7 @@ class MainWindow(QMainWindow):
         self.pause_button = QPushButton("暂停")
         self.resume_button = QPushButton("继续")
         self.retry_button = QPushButton("重试失败项")
+        self.verify_tasks_button = QPushButton("校验文件")
         self.archive_button = QPushButton("归档所选")
         self.restore_button = QPushButton("恢复所选")
         self.open_button = QPushButton("打开目录")
@@ -318,6 +360,7 @@ class MainWindow(QMainWindow):
             self.pause_button,
             self.resume_button,
             self.retry_button,
+            self.verify_tasks_button,
             self.archive_button,
             self.restore_button,
             self.open_button,
@@ -506,13 +549,21 @@ class MainWindow(QMainWindow):
         self.retry_button.setEnabled(
             any(not task.archived and task.status is TaskStatus.PARTIAL_FAILURE for task in tasks)
         )
+        self.verify_tasks_button.setEnabled(
+            not self._integrity_busy
+            and any(
+                not task.archived
+                and task.status in {TaskStatus.COMPLETED, TaskStatus.PARTIAL_FAILURE}
+                for task in tasks
+            )
+        )
         self.archive_button.setEnabled(
             bool(tasks)
             and all(not task.archived and task.status is TaskStatus.COMPLETED for task in tasks)
         )
         self.restore_button.setEnabled(bool(tasks) and all(task.archived for task in tasks))
         self.open_button.setEnabled(len(tasks) == 1)
-        self._update_open_file_state()
+        self._update_media_action_state()
 
     def _selected_task_summary(self) -> TaskSummary | None:
         tasks = self._selected_task_summaries()
@@ -595,11 +646,15 @@ class MainWindow(QMainWindow):
         tasks = self._selected_task_summaries()
         if len(tasks) != 1 or tasks[0].id != task_id:
             return
+        selected_media_ids = (
+            self.selected_media_ids() if self._detail_task_id == task_id else []
+        )
         self._detail_task_id = task_id
         self.task_detail_title.setText(tasks[0].title)
         self.task_detail_hint.setText(f"共 {len(items)} 个媒体文件")
         self.task_item_model.set_items(items)
-        self._update_open_file_state()
+        self._restore_media_selection(selected_media_ids)
+        self._update_media_action_state()
 
     def _task_selection_changed(self, *_args) -> None:
         if self._restoring_task_selection:
@@ -627,7 +682,7 @@ class MainWindow(QMainWindow):
         self.task_detail_title.setText(title)
         self.task_detail_hint.setText(hint)
         self.task_item_model.set_items([])
-        self._update_open_file_state()
+        self._update_media_action_state()
 
     def _restore_task_selection(self, task_ids: list[str]) -> None:
         selection = self.task_table.selectionModel()
@@ -636,6 +691,17 @@ class MainWindow(QMainWindow):
             row = self.task_model.row_for_task_id(task_id)
             if row is not None:
                 selection.select(self.task_model.index(row, 0), flags)
+
+    def _restore_media_selection(self, item_ids: list[str]) -> None:
+        wanted = set(item_ids)
+        if not wanted:
+            return
+        selection = self.task_item_table.selectionModel()
+        flags = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+        for row in range(self.task_item_model.rowCount()):
+            item = self.task_item_model.item_at(row)
+            if item is not None and item.id in wanted:
+                selection.select(self.task_item_model.index(row, 0), flags)
 
     def _apply_task_filter(self, *_args) -> None:
         selected_task_ids = self.selected_task_ids()
@@ -692,25 +758,132 @@ class MainWindow(QMainWindow):
         if answer is QMessageBox.StandardButton.Yes:
             self.restore_tasks_requested.emit(task_ids)
 
-    def _selected_media_summary(self) -> TaskItemSummary | None:
-        rows = self.task_item_table.selectionModel().selectedRows()
-        if not rows:
-            return None
-        return self.task_item_model.item_at(rows[0].row())
+    def _selected_media_summaries(self) -> list[TaskItemSummary]:
+        items: list[TaskItemSummary] = []
+        rows = sorted(
+            {index.row() for index in self.task_item_table.selectionModel().selectedRows()}
+        )
+        for row in rows:
+            item = self.task_item_model.item_at(row)
+            if item is not None:
+                items.append(item)
+        return items
 
-    def _update_open_file_state(self, *_args) -> None:
-        item = self._selected_media_summary()
-        self.open_file_button.setEnabled(item is not None and item.status is ItemStatus.COMPLETED)
+    def _selected_media_summary(self) -> TaskItemSummary | None:
+        items = self._selected_media_summaries()
+        return items[0] if len(items) == 1 else None
+
+    def selected_media_ids(self) -> list[str]:
+        return [item.id for item in self._selected_media_summaries()]
+
+    @staticmethod
+    def _can_open_media(item: TaskItemSummary) -> bool:
+        return (
+            item.status is ItemStatus.COMPLETED
+            and item.integrity_status not in _INTEGRITY_FAILURES
+        )
+
+    @staticmethod
+    def _can_verify_media(item: TaskItemSummary) -> bool:
+        return (
+            item.status is ItemStatus.COMPLETED
+            or item.integrity_status in _INTEGRITY_FAILURES
+        )
+
+    def _update_media_action_state(self, *_args) -> None:
+        items = self._selected_media_summaries()
+        single = items[0] if len(items) == 1 else None
+        self.open_file_button.setEnabled(
+            single is not None and self._can_open_media(single)
+        )
+        self.verify_media_button.setEnabled(
+            not self._integrity_busy and any(self._can_verify_media(item) for item in items)
+        )
+        self.repair_media_button.setEnabled(
+            not self._integrity_busy
+            and any(item.integrity_status in _INTEGRITY_FAILURES for item in items)
+        )
 
     def _emit_selected_media(self) -> None:
         item = self._selected_media_summary()
-        if item is not None and item.status is ItemStatus.COMPLETED:
+        if item is not None and self._can_open_media(item):
             self.open_media_requested.emit(item.id)
 
     def _emit_open_media(self, index) -> None:
         item = self.task_item_model.item_at(index.row())
-        if item is not None and item.status is ItemStatus.COMPLETED:
+        if item is not None and self._can_open_media(item):
             self.open_media_requested.emit(item.id)
+
+    def _emit_verify_media(self) -> None:
+        item_ids = [
+            item.id
+            for item in self._selected_media_summaries()
+            if self._can_verify_media(item)
+        ]
+        if item_ids and not self._integrity_busy:
+            self.verify_media_requested.emit(item_ids)
+
+    def _confirm_repair_media(self) -> None:
+        item_ids = [
+            item.id
+            for item in self._selected_media_summaries()
+            if item.integrity_status in _INTEGRITY_FAILURES
+        ]
+        if not item_ids or self._integrity_busy:
+            return
+        answer = QMessageBox.question(
+            self,
+            "重新下载异常文件",
+            f"重新下载所选 {len(item_ids)} 个异常文件？"
+            "现有文件和分片会先保留为 .corrupt* 留档。",
+        )
+        if answer is QMessageBox.StandardButton.Yes:
+            self.repair_media_requested.emit(item_ids)
+
+    def _emit_verify_tasks(self) -> None:
+        task_ids = [
+            task.id
+            for task in self._selected_task_summaries()
+            if not task.archived
+            and task.status in {TaskStatus.COMPLETED, TaskStatus.PARTIAL_FAILURE}
+        ]
+        if task_ids and not self._integrity_busy:
+            self.verify_tasks_requested.emit(task_ids)
+
+    def _emit_integrity_cancel(self) -> None:
+        if not self._integrity_busy:
+            return
+        self.integrity_progress_label.setText("正在取消校验…")
+        self.integrity_cancel_button.setEnabled(False)
+        self.integrity_cancel_requested.emit()
+
+    def set_integrity_busy(self, busy: bool) -> None:
+        self._integrity_busy = bool(busy)
+        if busy:
+            self.integrity_progress_label.setText("正在准备校验…")
+            self.integrity_progress.setRange(0, 0)
+            self.integrity_progress_panel.show()
+            self.integrity_cancel_button.setEnabled(True)
+        else:
+            self.integrity_progress_panel.hide()
+            self.integrity_progress.setRange(0, 1)
+            self.integrity_progress.setValue(0)
+            self.integrity_cancel_button.setEnabled(False)
+        self._update_action_state()
+        self._update_media_action_state()
+
+    def set_integrity_progress(self, progress: IntegrityProgress | None) -> None:
+        if progress is None:
+            if not self._integrity_busy:
+                self.integrity_progress_panel.hide()
+            return
+        self.integrity_progress_panel.show()
+        self.integrity_progress_label.setText(f"正在校验 {progress.file_name}")
+        self.integrity_progress.setRange(0, max(1, progress.total))
+        self.integrity_progress.setValue(progress.completed)
+        self.integrity_progress.setFormat(
+            f"{progress.completed} / {progress.total}"
+        )
 
     @staticmethod
     def _format_rate(value: float) -> str:
