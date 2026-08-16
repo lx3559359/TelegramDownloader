@@ -41,6 +41,11 @@ foreach ($required in ('TelegramDownloader.exe', 'UpdateHelper.exe', 'runtime-ma
     }
 }
 
+$python = Join-Path $projectRoot '.venv\Scripts\python.exe'
+$version = & $python -c "from telegram_downloader import __version__; print(__version__)"
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$setup = Assert-ProjectChild (Join-Path $releaseDir "TelegramDownloader-$version-win-x64-setup.exe")
+
 if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
     $innoInstaller = Assert-ProjectChild (Join-Path $downloadCache 'innosetup-7.0.2-x64.exe')
     $expectedHash = '5ad54ca3def786f8f4212552e54cc6d8d61329e2d24a1cfee0571d42c2684ff1'
@@ -79,18 +84,11 @@ if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
     throw "Inno Setup compiler missing: $compiler"
 }
 
-if (Test-Path -LiteralPath $releaseDir) {
-    $resolvedRelease = [IO.Path]::GetFullPath($releaseDir)
-    if (-not $resolvedRelease.StartsWith($projectPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "Release cleanup escaped project: $resolvedRelease"
-    }
-    Remove-Item -LiteralPath $resolvedRelease -Recurse -Force
-}
 New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+if (Test-Path -LiteralPath $setup -PathType Leaf) {
+    Remove-Item -LiteralPath $setup -Force
+}
 
-$python = Join-Path $projectRoot '.venv\Scripts\python.exe'
-$version = & $python -c "from telegram_downloader import __version__; print(__version__)"
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $compileLog = Assert-ProjectChild (Join-Path $buildTemp 'iscc.log')
 $compilerStart = [Diagnostics.ProcessStartInfo]::new()
 $compilerStart.FileName = $compiler
@@ -122,7 +120,6 @@ if ($compilerProcess.ExitCode -ne 0) {
     throw "Inno Setup compiler failed: $($compilerProcess.ExitCode)"
 }
 
-$setup = Assert-ProjectChild (Join-Path $releaseDir "TelegramDownloader-$version-win-x64-setup.exe")
 if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) {
     throw "Installer output missing: $setup"
 }

@@ -156,3 +156,18 @@ def test_build_preserves_existing_project_local_runtime_data() -> None:
         "Portable ZIP unexpectedly contains user data",
     ):
         assert required in script
+
+
+def test_packaging_cleanup_preserves_versioned_direct_run_releases() -> None:
+    root = Path(__file__).parents[1]
+    build = (root / "scripts/build.ps1").read_text(encoding="utf-8")
+    installer = (root / "scripts/build-installer.ps1").read_text(encoding="utf-8")
+
+    assert "$ownedBuildOutputs" in build
+    assert "foreach ($directory in ($work, $dist))" not in build
+    owned_outputs = build.split("$ownedBuildOutputs = @(", 1)[1].split(")", 1)[0]
+    assert "$dist" not in owned_outputs
+    assert "$existingAppDir" in owned_outputs
+    assert "$helperOutput" in owned_outputs
+    assert "Remove-Item -LiteralPath $releaseDir -Recurse -Force" not in installer
+    assert "Remove-Item -LiteralPath $setup -Force" in installer
