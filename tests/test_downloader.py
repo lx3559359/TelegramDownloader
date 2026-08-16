@@ -1,3 +1,4 @@
+import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -29,6 +30,7 @@ class FakeGateway:
 class FakeRepository:
     def __init__(self):
         self.updates = []
+        self.completed = []
 
     def update_item_progress(
         self,
@@ -39,6 +41,9 @@ class FakeRepository:
         retry_count=None,
     ):
         self.updates.append((item_id, downloaded_bytes, status))
+
+    def complete_item(self, item_id, downloaded_bytes, sha256, verified_at):
+        self.completed.append((item_id, downloaded_bytes, sha256, verified_at))
 
 
 def item(target: Path, size: int | None = 6) -> MediaItem:
@@ -83,7 +88,12 @@ async def test_resumes_from_part_size_and_atomically_finishes(tmp_path: Path) ->
     assert gateway.offset == 2
     assert target.read_bytes() == b"abcdef"
     assert not target.with_suffix(".mp4.part").exists()
-    assert repo.updates[-1] == ("i", 6, ItemStatus.COMPLETED)
+    assert repo.completed[0][0:3] == (
+        "i",
+        6,
+        hashlib.sha256(b"abcdef").hexdigest(),
+    )
+    assert repo.completed[0][3].tzinfo is not None
 
 
 @pytest.mark.asyncio
@@ -138,6 +148,7 @@ async def test_pause_retains_partial_and_persists_exact_offset(tmp_path: Path) -
 
     assert target.with_suffix(".mp4.part").read_bytes() == b"ab"
     assert repo.updates[-1] == ("i", 2, ItemStatus.PAUSED)
+    assert repo.completed == []
 
 
 @pytest.mark.asyncio
@@ -146,13 +157,13 @@ async def test_size_mismatch_keeps_partial_and_never_creates_final(tmp_path: Pat
     paths.ensure_layout()
     target = paths.downloads / "x.mp4"
 
+    repo = FakeRepository()
     with pytest.raises(SizeMismatchError):
-        await downloader(paths, FakeGateway([b"abc"]), FakeRepository()).download(
-            item(target)
-        )
+        await downloader(paths, FakeGateway([b"abc"]), repo).download(item(target))
 
     assert target.with_suffix(".mp4.part").read_bytes() == b"abc"
     assert not target.exists()
+    assert repo.completed == []
 
 
 @pytest.mark.asyncio
@@ -166,7 +177,27 @@ async def test_existing_verified_final_skips_network(tmp_path: Path) -> None:
     await downloader(paths, gateway, repo).download(item(target))
 
     assert gateway.calls == 0
-    assert repo.updates[-1] == ("i", 6, ItemStatus.COMPLETED)
+    assert repo.completed[0][0:3] == (
+        "i",
+        6,
+        hashlib.sha256(b"abcdef").hexdigest(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_fresh_download_records_sha256(tmp_path: Path) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    target = paths.downloads / "x.mp4"
+    gateway, repo = FakeGateway([b"abc", b"def"]), FakeRepository()
+
+    await downloader(paths, gateway, repo).download(item(target))
+
+    assert repo.completed[0][0:3] == (
+        "i",
+        6,
+        hashlib.sha256(b"abcdef").hexdigest(),
+    )
 
 
 @pytest.mark.asyncio

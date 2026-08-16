@@ -560,3 +560,21 @@ def test_prepare_integrity_repair_resets_only_an_integrity_failed_item(
 
     with pytest.raises(ValueError, match="完整性异常"):
         repo.prepare_integrity_repair(item.id)
+
+
+def test_complete_item_atomically_records_verified_hash(tmp_path: Path) -> None:
+    repo = TaskRepository(tmp_path / "tasks.sqlite3")
+    repo.initialize()
+    task, item = records(tmp_path)
+    repo.create_task(task, [replace(item, status=ItemStatus.DOWNLOADING)])
+    verified_at = datetime(2026, 8, 16, 5, 6, tzinfo=UTC)
+
+    repo.complete_item(item.id, 8, "d" * 64, verified_at)
+
+    saved = repo.get_item(item.id)
+    assert saved.downloaded_bytes == 8
+    assert saved.status is ItemStatus.COMPLETED
+    assert saved.integrity_status is IntegrityStatus.VERIFIED
+    assert saved.content_sha256 == "d" * 64
+    assert saved.verified_at == verified_at
+    assert repo.get_task(task.id).status is TaskStatus.COMPLETED

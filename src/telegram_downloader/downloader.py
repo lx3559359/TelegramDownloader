@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import shutil
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -34,6 +36,28 @@ class ProgressWriter(Protocol):
         error: str | None = None,
         retry_count: int | None = None,
     ) -> None: ...
+
+    def complete_item(
+        self,
+        item_id: str,
+        downloaded_bytes: int,
+        sha256: str,
+        verified_at: datetime,
+    ) -> None: ...
+
+
+class _Digest(Protocol):
+    def update(self, data: bytes) -> None: ...
+
+    def hexdigest(self) -> str: ...
+
+
+def _hash_file(path: Path) -> _Digest:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest
 
 
 class MediaDownloader:
@@ -69,10 +93,12 @@ class MediaDownloader:
         if target.exists():
             actual_size = target.stat().st_size
             if item.expected_size is None or actual_size == item.expected_size:
-                self.repository.update_item_progress(
+                digest = await asyncio.to_thread(_hash_file, target)
+                self.repository.complete_item(
                     item.id,
                     actual_size,
-                    ItemStatus.COMPLETED,
+                    digest.hexdigest(),
+                    datetime.now(UTC),
                 )
                 return target
             raise SizeMismatchError(
@@ -105,6 +131,11 @@ class MediaDownloader:
         last_progress = time.monotonic()
 
         try:
+            digest = (
+                await asyncio.to_thread(_hash_file, part)
+                if offset
+                else hashlib.sha256()
+            )
             with part.open("ab") as stream:
                 async for chunk in self.gateway.stream_media(
                     item.peer_ref,
@@ -112,6 +143,7 @@ class MediaDownloader:
                     offset,
                 ):
                     stream.write(chunk)
+                    digest.update(chunk)
                     stream.flush()
                     downloaded += len(chunk)
                     bytes_since_disk_check += len(chunk)
@@ -164,10 +196,11 @@ class MediaDownloader:
                 f"下载大小不符: 期望 {item.expected_size}，实际 {downloaded}"
             )
         os.replace(part, target)
-        self.repository.update_item_progress(
+        self.repository.complete_item(
             item.id,
             downloaded,
-            ItemStatus.COMPLETED,
+            digest.hexdigest(),
+            datetime.now(UTC),
         )
         return target
 

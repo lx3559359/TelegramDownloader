@@ -121,7 +121,7 @@ git commit -m "feat: persist media integrity state"
 - Modify: `src/telegram_downloader/downloader.py`
 - Modify: `tests/test_downloader.py`
 
-- [ ] **Step 1: Write failing digest tests**
+- [x] **Step 1: Write failing digest tests**
 
 Extend the fake progress writer with `complete_item`. Assert exact SHA-256 for fresh download, resumed `.part`, and an already-present final file. Assert pause and size mismatch never call `complete_item`.
 
@@ -143,13 +143,13 @@ async def test_resumed_download_records_full_file_sha256(tmp_path: Path) -> None
     assert repo.completed[0][2] == hashlib.sha256(b"abcdef").hexdigest()
 ```
 
-- [ ] **Step 2: Run the tests and confirm RED**
+- [x] **Step 2: Run the tests and confirm RED**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_downloader.py -k "sha256 or digest" -q`
 
 Expected: failure because successful downloads still call only `update_item_progress`.
 
-- [ ] **Step 3: Implement non-blocking full-file hashing and atomic completion**
+- [x] **Step 3: Implement non-blocking full-file hashing and atomic completion**
 
 Add a 1 MiB synchronous helper used through `asyncio.to_thread` for existing files and resumed prefixes:
 
@@ -175,13 +175,13 @@ self.repository.complete_item(
 
 The existing-file fast path also hashes through `to_thread` before `complete_item`.
 
-- [ ] **Step 4: Run downloader and scheduler compatibility tests**
+- [x] **Step 4: Run downloader and scheduler compatibility tests**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_downloader.py tests/test_scheduler.py -q`
 
 Expected: all pass; update test fakes to implement `complete_item` without weakening state assertions.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add src/telegram_downloader/downloader.py tests/test_downloader.py tests/test_scheduler.py

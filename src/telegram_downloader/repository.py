@@ -445,6 +445,42 @@ class TaskRepository:
             )
             self._recompute_task_status(connection, str(row["task_id"]))
 
+    def complete_item(
+        self,
+        item_id: str,
+        downloaded_bytes: int,
+        sha256: str,
+        verified_at: datetime,
+    ) -> None:
+        if downloaded_bytes < 0:
+            raise ValueError("下载字节数不能为负数")
+        if _SHA256_PATTERN.fullmatch(sha256) is None:
+            raise ValueError("SHA-256 必须是 64 位小写十六进制")
+        if verified_at.utcoffset() is None:
+            raise ValueError("校验时间必须包含时区")
+        timestamp = verified_at.astimezone(UTC).isoformat()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT task_id FROM media_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(item_id)
+            connection.execute(
+                "UPDATE media_items SET downloaded_bytes = ?, status = ?, "
+                "last_error = NULL, integrity_status = ?, content_sha256 = ?, "
+                "verified_at = ? WHERE id = ?",
+                (
+                    downloaded_bytes,
+                    ItemStatus.COMPLETED.value,
+                    IntegrityStatus.VERIFIED.value,
+                    sha256,
+                    timestamp,
+                    item_id,
+                ),
+            )
+            self._recompute_task_status(connection, str(row["task_id"]))
+
     def record_integrity_failure(
         self,
         item_id: str,
