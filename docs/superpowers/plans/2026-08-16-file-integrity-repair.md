@@ -429,15 +429,15 @@ git commit -m "feat: orchestrate integrity verification and repair"
 - Modify: `tests/test_logging.py`
 - Modify: `tests/test_packaging_contract.py`
 
-- [ ] **Step 1: Write the end-to-end test**
+- [x] **Step 1: Write the end-to-end test**
 
 Create a real repository, task, two completed files, and controller/service/scheduler with a controlled gateway. Establish baselines, overwrite one file with same-size bytes, verify mismatch, prepare only that item, redownload it, and assert the other item and its retry count were untouched. Assert `.corrupt` contains the changed bytes and all paths are under the test root.
 
-- [ ] **Step 2: Add privacy and packaging assertions**
+- [x] **Step 2: Add privacy and packaging assertions**
 
 Assert integrity errors/log messages never include the absolute test path or a registered secret. Require README language for hash storage and safe repair, and require the PyInstaller source graph to include `telegram_downloader.file_integrity` through the normal app import.
 
-- [ ] **Step 3: Run E2E plus full suite**
+- [x] **Step 3: Run E2E plus full suite**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_file_integrity_e2e.py tests/test_logging.py tests/test_packaging_contract.py -q`
 
@@ -445,7 +445,7 @@ Then: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1`
 
 Expected: all tests and Ruff pass.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```powershell
 git add tests/test_file_integrity_e2e.py tests/test_logging.py tests/test_packaging_contract.py

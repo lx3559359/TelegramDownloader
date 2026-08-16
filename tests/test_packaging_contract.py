@@ -171,3 +171,18 @@ def test_packaging_cleanup_preserves_versioned_direct_run_releases() -> None:
     assert "$helperOutput" in owned_outputs
     assert "Remove-Item -LiteralPath $releaseDir -Recurse -Force" not in installer
     assert "Remove-Item -LiteralPath $setup -Force" in installer
+
+
+def test_file_integrity_runtime_is_reachable_and_project_local() -> None:
+    root = Path(__file__).parents[1]
+    app = (root / "src/telegram_downloader/app.py").read_text(encoding="utf-8")
+    service = (root / "src/telegram_downloader/file_integrity.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "import FileIntegrityService" in app
+    assert "FileIntegrityService(repository, paths)" in app
+    assert "self.paths.guard" in service
+    assert "asyncio.to_thread" in service
+    for forbidden in ("appdata", "localappdata", "qsettings", "tempfile"):
+        assert forbidden not in service.casefold()
