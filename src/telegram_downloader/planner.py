@@ -72,7 +72,9 @@ class TaskPlanner:
 
     async def scan(self, source: ParsedLink, filters: ScanFilters) -> ScanPreview:
         remote = [item async for item in self.gateway.scan(source, filters)]
-        source_title = remote[0].source_title if remote else source.entity_ref
+        if not remote:
+            raise EmptyScanError("筛选范围内没有找到可下载媒体")
+        source_title = remote[0].source_title
         return self._build_preview(
             source_kind=source.kind,
             source_ref=source.entity_ref,
@@ -81,8 +83,8 @@ class TaskPlanner:
             filters=filters,
             remote=remote,
             display_title=None,
-            empty_message="筛选范围内没有找到可下载媒体",
-            skip_existing=False,
+            empty_message="扫描媒体已全部存在于下载队列",
+            skip_existing=True,
         )
 
     def plan_selected(

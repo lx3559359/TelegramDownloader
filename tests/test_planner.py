@@ -127,6 +127,56 @@ async def test_empty_scan_is_rejected(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_link_preview_filters_media_already_in_any_task(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 13, tzinfo=UTC)
+    media = [
+        RemoteMedia(
+            "peer", "频道", 9, None, "m9", MediaKind.VIDEO, "a.mp4", 100, now
+        ),
+        RemoteMedia(
+            "peer", "频道", 8, None, "m8", MediaKind.DOCUMENT, "b.pdf", 20, now
+        ),
+    ]
+    repo = FakeRepository()
+    repo.existing = {("peer", 9, "m9")}
+    planner = TaskPlanner(
+        FakeGateway(media),
+        repo,
+        tmp_path,
+        uuid_factory=iter(["task", "item-8"]).__next__,
+        clock=lambda: now,
+    )
+
+    preview = await planner.scan(
+        parse_telegram_link("https://t.me/channel"),
+        ScanFilters(now, now, frozenset(MediaKind), 20),
+    )
+
+    assert [item.message_id for item in preview.items] == [8]
+    assert preview.known_bytes == 20
+    assert preview.unknown_size_count == 0
+
+
+@pytest.mark.asyncio
+async def test_link_preview_distinguishes_fully_existing_from_empty_scan(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 13, tzinfo=UTC)
+    remote = RemoteMedia(
+        "peer", "频道", 9, None, "m9", MediaKind.VIDEO, "a.mp4", 100, now
+    )
+    repo = FakeRepository()
+    repo.existing = {("peer", 9, "m9")}
+    planner = TaskPlanner(FakeGateway([remote]), repo, tmp_path, clock=lambda: now)
+
+    with pytest.raises(EmptyScanError, match="扫描媒体已全部存在于下载队列"):
+        await planner.scan(
+            parse_telegram_link("https://t.me/channel"),
+            ScanFilters(now, now, frozenset(MediaKind), 20),
+        )
+
+
 def test_plan_selected_uses_search_title_but_archives_under_source(
     tmp_path: Path,
 ) -> None:
