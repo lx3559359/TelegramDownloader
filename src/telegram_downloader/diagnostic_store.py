@@ -625,7 +625,7 @@ def _parse_utc(value: object) -> datetime:
 
 
 def _utc_text(value: datetime) -> str:
-    return value.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return value.astimezone(UTC).isoformat(timespec="auto").replace("+00:00", "Z")
 
 
 def _required_string(value: object) -> str:

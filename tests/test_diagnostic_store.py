@@ -79,6 +79,28 @@ def test_report_serialization_is_canonical_schema_one_and_round_trips(
     assert not (paths.diagnostics / "latest.json.tmp").exists()
 
 
+def test_live_report_with_microseconds_round_trips_without_losing_time(
+    tmp_path: Path,
+) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    store = DiagnosticReportStore(paths, secrets=set(), environment_username="tester")
+    started = NOW.replace(microsecond=123456)
+    live_report = DiagnosticReport.build(
+        "0.10.0",
+        started,
+        started + timedelta(seconds=1, microseconds=530865),
+        report().results,
+    )
+
+    store.save(live_report)
+
+    assert store.load_latest() == live_report
+    document = json.loads(store.serialize(live_report))
+    assert document["startedAt"] == "2026-08-16T08:09:10.123456Z"
+    assert document["finishedAt"] == "2026-08-16T08:09:11.654321Z"
+
+
 def test_latest_loader_tolerates_absent_invalid_and_unknown_fields(tmp_path: Path) -> None:
     paths = PortablePaths(tmp_path)
     paths.ensure_layout()
