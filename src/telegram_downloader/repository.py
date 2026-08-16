@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -9,6 +10,7 @@ from itertools import batched
 from pathlib import Path
 
 from telegram_downloader.domain import (
+    IntegrityStatus,
     ItemStatus,
     MediaItem,
     MediaKind,
@@ -52,6 +54,9 @@ CREATE TABLE IF NOT EXISTS media_items (
     status TEXT NOT NULL,
     retry_count INTEGER NOT NULL DEFAULT 0 CHECK(retry_count >= 0),
     last_error TEXT,
+    integrity_status TEXT NOT NULL DEFAULT 'unverified',
+    content_sha256 TEXT,
+    verified_at TEXT,
     UNIQUE(peer_ref, message_id, media_id)
 );
 CREATE INDEX IF NOT EXISTS idx_items_task_status ON media_items(task_id, status);
@@ -76,8 +81,18 @@ t.archived_at AS archived_at
 _ITEM_COLUMNS = """
 id, task_id, peer_ref, message_id, grouped_id, media_id, media_kind,
 original_name, target_path, expected_size, message_date_utc,
-downloaded_bytes, status, retry_count, last_error
+downloaded_bytes, status, retry_count, last_error,
+integrity_status, content_sha256, verified_at
 """
+
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+_INTEGRITY_FAILURES = frozenset(
+    {
+        IntegrityStatus.MISSING,
+        IntegrityStatus.SIZE_MISMATCH,
+        IntegrityStatus.HASH_MISMATCH,
+    }
+)
 
 
 class AllMediaAlreadyExists(RuntimeError):
@@ -125,6 +140,25 @@ class TaskRepository:
                 connection.execute("ALTER TABLE tasks ADD COLUMN display_title TEXT")
             if "archived_at" not in columns:
                 connection.execute("ALTER TABLE tasks ADD COLUMN archived_at TEXT")
+            item_columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(media_items)"
+                ).fetchall()
+            }
+            if "integrity_status" not in item_columns:
+                connection.execute(
+                    "ALTER TABLE media_items ADD COLUMN integrity_status "
+                    "TEXT NOT NULL DEFAULT 'unverified'"
+                )
+            if "content_sha256" not in item_columns:
+                connection.execute(
+                    "ALTER TABLE media_items ADD COLUMN content_sha256 TEXT"
+                )
+            if "verified_at" not in item_columns:
+                connection.execute(
+                    "ALTER TABLE media_items ADD COLUMN verified_at TEXT"
+                )
 
     def create_task(self, task: TaskRecord, items: list[MediaItem]) -> None:
         with self._connection() as connection:
@@ -192,7 +226,7 @@ class TaskRepository:
         with self._connection() as connection:
             cursor = connection.execute(
                 f"INSERT OR IGNORE INTO media_items ({_ITEM_COLUMNS}) "
-                f"VALUES ({','.join('?' for _ in range(15))})",
+                f"VALUES ({','.join('?' for _ in range(18))})",
                 self._item_values(item),
             )
             return cursor.rowcount == 1
@@ -379,6 +413,106 @@ class TaskRepository:
             if cursor.rowcount != 1:
                 raise KeyError(item_id)
 
+    def record_integrity_success(
+        self,
+        item_id: str,
+        sha256: str,
+        verified_at: datetime,
+    ) -> None:
+        if _SHA256_PATTERN.fullmatch(sha256) is None:
+            raise ValueError("SHA-256 必须是 64 位小写十六进制")
+        if verified_at.utcoffset() is None:
+            raise ValueError("校验时间必须包含时区")
+        timestamp = verified_at.astimezone(UTC).isoformat()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT task_id FROM media_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(item_id)
+            connection.execute(
+                "UPDATE media_items SET integrity_status = ?, "
+                "content_sha256 = ?, verified_at = ?, status = ?, last_error = NULL "
+                "WHERE id = ?",
+                (
+                    IntegrityStatus.VERIFIED.value,
+                    sha256,
+                    timestamp,
+                    ItemStatus.COMPLETED.value,
+                    item_id,
+                ),
+            )
+            self._recompute_task_status(connection, str(row["task_id"]))
+
+    def record_integrity_failure(
+        self,
+        item_id: str,
+        status: IntegrityStatus,
+        safe_error: str,
+    ) -> None:
+        if status not in _INTEGRITY_FAILURES:
+            raise ValueError("完整性状态不是可记录的异常")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT task_id FROM media_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(item_id)
+            now = datetime.now(UTC).isoformat()
+            connection.execute(
+                "UPDATE media_items SET integrity_status = ?, status = ?, "
+                "last_error = ? WHERE id = ?",
+                (
+                    status.value,
+                    ItemStatus.FAILED.value,
+                    safe_error,
+                    item_id,
+                ),
+            )
+            connection.execute(
+                "UPDATE tasks SET status = ?, updated_at = ?, last_error = ? "
+                "WHERE id = ?",
+                (
+                    TaskStatus.PARTIAL_FAILURE.value,
+                    now,
+                    safe_error,
+                    str(row["task_id"]),
+                ),
+            )
+
+    def prepare_integrity_repair(self, item_id: str) -> MediaItem:
+        with self._connection() as connection:
+            row = connection.execute(
+                f"SELECT {_ITEM_COLUMNS} FROM media_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(item_id)
+            item = self._item_from_row(row)
+            if (
+                item.status is not ItemStatus.FAILED
+                or item.integrity_status not in _INTEGRITY_FAILURES
+            ):
+                raise ValueError("媒体项不是可修复的完整性异常")
+            connection.execute(
+                "UPDATE media_items SET downloaded_bytes = 0, status = ?, "
+                "retry_count = 0, last_error = NULL, integrity_status = ?, "
+                "content_sha256 = NULL, verified_at = NULL WHERE id = ?",
+                (
+                    ItemStatus.QUEUED.value,
+                    IntegrityStatus.UNVERIFIED.value,
+                    item_id,
+                ),
+            )
+            self._recompute_task_status(connection, item.task_id)
+        return item
+
+    def recompute_task_status(self, task_id: str) -> TaskStatus:
+        with self._connection() as connection:
+            return self._recompute_task_status(connection, task_id)
+
     def recover_interrupted(self) -> None:
         now = datetime.now(UTC).isoformat()
         task_states = (
@@ -410,7 +544,7 @@ class TaskRepository:
     def _insert_item(connection: sqlite3.Connection, item: MediaItem) -> None:
         connection.execute(
             f"INSERT INTO media_items ({_ITEM_COLUMNS}) "
-            f"VALUES ({','.join('?' for _ in range(15))})",
+            f"VALUES ({','.join('?' for _ in range(18))})",
             TaskRepository._item_values(item),
         )
 
@@ -432,6 +566,11 @@ class TaskRepository:
             item.status.value,
             item.retry_count,
             item.last_error,
+            item.integrity_status.value,
+            item.content_sha256,
+            item.verified_at.astimezone(UTC).isoformat()
+            if item.verified_at is not None
+            else None,
         )
 
     @staticmethod
@@ -514,4 +653,53 @@ class TaskRepository:
             ItemStatus(row["status"]),
             row["retry_count"],
             row["last_error"],
+            IntegrityStatus(row["integrity_status"]),
+            row["content_sha256"],
+            (
+                datetime.fromisoformat(row["verified_at"])
+                if row["verified_at"] is not None
+                else None
+            ),
         )
+
+    @staticmethod
+    def _recompute_task_status(
+        connection: sqlite3.Connection,
+        task_id: str,
+    ) -> TaskStatus:
+        task = connection.execute(
+            "SELECT id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            raise KeyError(task_id)
+        rows = connection.execute(
+            "SELECT status FROM media_items WHERE task_id = ?",
+            (task_id,),
+        ).fetchall()
+        statuses = [ItemStatus(str(row["status"])) for row in rows]
+        if ItemStatus.DOWNLOADING in statuses:
+            status = TaskStatus.DOWNLOADING
+        elif ItemStatus.WAITING_RETRY in statuses:
+            status = TaskStatus.WAITING_RETRY
+        elif ItemStatus.FAILED in statuses:
+            status = TaskStatus.PARTIAL_FAILURE
+        elif ItemStatus.PAUSED in statuses:
+            status = TaskStatus.PAUSED
+        elif statuses and all(value is ItemStatus.COMPLETED for value in statuses):
+            status = TaskStatus.COMPLETED
+        else:
+            status = TaskStatus.QUEUED
+        now = datetime.now(UTC).isoformat()
+        if status is TaskStatus.PARTIAL_FAILURE:
+            connection.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                (status.value, now, task_id),
+            )
+        else:
+            connection.execute(
+                "UPDATE tasks SET status = ?, updated_at = ?, last_error = NULL "
+                "WHERE id = ?",
+                (status.value, now, task_id),
+            )
+        return status

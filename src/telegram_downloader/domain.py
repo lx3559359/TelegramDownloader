@@ -40,6 +40,14 @@ class ItemStatus(StrEnum):
     FAILED = "failed"
 
 
+class IntegrityStatus(StrEnum):
+    UNVERIFIED = "unverified"
+    VERIFIED = "verified"
+    MISSING = "missing"
+    SIZE_MISMATCH = "size_mismatch"
+    HASH_MISMATCH = "hash_mismatch"
+
+
 @dataclass(frozen=True, slots=True)
 class ParsedLink:
     normalized_url: str
@@ -89,3 +97,6 @@ class MediaItem:
     status: ItemStatus = ItemStatus.QUEUED
     retry_count: int = 0
     last_error: str | None = None
+    integrity_status: IntegrityStatus = IntegrityStatus.UNVERIFIED
+    content_sha256: str | None = None
+    verified_at: datetime | None = None

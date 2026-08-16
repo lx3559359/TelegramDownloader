@@ -32,7 +32,7 @@
 - Modify: `src/telegram_downloader/repository.py`
 - Test: `tests/test_repository.py`
 
-- [ ] **Step 1: Write failing migration and validation tests**
+- [x] **Step 1: Write failing migration and validation tests**
 
 Add tests that initialize a v0.8-shaped database, preserve its task/media rows, and assert the new row loads as `UNVERIFIED`. Add repository tests for valid verified metadata and rejection of malformed SHA-256.
 
@@ -57,13 +57,13 @@ def test_record_integrity_success_validates_digest(tmp_path: Path) -> None:
         repository.record_integrity_success(item.id, "not-a-digest", datetime.now(UTC))
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm RED**
+- [x] **Step 2: Run the focused tests and confirm RED**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_repository.py -k "integrity or v080" -q`
 
 Expected: collection/import failure because `IntegrityStatus` and repository integrity methods do not exist.
 
-- [ ] **Step 3: Add the domain fields and idempotent migration**
+- [x] **Step 3: Add the domain fields and idempotent migration**
 
 Define the enum and extend `MediaItem` with backward-compatible defaults:
 
@@ -102,13 +102,13 @@ def recompute_task_status(self, task_id: str) -> TaskStatus: ...
 
 `record_integrity_failure` accepts only missing/size/hash mismatch, changes the item to failed, and changes its task to partial failure. `prepare_integrity_repair` accepts one integrity-failed row, resets it to queued/0 retries/0 bytes/unverified, clears hash/time/error, and returns the pre-reset record. The service deliberately invokes this atomic repository operation per successfully quarantined item so an unrelated file failure cannot partially reset a batch.
 
-- [ ] **Step 4: Run repository tests and confirm GREEN**
+- [x] **Step 4: Run repository tests and confirm GREEN**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_repository.py -q`
 
 Expected: all repository tests pass, including repeated `initialize()`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add src/telegram_downloader/domain.py src/telegram_downloader/repository.py tests/test_repository.py

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from telegram_downloader.domain import (
+    IntegrityStatus,
     ItemStatus,
     MediaItem,
     MediaKind,
@@ -349,3 +350,213 @@ def test_get_item_rejects_unknown_id(tmp_path: Path) -> None:
 
     with pytest.raises(KeyError):
         repo.get_item("missing")
+
+
+def _create_v080_database(database: Path, target: Path) -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC).isoformat()
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                source_kind TEXT NOT NULL,
+                source_ref TEXT NOT NULL,
+                source_title TEXT NOT NULL,
+                source_url TEXT NOT NULL,
+                date_from_utc TEXT NOT NULL,
+                date_to_utc TEXT NOT NULL,
+                media_kinds TEXT NOT NULL,
+                item_limit INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_error TEXT,
+                display_title TEXT,
+                archived_at TEXT
+            );
+            CREATE TABLE media_items (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                peer_ref TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                grouped_id INTEGER,
+                media_id TEXT NOT NULL,
+                media_kind TEXT NOT NULL,
+                original_name TEXT NOT NULL,
+                target_path TEXT NOT NULL,
+                expected_size INTEGER,
+                message_date_utc TEXT NOT NULL,
+                downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                UNIQUE(peer_ref, message_id, media_id)
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "legacy-task",
+                SourceKind.CHANNEL_OR_GROUP.value,
+                "legacy-peer",
+                "旧任务",
+                "https://t.me/legacy-peer",
+                now,
+                now,
+                MediaKind.VIDEO.value,
+                10,
+                TaskStatus.COMPLETED.value,
+                now,
+                now,
+                None,
+                None,
+                None,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO media_items VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "legacy-item",
+                "legacy-task",
+                "legacy-peer",
+                8,
+                None,
+                "legacy-media",
+                MediaKind.VIDEO.value,
+                "legacy.mp4",
+                str(target),
+                4,
+                now,
+                4,
+                ItemStatus.COMPLETED.value,
+                0,
+                None,
+            ),
+        )
+
+
+def test_initialize_migrates_v080_media_to_unverified(tmp_path: Path) -> None:
+    database = tmp_path / "tasks.sqlite3"
+    _create_v080_database(database, tmp_path / "legacy.mp4")
+    repo = TaskRepository(database)
+
+    repo.initialize()
+    repo.initialize()
+
+    item = repo.get_item("legacy-item")
+    assert item.status is ItemStatus.COMPLETED
+    assert item.integrity_status is IntegrityStatus.UNVERIFIED
+    assert item.content_sha256 is None
+    assert item.verified_at is None
+
+    with sqlite3.connect(database) as connection:
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(media_items)").fetchall()
+        }
+    assert {"integrity_status", "content_sha256", "verified_at"} <= columns
+
+
+def test_record_integrity_success_validates_and_round_trips_digest(
+    tmp_path: Path,
+) -> None:
+    repo = TaskRepository(tmp_path / "tasks.sqlite3")
+    repo.initialize()
+    task, item = records(tmp_path)
+    repo.create_task(
+        replace(task, status=TaskStatus.COMPLETED),
+        [replace(item, status=ItemStatus.COMPLETED, downloaded_bytes=8)],
+    )
+    verified_at = datetime(2026, 8, 16, 3, 4, tzinfo=UTC)
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        repo.record_integrity_success(item.id, "not-a-digest", verified_at)
+
+    digest = "a" * 64
+    repo.record_integrity_success(item.id, digest, verified_at)
+
+    saved = repo.get_item(item.id)
+    assert saved.integrity_status is IntegrityStatus.VERIFIED
+    assert saved.content_sha256 == digest
+    assert saved.verified_at == verified_at
+    assert saved.status is ItemStatus.COMPLETED
+
+
+def test_integrity_failure_preserves_baseline_and_marks_task_partial(
+    tmp_path: Path,
+) -> None:
+    repo = TaskRepository(tmp_path / "tasks.sqlite3")
+    repo.initialize()
+    task, item = records(tmp_path)
+    verified_at = datetime(2026, 8, 16, tzinfo=UTC)
+    digest = "b" * 64
+    repo.create_task(
+        replace(task, status=TaskStatus.COMPLETED),
+        [
+            replace(
+                item,
+                status=ItemStatus.COMPLETED,
+                downloaded_bytes=8,
+                integrity_status=IntegrityStatus.VERIFIED,
+                content_sha256=digest,
+                verified_at=verified_at,
+            )
+        ],
+    )
+
+    repo.record_integrity_failure(
+        item.id,
+        IntegrityStatus.HASH_MISMATCH,
+        "文件哈希不一致",
+    )
+
+    failed = repo.get_item(item.id)
+    assert failed.status is ItemStatus.FAILED
+    assert failed.integrity_status is IntegrityStatus.HASH_MISMATCH
+    assert failed.content_sha256 == digest
+    assert failed.verified_at == verified_at
+    assert failed.last_error == "文件哈希不一致"
+    assert repo.get_task(task.id).status is TaskStatus.PARTIAL_FAILURE
+
+    with pytest.raises(ValueError, match="异常"):
+        repo.record_integrity_failure(
+            item.id,
+            IntegrityStatus.UNVERIFIED,
+            "invalid",
+        )
+
+
+def test_prepare_integrity_repair_resets_only_an_integrity_failed_item(
+    tmp_path: Path,
+) -> None:
+    repo = TaskRepository(tmp_path / "tasks.sqlite3")
+    repo.initialize()
+    task, item = records(tmp_path)
+    failed = replace(
+        item,
+        downloaded_bytes=8,
+        status=ItemStatus.FAILED,
+        retry_count=3,
+        last_error="文件缺失",
+        integrity_status=IntegrityStatus.MISSING,
+        content_sha256="c" * 64,
+        verified_at=datetime(2026, 8, 16, tzinfo=UTC),
+    )
+    repo.create_task(replace(task, status=TaskStatus.PARTIAL_FAILURE), [failed])
+
+    previous = repo.prepare_integrity_repair(item.id)
+
+    assert previous == failed
+    queued = repo.get_item(item.id)
+    assert queued.status is ItemStatus.QUEUED
+    assert queued.downloaded_bytes == 0
+    assert queued.retry_count == 0
+    assert queued.last_error is None
+    assert queued.integrity_status is IntegrityStatus.UNVERIFIED
+    assert queued.content_sha256 is None
+    assert queued.verified_at is None
+    assert repo.get_task(task.id).status is TaskStatus.QUEUED
+
+    with pytest.raises(ValueError, match="完整性异常"):
+        repo.prepare_integrity_repair(item.id)
