@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -20,6 +21,12 @@ from telegram_downloader.subscriptions import (
     SubscriptionState,
 )
 
+_LOGGER = logging.getLogger("telegram_downloader.subscription_scheduler")
+
+
+async def _ignore_session_expired(_error: SessionExpiredError) -> None:
+    return None
+
 
 class SubscriptionScheduler:
     _BACKOFF_MINUTES = (1, 2, 5, 15)
@@ -33,6 +40,10 @@ class SubscriptionScheduler:
         on_rules_changed: Callable[[], None] | None = None,
         on_task_created: Callable[[str], None] | None = None,
         on_progress: Callable[[SubscriptionProgress | None], None] | None = None,
+        on_session_expired: Callable[
+            [SessionExpiredError], Awaitable[None]
+        ]
+        | None = None,
         idle_delay: float = 1.0,
     ) -> None:
         if idle_delay <= 0:
@@ -43,6 +54,7 @@ class SubscriptionScheduler:
         self.on_rules_changed = on_rules_changed or (lambda: None)
         self.on_task_created = on_task_created or (lambda _task_id: None)
         self.on_progress = on_progress or (lambda _progress: None)
+        self.on_session_expired = on_session_expired or _ignore_session_expired
         self.idle_delay = idle_delay
         self.account_id: str | None = None
         self._wake_event = asyncio.Event()
@@ -163,13 +175,22 @@ class SubscriptionScheduler:
                 "Telegram 网络连接失败",
                 failure_count=failure_count,
             )
-        except SessionExpiredError:
+        except SessionExpiredError as error:
             self._record_failure(
                 rule,
                 SubscriptionState.AUTH_REQUIRED,
                 None,
                 "Telegram 登录已失效",
             )
+            try:
+                await self.on_session_expired(error)
+            except asyncio.CancelledError:
+                raise
+            except Exception as callback_error:
+                _LOGGER.error(
+                    "subscription auth callback failed (%s)",
+                    type(callback_error).__name__,
+                )
         except AccessDeniedError as error:
             self.service.set_enabled(rule.id, False)
             self._record_failure(

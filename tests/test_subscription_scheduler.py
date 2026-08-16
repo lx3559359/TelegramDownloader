@@ -9,6 +9,7 @@ import pytest
 from telegram_downloader.domain import MediaKind
 from telegram_downloader.gateway import (
     AccessDeniedError,
+    AuthorizationFailureReason,
     FloodWaitError,
     SessionExpiredError,
     TransientNetworkError,
@@ -362,3 +363,60 @@ async def test_scheduler_classifies_non_network_failures(
     assert service.runtime_calls[0][2] == expected_next
     if isinstance(error, AccessDeniedError):
         assert service.rules["r1"].enabled is False
+
+
+@pytest.mark.asyncio
+async def test_auth_failure_is_persisted_before_global_callback() -> None:
+    service = Service(rule("r1"))
+    error = SessionExpiredError(
+        reason=AuthorizationFailureReason.SESSION_REVOKED
+    )
+    service.outcomes = [error]
+    events: list[tuple[str, object]] = []
+
+    async def expired(caught: SessionExpiredError) -> None:
+        events.append(("callback", caught.reason))
+        assert service.rules["r1"].state is SubscriptionState.AUTH_REQUIRED
+
+    scheduler = SubscriptionScheduler(
+        service,
+        clock=lambda: NOW,
+        foreground_busy=lambda: False,
+        on_session_expired=expired,
+        idle_delay=0.01,
+    )
+    scheduler.set_account("a1")
+    scheduler.start()
+
+    await wait_until(lambda: bool(events))
+
+    assert events == [("callback", AuthorizationFailureReason.SESSION_REVOKED)]
+    assert scheduler.running is True
+    await scheduler.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_auth_callback_failure_does_not_stop_scheduler(caplog) -> None:
+    service = Service(rule("r1"))
+    service.outcomes = [SessionExpiredError()]
+
+    async def broken_callback(_error: SessionExpiredError) -> None:
+        raise RuntimeError("private callback detail")
+
+    scheduler = SubscriptionScheduler(
+        service,
+        clock=lambda: NOW,
+        foreground_busy=lambda: False,
+        on_session_expired=broken_callback,
+        idle_delay=0.01,
+    )
+    scheduler.set_account("a1")
+    scheduler.start()
+
+    await wait_until(lambda: len(service.runtime_calls) == 1)
+    await asyncio.sleep(0.01)
+
+    assert scheduler.running is True
+    assert "RuntimeError" in caplog.text
+    assert "private callback detail" not in caplog.text
+    await scheduler.shutdown()
