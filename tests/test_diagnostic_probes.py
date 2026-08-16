@@ -1,22 +1,39 @@
 from __future__ import annotations
 
 from collections import namedtuple
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from telegram_downloader.catalog import CatalogRepository
+from telegram_downloader.content import AccountProfile, ContentDialog, DialogKind
 from telegram_downloader.diagnostic_probes import (
     GIB,
     MIB,
     component_availability,
     managed_writable_paths,
     probe_components,
+    probe_content_database,
+    probe_credentials,
     probe_disk,
     probe_environment,
     probe_project_write,
+    probe_task_database,
 )
 from telegram_downloader.diagnostics import DiagnosticStatus
+from telegram_downloader.domain import (
+    IntegrityStatus,
+    ItemStatus,
+    MediaItem,
+    MediaKind,
+    ScanFilters,
+    SourceKind,
+    TaskRecord,
+    TaskStatus,
+)
 from telegram_downloader.paths import PortablePaths
+from telegram_downloader.repository import TaskRepository
 
 DiskUsage = namedtuple("DiskUsage", "total used free")
 
@@ -195,3 +212,169 @@ def test_components_probe_fails_when_any_required_component_is_missing(
     assert result.status is DiagnosticStatus.FAILED
     assert result.code == "component-missing"
     assert result.metrics == availability
+
+
+def test_task_database_probe_reports_schema_and_aggregate_counts_only(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "tasks.sqlite3"
+    repository = TaskRepository(database)
+    repository.initialize()
+    now = datetime(2026, 8, 16, tzinfo=UTC)
+    filters = ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 10)
+    task = TaskRecord(
+        "task-1",
+        SourceKind.CHANNEL_OR_GROUP,
+        "private-peer",
+        "private-group",
+        "https://t.me/private/1",
+        filters,
+        TaskStatus.COMPLETED,
+        now,
+        now,
+    )
+    items = [
+        MediaItem(
+            f"item-{index}",
+            task.id,
+            "private-peer",
+            index,
+            None,
+            f"media-{index}",
+            MediaKind.VIDEO,
+            f"private-{index}.mp4",
+            tmp_path / f"private-{index}.mp4",
+            10,
+            now,
+            10,
+            ItemStatus.COMPLETED,
+            integrity_status=(
+                IntegrityStatus.VERIFIED if index == 1 else IntegrityStatus.UNVERIFIED
+            ),
+            content_sha256=("a" * 64 if index == 1 else None),
+            verified_at=(now if index == 1 else None),
+        )
+        for index in (1, 2)
+    ]
+    repository.create_task(task, items)
+
+    result = probe_task_database(database)
+
+    assert result.status is DiagnosticStatus.PASSED
+    assert result.code == "task-database-ok"
+    assert result.metrics == {
+        "taskCount": 1,
+        "mediaCount": 2,
+        "schemaCompatible": True,
+        "taskStatusCompleted": 1,
+        "itemStatusCompleted": 2,
+        "integrityStatusUnverified": 1,
+        "integrityStatusVerified": 1,
+    }
+    serialized = repr(dict(result.metrics)) + result.summary
+    assert "private" not in serialized
+    assert str(tmp_path) not in serialized
+
+
+def test_content_database_probe_reports_schema_and_counts_only(tmp_path: Path) -> None:
+    database = tmp_path / "catalog.sqlite3"
+    repository = CatalogRepository(database)
+    repository.initialize()
+    now = datetime(2026, 8, 16, tzinfo=UTC)
+    repository.upsert_account(AccountProfile("private-account", "private-name"), now)
+    repository.replace_dialogs(
+        "private-account",
+        [
+            ContentDialog(
+                "private-account",
+                "private-peer",
+                "private-group",
+                "private-user",
+                DialogKind.GROUP,
+                False,
+                True,
+                now,
+            )
+        ],
+        now,
+    )
+
+    result = probe_content_database(database)
+
+    assert result.status is DiagnosticStatus.PASSED
+    assert result.code == "content-database-ok"
+    assert result.metrics == {
+        "schemaVersion": 3,
+        "schemaCompatible": True,
+        "accountCount": 1,
+        "dialogCount": 1,
+        "searchCount": 0,
+        "searchResultCount": 0,
+        "subscriptionCount": 0,
+        "subscriptionRunCount": 0,
+    }
+    serialized = repr(dict(result.metrics)) + result.summary
+    assert "private" not in serialized
+    assert str(tmp_path) not in serialized
+
+
+@pytest.mark.parametrize("probe", [probe_task_database, probe_content_database])
+def test_database_probe_maps_missing_and_corrupt_files_to_safe_codes(
+    tmp_path: Path,
+    probe,
+) -> None:
+    missing = probe(tmp_path / "missing.sqlite3")
+    corrupt_path = tmp_path / "private-corrupt.sqlite3"
+    corrupt_path.write_bytes(b"not-a-sqlite-database private-value")
+    corrupt = probe(corrupt_path)
+
+    assert (missing.status, missing.code) == (
+        DiagnosticStatus.FAILED,
+        "database-missing",
+    )
+    assert corrupt.status is DiagnosticStatus.FAILED
+    assert corrupt.code in {"database-unreadable", "database-corrupt"}
+    assert "private" not in corrupt.summary
+    assert str(tmp_path) not in corrupt.summary
+
+
+def test_credentials_probe_exposes_only_boolean_state() -> None:
+    ready = probe_credentials(
+        settings_readable=True,
+        secrets_present=True,
+        secrets_decrypted=True,
+    )
+    absent = probe_credentials(
+        settings_readable=True,
+        secrets_present=False,
+        secrets_decrypted=False,
+    )
+    unreadable = probe_credentials(
+        settings_readable=True,
+        secrets_present=True,
+        secrets_decrypted=False,
+    )
+    settings_error = probe_credentials(
+        settings_readable=False,
+        secrets_present=True,
+        secrets_decrypted=True,
+    )
+
+    assert ready.status is DiagnosticStatus.PASSED
+    assert ready.metrics == {
+        "settingsReadable": True,
+        "secretsPresent": True,
+        "secretsDecryptable": True,
+    }
+    assert (absent.status, absent.code) == (
+        DiagnosticStatus.WARNING,
+        "credentials-not-configured",
+    )
+    assert (unreadable.status, unreadable.code) == (
+        DiagnosticStatus.FAILED,
+        "credentials-unreadable",
+    )
+    assert (settings_error.status, settings_error.code) == (
+        DiagnosticStatus.FAILED,
+        "settings-unreadable",
+    )

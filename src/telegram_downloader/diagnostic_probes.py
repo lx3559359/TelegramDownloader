@@ -4,6 +4,7 @@ import importlib
 import os
 import secrets
 import shutil
+import sqlite3
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from pathlib import Path
@@ -221,6 +222,285 @@ def probe_components(availability: Mapping[str, bool]) -> DiagnosticResult:
         "components-ok",
         "必要运行组件全部可用",
         metrics,
+    )
+
+
+def probe_task_database(database: Path) -> DiagnosticResult:
+    title = "下载任务数据库"
+    connection = _open_read_only_database(database)
+    if isinstance(connection, DiagnosticResult):
+        return _database_failure("task-database", title, connection.code)
+    try:
+        if not _database_integrity_ok(connection):
+            return _database_failure("task-database", title, "database-corrupt")
+        compatible = _schema_contains(
+            connection,
+            {
+                "tasks": {"id", "status"},
+                "media_items": {"id", "status", "integrity_status"},
+            },
+        )
+        if not compatible:
+            return _result(
+                "task-database",
+                title,
+                DiagnosticStatus.FAILED,
+                "database-schema-incompatible",
+                "下载任务数据库结构不兼容",
+                {"schemaCompatible": False},
+            )
+        metrics: dict[str, bool | int] = {
+            "taskCount": _row_count(connection, "tasks"),
+            "mediaCount": _row_count(connection, "media_items"),
+            "schemaCompatible": True,
+        }
+        metrics.update(
+            _grouped_state_counts(
+                connection,
+                "tasks",
+                "status",
+                "taskStatus",
+                (
+                    "queued",
+                    "scanning",
+                    "downloading",
+                    "waiting_retry",
+                    "paused",
+                    "completed",
+                    "partial_failure",
+                ),
+            )
+        )
+        metrics.update(
+            _grouped_state_counts(
+                connection,
+                "media_items",
+                "status",
+                "itemStatus",
+                ("queued", "downloading", "waiting_retry", "paused", "completed", "failed"),
+            )
+        )
+        metrics.update(
+            _grouped_state_counts(
+                connection,
+                "media_items",
+                "integrity_status",
+                "integrityStatus",
+                (
+                    "unverified",
+                    "verified",
+                    "missing",
+                    "size_mismatch",
+                    "hash_mismatch",
+                    "read_error",
+                ),
+            )
+        )
+    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        return _database_failure("task-database", title, "database-unreadable")
+    finally:
+        connection.close()
+    return _result(
+        "task-database",
+        title,
+        DiagnosticStatus.PASSED,
+        "task-database-ok",
+        "下载任务数据库结构和聚合状态正常",
+        metrics,
+    )
+
+
+def probe_content_database(database: Path) -> DiagnosticResult:
+    title = "账号内容数据库"
+    connection = _open_read_only_database(database)
+    if isinstance(connection, DiagnosticResult):
+        return _database_failure("content-database", title, connection.code)
+    try:
+        if not _database_integrity_ok(connection):
+            return _database_failure("content-database", title, "database-corrupt")
+        schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        tables = {
+            "accounts": {"account_id"},
+            "dialogs": {"account_id", "peer_ref"},
+            "search_sessions": {"id"},
+            "search_results": {"id"},
+            "subscription_rules": {"id"},
+            "subscription_runs": {"id", "keyword_hits"},
+        }
+        compatible = schema_version == 3 and _schema_contains(connection, tables)
+        if not compatible:
+            return _result(
+                "content-database",
+                title,
+                DiagnosticStatus.FAILED,
+                "database-schema-incompatible",
+                "账号内容数据库结构不兼容",
+                {"schemaVersion": schema_version, "schemaCompatible": False},
+            )
+        metrics = {
+            "schemaVersion": schema_version,
+            "schemaCompatible": True,
+            "accountCount": _row_count(connection, "accounts"),
+            "dialogCount": _row_count(connection, "dialogs"),
+            "searchCount": _row_count(connection, "search_sessions"),
+            "searchResultCount": _row_count(connection, "search_results"),
+            "subscriptionCount": _row_count(connection, "subscription_rules"),
+            "subscriptionRunCount": _row_count(connection, "subscription_runs"),
+        }
+    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        return _database_failure("content-database", title, "database-unreadable")
+    finally:
+        connection.close()
+    return _result(
+        "content-database",
+        title,
+        DiagnosticStatus.PASSED,
+        "content-database-ok",
+        "账号内容数据库结构和聚合状态正常",
+        metrics,
+    )
+
+
+def probe_credentials(
+    *,
+    settings_readable: bool,
+    secrets_present: bool,
+    secrets_decrypted: bool,
+) -> DiagnosticResult:
+    metrics = {
+        "settingsReadable": bool(settings_readable),
+        "secretsPresent": bool(secrets_present),
+        "secretsDecryptable": bool(secrets_decrypted),
+    }
+    if not settings_readable:
+        return _result(
+            "credentials",
+            "登录凭据",
+            DiagnosticStatus.FAILED,
+            "settings-unreadable",
+            "应用设置无法读取",
+            metrics,
+        )
+    if not secrets_present:
+        return _result(
+            "credentials",
+            "登录凭据",
+            DiagnosticStatus.WARNING,
+            "credentials-not-configured",
+            "尚未配置 Telegram 登录凭据",
+            metrics,
+        )
+    if not secrets_decrypted:
+        return _result(
+            "credentials",
+            "登录凭据",
+            DiagnosticStatus.FAILED,
+            "credentials-unreadable",
+            "Telegram 登录凭据无法解密",
+            metrics,
+        )
+    return _result(
+        "credentials",
+        "登录凭据",
+        DiagnosticStatus.PASSED,
+        "credentials-ok",
+        "Telegram 登录凭据可用",
+        metrics,
+    )
+
+
+def _open_read_only_database(database: Path) -> sqlite3.Connection | DiagnosticResult:
+    if not database.is_file():
+        return _result(
+            "database",
+            "数据库",
+            DiagnosticStatus.FAILED,
+            "database-missing",
+            "数据库文件不存在",
+        )
+    try:
+        uri = f"{database.resolve().as_uri()}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=2)
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA busy_timeout=2000")
+        return connection
+    except (OSError, sqlite3.DatabaseError, ValueError):
+        return _result(
+            "database",
+            "数据库",
+            DiagnosticStatus.FAILED,
+            "database-unreadable",
+            "数据库无法读取",
+        )
+
+
+def _database_integrity_ok(connection: sqlite3.Connection) -> bool:
+    row = connection.execute("PRAGMA quick_check").fetchone()
+    return row is not None and str(row[0]).casefold() == "ok"
+
+
+def _schema_contains(
+    connection: sqlite3.Connection,
+    required: Mapping[str, set[str]],
+) -> bool:
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_schema WHERE type='table'"
+        ).fetchall()
+    }
+    if not required.keys() <= tables:
+        return False
+    for table, columns in required.items():
+        actual = {
+            str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        if not columns <= actual:
+            return False
+    return True
+
+
+def _row_count(connection: sqlite3.Connection, table: str) -> int:
+    return int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+
+def _grouped_state_counts(
+    connection: sqlite3.Connection,
+    table: str,
+    column: str,
+    prefix: str,
+    allowed: tuple[str, ...],
+) -> dict[str, int]:
+    rows = connection.execute(
+        f"SELECT {column}, COUNT(*) FROM {table} GROUP BY {column}"
+    ).fetchall()
+    known = set(allowed)
+    metrics: dict[str, int] = {}
+    other = 0
+    for state, count in rows:
+        value = str(state)
+        if value in known:
+            suffix = "".join(part.capitalize() for part in value.split("_"))
+            metrics[f"{prefix}{suffix}"] = int(count)
+        else:
+            other += int(count)
+    if other:
+        metrics[f"{prefix}Other"] = other
+    return metrics
+
+
+def _database_failure(result_id: str, title: str, code: str) -> DiagnosticResult:
+    summaries = {
+        "database-missing": "数据库文件不存在",
+        "database-corrupt": "数据库完整性检查失败",
+        "database-unreadable": "数据库无法读取",
+    }
+    return _result(
+        result_id,
+        title,
+        DiagnosticStatus.FAILED,
+        code,
+        summaries.get(code, "数据库检查失败"),
     )
 
 
