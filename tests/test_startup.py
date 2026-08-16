@@ -25,6 +25,18 @@ def test_startup_indicator_is_visible_updates_and_closes(qtbot) -> None:
     indicator.close()
 
 
+def test_startup_indicator_loads_explicit_cjk_font(qtbot, monkeypatch) -> None:
+    from telegram_downloader.ui import theme
+
+    monkeypatch.setattr(theme, "ensure_cjk_font", lambda: "QA CJK Font")
+
+    indicator = create_startup_indicator()
+    qtbot.addWidget(indicator.widget)
+
+    assert indicator.font_family == "QA CJK Font"
+    indicator.close()
+
+
 def test_gui_bootstrap_closes_indicator_after_runner_returns(tmp_path) -> None:
     events: list[object] = []
 
