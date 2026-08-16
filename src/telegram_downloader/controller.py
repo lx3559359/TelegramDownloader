@@ -38,6 +38,7 @@ from telegram_downloader.gateway import (
 )
 from telegram_downloader.links import InvalidTelegramLink, parse_telegram_link
 from telegram_downloader.paths import PortablePaths
+from telegram_downloader.scheduler import SchedulerSnapshot
 from telegram_downloader.settings import AppSettings, ProxySettings
 from telegram_downloader.subscriptions import SubscriptionDraft
 from telegram_downloader.ui.models import TaskItemSummary, TaskSummary
@@ -88,6 +89,16 @@ class _NullWindow:
 
     def set_task_summaries(self, value: list[TaskSummary]) -> None:
         self.tasks = value
+
+    def set_scheduler_summary(
+        self,
+        *,
+        active: int,
+        queued: int,
+        concurrency: int,
+        speed_limit_kib: int,
+    ) -> None:
+        pass
 
     def set_task_items(self, _task_id: str, _items: list[TaskItemSummary]) -> None:
         pass
@@ -289,6 +300,21 @@ class _NullScheduler:
     def pause_task(self, _task_id: str) -> None:
         pass
 
+    def snapshot(self) -> SchedulerSnapshot:
+        return SchedulerSnapshot(None, (), 3, 0)
+
+    def queue_positions(self) -> dict[str, int]:
+        return {}
+
+    def is_active(self, _task_id: str) -> bool:
+        return False
+
+    def prioritize_task(self, _task_id: str) -> bool:
+        return False
+
+    def configure_resources(self, _concurrency: int, _speed_limit_kib: int) -> None:
+        pass
+
     async def shutdown(self) -> None:
         pass
 
@@ -367,7 +393,7 @@ class AppController:
         paths: PortablePaths | None = None,
         gateway_factory: Callable[..., TelegramGateway] | None = None,
         service_builder: Callable[
-            [TelegramGateway, int],
+            [TelegramGateway, AppSettings],
             tuple[Any, Any, Any],
         ]
         | None = None,
@@ -565,9 +591,17 @@ class AppController:
                 return
             self.window.set_account(name)
             await self.activate_content_account()
-            for task in self.repository.list_tasks():
-                if task.status is TaskStatus.QUEUED:
-                    self._start_task(task.id)
+            list_queued = getattr(self.repository, "list_queued_for_dispatch", None)
+            if callable(list_queued):
+                queued_tasks = list_queued()
+            else:
+                queued_tasks = [
+                    task
+                    for task in self.repository.list_tasks()
+                    if task.status is TaskStatus.QUEUED
+                ]
+            for task in queued_tasks:
+                self._start_task(task.id)
         except SessionExpiredError as error:
             await self._handle_session_expired(error)
         except Exception as error:
@@ -631,7 +665,7 @@ class AppController:
             if self.service_builder is not None:
                 services = self.service_builder(
                     gateway,
-                    updated_settings.concurrency,
+                    updated_settings,
                 )
                 if len(services) == 3:
                     self.planner, self.scheduler, self.content_browser = services
@@ -1450,6 +1484,10 @@ class AppController:
                 await probe.disconnect()
 
     def apply_settings(self, settings: AppSettings, proxy_password: str) -> None:
+        connection_changed = (
+            settings.api_id != self.settings.api_id
+            or settings.proxy != self.settings.proxy
+        )
         updated_secrets = dict(self.secrets)
         if proxy_password:
             updated_secrets["proxy_password"] = proxy_password
@@ -1459,7 +1497,13 @@ class AppController:
         self.vault.save(updated_secrets)
         self.settings = settings
         self.secrets = updated_secrets
-        self._show_status("设置已保存；代理变更将在下次连接时生效")
+        configure = getattr(self.scheduler, "configure_resources", None)
+        if callable(configure):
+            configure(settings.concurrency, settings.speed_limit_kib)
+        message = "设置已保存；下载资源设置已即时应用"
+        if connection_changed:
+            message += "，API/代理变更将在下次连接时生效"
+        self._show_status(message)
 
     def pause_task(self, task_id: str) -> None:
         self.pause_tasks([task_id])
@@ -1488,6 +1532,33 @@ class AppController:
             accepted += 1
         self.refresh_tasks()
         self._show_status(f"已暂停 {accepted} 个任务，跳过 {len(unique) - accepted} 个")
+
+    def prioritize_task(self, task_id: str) -> None:
+        try:
+            task = self.repository.get_task(task_id)
+        except KeyError:
+            self._show_status("任务不存在或已被移除")
+            return
+        if task.archived_at is not None or task.status is not TaskStatus.QUEUED:
+            self._show_status("任务已经开始下载或状态已变化")
+            return
+
+        prioritize = getattr(self.repository, "prioritize_task", None)
+        persisted = bool(prioritize(task_id)) if callable(prioritize) else False
+        reordered = self.scheduler.prioritize_task(task_id) if persisted else False
+        if not reordered:
+            clear_priority = getattr(self.repository, "clear_task_priority", None)
+            if callable(clear_priority):
+                clear_priority(task_id)
+        self.refresh_tasks()
+        if reordered:
+            position = self.scheduler.queue_positions().get(task_id)
+            if position is not None:
+                self._show_status(f"已将任务移到等待队列第 {position} 位")
+                return
+            self._show_status("已将任务设为优先下载")
+            return
+        self._show_status("任务已经开始下载或状态已变化")
 
     async def resume_tasks(self, task_ids: list[str]) -> None:
         unique = self._unique_task_ids(task_ids)
@@ -1791,6 +1862,21 @@ class AppController:
         sampled_at = monotonic_clock() if now is None else now
         summaries: list[TaskSummary] = []
         active_ids: set[str] = set()
+        snapshot_method = getattr(self.scheduler, "snapshot", None)
+        scheduler_state = (
+            snapshot_method()
+            if callable(snapshot_method)
+            else SchedulerSnapshot(
+                None,
+                (),
+                self.settings.concurrency,
+                self.settings.speed_limit_kib,
+            )
+        )
+        queue_positions_method = getattr(self.scheduler, "queue_positions", None)
+        queue_positions = (
+            queue_positions_method() if callable(queue_positions_method) else {}
+        )
         snapshots = self.repository.list_task_snapshots(include_archived=True)
         for snapshot in snapshots:
             task = snapshot.task
@@ -1827,6 +1913,9 @@ class AppController:
                     speed,
                     remaining_seconds,
                     archived,
+                    queue_positions.get(task.id)
+                    if task.status is TaskStatus.QUEUED and not archived
+                    else None,
                 )
             )
             if not archived and task.status is TaskStatus.DOWNLOADING:
@@ -1834,6 +1923,14 @@ class AppController:
         for task_id in set(self._progress_samples) - active_ids:
             self._progress_samples.pop(task_id, None)
         self.window.set_task_summaries(summaries)
+        set_scheduler_summary = getattr(self.window, "set_scheduler_summary", None)
+        if callable(set_scheduler_summary):
+            set_scheduler_summary(
+                active=1 if scheduler_state.active_task_id is not None else 0,
+                queued=scheduler_state.queued_count,
+                concurrency=scheduler_state.concurrency,
+                speed_limit_kib=scheduler_state.speed_limit_kib,
+            )
 
     def _sample_speed(
         self,
@@ -1957,7 +2054,7 @@ class AppController:
             if self.service_builder is not None:
                 services = self.service_builder(
                     fresh_gateway,
-                    self.settings.concurrency,
+                    self.settings,
                 )
                 if len(services) == 3:
                     self.planner, self.scheduler, self.content_browser = services
@@ -2075,7 +2172,9 @@ class AppController:
         operation = asyncio.create_task(self.scheduler.run_task(task_id))
         try:
             while not operation.done():
-                self._refresh_tasks_if_due()
+                is_active = getattr(self.scheduler, "is_active", None)
+                if not callable(is_active) or is_active(task_id):
+                    self._refresh_tasks_if_due()
                 try:
                     await asyncio.wait_for(
                         asyncio.shield(operation),

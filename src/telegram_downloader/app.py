@@ -40,6 +40,7 @@ from telegram_downloader.logging import configure_logging
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.planner import ScanPreview, TaskPlanner
 from telegram_downloader.repository import TaskRepository
+from telegram_downloader.resource_control import AsyncBandwidthLimiter
 from telegram_downloader.scheduler import DownloadScheduler
 from telegram_downloader.security import SecretsError, SecretsVault
 from telegram_downloader.settings import AppSettings, SettingsError, SettingsStore
@@ -271,10 +272,16 @@ def create_application(root: Path):
     ) -> TelethonGateway:
         return TelethonGateway(api_id, api_hash, session, proxy, proxy_password)
 
-    def build_services(gateway: TelethonGateway, concurrency: int):
+    def build_services(gateway: TelethonGateway, resource_settings: AppSettings):
         planner = TaskPlanner(gateway, repository, paths.downloads)
-        downloader = MediaDownloader(gateway, repository, paths)
-        scheduler = DownloadScheduler(repository, downloader, concurrency=concurrency)
+        bandwidth = AsyncBandwidthLimiter(resource_settings.speed_limit_kib)
+        downloader = MediaDownloader(gateway, repository, paths, bandwidth=bandwidth)
+        scheduler = DownloadScheduler(
+            repository,
+            downloader,
+            concurrency=resource_settings.concurrency,
+            bandwidth=bandwidth,
+        )
         content_browser.bind_online(gateway, planner)
         subscriptions.bind_online(gateway, planner)
         return planner, scheduler, content_browser
@@ -293,7 +300,7 @@ def create_application(root: Path):
         )
         planner, scheduler, content_browser = build_services(
             gateway,
-            settings.concurrency,
+            settings,
         )
 
     async def confirm_preview(preview: ScanPreview) -> bool:
@@ -541,6 +548,9 @@ def create_application(root: Path):
     def pause_tasks_requested(value: object) -> None:
         controller.pause_tasks(_task_ids(value))
 
+    def prioritize_task_requested(task_id: str) -> None:
+        controller.prioritize_task(task_id)
+
     async def resume_tasks_requested(value: object) -> None:
         await controller.resume_tasks(_task_ids(value))
 
@@ -649,6 +659,7 @@ def create_application(root: Path):
     window.scan_requested.connect(scan_requested)
     window.task_selection_changed.connect(task_selection_changed)
     window.pause_tasks_requested.connect(pause_tasks_requested)
+    window.prioritize_task_requested.connect(prioritize_task_requested)
     window.archive_tasks_requested.connect(archive_tasks_requested)
     window.restore_tasks_requested.connect(restore_tasks_requested)
     window.open_media_requested.connect(open_media_requested)

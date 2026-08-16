@@ -42,6 +42,7 @@ from telegram_downloader.gateway import (
     TransientNetworkError,
 )
 from telegram_downloader.paths import PortablePaths
+from telegram_downloader.scheduler import SchedulerSnapshot
 from telegram_downloader.settings import AppSettings, ProxySettings
 from telegram_downloader.ui.login import LoginPage
 
@@ -2603,8 +2604,9 @@ async def test_content_search_expired_session_rebuilds_gateway_for_qr_login() ->
         calls.append(("factory", api_id, api_hash, session))
         return fresh
 
-    def service_builder(gateway, concurrency):
-        calls.append(("services", gateway, concurrency))
+    def service_builder(gateway, resource_settings):
+        assert isinstance(resource_settings, AppSettings)
+        calls.append(("services", gateway, resource_settings))
         return "planner", "scheduler", content
 
     controller = AppController.for_test(
@@ -2631,7 +2633,7 @@ async def test_content_search_expired_session_rebuilds_gateway_for_qr_login() ->
         "disconnect-old",
         ("factory", 12345, "saved-api-hash", ""),
         "connect-fresh",
-        ("services", fresh, 3),
+        ("services", fresh, AppSettings(api_id=12345)),
         "show-login",
     ]
     assert window.account is None
@@ -2816,6 +2818,259 @@ async def test_scan_failure_is_persistent_and_releases_busy_state() -> None:
     assert window.message == "当前账号未加入该私有频道或群组"
     assert window.timeout == 0
     assert window.busy_states == [True, False]
+
+
+def test_refresh_tasks_exposes_queue_positions_and_scheduler_summary() -> None:
+    queued_task = SimpleNamespace(
+        id="queued",
+        source_title="Queued",
+        display_title=None,
+        status=TaskStatus.QUEUED,
+        last_error=None,
+        archived_at=None,
+    )
+    active_task = SimpleNamespace(
+        id="active",
+        source_title="Active",
+        display_title=None,
+        status=TaskStatus.DOWNLOADING,
+        last_error=None,
+        archived_at=None,
+    )
+
+    class Repository:
+        def list_task_snapshots(self, *, include_archived=False):
+            assert include_archived is True
+            return [
+                SimpleNamespace(
+                    task=task,
+                    total_items=1,
+                    completed_items=0,
+                    downloaded_bytes=0,
+                    known_size=1,
+                    unknown_size_count=0,
+                    item_error=None,
+                )
+                for task in (queued_task, active_task)
+            ]
+
+    class Scheduler:
+        def snapshot(self):
+            return SchedulerSnapshot("active", ("queued",), 4, 2048)
+
+        def queue_positions(self):
+            return {"queued": 1}
+
+    class Window:
+        def __init__(self):
+            self.tasks = []
+            self.scheduler_summary = None
+
+        def set_task_summaries(self, summaries):
+            self.tasks = summaries
+
+        def set_scheduler_summary(self, **summary):
+            self.scheduler_summary = summary
+
+    window = Window()
+    controller = AppController.for_test(
+        repository=Repository(),
+        scheduler=Scheduler(),
+        window=window,
+    )
+
+    controller.refresh_tasks(now=1.0)
+
+    assert window.tasks[0].queue_position == 1
+    assert window.tasks[1].queue_position is None
+    assert window.scheduler_summary == {
+        "active": 1,
+        "queued": 1,
+        "concurrency": 4,
+        "speed_limit_kib": 2048,
+    }
+
+
+def test_prioritize_task_persists_before_reordering_and_reports_position() -> None:
+    events: list[str] = []
+    task = SimpleNamespace(
+        id="queued",
+        status=TaskStatus.QUEUED,
+        archived_at=None,
+    )
+
+    class Repository:
+        def get_task(self, task_id):
+            assert task_id == task.id
+            return task
+
+        def prioritize_task(self, task_id):
+            events.append(f"repository:{task_id}")
+            return True
+
+        def list_task_snapshots(self, *, include_archived=False):
+            return []
+
+    class Scheduler:
+        def prioritize_task(self, task_id):
+            events.append(f"scheduler:{task_id}")
+            return True
+
+        def queue_positions(self):
+            return {task.id: 1}
+
+        def snapshot(self):
+            return SchedulerSnapshot(None, (task.id,), 3, 0)
+
+    controller = AppController.for_test(
+        repository=Repository(),
+        scheduler=Scheduler(),
+    )
+
+    controller.prioritize_task(task.id)
+
+    assert events == ["repository:queued", "scheduler:queued"]
+    assert "第 1 位" in controller.window.message.last_message
+
+
+def test_prioritize_task_handles_state_race_without_duplicate_start() -> None:
+    task = SimpleNamespace(
+        id="queued",
+        status=TaskStatus.QUEUED,
+        archived_at=None,
+    )
+
+    class Repository:
+        def get_task(self, _task_id):
+            return task
+
+        def prioritize_task(self, _task_id):
+            return True
+
+        def list_task_snapshots(self, *, include_archived=False):
+            return []
+
+    class Scheduler:
+        def prioritize_task(self, _task_id):
+            return False
+
+        def queue_positions(self):
+            return {}
+
+        def snapshot(self):
+            return SchedulerSnapshot(task.id, (), 3, 0)
+
+    controller = AppController.for_test(
+        repository=Repository(),
+        scheduler=Scheduler(),
+    )
+
+    controller.prioritize_task(task.id)
+
+    assert "已经开始下载" in controller.window.message.last_message
+
+
+def test_apply_settings_reconfigures_active_scheduler_after_persistence() -> None:
+    events: list[object] = []
+
+    class Store:
+        def load(self):
+            return AppSettings(api_id=1)
+
+        def save(self, value):
+            events.append(("settings", value))
+
+    class SecretStore:
+        def load(self):
+            return {}
+
+        def save(self, value):
+            events.append(("secrets", value))
+
+    class Scheduler:
+        def configure_resources(self, concurrency, speed_limit_kib):
+            events.append(("scheduler", concurrency, speed_limit_kib))
+
+    updated = AppSettings(api_id=1, concurrency=5, speed_limit_kib=2048)
+    controller = AppController.for_test(
+        settings_store=Store(),
+        vault=SecretStore(),
+        scheduler=Scheduler(),
+    )
+
+    controller.apply_settings(updated, "")
+
+    assert events == [
+        ("settings", updated),
+        ("secrets", {}),
+        ("scheduler", 5, 2048),
+    ]
+    assert controller.settings == updated
+    assert "即时应用" in controller.window.message.last_message
+
+
+@pytest.mark.asyncio
+async def test_restore_uses_persistent_dispatch_order() -> None:
+    ordered = [SimpleNamespace(id="priority"), SimpleNamespace(id="oldest")]
+
+    class Repository:
+        def list_queued_for_dispatch(self):
+            return ordered
+
+    controller = AppController.for_test(
+        gateway=ConnectedGateway(),
+        repository=Repository(),
+    )
+    started: list[str] = []
+
+    async def online() -> bool:
+        return True
+
+    async def account_name() -> str:
+        return "Synthetic account"
+
+    async def activate() -> None:
+        return None
+
+    controller.ensure_telegram_online = online
+    controller._account_name = account_name
+    controller.activate_content_account = activate
+    controller._start_task = started.append
+
+    await controller._restore_saved_session()
+
+    assert started == ["priority", "oldest"]
+
+
+@pytest.mark.asyncio
+async def test_waiting_run_does_not_poll_database_until_completion() -> None:
+    release = asyncio.Event()
+
+    class Scheduler:
+        async def run_task(self, _task_id):
+            await release.wait()
+
+        def is_active(self, _task_id):
+            return False
+
+    controller = AppController.for_test(
+        scheduler=Scheduler(),
+        progress_refresh_interval=0.01,
+    )
+    refreshes = 0
+
+    def refresh() -> None:
+        nonlocal refreshes
+        refreshes += 1
+
+    controller.refresh_tasks = refresh
+    operation = asyncio.create_task(controller._run_and_refresh("waiting"))
+    await asyncio.sleep(0.03)
+    assert refreshes == 0
+
+    release.set()
+    await operation
+    assert refreshes == 1
 
 
 @pytest.mark.asyncio

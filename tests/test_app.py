@@ -14,6 +14,7 @@ from telegram_downloader.content_browser import ContentBrowserService
 from telegram_downloader.domain import MediaKind
 from telegram_downloader.file_integrity import FileIntegrityService
 from telegram_downloader.paths import PortablePaths
+from telegram_downloader.settings import AppSettings
 from telegram_downloader.subscription_scheduler import SubscriptionScheduler
 from telegram_downloader.subscription_service import SubscriptionService
 from telegram_downloader.subscriptions import SubscriptionRule, SubscriptionState
@@ -188,6 +189,25 @@ def test_create_application_initializes_project_local_content_services(
         application.processEvents()
 
 
+def test_service_builder_shares_runtime_download_resource_settings(tmp_path) -> None:
+    application, loop, controller = app.create_application(tmp_path)
+    settings = AppSettings(concurrency=4, speed_limit_kib=2048)
+
+    try:
+        planner, scheduler, content = controller.service_builder(object(), settings)
+
+        assert planner is not None
+        assert content is controller.content_browser
+        assert scheduler.snapshot().concurrency == 4
+        assert scheduler.snapshot().speed_limit_kib == 2048
+        assert scheduler.downloader.bandwidth is scheduler._bandwidth
+    finally:
+        loop.run_until_complete(controller._async_actions.shutdown())
+        controller.window.close()
+        loop.close()
+        application.processEvents()
+
+
 def test_create_application_recovers_interrupted_subscription(tmp_path) -> None:
     now = datetime(2026, 8, 15, 9, 0, tzinfo=UTC)
     paths = PortablePaths(tmp_path)
@@ -347,6 +367,7 @@ def test_task_management_signals_route_sync_and_async_actions(
 
     monkeypatch.setattr(controller, "select_task_details", record_sync("select"))
     monkeypatch.setattr(controller, "pause_tasks", record_sync("pause"))
+    monkeypatch.setattr(controller, "prioritize_task", record_sync("priority"))
     monkeypatch.setattr(controller, "archive_tasks", record_sync("archive"))
     monkeypatch.setattr(controller, "restore_tasks", record_sync("restore"))
     monkeypatch.setattr(controller, "open_media_file", record_sync("open"))
@@ -380,6 +401,7 @@ def test_task_management_signals_route_sync_and_async_actions(
     async def emit_actions() -> None:
         controller.window.task_selection_changed.emit(["one"])
         controller.window.pause_tasks_requested.emit(["one", "two"])
+        controller.window.prioritize_task_requested.emit("queued")
         controller.window.archive_tasks_requested.emit(["done"])
         controller.window.restore_tasks_requested.emit(["old"])
         controller.window.open_media_requested.emit("media")
@@ -400,6 +422,7 @@ def test_task_management_signals_route_sync_and_async_actions(
         assert calls == [
             ("select", ["one"]),
             ("pause", ["one", "two"]),
+            ("priority", "queued"),
             ("archive", ["done"]),
             ("restore", ["old"]),
             ("open", "media"),
