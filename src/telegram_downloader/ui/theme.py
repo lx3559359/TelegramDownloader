@@ -351,4 +351,221 @@ QScrollBar::handle:vertical {
     border-radius: 5px;
     background: #344a65;
 }
+
+QWidget#accountContentPage {
+    background: qlineargradient(
+        x1: 0, y1: 0, x2: 1, y2: 1,
+        stop: 0 #e3ebf4, stop: 1 #dce6f0
+    );
+    color: #1f2a3d;
+}
+
+QWidget#accountContentPage QWidget#accountContentDialogColumn,
+QWidget#accountContentPage QWidget#accountContentSearchColumn {
+    background: transparent;
+}
+
+QWidget#accountContentPage QSplitter#contentSplitter,
+QWidget#accountContentPage QSplitter#contentSplitter::handle {
+    background: transparent;
+}
+
+QWidget#accountContentPage QFrame#accountContentCard {
+    border: 1px solid #d3dee9;
+    border-radius: 12px;
+    background: qlineargradient(
+        x1: 0, y1: 0, x2: 0, y2: 1,
+        stop: 0 #ffffff, stop: 0.12 #fbfdff, stop: 1 #f5f8fc
+    );
+}
+
+QWidget#accountContentPage QLabel {
+    background: transparent;
+    color: #1f2a3d;
+}
+
+QWidget#accountContentPage QLabel#pageTitle {
+    color: #182338;
+}
+
+QWidget#accountContentPage QLabel#sectionTitle {
+    color: #1f2a3d;
+}
+
+QWidget#accountContentPage QLabel#muted {
+    color: #64748b;
+}
+
+QWidget#accountContentPage QLabel#contentHint {
+    border: 1px solid #c7dbe7;
+    background: #edf8fb;
+    color: #376578;
+}
+
+QWidget#accountContentPage QLabel#errorText {
+    border: 1px solid #f1b8c2;
+    background: #fff1f3;
+    color: #a33c50;
+}
+
+QWidget#accountContentPage QLabel#selectionSummary {
+    color: #087f96;
+}
+
+QWidget#accountContentPage QPushButton {
+    border: 1px solid #c8d5e2;
+    background: #f8fafc;
+    color: #334155;
+}
+
+QWidget#accountContentPage QPushButton:hover {
+    border-color: #8fb4c3;
+    background: #edf7fa;
+    color: #1f4858;
+}
+
+QWidget#accountContentPage QPushButton:pressed {
+    background: #e1f0f4;
+}
+
+QWidget#accountContentPage QPushButton:disabled {
+    border-color: #dce4ec;
+    background: #eef2f6;
+    color: #94a3b8;
+}
+
+QWidget#accountContentPage QPushButton#primaryButton {
+    border-color: #17a8c2;
+    background: #17a8c2;
+    color: #ffffff;
+}
+
+QWidget#accountContentPage QPushButton#primaryButton:hover {
+    border-color: #0e8fa8;
+    background: #0e8fa8;
+}
+
+QWidget#accountContentPage QPushButton#primaryButton:pressed {
+    border-color: #0b758b;
+    background: #0b758b;
+}
+
+QWidget#accountContentPage QLineEdit,
+QWidget#accountContentPage QDateEdit,
+QWidget#accountContentPage QSpinBox {
+    border: 1px solid #cbd7e3;
+    background: #ffffff;
+    color: #1f2a3d;
+    selection-background-color: #9ee5ef;
+}
+
+QWidget#accountContentPage QLineEdit:focus,
+QWidget#accountContentPage QDateEdit:focus,
+QWidget#accountContentPage QSpinBox:focus,
+QWidget#accountContentPage QPushButton:focus,
+QWidget#accountContentPage QTableView:focus {
+    border: 1px solid #17a8c2;
+}
+
+QWidget#accountContentPage QDateEdit::drop-down,
+QWidget#accountContentPage QSpinBox::up-button,
+QWidget#accountContentPage QSpinBox::down-button {
+    background: #edf3f8;
+}
+
+QWidget#accountContentPage QCheckBox {
+    background: transparent;
+    color: #334155;
+}
+
+QWidget#accountContentPage QCheckBox::indicator {
+    border: 1px solid #9fb1c4;
+    background: #ffffff;
+}
+
+QWidget#accountContentPage QCheckBox::indicator:checked {
+    border-color: #17a8c2;
+    background: #17a8c2;
+}
+
+QWidget#accountContentPage QTabWidget::pane {
+    border: 1px solid #d5e0ea;
+    background: #ffffff;
+}
+
+QWidget#accountContentPage QTabWidget,
+QWidget#accountContentPage QTabBar,
+QWidget#accountContentPage QWidget#accountContentTabPage {
+    background: transparent;
+    color: #1f2a3d;
+}
+
+QWidget#accountContentPage QTabWidget QStackedWidget {
+    background: #ffffff;
+}
+
+QWidget#accountContentPage QTabBar::tab {
+    border: 1px solid #d5e0ea;
+    background: #edf2f7;
+    color: #64748b;
+}
+
+QWidget#accountContentPage QTabBar::tab:selected {
+    border-color: #8dd6e2;
+    background: #e4f7fa;
+    color: #087f96;
+}
+
+QWidget#accountContentPage QListView,
+QWidget#accountContentPage QTableView {
+    border: 1px solid #d5e0ea;
+    background: #ffffff;
+    alternate-background-color: #f7fafc;
+    color: #25344a;
+    gridline-color: #e2e8f0;
+    selection-background-color: #d9f4f8;
+    selection-color: #173744;
+}
+
+QWidget#accountContentPage QListView::item {
+    border-bottom: 1px solid #edf1f5;
+}
+
+QWidget#accountContentPage QListView::item:hover,
+QWidget#accountContentPage QTableView::item:hover {
+    background: #eef9fb;
+}
+
+QWidget#accountContentPage QHeaderView::section {
+    border-bottom: 1px solid #d5e0ea;
+    background: #eef3f8;
+    color: #596b82;
+}
+
+QWidget#accountContentPage QHeaderView {
+    background: #eef3f8;
+    color: #596b82;
+}
+
+QWidget#accountContentPage QTableCornerButton::section {
+    border: 0;
+    border-bottom: 1px solid #d5e0ea;
+    background: #eef3f8;
+}
+
+QWidget#accountContentPage QProgressBar {
+    background: #dce6ef;
+}
+
+QWidget#accountContentPage QProgressBar::chunk {
+    background: #17a8c2;
+}
+
+QWidget#accountContentPage QScrollBar:vertical {
+    background: #edf2f7;
+}
+
+QWidget#accountContentPage QScrollBar::handle:vertical {
+    background: #a6b8ca;
+}
 """

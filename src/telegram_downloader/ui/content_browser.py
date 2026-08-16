@@ -4,11 +4,13 @@ from datetime import date
 from pathlib import Path
 
 from PySide6.QtCore import QDate, QModelIndex, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QDateEdit,
     QFrame,
+    QGraphicsDropShadowEffect,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
@@ -117,12 +119,13 @@ class ContentBrowserPage(QWidget):
         self.content_splitter.setObjectName("contentSplitter")
 
         self.dialog_column = QWidget()
+        self.dialog_column.setObjectName("accountContentDialogColumn")
         dialog_column_layout = QVBoxLayout(self.dialog_column)
-        dialog_column_layout.setContentsMargins(10, 10, 10, 10)
+        dialog_column_layout.setContentsMargins(16, 16, 16, 16)
         self.dialog_card = self._build_dialog_panel()
         dialog_column_layout.addWidget(self.dialog_card)
-        self.dialog_column.setMinimumWidth(230)
-        self.dialog_column.setMaximumWidth(290)
+        self.dialog_column.setMinimumWidth(242)
+        self.dialog_column.setMaximumWidth(302)
 
         self.search_column = self._build_search_panel()
         self.search_column.setMinimumWidth(680)
@@ -130,8 +133,18 @@ class ContentBrowserPage(QWidget):
         self.content_splitter.addWidget(self.search_column)
         self.content_splitter.setStretchFactor(0, 0)
         self.content_splitter.setStretchFactor(1, 1)
-        self.content_splitter.setSizes([250, 770])
+        self.content_splitter.setSizes([262, 758])
+        for card in (self.dialog_card, self.filter_card, self.results_card):
+            self._apply_card_shadow(card)
         root.addWidget(self.content_splitter, 1)
+
+    @staticmethod
+    def _apply_card_shadow(card: QFrame) -> None:
+        shadow = QGraphicsDropShadowEffect(card)
+        shadow.setBlurRadius(40)
+        shadow.setOffset(0, 7)
+        shadow.setColor(QColor(35, 50, 70, 78))
+        card.setGraphicsEffect(shadow)
 
     def _build_dialog_panel(self) -> QFrame:
         panel = QFrame()
@@ -166,6 +179,10 @@ class ContentBrowserPage(QWidget):
         self.dialog_list = QListView()
         self.dialog_list.setModel(self.dialog_model)
         self.dialog_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.dialog_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.dialog_list.setTextElideMode(Qt.TextElideMode.ElideRight)
         layout.addWidget(self.dialog_list, 1)
         return panel
 
@@ -173,7 +190,7 @@ class ContentBrowserPage(QWidget):
         panel = QWidget()
         panel.setObjectName("accountContentSearchColumn")
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
         self.filter_card = self._build_filter_card()
         self.results_card = self._build_results_card()
@@ -268,6 +285,7 @@ class ContentBrowserPage(QWidget):
 
         self.tabs = QTabWidget()
         self.results_tab = QWidget()
+        self.results_tab.setObjectName("accountContentTabPage")
         results_layout = QVBoxLayout(self.results_tab)
         results_layout.setContentsMargins(0, 8, 0, 0)
         self.result_table = QTableView()
@@ -306,6 +324,7 @@ class ContentBrowserPage(QWidget):
         )
 
         self.history_tab = QWidget()
+        self.history_tab.setObjectName("accountContentTabPage")
         history_layout = QVBoxLayout(self.history_tab)
         history_layout.setContentsMargins(0, 8, 0, 0)
         self.history_table = QTableView()

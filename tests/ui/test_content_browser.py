@@ -3,7 +3,7 @@ from datetime import UTC, date, datetime
 
 from PySide6.QtCore import QPoint, QSize, Qt
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QHeaderView
+from PySide6.QtWidgets import QGraphicsDropShadowEffect, QHeaderView
 
 from telegram_downloader.content import (
     ContentDialog,
@@ -16,6 +16,7 @@ from telegram_downloader.content import (
 from telegram_downloader.content_progress import SearchProgress
 from telegram_downloader.domain import MediaKind, ScanFilters
 from telegram_downloader.ui.content_browser import ContentBrowserPage
+from telegram_downloader.ui.theme import DARK_STYLESHEET
 
 
 def dialog(now: datetime, *, available: bool = True) -> ContentDialog:
@@ -117,6 +118,11 @@ def test_account_content_card_structure_keeps_filter_minimums(qtbot) -> None:
     assert page.date_to.minimumWidth() >= 132
     assert page.limit_input.minimumWidth() >= 90
     assert page.error_label.parentWidget() is page.filter_card
+    assert (
+        page.dialog_list.horizontalScrollBarPolicy()
+        == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    )
+    assert page.dialog_list.textElideMode() == Qt.TextElideMode.ElideRight
 
 
 def test_result_columns_do_not_squeeze_fixed_text_at_minimum_size(qtbot) -> None:
@@ -141,6 +147,21 @@ def test_result_columns_do_not_squeeze_fixed_text_at_minimum_size(qtbot) -> None
 
     assert page.result_table.horizontalScrollBar().maximum() == 0
     assert page.result_table.columnWidth(3) > 0
+
+
+def test_account_content_cards_use_w3_shadows_and_scoped_theme(qtbot) -> None:
+    page = ContentBrowserPage()
+    qtbot.addWidget(page)
+
+    for card in (page.dialog_card, page.filter_card, page.results_card):
+        effect = card.graphicsEffect()
+        assert isinstance(effect, QGraphicsDropShadowEffect)
+        assert 36 <= effect.blurRadius() <= 42
+        assert 6 <= effect.yOffset() <= 8
+
+    assert "QWidget#accountContentPage" in DARK_STYLESHEET
+    assert "QFrame#accountContentCard" in DARK_STYLESHEET
+    assert "QFrame#contentPanel" in DARK_STYLESHEET
 
 
 def test_progress_and_retry_widgets_show_honest_operation_state(qtbot) -> None:
