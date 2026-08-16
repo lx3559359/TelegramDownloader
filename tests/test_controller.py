@@ -1464,6 +1464,65 @@ async def test_repair_selected_media_runs_only_prepared_ids() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancel_integrity_pauses_active_repair_download() -> None:
+    broken = _integrity_item(
+        "broken",
+        status=ItemStatus.FAILED,
+        integrity_status=IntegrityStatus.MISSING,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class Repository:
+        def get_item(self, _item_id):
+            return broken
+
+        def list_items(self, task_id, statuses=None):
+            return [broken]
+
+        def list_task_snapshots(self, *, include_archived=False):
+            return []
+
+    class Integrity:
+        def prepare_repairs(self, item_ids):
+            broken.status = ItemStatus.QUEUED
+            broken.integrity_status = IntegrityStatus.UNVERIFIED
+            return RepairPreparation((broken.id,), 0)
+
+    class Scheduler:
+        def __init__(self):
+            self.paused = []
+
+        async def run_items(self, task_id, item_ids):
+            entered.set()
+            await release.wait()
+
+        def pause_task(self, task_id):
+            self.paused.append(task_id)
+            broken.status = ItemStatus.PAUSED
+            release.set()
+
+    scheduler = Scheduler()
+    controller = AppController.for_test(
+        repository=Repository(),
+        scheduler=scheduler,
+        window=_IntegrityWindow(),
+        integrity_service=Integrity(),
+    )
+    operation = asyncio.create_task(controller.repair_media([broken.id]))
+    await entered.wait()
+
+    controller.cancel_integrity()
+    await asyncio.sleep(0)
+
+    try:
+        assert scheduler.paused == [broken.task_id]
+    finally:
+        release.set()
+        await operation
+
+
+@pytest.mark.asyncio
 async def test_task_batch_actions_deduplicate_and_skip_ineligible_tasks() -> None:
     tasks = {
         "run": SimpleNamespace(

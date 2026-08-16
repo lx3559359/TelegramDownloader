@@ -409,6 +409,7 @@ class AppController:
         self._thumbnail_tasks: dict[str, asyncio.Task[Any]] = {}
         self._integrity_task: asyncio.Task[Any] | None = None
         self._integrity_cancel_event: Event | None = None
+        self._integrity_repair_task_ids: set[str] = set()
         self._detail_task_id: str | None = None
         self._progress_refresh_interval = progress_refresh_interval
         self._next_progress_refresh = 0.0
@@ -1522,6 +1523,7 @@ class AppController:
                 item = self.repository.get_item(item_id)
                 grouped.setdefault(item.task_id, []).append(item_id)
             if grouped:
+                self._integrity_repair_task_ids = set(grouped)
                 await asyncio.gather(
                     *(
                         self.scheduler.run_items(task_id, selected)
@@ -1547,6 +1549,8 @@ class AppController:
         if event is None:
             return
         event.set()
+        for task_id in sorted(self._integrity_repair_task_ids):
+            self.scheduler.pause_task(task_id)
         self._show_status("正在取消文件校验…")
 
     def _begin_integrity_operation(
@@ -1562,6 +1566,7 @@ class AppController:
         cancelled = Event()
         self._integrity_task = current
         self._integrity_cancel_event = cancelled
+        self._integrity_repair_task_ids.clear()
         self.window.set_integrity_busy(True)
         return current, cancelled
 
@@ -1570,6 +1575,7 @@ class AppController:
             return
         self._integrity_task = None
         self._integrity_cancel_event = None
+        self._integrity_repair_task_ids.clear()
         self.window.set_integrity_progress(None)
         self.window.set_integrity_busy(False)
 

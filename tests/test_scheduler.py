@@ -357,3 +357,31 @@ async def test_selected_run_reuses_active_task_guard_without_duplicate_downloads
     await asyncio.gather(full_run, selected_run)
 
     assert downloaded == ["i0"]
+
+
+@pytest.mark.asyncio
+async def test_selected_run_executes_newly_queued_item_after_active_task() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    downloaded = []
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            downloaded.append(item.id)
+            if item.id == "i0":
+                entered.set()
+                await release.wait()
+
+    repo = Repo(count=2)
+    repo.items[1].status = ItemStatus.COMPLETED
+    scheduler = DownloadScheduler(repo, Downloader(), concurrency=1)
+    full_run = asyncio.create_task(scheduler.run_task("t"))
+    await entered.wait()
+    repo.items[1].status = ItemStatus.QUEUED
+    selected_run = asyncio.create_task(scheduler.run_items("t", ["i1"]))
+    await asyncio.sleep(0)
+
+    release.set()
+    await asyncio.gather(full_run, selected_run)
+
+    assert downloaded == ["i0", "i1"]

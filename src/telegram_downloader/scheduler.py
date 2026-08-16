@@ -128,7 +128,23 @@ class DownloadScheduler:
         existing = self._active.get(task_id)
         if existing is not None:
             await asyncio.shield(existing)
-            return
+            if self._active.get(task_id) is existing and existing.done():
+                self._active.pop(task_id, None)
+            if self._shutting_down:
+                return
+            remaining_ids: list[str] = []
+            for item_id in ordered_ids:
+                item = self.repository.get_item(item_id)
+                if item.task_id != task_id:
+                    raise ValueError("所选媒体项不属于当前任务")
+                if item.status is ItemStatus.QUEUED:
+                    remaining_ids.append(item_id)
+                elif item.status is not ItemStatus.COMPLETED:
+                    raise ValueError("所选媒体项尚未处于等待下载状态")
+            if not remaining_ids:
+                self.repository.recompute_task_status(task_id)
+                return
+            ordered_ids = tuple(remaining_ids)
 
         task = asyncio.create_task(self._execute_items(task_id, ordered_ids))
         self._active[task_id] = task
