@@ -71,6 +71,93 @@ def test_task_actions_emit_selected_task_id(qtbot) -> None:
     assert signal.args == ["task-7"]
 
 
+def test_single_queued_task_can_be_prioritized(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.set_task_summaries(
+        [
+            TaskSummary(
+                "queued",
+                "Queued task",
+                TaskStatus.QUEUED,
+                "0 / 1",
+                "1 MB",
+                "—",
+                "—",
+                "—",
+                queue_position=2,
+            )
+        ]
+    )
+    window.task_table.selectRow(0)
+
+    assert window.prioritize_button.isEnabled() is True
+    with qtbot.waitSignal(window.prioritize_task_requested, timeout=500) as signal:
+        qtbot.mouseClick(window.prioritize_button, Qt.MouseButton.LeftButton)
+
+    assert signal.args == ["queued"]
+
+
+def test_priority_requires_exactly_one_unarchived_queued_task(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    queued = TaskSummary(
+        "queued",
+        "Queued",
+        TaskStatus.QUEUED,
+        "0 / 1",
+        "1 MB",
+        "—",
+        "—",
+        "—",
+    )
+    window.set_task_summaries(
+        [
+            queued,
+            replace(queued, id="second"),
+            replace(queued, id="active", status=TaskStatus.DOWNLOADING),
+        ]
+    )
+    selection = window.task_table.selectionModel()
+    flags = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+    selection.select(window.task_model.index(0, 0), flags)
+    selection.select(window.task_model.index(1, 0), flags)
+    assert window.prioritize_button.isEnabled() is False
+
+    selection.clearSelection()
+    window.task_table.selectRow(2)
+    assert window.prioritize_button.isEnabled() is False
+
+    window.set_task_summaries([replace(queued, archived=True)])
+    window.task_filter.setCurrentIndex(window.task_filter.findData(TaskFilter.ARCHIVED))
+    window.task_table.selectRow(0)
+    assert window.prioritize_button.isEnabled() is False
+
+
+def test_scheduler_summary_formats_active_and_idle_resources(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+
+    window.set_scheduler_summary(
+        active=1,
+        queued=3,
+        concurrency=3,
+        speed_limit_kib=0,
+    )
+    assert (
+        window.scheduler_summary.text()
+        == "调度：1 个下载中 · 3 个等待 · 文件并发 3 · 不限速"
+    )
+
+    window.set_scheduler_summary(
+        active=0,
+        queued=0,
+        concurrency=3,
+        speed_limit_kib=2048,
+    )
+    assert window.scheduler_summary.text() == "调度：空闲 · 文件并发 3 · 限速 2.0 MB/s"
+
+
 @pytest.mark.parametrize(
     ("status", "expected"),
     [

@@ -11,6 +11,7 @@ def test_round_trip_manual_proxy_form(qtbot) -> None:
         4,
         ProxySettings("http", "127.0.0.1", 8080, "u"),
         False,
+        speed_limit_kib=2048,
     )
     dialog = SettingsDialog(settings, proxy_password="secret")
     qtbot.addWidget(dialog)
@@ -18,6 +19,12 @@ def test_round_trip_manual_proxy_form(qtbot) -> None:
     assert dialog.values() == settings
     assert dialog.concurrency.minimum() == 1
     assert dialog.concurrency.maximum() == 5
+    assert dialog.concurrency_label.text() == "文件并发"
+    assert tuple(
+        dialog.speed_limit.itemData(index)
+        for index in range(dialog.speed_limit.count())
+    ) == (0, 256, 512, 1024, 2048, 5120, 10240, 20480, 51200)
+    assert dialog.speed_limit.currentData() == 2048
     assert dialog.proxy_password.echoMode() is QLineEdit.EchoMode.Password
     assert dialog.proxy_password.text() == "secret"
 

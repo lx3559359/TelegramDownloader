@@ -57,6 +57,28 @@ class SettingsDialog(QDialog):
         self.concurrency = QSpinBox()
         self.concurrency.setRange(1, 5)
         self.concurrency.setValue(settings.concurrency)
+        self.speed_limit = QComboBox()
+        speed_presets = (
+            ("不限速", 0),
+            ("256 KiB/s", 256),
+            ("512 KiB/s", 512),
+            ("1 MiB/s", 1024),
+            ("2 MiB/s", 2048),
+            ("5 MiB/s", 5120),
+            ("10 MiB/s", 10240),
+            ("20 MiB/s", 20480),
+            ("50 MiB/s", 51200),
+        )
+        for label, value in speed_presets:
+            self.speed_limit.addItem(label, value)
+        selected_speed = self.speed_limit.findData(settings.speed_limit_kib)
+        if selected_speed < 0:
+            self.speed_limit.addItem(
+                f"自定义 {settings.speed_limit_kib} KiB/s",
+                settings.speed_limit_kib,
+            )
+            selected_speed = self.speed_limit.count() - 1
+        self.speed_limit.setCurrentIndex(selected_speed)
         self.check_updates = QCheckBox("启动后自动检查正式版更新")
         self.check_updates.setChecked(settings.check_updates_on_startup)
         self.proxy_kind = QComboBox()
@@ -72,7 +94,9 @@ class SettingsDialog(QDialog):
         self.proxy_password = QLineEdit(proxy_password)
         self.proxy_password.setEchoMode(QLineEdit.EchoMode.Password)
         form.addRow("API ID", self.api_id)
-        form.addRow("并发下载", self.concurrency)
+        self.concurrency_label = QLabel("文件并发")
+        form.addRow(self.concurrency_label, self.concurrency)
+        form.addRow("总下载限速", self.speed_limit)
         form.addRow("在线更新", self.check_updates)
         form.addRow("代理类型", self.proxy_kind)
         form.addRow("代理地址", self.proxy_host)
@@ -135,6 +159,7 @@ class SettingsDialog(QDialog):
             self.concurrency.value(),
             self.proxy_values(),
             self.check_updates.isChecked(),
+            speed_limit_kib=int(self.speed_limit.currentData()),
         )
 
     def _update_proxy_fields(self) -> None:

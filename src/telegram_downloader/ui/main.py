@@ -82,6 +82,7 @@ class MainWindow(QMainWindow):
     pause_tasks_requested = Signal(object)
     resume_tasks_requested = Signal(object)
     retry_tasks_requested = Signal(object)
+    prioritize_task_requested = Signal(str)
     archive_tasks_requested = Signal(object)
     restore_tasks_requested = Signal(object)
     open_media_requested = Signal(str)
@@ -141,6 +142,9 @@ class MainWindow(QMainWindow):
                 self.retry_tasks_requested.emit,
                 self.retry_failed_requested.emit,
             )
+        )
+        self.prioritize_button.clicked.connect(
+            lambda: self._emit_for_selected(self.prioritize_task_requested.emit)
         )
         self.open_button.clicked.connect(
             lambda: self._emit_for_selected(self.open_directory_requested.emit)
@@ -358,6 +362,7 @@ class MainWindow(QMainWindow):
         actions = QHBoxLayout()
         self.pause_button = QPushButton("暂停")
         self.resume_button = QPushButton("继续")
+        self.prioritize_button = QPushButton("优先下载")
         self.retry_button = QPushButton("重试失败项")
         self.verify_tasks_button = QPushButton("校验文件")
         self.archive_button = QPushButton("归档所选")
@@ -366,6 +371,7 @@ class MainWindow(QMainWindow):
         for button in (
             self.pause_button,
             self.resume_button,
+            self.prioritize_button,
             self.retry_button,
             self.verify_tasks_button,
             self.archive_button,
@@ -454,6 +460,10 @@ class MainWindow(QMainWindow):
         current_layout.setContentsMargins(13, 13, 13, 14)
         current_layout.setSpacing(9)
         current_layout.addWidget(self._section_label("当前任务"))
+        self.scheduler_summary = QLabel("调度：空闲 · 文件并发 3 · 不限速")
+        self.scheduler_summary.setObjectName("muted")
+        self.scheduler_summary.setWordWrap(True)
+        current_layout.addWidget(self.scheduler_summary)
         self.current_task_label = QLabel("暂无活动任务")
         self.current_task_label.setObjectName("muted")
         self.current_task_label.setWordWrap(True)
@@ -553,6 +563,11 @@ class MainWindow(QMainWindow):
         self.resume_button.setEnabled(
             any(not task.archived and task.status is TaskStatus.PAUSED for task in tasks)
         )
+        self.prioritize_button.setEnabled(
+            len(tasks) == 1
+            and not tasks[0].archived
+            and tasks[0].status is TaskStatus.QUEUED
+        )
         self.retry_button.setEnabled(
             any(not task.archived and task.status is TaskStatus.PARTIAL_FAILURE for task in tasks)
         )
@@ -644,6 +659,28 @@ class MainWindow(QMainWindow):
         if active.remaining_text != "—":
             detail += f" · 剩余 {active.remaining_text}"
         self.current_detail.setText(detail)
+
+    def set_scheduler_summary(
+        self,
+        *,
+        active: int,
+        queued: int,
+        concurrency: int,
+        speed_limit_kib: int,
+    ) -> None:
+        activity = (
+            f"{active} 个下载中 · {queued} 个等待"
+            if active > 0
+            else "空闲"
+        )
+        speed = (
+            "不限速"
+            if speed_limit_kib == 0
+            else f"限速 {self._format_rate(speed_limit_kib * 1024)}"
+        )
+        self.scheduler_summary.setText(
+            f"调度：{activity} · 文件并发 {concurrency} · {speed}"
+        )
 
     def set_task_items(
         self,

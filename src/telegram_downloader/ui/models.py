@@ -32,6 +32,7 @@ class TaskSummary:
     speed_bps: float = 0.0
     remaining_seconds: int | None = None
     archived: bool = False
+    queue_position: int | None = None
 
 
 class TaskFilter(StrEnum):
@@ -146,7 +147,7 @@ class TaskTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.DisplayRole:
             values = (
                 task.title,
-                _STATUS_LABELS[task.status],
+                self._status_text(task),
                 task.progress_text,
                 task.size_text,
                 task.speed_text,
@@ -159,7 +160,7 @@ class TaskTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.TextAlignmentRole and index.column() > 0:
             return int(Qt.AlignmentFlag.AlignCenter)
         if role == Qt.ItemDataRole.ToolTipRole:
-            summary = f"{task.title} · {_STATUS_LABELS[task.status]}"
+            summary = f"{task.title} · {self._status_text(task)}"
             return summary if task.error_text == "—" else f"{summary} · {task.error_text}"
         return None
 
@@ -208,6 +209,17 @@ class TaskTableModel(QAbstractTableModel):
             (row for row, task in enumerate(self._tasks) if task.id == task_id),
             None,
         )
+
+    @staticmethod
+    def _status_text(task: TaskSummary) -> str:
+        label = _STATUS_LABELS[task.status]
+        if (
+            task.status is TaskStatus.QUEUED
+            and task.queue_position is not None
+            and task.queue_position > 0
+        ):
+            return f"{label} · 第 {task.queue_position} 位"
+        return label
 
     def _filtered_tasks(self) -> list[TaskSummary]:
         return [
