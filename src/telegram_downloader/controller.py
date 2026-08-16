@@ -9,6 +9,7 @@ from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from pathlib import Path
+from threading import Event
 from time import monotonic as monotonic_clock
 from typing import Any
 
@@ -17,10 +18,16 @@ from telegram_downloader.content import ContentSearchQuery, SearchResult
 from telegram_downloader.content_browser import NothingToQueueError
 from telegram_downloader.content_progress import DialogSyncProgress, SearchProgress
 from telegram_downloader.domain import (
+    IntegrityStatus,
     ItemStatus,
     MediaKind,
     ScanFilters,
     TaskStatus,
+)
+from telegram_downloader.file_integrity import (
+    IntegrityProgress,
+    IntegritySummary,
+    RepairPreparation,
 )
 from telegram_downloader.gateway import (
     AuthState,
@@ -86,6 +93,12 @@ class _NullWindow:
         pass
 
     def set_scan_busy(self, _busy: bool) -> None:
+        pass
+
+    def set_integrity_busy(self, _busy: bool) -> None:
+        pass
+
+    def set_integrity_progress(self, _progress: IntegrityProgress | None) -> None:
         pass
 
     def statusBar(self) -> _NullStatusBar:
@@ -254,11 +267,28 @@ class _NullScheduler:
     async def resume_task(self, _task_id: str) -> None:
         pass
 
+    async def run_items(self, _task_id: str, _item_ids: list[str]) -> None:
+        pass
+
     def pause_task(self, _task_id: str) -> None:
         pass
 
     async def shutdown(self) -> None:
         pass
+
+
+class _NullIntegrityService:
+    async def verify(
+        self,
+        _item_ids: list[str],
+        *,
+        progress=None,
+        cancelled=None,
+    ) -> IntegritySummary:
+        return IntegritySummary()
+
+    def prepare_repairs(self, _item_ids: list[str]) -> RepairPreparation:
+        return RepairPreparation()
 
 
 class _NullSubscriptionService:
@@ -315,6 +345,7 @@ class AppController:
         content_browser: Any | None = None,
         subscriptions: Any | None = None,
         subscription_scheduler: Any | None = None,
+        integrity_service: Any | None = None,
         paths: PortablePaths | None = None,
         gateway_factory: Callable[..., TelegramGateway] | None = None,
         service_builder: Callable[
@@ -348,6 +379,7 @@ class AppController:
         self.content_browser = content_browser
         self.subscriptions = subscriptions or _NullSubscriptionService()
         self.subscription_scheduler = subscription_scheduler or _NullSubscriptionScheduler()
+        self.integrity_service = integrity_service or _NullIntegrityService()
         self.paths = paths
         self.gateway_factory = gateway_factory
         self.service_builder = service_builder
@@ -375,6 +407,9 @@ class AppController:
         self._subscription_probe_task: asyncio.Task[Any] | None = None
         self._subscription_actions_active = 0
         self._thumbnail_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._integrity_task: asyncio.Task[Any] | None = None
+        self._integrity_cancel_event: Event | None = None
+        self._detail_task_id: str | None = None
         self._progress_refresh_interval = progress_refresh_interval
         self._next_progress_refresh = 0.0
         self._progress_samples: dict[str, tuple[float, int]] = {}
@@ -395,6 +430,7 @@ class AppController:
             content_browser=dependencies.pop("content_browser", None),
             subscriptions=dependencies.pop("subscriptions", None),
             subscription_scheduler=dependencies.pop("subscription_scheduler", None),
+            integrity_service=dependencies.pop("integrity_service", None),
             paths=dependencies.pop("paths", None),
             gateway_factory=dependencies.pop("gateway_factory", None),
             service_builder=dependencies.pop("service_builder", None),
@@ -1405,6 +1441,7 @@ class AppController:
     def select_task_details(self, task_ids: list[str]) -> None:
         unique = self._unique_task_ids(task_ids)
         if len(unique) != 1:
+            self._detail_task_id = None
             return
         task_id = unique[0]
         try:
@@ -1421,10 +1458,135 @@ class AppController:
                 item.expected_size,
                 item.retry_count,
                 item.last_error or "—",
+                getattr(
+                    item,
+                    "integrity_status",
+                    IntegrityStatus.UNVERIFIED,
+                ),
+                getattr(item, "verified_at", None),
             )
             for item in items
         ]
+        self._detail_task_id = task_id
         self.window.set_task_items(task_id, summaries)
+
+    async def verify_media(self, item_ids: list[str]) -> None:
+        unique = self._unique_task_ids(item_ids)
+        if not unique:
+            self._show_status("请先选择要校验的媒体")
+            return
+        await self._verify_integrity_items(unique)
+
+    async def verify_tasks(self, task_ids: list[str]) -> None:
+        item_ids: list[str] = []
+        for task_id in self._unique_task_ids(task_ids):
+            item_ids.extend(item.id for item in self.repository.list_items(task_id))
+        unique = self._unique_task_ids(item_ids)
+        if not unique:
+            self._show_status("所选任务没有可校验的媒体")
+            return
+        await self._verify_integrity_items(unique)
+
+    async def _verify_integrity_items(self, item_ids: list[str]) -> None:
+        operation = self._begin_integrity_operation()
+        if operation is None:
+            return
+        current, cancelled = operation
+        try:
+            summary = await self.integrity_service.verify(
+                item_ids,
+                progress=self.window.set_integrity_progress,
+                cancelled=cancelled,
+            )
+            self._show_status(self._integrity_summary_text(summary))
+        finally:
+            self._finish_integrity_operation(current)
+            self._refresh_integrity_views()
+
+    async def repair_media(self, item_ids: list[str]) -> None:
+        unique = self._unique_task_ids(item_ids)
+        if not unique:
+            self._show_status("请先选择要重新下载的异常媒体")
+            return
+        operation = self._begin_integrity_operation()
+        if operation is None:
+            return
+        current, _cancelled = operation
+        try:
+            prepared = await asyncio.to_thread(
+                self.integrity_service.prepare_repairs,
+                unique,
+            )
+            grouped: dict[str, list[str]] = {}
+            for item_id in prepared.accepted_ids:
+                item = self.repository.get_item(item_id)
+                grouped.setdefault(item.task_id, []).append(item_id)
+            if grouped:
+                await asyncio.gather(
+                    *(
+                        self.scheduler.run_items(task_id, selected)
+                        for task_id, selected in grouped.items()
+                    )
+                )
+            repaired = [
+                self.repository.get_item(item_id)
+                for item_id in prepared.accepted_ids
+            ]
+            succeeded = sum(item.status is ItemStatus.COMPLETED for item in repaired)
+            failed = len(repaired) - succeeded
+            self._show_status(
+                "精准修复完成："
+                f"成功 {succeeded}，失败 {failed}，跳过 {prepared.skipped}"
+            )
+        finally:
+            self._finish_integrity_operation(current)
+            self._refresh_integrity_views()
+
+    def cancel_integrity(self) -> None:
+        event = self._integrity_cancel_event
+        if event is None:
+            return
+        event.set()
+        self._show_status("正在取消文件校验…")
+
+    def _begin_integrity_operation(
+        self,
+    ) -> tuple[asyncio.Task[Any], Event] | None:
+        current = asyncio.current_task()
+        if current is None:
+            raise RuntimeError("完整性操作必须在异步任务中运行")
+        active = self._integrity_task
+        if active is not None and active is not current and not active.done():
+            self._show_status("已有文件完整性操作正在进行")
+            return None
+        cancelled = Event()
+        self._integrity_task = current
+        self._integrity_cancel_event = cancelled
+        self.window.set_integrity_busy(True)
+        return current, cancelled
+
+    def _finish_integrity_operation(self, current: asyncio.Task[Any]) -> None:
+        if self._integrity_task is not current:
+            return
+        self._integrity_task = None
+        self._integrity_cancel_event = None
+        self.window.set_integrity_progress(None)
+        self.window.set_integrity_busy(False)
+
+    def _refresh_integrity_views(self) -> None:
+        self.refresh_tasks()
+        if self._detail_task_id is not None:
+            self.select_task_details([self._detail_task_id])
+
+    @staticmethod
+    def _integrity_summary_text(summary: IntegritySummary) -> str:
+        prefix = "校验已取消" if summary.cancelled else "校验完成"
+        return (
+            f"{prefix}：通过 {summary.verified}，建立基线 {summary.baselined}，"
+            f"缺失 {summary.missing}，大小异常 {summary.size_mismatch}，"
+            f"哈希异常 {summary.hash_mismatch}，无法读取 {summary.read_error}，"
+            f"跳过 {summary.skipped}，取消 {summary.cancelled}"
+        )
 
     def open_media_file(self, item_id: str) -> None:
         if self.paths is None:
@@ -1434,9 +1596,21 @@ class AppController:
             if item.status is not ItemStatus.COMPLETED:
                 self._show_status("媒体尚未下载完成，不能打开文件")
                 return
+            if getattr(item, "integrity_status", IntegrityStatus.UNVERIFIED) in {
+                IntegrityStatus.MISSING,
+                IntegrityStatus.SIZE_MISMATCH,
+                IntegrityStatus.HASH_MISMATCH,
+                IntegrityStatus.READ_ERROR,
+            }:
+                self._show_status("媒体完整性异常，请先校验或重新下载")
+                return
             target = self.paths.guard(Path(item.target_path))
             if not target.is_file():
                 self._show_status("本地文件不存在；当前操作不会修改任务记录")
+                return
+            expected_size = getattr(item, "expected_size", None)
+            if expected_size is not None and target.stat().st_size != expected_size:
+                self._show_status("本地文件大小异常，请先校验或重新下载")
                 return
             startfile = getattr(os, "startfile", None)
             if startfile is not None:
@@ -1467,6 +1641,7 @@ class AppController:
         if self._shutting_down:
             return
         self._shutting_down = True
+        await self._cancel_integrity_for_shutdown()
         await self._cancel_connection_monitor()
         await self._cancel_qr_wait()
         await self._cancel_subscription_probe()
@@ -1485,6 +1660,17 @@ class AppController:
                 go_offline()
         self.subscriptions.go_offline()
         self.subscription_scheduler.set_account(None)
+
+    async def _cancel_integrity_for_shutdown(self) -> None:
+        task = self._integrity_task
+        event = self._integrity_cancel_event
+        if event is not None:
+            event.set()
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
     async def _cancel_connection_monitor(self) -> None:
         task = self._connection_monitor_task

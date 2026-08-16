@@ -15,7 +15,18 @@ from telegram_downloader.content import (
 )
 from telegram_downloader.content_progress import DialogSyncProgress, SearchProgress
 from telegram_downloader.controller import AppController
-from telegram_downloader.domain import ItemStatus, MediaKind, ScanFilters, TaskStatus
+from telegram_downloader.domain import (
+    IntegrityStatus,
+    ItemStatus,
+    MediaKind,
+    ScanFilters,
+    TaskStatus,
+)
+from telegram_downloader.file_integrity import (
+    IntegrityProgress,
+    IntegritySummary,
+    RepairPreparation,
+)
 from telegram_downloader.gateway import (
     AccessDeniedError,
     AuthState,
@@ -1175,6 +1186,8 @@ def test_task_detail_selection_loads_only_one_selected_task() -> None:
         expected_size=10,
         retry_count=2,
         last_error="safe-error",
+        integrity_status=IntegrityStatus.HASH_MISMATCH,
+        verified_at=datetime(2026, 8, 16, tzinfo=UTC),
     )
 
     class Repository:
@@ -1206,6 +1219,248 @@ def test_task_detail_selection_loads_only_one_selected_task() -> None:
     assert len(summaries) == 1
     assert summaries[0].id == item.id
     assert summaries[0].error_text == "safe-error"
+    assert summaries[0].integrity_status is IntegrityStatus.HASH_MISMATCH
+    assert summaries[0].verified_at == item.verified_at
+
+
+def _integrity_item(
+    item_id: str,
+    task_id: str = "task",
+    *,
+    status: ItemStatus = ItemStatus.COMPLETED,
+    integrity_status: IntegrityStatus = IntegrityStatus.UNVERIFIED,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=item_id,
+        task_id=task_id,
+        original_name=f"{item_id}.bin",
+        media_kind=MediaKind.DOCUMENT,
+        status=status,
+        downloaded_bytes=4,
+        expected_size=4,
+        retry_count=0,
+        last_error=None,
+        integrity_status=integrity_status,
+        verified_at=None,
+    )
+
+
+class _IntegrityWindow:
+    def __init__(self) -> None:
+        self.busy: list[bool] = []
+        self.progress = []
+        self.task_refreshes = 0
+        self.details = []
+        self.message = ""
+
+    def set_integrity_busy(self, value):
+        self.busy.append(value)
+
+    def set_integrity_progress(self, value):
+        self.progress.append(value)
+
+    def set_task_summaries(self, _summaries):
+        self.task_refreshes += 1
+
+    def set_task_items(self, task_id, items):
+        self.details.append((task_id, items))
+
+    def statusBar(self):
+        return self
+
+    def showMessage(self, message, _timeout=0):
+        self.message = message
+
+
+@pytest.mark.asyncio
+async def test_verify_media_forwards_progress_suppresses_duplicate_and_refreshes() -> None:
+    item = _integrity_item("media")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class Repository:
+        def get_item(self, item_id):
+            assert item_id == item.id
+            return item
+
+        def list_items(self, task_id, statuses=None):
+            assert task_id == item.task_id
+            return [item]
+
+        def list_task_snapshots(self, *, include_archived=False):
+            assert include_archived is True
+            return []
+
+    class Integrity:
+        def __init__(self):
+            self.calls = []
+
+        async def verify(self, item_ids, *, progress, cancelled):
+            self.calls.append(item_ids)
+            entered.set()
+            await release.wait()
+            progress(
+                IntegrityProgress(
+                    1,
+                    1,
+                    item.id,
+                    item.original_name,
+                    IntegrityStatus.VERIFIED,
+                )
+            )
+            return IntegritySummary(baselined=1)
+
+    window = _IntegrityWindow()
+    integrity = Integrity()
+    controller = AppController.for_test(
+        repository=Repository(),
+        window=window,
+        integrity_service=integrity,
+    )
+    controller.select_task_details([item.task_id])
+
+    active = asyncio.create_task(controller.verify_media([item.id, item.id]))
+    await entered.wait()
+    await controller.verify_media([item.id])
+    release.set()
+    await active
+
+    assert integrity.calls == [[item.id]]
+    assert window.busy == [True, False]
+    assert next(value for value in window.progress if value is not None).item_id == item.id
+    assert window.progress[-1] is None
+    assert window.task_refreshes == 1
+    assert window.details[-1][0] == item.task_id
+    assert "建立基线 1" in window.message
+
+
+@pytest.mark.asyncio
+async def test_verify_tasks_expands_media_and_cancel_stops_operation() -> None:
+    items = [_integrity_item("one", "a"), _integrity_item("two", "b")]
+    entered = asyncio.Event()
+
+    class Repository:
+        def list_items(self, task_id, statuses=None):
+            return [item for item in items if item.task_id == task_id]
+
+        def list_task_snapshots(self, *, include_archived=False):
+            return []
+
+    class Integrity:
+        def __init__(self):
+            self.ids = []
+
+        async def verify(self, item_ids, *, progress, cancelled):
+            self.ids = item_ids
+            entered.set()
+            while not cancelled.is_set():
+                await asyncio.sleep(0)
+            return IntegritySummary(cancelled=len(item_ids))
+
+    integrity = Integrity()
+    window = _IntegrityWindow()
+    controller = AppController.for_test(
+        repository=Repository(),
+        window=window,
+        integrity_service=integrity,
+    )
+
+    operation = asyncio.create_task(controller.verify_tasks(["a", "b", "a"]))
+    await entered.wait()
+    controller.cancel_integrity()
+    await operation
+
+    assert integrity.ids == ["one", "two"]
+    assert window.busy == [True, False]
+    assert "取消" in window.message
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_active_integrity_operation() -> None:
+    entered = asyncio.Event()
+
+    class Integrity:
+        async def verify(self, item_ids, *, progress, cancelled):
+            entered.set()
+            await asyncio.Event().wait()
+
+    class Repository:
+        def list_task_snapshots(self, *, include_archived=False):
+            return []
+
+    controller = AppController.for_test(
+        repository=Repository(),
+        window=_IntegrityWindow(),
+        integrity_service=Integrity(),
+    )
+    operation = asyncio.create_task(controller.verify_media(["media"]))
+    await entered.wait()
+
+    await controller.shutdown()
+
+    try:
+        assert operation.cancelled() is True
+    finally:
+        if not operation.done():
+            operation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+
+
+@pytest.mark.asyncio
+async def test_repair_selected_media_runs_only_prepared_ids() -> None:
+    broken = _integrity_item(
+        "broken",
+        status=ItemStatus.FAILED,
+        integrity_status=IntegrityStatus.MISSING,
+    )
+    healthy = _integrity_item(
+        "healthy",
+        status=ItemStatus.COMPLETED,
+        integrity_status=IntegrityStatus.VERIFIED,
+    )
+    items = {item.id: item for item in (broken, healthy)}
+
+    class Repository:
+        def get_item(self, item_id):
+            return items[item_id]
+
+        def list_items(self, task_id, statuses=None):
+            return list(items.values())
+
+        def list_task_snapshots(self, *, include_archived=False):
+            return []
+
+    class Integrity:
+        def prepare_repairs(self, item_ids):
+            assert item_ids == [broken.id, healthy.id]
+            broken.status = ItemStatus.QUEUED
+            broken.integrity_status = IntegrityStatus.UNVERIFIED
+            return RepairPreparation((broken.id,), skipped=1)
+
+    class Scheduler:
+        def __init__(self):
+            self.selected_runs = []
+
+        async def run_items(self, task_id, item_ids):
+            self.selected_runs.append((task_id, item_ids))
+            items[item_ids[0]].status = ItemStatus.COMPLETED
+
+    scheduler = Scheduler()
+    window = _IntegrityWindow()
+    controller = AppController.for_test(
+        repository=Repository(),
+        scheduler=scheduler,
+        window=window,
+        integrity_service=Integrity(),
+    )
+    controller.select_task_details([broken.task_id])
+
+    await controller.repair_media([broken.id, healthy.id])
+
+    assert scheduler.selected_runs == [(broken.task_id, [broken.id])]
+    assert "成功 1" in window.message
+    assert "跳过 1" in window.message
 
 
 @pytest.mark.asyncio

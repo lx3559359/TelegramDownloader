@@ -12,6 +12,7 @@ from telegram_downloader.connectivity import ConnectionRecovery
 from telegram_downloader.content import AccountProfile, ContentDialog, DialogKind
 from telegram_downloader.content_browser import ContentBrowserService
 from telegram_downloader.domain import MediaKind
+from telegram_downloader.file_integrity import FileIntegrityService
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.subscription_scheduler import SubscriptionScheduler
 from telegram_downloader.subscription_service import SubscriptionService
@@ -150,11 +151,13 @@ def test_create_application_initializes_project_local_content_services(
         assert isinstance(controller.subscription_scheduler, SubscriptionScheduler)
         assert controller.window.subscriptions_page is not None
         assert isinstance(controller.connection_recovery, ConnectionRecovery)
+        assert isinstance(controller.integrity_service, FileIntegrityService)
+        assert controller.integrity_service.paths.root == tmp_path.resolve()
         slot_names = {getattr(slot, "__name__", "") for slot in controller._ui_slots}
         assert "content_preview_requested" in slot_names
         assert "subscription_probe_requested" in slot_names
         assert controller._async_actions.active_keys == frozenset()
-        assert len(controller._async_actions._slots) == 10
+        assert len(controller._async_actions._slots) == 13
         controller.window.content_page.link_requested.emit("https://t.me/example/1#fragment")
         assert controller.window.content_page.error_label.text() == ("请输入有效的 t.me 链接")
 
@@ -345,6 +348,7 @@ def test_task_management_signals_route_sync_and_async_actions(
     monkeypatch.setattr(controller, "archive_tasks", record_sync("archive"))
     monkeypatch.setattr(controller, "restore_tasks", record_sync("restore"))
     monkeypatch.setattr(controller, "open_media_file", record_sync("open"))
+    monkeypatch.setattr(controller, "cancel_integrity", lambda: calls.append(("cancel", None)))
     monkeypatch.setattr(
         controller,
         "resume_tasks",
@@ -354,6 +358,21 @@ def test_task_management_signals_route_sync_and_async_actions(
         controller,
         "retry_failed_tasks",
         lambda value: record_async("retry", value),
+    )
+    monkeypatch.setattr(
+        controller,
+        "verify_media",
+        lambda value: record_async("verify_media", value),
+    )
+    monkeypatch.setattr(
+        controller,
+        "verify_tasks",
+        lambda value: record_async("verify_tasks", value),
+    )
+    monkeypatch.setattr(
+        controller,
+        "repair_media",
+        lambda value: record_async("repair_media", value),
     )
 
     async def emit_actions() -> None:
@@ -365,6 +384,13 @@ def test_task_management_signals_route_sync_and_async_actions(
         controller.window.resume_tasks_requested.emit(["paused"])
         controller.window.retry_tasks_requested.emit(["failed"])
         await controller._async_actions.wait_idle()
+        controller.window.verify_media_requested.emit(["media"])
+        await controller._async_actions.wait_idle()
+        controller.window.verify_tasks_requested.emit(["done"])
+        await controller._async_actions.wait_idle()
+        controller.window.repair_media_requested.emit(["broken"])
+        await controller._async_actions.wait_idle()
+        controller.window.integrity_cancel_requested.emit()
 
     try:
         loop.run_until_complete(emit_actions())
@@ -377,11 +403,18 @@ def test_task_management_signals_route_sync_and_async_actions(
             ("open", "media"),
             ("resume", ["paused"]),
             ("retry", ["failed"]),
+            ("verify_media", ["media"]),
+            ("verify_tasks", ["done"]),
+            ("repair_media", ["broken"]),
+            ("cancel", None),
         ]
         slot_names = {getattr(slot, "__name__", "") for slot in controller._ui_slots}
         assert "task_selection_changed" in slot_names
         assert "resume_tasks_requested" in slot_names
         assert "retry_tasks_requested" in slot_names
+        assert "verify_media_requested" in slot_names
+        assert "verify_tasks_requested" in slot_names
+        assert "repair_media_requested" in slot_names
     finally:
         loop.run_until_complete(controller._async_actions.shutdown())
         controller.window.close()

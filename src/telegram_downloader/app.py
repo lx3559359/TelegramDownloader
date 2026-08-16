@@ -17,6 +17,7 @@ from telegram_downloader.content import ContentSearchQuery
 from telegram_downloader.content_browser import ContentBrowserService
 from telegram_downloader.controller import AppController
 from telegram_downloader.downloader import MediaDownloader
+from telegram_downloader.file_integrity import FileIntegrityService
 from telegram_downloader.gateway import TelethonGateway
 from telegram_downloader.instance_guard import WindowsInstanceGuard
 from telegram_downloader.logging import configure_logging
@@ -209,6 +210,7 @@ def create_application(root: Path):
     repository = TaskRepository(paths.database)
     repository.initialize()
     repository.recover_interrupted()
+    integrity_service = FileIntegrityService(repository, paths)
     catalog = CatalogRepository(paths.catalog_database)
     catalog_error: Exception | None = None
     try:
@@ -337,6 +339,7 @@ def create_application(root: Path):
         content_browser=content_browser,
         subscriptions=subscriptions,
         subscription_scheduler=subscription_scheduler,
+        integrity_service=integrity_service,
         paths=paths,
         gateway_factory=gateway_factory,
         service_builder=build_services,
@@ -414,6 +417,18 @@ def create_application(root: Path):
 
     def open_media_requested(item_id: str) -> None:
         controller.open_media_file(item_id)
+
+    async def verify_media_requested(value: object) -> None:
+        await controller.verify_media(_task_ids(value))
+
+    async def verify_tasks_requested(value: object) -> None:
+        await controller.verify_tasks(_task_ids(value))
+
+    async def repair_media_requested(value: object) -> None:
+        await controller.repair_media(_task_ids(value))
+
+    def integrity_cancel_requested() -> None:
+        controller.cancel_integrity()
 
     @qasync.asyncSlot(str)
     async def content_dialog_selected(peer_ref: str) -> None:
@@ -499,6 +514,7 @@ def create_application(root: Path):
     window.archive_tasks_requested.connect(archive_tasks_requested)
     window.restore_tasks_requested.connect(restore_tasks_requested)
     window.open_media_requested.connect(open_media_requested)
+    window.integrity_cancel_requested.connect(integrity_cancel_requested)
     window.open_directory_requested.connect(controller.open_task_directory)
     window.settings_requested.connect(open_settings)
     window.login_requested.connect(controller.show_login)
@@ -567,6 +583,24 @@ def create_application(root: Path):
         retry_tasks_requested,
         hooks=ActionHooks(failed=task_failure),
     )
+    async_actions.connect_payload(
+        window.verify_media_requested,
+        "integrity.operation",
+        verify_media_requested,
+        hooks=ActionHooks(failed=task_failure),
+    )
+    async_actions.connect_payload(
+        window.verify_tasks_requested,
+        "integrity.operation",
+        verify_tasks_requested,
+        hooks=ActionHooks(failed=task_failure),
+    )
+    async_actions.connect_payload(
+        window.repair_media_requested,
+        "integrity.operation",
+        repair_media_requested,
+        hooks=ActionHooks(failed=task_failure),
+    )
     async_actions.connect(
         window.content_page.refresh_requested,
         "dialogs.refresh",
@@ -623,6 +657,10 @@ def create_application(root: Path):
             archive_tasks_requested,
             restore_tasks_requested,
             open_media_requested,
+            verify_media_requested,
+            verify_tasks_requested,
+            repair_media_requested,
+            integrity_cancel_requested,
             content_dialog_selected,
             content_search_requested,
             content_load_more_requested,

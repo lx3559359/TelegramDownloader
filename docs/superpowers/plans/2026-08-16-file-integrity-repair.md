@@ -381,7 +381,7 @@ git commit -m "feat: add media integrity controls"
 - Modify: `tests/test_controller.py`
 - Modify: `tests/test_app.py`
 
-- [ ] **Step 1: Write failing controller tests**
+- [x] **Step 1: Write failing controller tests**
 
 Add a fake integrity service and assert media/task selection expansion, progress forwarding, duplicate-action suppression, cancellation, summary wording, refresh after completion, safe repair confirmation input, and selected scheduler IDs. Add shutdown cancellation coverage.
 
@@ -397,25 +397,25 @@ async def test_repair_selected_media_runs_only_prepared_ids(controller_fixture) 
     assert "已重新下载 1" in window.statusBar().last_message
 ```
 
-- [ ] **Step 2: Run focused controller tests and confirm RED**
+- [x] **Step 2: Run focused controller tests and confirm RED**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_controller.py tests/test_app.py -k "integrity or repair_media" -q`
 
 Expected: controller constructor and UI wiring do not expose integrity operations.
 
-- [ ] **Step 3: Inject service and implement cancellable actions**
+- [x] **Step 3: Inject service and implement cancellable actions**
 
 Add `integrity_service` to `AppController`, `_integrity_task`, and a cancellation event. Implement `verify_media`, `verify_tasks`, `repair_media`, and `cancel_integrity`; use one active operation guard. Expand task IDs with repository queries before starting, forward progress to `window.set_integrity_progress`, and refresh task/detail state in `finally`.
 
 Construct `FileIntegrityService(repository, paths)` in `create_application`. Connect new sync signals through `AsyncActionBridge` with stable keys so repeated clicks reuse/cancel safely.
 
-- [ ] **Step 4: Run controller/app tests and confirm GREEN**
+- [x] **Step 4: Run controller/app tests and confirm GREEN**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_controller.py tests/test_app.py -q`
 
 Expected: all existing login, search, subscription, download, and update tests remain green.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add src/telegram_downloader/controller.py src/telegram_downloader/app.py tests/test_controller.py tests/test_app.py
