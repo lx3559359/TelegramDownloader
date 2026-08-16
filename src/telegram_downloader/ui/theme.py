@@ -25,18 +25,18 @@ def ensure_cjk_font() -> str:
 
 
 APP_STYLESHEET = """
+QWidget {
+    background: transparent;
+    color: #1F2937;
+    font-family: "Microsoft YaHei UI", "Segoe UI";
+    font-size: 13px;
+}
 QMainWindow, QDialog {
     background: qlineargradient(
         x1: 0, y1: 0, x2: 0, y2: 1,
         stop: 0 #F7F9FC, stop: 1 #E6EBF2
     );
     color: #1F2937;
-}
-QWidget {
-    background: transparent;
-    color: #1F2937;
-    font-family: "Microsoft YaHei UI", "Segoe UI";
-    font-size: 13px;
 }
 QWidget#navRail, QWidget#statsRail,
 QFrame#elevatedCard, QFrame#dialogSurface,

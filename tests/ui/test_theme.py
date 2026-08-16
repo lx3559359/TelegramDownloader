@@ -1,3 +1,5 @@
+from PySide6.QtWidgets import QDialog, QMainWindow, QWidget
+
 from telegram_downloader.ui.theme import APP_STYLESHEET, DARK_STYLESHEET
 
 
@@ -35,3 +37,20 @@ def test_application_theme_covers_every_surface_family() -> None:
         "QStatusBar",
     ):
         assert selector in APP_STYLESHEET
+
+
+def test_application_theme_paints_an_opaque_light_top_level_canvas(qtbot) -> None:
+    main_window = QMainWindow()
+    main_window.setCentralWidget(QWidget())
+    dialog = QDialog()
+
+    for top_level in (main_window, dialog):
+        qtbot.addWidget(top_level)
+        top_level.setStyleSheet(APP_STYLESHEET)
+        top_level.resize(320, 240)
+        top_level.show()
+        qtbot.wait(20)
+
+        canvas = top_level.grab().toImage().pixelColor(8, 8)
+        assert canvas.alpha() == 255
+        assert canvas.lightness() >= 220
