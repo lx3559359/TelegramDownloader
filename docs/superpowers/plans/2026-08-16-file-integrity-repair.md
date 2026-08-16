@@ -481,7 +481,7 @@ Set 0.9.0 in all three version sources. Document migration, manual verification 
 
 Run `scripts/test.ps1` three times from the same clean feature commit. Record test counts and durations. Run real-data QA only on a copied project-local database/download tree: baseline both files, alter a copied byte without changing size, detect hash mismatch, repair with controlled media bytes, and verify original recovery data hashes are unchanged.
 
-- [ ] **Step 5: Build and inspect both Windows artifacts**
+- [x] **Step 5: Build and inspect both Windows artifacts**
 
 Run: `scripts/build.ps1`
 
