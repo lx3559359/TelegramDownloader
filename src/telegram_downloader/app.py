@@ -34,7 +34,7 @@ from telegram_downloader.diagnostic_store import DiagnosticReportStore
 from telegram_downloader.diagnostics import DiagnosticResult, DiagnosticsService
 from telegram_downloader.downloader import MediaDownloader
 from telegram_downloader.file_integrity import FileIntegrityService
-from telegram_downloader.gateway import TelethonGateway
+from telegram_downloader.gateway import SessionExpiredError, TelethonGateway
 from telegram_downloader.instance_guard import WindowsInstanceGuard
 from telegram_downloader.logging import configure_logging
 from telegram_downloader.paths import PortablePaths
@@ -73,6 +73,22 @@ class _FunctionDiagnosticProbe:
         if self.threaded:
             return await asyncio.to_thread(self.action)
         return await self.action()
+
+
+async def _telegram_health(controller: AppController) -> DiagnosticResult:
+    reason = controller.last_authorization_failure_reason
+    if reason is not None:
+        return await probe_telegram(None, authorization_reason=reason)
+    gateway_value = controller.gateway
+    if gateway_value is None:
+        return await probe_telegram(None)
+
+    class RecoveredConnection:
+        async def test_connection(self) -> None:
+            await controller.connection_recovery.ensure_connected(gateway_value)
+            await gateway_value.test_connection()
+
+    return await probe_telegram(RecoveredConnection())
 
 
 class _GracefulShutdown:
@@ -371,17 +387,7 @@ def create_application(root: Path):
         )
 
     async def telegram_health() -> DiagnosticResult:
-        controller = controller_ref["controller"]
-        gateway_value = controller.gateway
-        if gateway_value is None:
-            return await probe_telegram(None)
-
-        class RecoveredConnection:
-            async def test_connection(self) -> None:
-                await controller.connection_recovery.ensure_connected(gateway_value)
-                await gateway_value.test_connection()
-
-        return await probe_telegram(RecoveredConnection())
+        return await _telegram_health(controller_ref["controller"])
 
     diagnostics = DiagnosticsService(
         (
@@ -450,6 +456,11 @@ def create_application(root: Path):
         ),
         app_version=__version__,
     )
+    async def subscription_session_expired(error: SessionExpiredError) -> None:
+        controller = controller_ref.get("controller")
+        if controller is not None:
+            await controller._handle_session_expired(error)
+
     subscription_scheduler = SubscriptionScheduler(
         subscriptions,
         foreground_busy=lambda: (
@@ -468,6 +479,7 @@ def create_application(root: Path):
             else None
         ),
         on_progress=window.subscriptions_page.set_progress,
+        on_session_expired=subscription_session_expired,
     )
 
     controller = AppController(

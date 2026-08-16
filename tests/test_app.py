@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from inspect import getsource, isawaitable
 from types import SimpleNamespace
 
+import pytest
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QMessageBox
 
@@ -13,6 +14,10 @@ from telegram_downloader.content import AccountProfile, ContentDialog, DialogKin
 from telegram_downloader.content_browser import ContentBrowserService
 from telegram_downloader.domain import MediaKind
 from telegram_downloader.file_integrity import FileIntegrityService
+from telegram_downloader.gateway import (
+    AuthorizationFailureReason,
+    SessionExpiredError,
+)
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.settings import AppSettings
 from telegram_downloader.subscription_scheduler import SubscriptionScheduler
@@ -179,6 +184,21 @@ def test_create_application_initializes_project_local_content_services(
         assert probe_calls == ["rule-1"]
         assert controller._async_actions.active_keys == frozenset()
 
+        auth_events: list[AuthorizationFailureReason] = []
+
+        async def record_expiry(error: SessionExpiredError) -> None:
+            auth_events.append(error.reason)
+
+        controller._handle_session_expired = record_expiry
+        loop.run_until_complete(
+            controller.subscription_scheduler.on_session_expired(
+                SessionExpiredError(
+                    reason=AuthorizationFailureReason.SESSION_REVOKED
+                )
+            )
+        )
+        assert auth_events == [AuthorizationFailureReason.SESSION_REVOKED]
+
         report = app.run_self_test(tmp_path)
         for value in report["writable_paths"].values():
             assert str(value).startswith(str(tmp_path.resolve()))
@@ -187,6 +207,23 @@ def test_create_application_initializes_project_local_content_services(
         controller.window.close()
         loop.close()
         application.processEvents()
+
+
+@pytest.mark.asyncio
+async def test_telegram_health_uses_retained_authorization_reason() -> None:
+    controller = SimpleNamespace(
+        gateway=None,
+        last_authorization_failure_reason=(
+            AuthorizationFailureReason.AUTH_KEY_DUPLICATED
+        ),
+    )
+
+    result = await app._telegram_health(controller)
+
+    assert result.code == "telegram-session-expired"
+    assert result.metrics == {
+        "authorizationReason": "auth-key-duplicated"
+    }
 
 
 def test_service_builder_shares_runtime_download_resource_settings(tmp_path) -> None:
