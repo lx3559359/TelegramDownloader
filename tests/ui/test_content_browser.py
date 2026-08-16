@@ -3,6 +3,7 @@ from datetime import UTC, date, datetime
 
 from PySide6.QtCore import QPoint, QSize, Qt
 from PySide6.QtGui import QImage
+from PySide6.QtWidgets import QHeaderView
 
 from telegram_downloader.content import (
     ContentDialog,
@@ -86,8 +87,19 @@ def test_page_contains_content_browser_controls(qtbot) -> None:
     assert page.select_all_button.text() == "全选"
     assert page.invert_button.text() == "反选"
     assert page.queue_button.text() == "加入下载队列"
-    assert page.result_table.iconSize() == QSize(112, 84)
-    assert page.result_table.verticalHeader().defaultSectionSize() == 96
+    assert page.result_table.iconSize() == QSize(88, 60)
+    assert page.result_table.verticalHeader().defaultSectionSize() == 78
+    assert page.result_table.wordWrap() is False
+    assert (
+        page.result_table.textElideMode()
+        == Qt.TextElideMode.ElideRight
+    )
+    header = page.result_table.horizontalHeader()
+    fixed_widths = {0: 52, 1: 96, 2: 132, 4: 58, 5: 82, 6: 64}
+    for column, width in fixed_widths.items():
+        assert header.sectionResizeMode(column) == QHeaderView.ResizeMode.Fixed
+        assert page.result_table.columnWidth(column) == width
+    assert header.sectionResizeMode(3) == QHeaderView.ResizeMode.Stretch
 
 
 def test_account_content_card_structure_keeps_filter_minimums(qtbot) -> None:
@@ -105,6 +117,30 @@ def test_account_content_card_structure_keeps_filter_minimums(qtbot) -> None:
     assert page.date_to.minimumWidth() >= 132
     assert page.limit_input.minimumWidth() >= 90
     assert page.error_label.parentWidget() is page.filter_card
+
+
+def test_result_columns_do_not_squeeze_fixed_text_at_minimum_size(qtbot) -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    page = ContentBrowserPage()
+    page.resize(996, 650)
+    qtbot.addWidget(page)
+    page.show()
+    page.set_results(
+        [
+            replace(
+                result(now, "long-summary", 1),
+                excerpt=(
+                    "这是一段很长的摘要，只允许在摘要列内省略，"
+                    "不能挤压日期、类型、大小或状态列。"
+                )
+                * 4,
+            )
+        ]
+    )
+    qtbot.wait(20)
+
+    assert page.result_table.horizontalScrollBar().maximum() == 0
+    assert page.result_table.columnWidth(3) > 0
 
 
 def test_progress_and_retry_widgets_show_honest_operation_state(qtbot) -> None:

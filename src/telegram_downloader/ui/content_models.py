@@ -239,6 +239,8 @@ class SearchResultTableModel(QAbstractTableModel):
                     return icon
             return self._fallback_icon(result.media_kind)
         if role == Qt.ItemDataRole.ToolTipRole:
+            if index.column() == 3:
+                return result.excerpt
             return result.original_name
         if role != Qt.ItemDataRole.DisplayRole:
             return None

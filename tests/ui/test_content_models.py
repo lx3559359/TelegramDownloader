@@ -203,6 +203,10 @@ def test_result_model_selection_roles_and_disabled_rows(qtbot) -> None:
     assert changed == [(results[0].id, True)]
     assert model.data(select_index, Qt.ItemDataRole.UserRole) == results[0].id
     assert model.data(model.index(1, 5)) == "未知"
+    assert (
+        model.data(model.index(0, 3), Qt.ItemDataRole.ToolTipRole)
+        == results[0].excerpt
+    )
     assert not (
         model.flags(model.index(2, 0)) & Qt.ItemFlag.ItemIsUserCheckable
     )

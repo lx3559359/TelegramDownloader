@@ -278,17 +278,25 @@ class ContentBrowserPage(QWidget):
             0,
             self.selection_delegate,
         )
-        self.result_table.setIconSize(QSize(112, 84))
-        self.result_table.verticalHeader().setDefaultSectionSize(96)
+        self.result_table.setIconSize(QSize(88, 60))
+        self.result_table.verticalHeader().setDefaultSectionSize(78)
+        self.result_table.setWordWrap(False)
+        self.result_table.setTextElideMode(Qt.TextElideMode.ElideRight)
         result_header = self.result_table.horizontalHeader()
-        result_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        result_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self.result_table.setColumnWidth(1, 124)
-        for column in (0, 2, 4, 5, 6):
+        for column, width in {
+            0: 52,
+            1: 96,
+            2: 132,
+            4: 58,
+            5: 82,
+            6: 64,
+        }.items():
             result_header.setSectionResizeMode(
                 column,
-                QHeaderView.ResizeMode.ResizeToContents,
+                QHeaderView.ResizeMode.Fixed,
             )
+            self.result_table.setColumnWidth(column, width)
+        result_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         results_layout.addWidget(self.result_table, 1)
         self.load_more_button = QPushButton("加载更多")
         results_layout.addWidget(
