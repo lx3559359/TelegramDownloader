@@ -477,7 +477,7 @@ Expected: version remains 0.8.0 and documentation is absent.
 
 Set 0.9.0 in all three version sources. Document migration, manual verification cost, `.corrupt*` retention, selected repair, no startup full-disk hash, and project-local data boundaries. Do not claim formal hashes until the release pipeline produces them.
 
-- [ ] **Step 4: Run three complete verification rounds**
+- [x] **Step 4: Run three complete verification rounds**
 
 Run `scripts/test.ps1` three times from the same clean feature commit. Record test counts and durations. Run real-data QA only on a copied project-local database/download tree: baseline both files, alter a copied byte without changing size, detect hash mismatch, repair with controlled media bytes, and verify original recovery data hashes are unchanged.
 
