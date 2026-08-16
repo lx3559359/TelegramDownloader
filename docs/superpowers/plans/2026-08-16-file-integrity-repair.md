@@ -269,7 +269,7 @@ git commit -m "feat: verify and quarantine local media"
 - Modify: `src/telegram_downloader/scheduler.py`
 - Modify: `tests/test_scheduler.py`
 
-- [ ] **Step 1: Write failing selected-item tests**
+- [x] **Step 1: Write failing selected-item tests**
 
 Create three failed media rows, select only the second integrity-repair item, and assert only its downloader call occurs. Add mixed final-state cases so the task becomes completed only when every row is completed, partial failure while any row is failed, and paused while any selected execution pauses.
 
@@ -286,23 +286,23 @@ async def test_run_items_downloads_only_requested_media() -> None:
     assert scheduler.downloader.ids == ["i1"]
 ```
 
-- [ ] **Step 2: Run focused scheduler tests and confirm RED**
+- [x] **Step 2: Run focused scheduler tests and confirm RED**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_scheduler.py -k "run_items or recompute" -q`
 
 Expected: `DownloadScheduler` has no `run_items`.
 
-- [ ] **Step 3: Implement the selected path**
+- [x] **Step 3: Implement the selected path**
 
 Add `run_items(task_id, item_ids)` that rejects empty input, deduplicates IDs, confirms every row belongs to the task and is queued, executes only those records through `_guarded_item`, then calls `repository.recompute_task_status(task_id)`. Protect concurrent task and selected-item runs with the same `_active` task entry so they cannot race.
 
-- [ ] **Step 4: Run scheduler tests and confirm GREEN**
+- [x] **Step 4: Run scheduler tests and confirm GREEN**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_scheduler.py -q`
 
 Expected: all scheduler tests pass, including original task retry behavior.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add src/telegram_downloader/scheduler.py tests/test_scheduler.py

@@ -14,6 +14,7 @@ class Repo:
         self.items = [
             SimpleNamespace(
                 id=f"i{index}",
+                task_id="t",
                 retry_count=0,
                 downloaded_bytes=0,
                 status=ItemStatus.QUEUED,
@@ -27,6 +28,7 @@ class Repo:
         self.recovered = False
         self.list_item_calls = 0
         self.get_item_calls = []
+        self.recomputed = []
 
     def list_items(self, task_id, statuses=None):
         self.list_item_calls += 1
@@ -60,6 +62,17 @@ class Repo:
 
     def recover_interrupted(self):
         self.recovered = True
+
+    def recompute_task_status(self, task_id):
+        self.recomputed.append(task_id)
+        statuses = {item.status for item in self.items}
+        if ItemStatus.FAILED in statuses:
+            return TaskStatus.PARTIAL_FAILURE
+        if ItemStatus.PAUSED in statuses:
+            return TaskStatus.PAUSED
+        if statuses == {ItemStatus.COMPLETED}:
+            return TaskStatus.COMPLETED
+        return TaskStatus.QUEUED
 
 
 @pytest.mark.asyncio
@@ -267,3 +280,80 @@ async def test_partial_failure_preserves_safe_item_error_on_task() -> None:
 
     assert repo.task_updates[-1] is TaskStatus.PARTIAL_FAILURE
     assert repo.task_errors[-1] == "Telegram 网络连接失败"
+
+
+@pytest.mark.asyncio
+async def test_run_items_downloads_only_deduplicated_requested_media() -> None:
+    downloaded = []
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            downloaded.append(item.id)
+
+    repo = Repo(count=3)
+    scheduler = DownloadScheduler(repo, Downloader(), concurrency=1)
+
+    await scheduler.run_items("t", ["i1", "i1"])
+
+    assert downloaded == ["i1"]
+    assert repo.items[0].status is ItemStatus.QUEUED
+    assert repo.items[1].status is ItemStatus.COMPLETED
+    assert repo.items[2].status is ItemStatus.QUEUED
+    assert repo.recomputed == ["t"]
+
+
+@pytest.mark.asyncio
+async def test_run_items_validates_every_item_before_starting() -> None:
+    downloaded = []
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            downloaded.append(item.id)
+
+    repo = Repo(count=2)
+    repo.items[1].task_id = "other"
+    scheduler = DownloadScheduler(repo, Downloader())
+
+    with pytest.raises(ValueError, match="不属于"):
+        await scheduler.run_items("t", ["i0", "i1"])
+
+    assert downloaded == []
+    assert repo.task_updates == []
+
+
+@pytest.mark.asyncio
+async def test_run_items_rejects_empty_and_nonqueued_selections() -> None:
+    repo = Repo()
+    scheduler = DownloadScheduler(repo, object())
+
+    with pytest.raises(ValueError, match="至少"):
+        await scheduler.run_items("t", [])
+
+    repo.items[0].status = ItemStatus.FAILED
+    with pytest.raises(ValueError, match="等待下载"):
+        await scheduler.run_items("t", ["i0"])
+
+
+@pytest.mark.asyncio
+async def test_selected_run_reuses_active_task_guard_without_duplicate_downloads() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    downloaded = []
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            downloaded.append(item.id)
+            entered.set()
+            await release.wait()
+
+    repo = Repo()
+    scheduler = DownloadScheduler(repo, Downloader())
+    full_run = asyncio.create_task(scheduler.run_task("t"))
+    await entered.wait()
+    selected_run = asyncio.create_task(scheduler.run_items("t", ["i0"]))
+    await asyncio.sleep(0)
+
+    release.set()
+    await asyncio.gather(full_run, selected_run)
+
+    assert downloaded == ["i0"]
