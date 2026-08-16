@@ -79,6 +79,7 @@ class TaskRecord:
     last_error: str | None = None
     display_title: str | None = None
     archived_at: datetime | None = None
+    queue_priority: int = 0
 
 
 @dataclass(frozen=True, slots=True)

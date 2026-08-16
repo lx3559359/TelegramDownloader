@@ -1,6 +1,6 @@
 import sqlite3
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -456,6 +456,102 @@ def test_initialize_migrates_v080_media_to_unverified(tmp_path: Path) -> None:
             for row in connection.execute("PRAGMA table_info(media_items)").fetchall()
         }
     assert {"integrity_status", "content_sha256", "verified_at"} <= columns
+
+
+def test_initialize_adds_queue_priority_without_changing_legacy_task_data(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "tasks.sqlite3"
+    _create_v080_database(database, tmp_path / "legacy.mp4")
+    legacy_columns = (
+        "id, source_kind, source_ref, source_title, source_url, "
+        "date_from_utc, date_to_utc, media_kinds, item_limit, status, "
+        "created_at, updated_at, last_error, display_title, archived_at"
+    )
+    with sqlite3.connect(database) as connection:
+        before = connection.execute(f"SELECT {legacy_columns} FROM tasks").fetchall()
+
+    repo = TaskRepository(database)
+    repo.initialize()
+
+    with sqlite3.connect(database) as connection:
+        after = connection.execute(f"SELECT {legacy_columns} FROM tasks").fetchall()
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        priority = connection.execute(
+            "SELECT queue_priority FROM tasks WHERE id = 'legacy-task'"
+        ).fetchone()[0]
+    assert before == after
+    assert "queue_priority" in columns
+    assert priority == 0
+    assert repo.get_task("legacy-task").queue_priority == 0
+
+
+def test_dispatch_order_is_fifo_and_priority_is_state_guarded(tmp_path: Path) -> None:
+    repo = TaskRepository(tmp_path / "tasks.sqlite3")
+    repo.initialize()
+    template, _item = records(tmp_path)
+    created = template.created_at
+    older = replace(
+        template,
+        id="z-older",
+        created_at=created - timedelta(minutes=2),
+        updated_at=created - timedelta(minutes=2),
+    )
+    same_time_a = replace(template, id="a-same")
+    same_time_b = replace(template, id="b-same")
+    paused = replace(
+        template,
+        id="paused",
+        status=TaskStatus.PAUSED,
+        created_at=created - timedelta(minutes=3),
+    )
+    completed = replace(template, id="completed", status=TaskStatus.COMPLETED)
+    archived = replace(template, id="archived", archived_at=created)
+    for task in (same_time_b, paused, archived, older, completed, same_time_a):
+        repo.create_task(task, [])
+
+    assert [task.id for task in repo.list_queued_for_dispatch()] == [
+        older.id,
+        same_time_a.id,
+        same_time_b.id,
+    ]
+    assert repo.prioritize_task(same_time_b.id) is True
+    assert [task.id for task in repo.list_queued_for_dispatch()] == [
+        same_time_b.id,
+        older.id,
+        same_time_a.id,
+    ]
+    assert repo.get_task(same_time_b.id).queue_priority == 1
+    assert repo.task_dispatch_key(same_time_b.id) < repo.task_dispatch_key(older.id)
+
+    assert repo.prioritize_task(paused.id) is False
+    assert repo.prioritize_task(completed.id) is False
+    assert repo.prioritize_task(archived.id) is False
+    assert repo.prioritize_task("missing") is False
+    assert repo.clear_task_priority(same_time_b.id) is True
+    assert repo.clear_task_priority(same_time_b.id) is False
+    assert repo.get_task(same_time_b.id).queue_priority == 0
+
+
+def test_repeated_priority_changes_keep_latest_request_first(tmp_path: Path) -> None:
+    repo = TaskRepository(tmp_path / "tasks.sqlite3")
+    repo.initialize()
+    template, _item = records(tmp_path)
+    first = replace(template, id="first")
+    second = replace(template, id="second")
+    repo.create_task(first, [])
+    repo.create_task(second, [])
+
+    assert repo.prioritize_task(first.id) is True
+    assert repo.prioritize_task(second.id) is True
+    assert [task.id for task in repo.list_queued_for_dispatch()] == [
+        second.id,
+        first.id,
+    ]
+    assert repo.get_task(second.id).queue_priority > repo.get_task(first.id).queue_priority
 
 
 def test_record_integrity_success_validates_and_round_trips_digest(

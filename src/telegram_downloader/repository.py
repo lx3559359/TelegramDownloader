@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at TEXT NOT NULL,
     last_error TEXT,
     display_title TEXT,
-    archived_at TEXT
+    archived_at TEXT,
+    queue_priority INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS media_items (
     id TEXT PRIMARY KEY,
@@ -65,7 +66,7 @@ CREATE INDEX IF NOT EXISTS idx_items_task_status ON media_items(task_id, status)
 _TASK_COLUMNS = """
 id, source_kind, source_ref, source_title, source_url,
 date_from_utc, date_to_utc, media_kinds, item_limit, status,
-created_at, updated_at, last_error, display_title, archived_at
+created_at, updated_at, last_error, display_title, archived_at, queue_priority
 """
 
 _QUALIFIED_TASK_COLUMNS = """
@@ -75,7 +76,7 @@ t.date_from_utc AS date_from_utc, t.date_to_utc AS date_to_utc,
 t.media_kinds AS media_kinds, t.item_limit AS item_limit,
 t.status AS status, t.created_at AS created_at, t.updated_at AS updated_at,
 t.last_error AS last_error, t.display_title AS display_title,
-t.archived_at AS archived_at
+t.archived_at AS archived_at, t.queue_priority AS queue_priority
 """
 
 _ITEM_COLUMNS = """
@@ -141,6 +142,11 @@ class TaskRepository:
                 connection.execute("ALTER TABLE tasks ADD COLUMN display_title TEXT")
             if "archived_at" not in columns:
                 connection.execute("ALTER TABLE tasks ADD COLUMN archived_at TEXT")
+            if "queue_priority" not in columns:
+                connection.execute(
+                    "ALTER TABLE tasks ADD COLUMN queue_priority "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
             item_columns = {
                 str(row[1])
                 for row in connection.execute(
@@ -260,6 +266,51 @@ class TaskRepository:
                 "ORDER BY created_at DESC, id"
             ).fetchall()
         return [self._task_from_row(row) for row in rows]
+
+    def list_queued_for_dispatch(self) -> list[TaskRecord]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT {_TASK_COLUMNS} FROM tasks "
+                "WHERE status = ? AND archived_at IS NULL "
+                "ORDER BY queue_priority DESC, created_at ASC, id ASC",
+                (TaskStatus.QUEUED.value,),
+            ).fetchall()
+        return [self._task_from_row(row) for row in rows]
+
+    def prioritize_task(self, task_id: str) -> bool:
+        with self._connection() as connection:
+            eligible = connection.execute(
+                "SELECT 1 FROM tasks WHERE id = ? AND status = ? "
+                "AND archived_at IS NULL",
+                (task_id, TaskStatus.QUEUED.value),
+            ).fetchone()
+            if eligible is None:
+                return False
+            highest = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(queue_priority), 0) FROM tasks "
+                    "WHERE status = ? AND archived_at IS NULL",
+                    (TaskStatus.QUEUED.value,),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                "UPDATE tasks SET queue_priority = ? WHERE id = ?",
+                (highest + 1, task_id),
+            )
+        return True
+
+    def clear_task_priority(self, task_id: str) -> bool:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE tasks SET queue_priority = 0 "
+                "WHERE id = ? AND queue_priority <> 0",
+                (task_id,),
+            )
+        return cursor.rowcount == 1
+
+    def task_dispatch_key(self, task_id: str) -> tuple[int, datetime, str]:
+        task = self.get_task(task_id)
+        return (-task.queue_priority, task.created_at, task.id)
 
     def list_task_snapshots(
         self,
@@ -573,7 +624,7 @@ class TaskRepository:
     def _insert_task(connection: sqlite3.Connection, task: TaskRecord) -> None:
         connection.execute(
             f"INSERT INTO tasks ({_TASK_COLUMNS}) "
-            f"VALUES ({','.join('?' for _ in range(15))})",
+            f"VALUES ({','.join('?' for _ in range(16))})",
             TaskRepository._task_values(task),
         )
 
@@ -628,6 +679,7 @@ class TaskRepository:
             task.last_error,
             task.display_title,
             task.archived_at.isoformat() if task.archived_at is not None else None,
+            task.queue_priority,
         )
 
     @staticmethod
@@ -658,6 +710,7 @@ class TaskRepository:
                 if row["archived_at"] is not None
                 else None
             ),
+            int(row["queue_priority"]),
         )
 
     @staticmethod
