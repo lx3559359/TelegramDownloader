@@ -52,6 +52,14 @@ class PortablePaths:
         return self.data / "temp"
 
     @property
+    def diagnostics(self) -> Path:
+        return self.data / "diagnostics"
+
+    @property
+    def diagnostic_temp(self) -> Path:
+        return self.temp / "diagnostics"
+
+    @property
     def update(self) -> Path:
         return self.data / "update"
 
@@ -96,6 +104,8 @@ class PortablePaths:
             self.cache,
             self.thumbnail_cache,
             self.temp,
+            self.diagnostics,
+            self.diagnostic_temp,
             self.update_staging,
             self.update_backup,
             self.update_helper,
