@@ -176,7 +176,7 @@ async def test_real_queue_prioritizes_pauses_restarts_and_stays_portable(tmp_pat
     scheduler.pause_task(subscription_task.id)
     gateway.release(103, 1)
     await wait_until(lambda: scheduler.active_task_id == search_task.id)
-    assert part.read_bytes() == b"sub-partial-"
+    assert part.read_bytes() == b"sub-"
     gateway.release_all(102)
     await asyncio.gather(*operations)
     await scheduler.shutdown()
@@ -205,7 +205,7 @@ async def test_real_queue_prioritizes_pauses_restarts_and_stays_portable(tmp_pat
     await restarted_scheduler.shutdown()
 
     assert gateway.started == [101, 103, 102, 103]
-    assert gateway.offsets[-1] == (103, len(b"sub-partial-"))
+    assert gateway.offsets[-1] == (103, len(b"sub-"))
     all_items = [
         restarted_repository.get_item(item.id)
         for item in (link_item, search_item, subscription_item)

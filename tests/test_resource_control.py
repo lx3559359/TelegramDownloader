@@ -86,6 +86,73 @@ async def test_speed_change_resets_future_reservations() -> None:
 
 
 @pytest.mark.asyncio
+async def test_switching_to_unlimited_wakes_an_existing_bandwidth_wait() -> None:
+    sleep_started = asyncio.Event()
+    never_release = asyncio.Event()
+
+    async def blocking_sleep(_delay: float) -> None:
+        sleep_started.set()
+        await never_release.wait()
+
+    limiter = AsyncBandwidthLimiter(1, sleeper=blocking_sleep)
+    waiting = asyncio.create_task(limiter.acquire(1024))
+    await sleep_started.wait()
+
+    limiter.set_speed_limit_kib(0)
+    await asyncio.wait_for(waiting, timeout=0.1)
+
+    assert limiter.speed_limit_kib == 0
+
+
+@pytest.mark.asyncio
+async def test_external_cancellation_wins_when_configuration_changes_too() -> None:
+    sleep_started = asyncio.Event()
+    never_release = asyncio.Event()
+
+    async def blocking_sleep(_delay: float) -> None:
+        sleep_started.set()
+        await never_release.wait()
+
+    limiter = AsyncBandwidthLimiter(1, sleeper=blocking_sleep)
+    waiting = asyncio.create_task(limiter.acquire(1024))
+    await sleep_started.wait()
+
+    waiting.cancel()
+    limiter.set_speed_limit_kib(0)
+
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+
+
+@pytest.mark.asyncio
+async def test_cancelled_bandwidth_reservation_does_not_delay_the_next_chunk() -> None:
+    clock = FakeClock()
+    first_started = asyncio.Event()
+    never_release = asyncio.Event()
+    delays: list[float] = []
+
+    async def controlled_sleep(delay: float) -> None:
+        delays.append(delay)
+        if len(delays) == 1:
+            first_started.set()
+            await never_release.wait()
+            return
+        clock.now += delay
+
+    limiter = AsyncBandwidthLimiter(1, clock=clock, sleeper=controlled_sleep)
+    cancelled = asyncio.create_task(limiter.acquire(1024))
+    await first_started.wait()
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+
+    await limiter.acquire(1024)
+
+    assert delays == pytest.approx([1.0, 1.0])
+    assert clock.now == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
 async def test_adjustable_limiter_never_exceeds_configured_limit() -> None:
     limiter = AdjustableConcurrencyLimiter(2)
     await limiter.acquire()

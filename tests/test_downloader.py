@@ -68,6 +68,24 @@ class CancellingBandwidth:
             raise asyncio.CancelledError
 
 
+class PausingBandwidth:
+    def __init__(self, pause) -> None:
+        self.pause = pause
+
+    async def acquire(self, _byte_count: int) -> None:
+        self.pause()
+
+
+class BlockingBandwidth:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def acquire(self, _byte_count: int) -> None:
+        self.started.set()
+        await self.release.wait()
+
+
 def item(target: Path, size: int | None = 6) -> MediaItem:
     return MediaItem(
         "i",
@@ -160,7 +178,7 @@ async def test_pause_retains_partial_and_persists_exact_offset(tmp_path: Path) -
     paths.ensure_layout()
     target = paths.downloads / "x.mp4"
     gateway, repo = FakeGateway([b"ab", b"cd"]), FakeRepository()
-    checks = iter([False, True])
+    checks = iter([False, False, False, False, True])
 
     with pytest.raises(DownloadPaused):
         await downloader(paths, gateway, repo).download(
@@ -220,6 +238,61 @@ async def test_fresh_download_records_sha256(tmp_path: Path) -> None:
         6,
         hashlib.sha256(b"abcdef").hexdigest(),
     )
+
+
+@pytest.mark.asyncio
+async def test_pause_during_bandwidth_wait_does_not_write_the_released_chunk(
+    tmp_path: Path,
+) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    target = paths.downloads / "x.mp4"
+    repository = FakeRepository()
+    paused = False
+
+    def request_pause() -> None:
+        nonlocal paused
+        paused = True
+
+    media_downloader = downloader(
+        paths,
+        FakeGateway([b"abcdef"]),
+        repository,
+        bandwidth=PausingBandwidth(request_pause),
+    )
+
+    with pytest.raises(DownloadPaused):
+        await media_downloader.download(item(target), should_pause=lambda: paused)
+
+    assert target.with_suffix(".mp4.part").read_bytes() == b""
+    assert repository.updates[-1] == ("i", 0, ItemStatus.PAUSED)
+
+
+@pytest.mark.asyncio
+async def test_pause_interrupts_a_blocked_bandwidth_wait(tmp_path: Path) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    target = paths.downloads / "x.mp4"
+    repository = FakeRepository()
+    bandwidth = BlockingBandwidth()
+    paused = False
+    media_downloader = downloader(
+        paths,
+        FakeGateway([b"abcdef"]),
+        repository,
+        bandwidth=bandwidth,
+    )
+    operation = asyncio.create_task(
+        media_downloader.download(item(target), should_pause=lambda: paused)
+    )
+    await bandwidth.started.wait()
+
+    paused = True
+
+    with pytest.raises(DownloadPaused):
+        await asyncio.wait_for(operation, timeout=0.5)
+    assert target.with_suffix(".mp4.part").read_bytes() == b""
+    assert repository.updates[-1] == ("i", 0, ItemStatus.PAUSED)
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ import asyncio
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 
 def validate_speed_limit_kib(value: int) -> None:
@@ -28,6 +29,9 @@ class AsyncBandwidthLimiter:
         self._lock = asyncio.Lock()
         self._speed_limit_kib = 0
         self._next_available = clock()
+        self._configuration_generation = 0
+        self._sleeping_tasks: set[asyncio.Task[Any]] = set()
+        self._configuration_cancels: dict[asyncio.Task[Any], int] = {}
         self.set_speed_limit_kib(speed_limit_kib)
 
     @property
@@ -37,26 +41,68 @@ class AsyncBandwidthLimiter:
     def set_speed_limit_kib(self, value: int) -> None:
         validate_speed_limit_kib(value)
         self._speed_limit_kib = value
+        self._reset_reservations()
+
+    def _reset_reservations(
+        self,
+        *,
+        exclude: asyncio.Task[Any] | None = None,
+    ) -> None:
         self._next_available = self._clock()
+        self._configuration_generation += 1
+        for task in tuple(self._sleeping_tasks):
+            if task is exclude:
+                continue
+            if task.cancel():
+                self._configuration_cancels[task] = (
+                    self._configuration_cancels.get(task, 0) + 1
+                )
 
     async def acquire(self, byte_count: int) -> None:
         if not isinstance(byte_count, int) or isinstance(byte_count, bool) or byte_count < 0:
             raise ValueError("下载字节数必须是非负整数")
-        if byte_count == 0 or self._speed_limit_kib == 0:
-            return
-        async with self._lock:
-            speed_limit_kib = self._speed_limit_kib
-            if speed_limit_kib == 0:
+        while True:
+            if byte_count == 0 or self._speed_limit_kib == 0:
                 return
-            now = self._clock()
-            finish = (
-                max(now, self._next_available)
-                + byte_count / (speed_limit_kib * 1024)
-            )
-            delay = max(0.0, finish - now)
-            self._next_available = finish
-        if delay:
-            await self._sleeper(delay)
+            async with self._lock:
+                speed_limit_kib = self._speed_limit_kib
+                if speed_limit_kib == 0:
+                    return
+                generation = self._configuration_generation
+                now = self._clock()
+                finish = (
+                    max(now, self._next_available)
+                    + byte_count / (speed_limit_kib * 1024)
+                )
+                delay = max(0.0, finish - now)
+                self._next_available = finish
+            if not delay:
+                return
+            current_task = asyncio.current_task()
+            if current_task is None:
+                await self._sleeper(delay)
+                return
+            self._sleeping_tasks.add(current_task)
+            try:
+                await self._sleeper(delay)
+                return
+            except asyncio.CancelledError:
+                configuration_cancels = self._configuration_cancels.pop(
+                    current_task,
+                    0,
+                )
+                for _ in range(configuration_cancels):
+                    current_task.uncancel()
+                if (
+                    generation != self._configuration_generation
+                    and current_task.cancelling() == 0
+                ):
+                    continue
+                self._reset_reservations(exclude=current_task)
+                raise
+            finally:
+                self._sleeping_tasks.discard(current_task)
+                self._configuration_cancels.pop(current_task, None)
 
 
 class AdjustableConcurrencyLimiter:

@@ -63,6 +63,7 @@ def _hash_file(path: Path) -> _Digest:
 
 class MediaDownloader:
     _DISK_RECHECK_BYTES = 16 * 1024 * 1024
+    _PAUSE_POLL_SECONDS = 0.05
 
     def __init__(
         self,
@@ -145,7 +146,19 @@ class MediaDownloader:
                     item.message_id,
                     offset,
                 ):
-                    await self.bandwidth.acquire(len(chunk))
+                    bandwidth_ready = await self._acquire_bandwidth(
+                        len(chunk),
+                        pause_requested,
+                    )
+                    if not bandwidth_ready or pause_requested():
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                        self.repository.update_item_progress(
+                            item.id,
+                            downloaded,
+                            ItemStatus.PAUSED,
+                        )
+                        raise DownloadPaused("下载已暂停")
                     stream.write(chunk)
                     digest.update(chunk)
                     stream.flush()
@@ -207,6 +220,27 @@ class MediaDownloader:
             datetime.now(UTC),
         )
         return target
+
+    async def _acquire_bandwidth(
+        self,
+        byte_count: int,
+        pause_requested: Callable[[], bool],
+    ) -> bool:
+        operation = asyncio.ensure_future(self.bandwidth.acquire(byte_count))
+        try:
+            while not operation.done():
+                if pause_requested():
+                    return False
+                await asyncio.wait(
+                    (operation,),
+                    timeout=self._PAUSE_POLL_SECONDS,
+                )
+            await operation
+            return not pause_requested()
+        finally:
+            if not operation.done():
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
 
     def _ensure_space(
         self,
