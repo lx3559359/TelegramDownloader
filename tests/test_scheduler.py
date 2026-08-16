@@ -6,7 +6,12 @@ import pytest
 from telegram_downloader.domain import ItemStatus, TaskStatus
 from telegram_downloader.downloader import DownloadPaused, InsufficientSpaceError
 from telegram_downloader.gateway import FloodWaitError, TransientNetworkError
-from telegram_downloader.scheduler import DownloadScheduler, RetryPolicy
+from telegram_downloader.resource_control import AsyncBandwidthLimiter
+from telegram_downloader.scheduler import (
+    DownloadScheduler,
+    RetryPolicy,
+    SchedulerSnapshot,
+)
 
 
 class Repo:
@@ -73,6 +78,86 @@ class Repo:
         if statuses == {ItemStatus.COMPLETED}:
             return TaskStatus.COMPLETED
         return TaskStatus.QUEUED
+
+
+class QueueRepo:
+    def __init__(self, task_ids: tuple[str, ...]) -> None:
+        self.items = {
+            task_id: SimpleNamespace(
+                id=f"{task_id}-item",
+                task_id=task_id,
+                retry_count=0,
+                downloaded_bytes=0,
+                status=ItemStatus.QUEUED,
+                last_error=None,
+            )
+            for task_id in task_ids
+        }
+        self.order = {task_id: index for index, task_id in enumerate(task_ids)}
+        self.priorities = dict.fromkeys(task_ids, 0)
+        self.task_statuses = dict.fromkeys(task_ids, TaskStatus.QUEUED)
+        self.task_updates: list[tuple[str, TaskStatus]] = []
+        self.cleared: list[str] = []
+
+    def list_items(self, task_id, statuses=None):
+        selected = [self.items[task_id]]
+        if statuses is None:
+            return selected
+        return [item for item in selected if item.status in statuses]
+
+    def get_item(self, item_id):
+        return next(item for item in self.items.values() if item.id == item_id)
+
+    def update_item_progress(
+        self,
+        item_id,
+        downloaded_bytes,
+        status,
+        error=None,
+        retry_count=None,
+    ):
+        item = self.get_item(item_id)
+        item.downloaded_bytes = downloaded_bytes
+        item.status = status
+        item.last_error = error
+        if retry_count is not None:
+            item.retry_count = retry_count
+
+    def update_task_status(self, task_id, status, error=None):
+        self.task_statuses[task_id] = status
+        self.task_updates.append((task_id, status))
+
+    def recover_interrupted(self):
+        return None
+
+    def recompute_task_status(self, task_id):
+        status = self.items[task_id].status
+        if status is ItemStatus.COMPLETED:
+            result = TaskStatus.COMPLETED
+        elif status is ItemStatus.PAUSED:
+            result = TaskStatus.PAUSED
+        elif status is ItemStatus.FAILED:
+            result = TaskStatus.PARTIAL_FAILURE
+        else:
+            result = TaskStatus.QUEUED
+        self.task_statuses[task_id] = result
+        return result
+
+    def task_dispatch_key(self, task_id):
+        return (-self.priorities[task_id], self.order[task_id], task_id)
+
+    def clear_task_priority(self, task_id):
+        self.priorities[task_id] = 0
+        self.cleared.append(task_id)
+        return True
+
+
+async def wait_until(predicate, attempts: int = 100) -> None:
+    for _ in range(attempts):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition was not reached")
 
 
 @pytest.mark.asyncio
@@ -385,3 +470,141 @@ async def test_selected_run_executes_newly_queued_item_after_active_task() -> No
     await asyncio.gather(full_run, selected_run)
 
     assert downloaded == ["i0", "i1"]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_runs_one_task_and_prioritizes_waiting_work() -> None:
+    task_ids = ("oldest", "middle", "newest")
+    repo = QueueRepo(task_ids)
+    gates = {task_id: asyncio.Event() for task_id in task_ids}
+    entered: list[str] = []
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            entered.append(item.task_id)
+            await gates[item.task_id].wait()
+
+    scheduler = DownloadScheduler(repo, Downloader(), concurrency=2)
+    oldest = asyncio.create_task(scheduler.run_task("oldest"))
+    await wait_until(lambda: entered == ["oldest"])
+    middle = asyncio.create_task(scheduler.run_task("middle"))
+    newest = asyncio.create_task(scheduler.run_task("newest"))
+    await wait_until(lambda: scheduler.queue_positions() == {"middle": 1, "newest": 2})
+
+    assert scheduler.active_task_id == "oldest"
+    assert scheduler.snapshot() == SchedulerSnapshot(
+        "oldest",
+        ("middle", "newest"),
+        2,
+        0,
+    )
+    repo.priorities["newest"] = 1
+    assert scheduler.prioritize_task("newest") is True
+    assert scheduler.queue_positions() == {"newest": 1, "middle": 2}
+
+    gates["oldest"].set()
+    await wait_until(lambda: entered == ["oldest", "newest"])
+    assert scheduler.active_task_id == "newest"
+    gates["newest"].set()
+    await wait_until(lambda: entered == ["oldest", "newest", "middle"])
+    gates["middle"].set()
+    await asyncio.gather(oldest, middle, newest)
+
+    assert repo.cleared == ["oldest", "newest", "middle"]
+    assert scheduler.snapshot().active_task_id is None
+    assert scheduler.queue_positions() == {}
+
+
+@pytest.mark.asyncio
+async def test_duplicate_task_submission_shares_one_operation() -> None:
+    repo = QueueRepo(("task",))
+    entered = 0
+    release = asyncio.Event()
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            nonlocal entered
+            entered += 1
+            await release.wait()
+
+    scheduler = DownloadScheduler(repo, Downloader())
+    first = asyncio.create_task(scheduler.run_task("task"))
+    await wait_until(lambda: entered == 1)
+    duplicate = asyncio.create_task(scheduler.run_task("task"))
+    await asyncio.sleep(0)
+
+    assert entered == 1
+    release.set()
+    await asyncio.gather(first, duplicate)
+    assert entered == 1
+
+
+@pytest.mark.asyncio
+async def test_pausing_waiting_task_removes_it_without_downloading() -> None:
+    repo = QueueRepo(("active", "waiting"))
+    active_release = asyncio.Event()
+    entered: list[str] = []
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            entered.append(item.task_id)
+            if item.task_id == "active":
+                await active_release.wait()
+
+    scheduler = DownloadScheduler(repo, Downloader())
+    active = asyncio.create_task(scheduler.run_task("active"))
+    await wait_until(lambda: entered == ["active"])
+    waiting = asyncio.create_task(scheduler.run_task("waiting"))
+    await wait_until(lambda: scheduler.queue_positions() == {"waiting": 1})
+
+    scheduler.pause_task("waiting")
+    await waiting
+
+    assert entered == ["active"]
+    assert repo.task_statuses["waiting"] is TaskStatus.PAUSED
+    assert scheduler.queue_positions() == {}
+    active_release.set()
+    await active
+
+
+@pytest.mark.asyncio
+async def test_shutdown_resolves_waiting_callers_and_settles_active_task() -> None:
+    repo = QueueRepo(("active", "waiting"))
+    entered = asyncio.Event()
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            if item.task_id == "active":
+                entered.set()
+                while not should_pause():
+                    await asyncio.sleep(0)
+                raise DownloadPaused("paused")
+
+    scheduler = DownloadScheduler(repo, Downloader(), shutdown_grace_seconds=0.1)
+    active = asyncio.create_task(scheduler.run_task("active"))
+    await entered.wait()
+    waiting = asyncio.create_task(scheduler.run_task("waiting"))
+    await wait_until(lambda: scheduler.queue_positions() == {"waiting": 1})
+
+    await scheduler.shutdown()
+    await asyncio.gather(active, waiting)
+
+    assert repo.task_statuses["active"] is TaskStatus.PAUSED
+    assert entered.is_set()
+    assert scheduler.snapshot().queued_task_ids == ()
+
+
+def test_runtime_resource_configuration_is_visible_in_snapshot() -> None:
+    repo = QueueRepo(("task",))
+    bandwidth = AsyncBandwidthLimiter()
+    scheduler = DownloadScheduler(
+        repo,
+        object(),
+        concurrency=2,
+        bandwidth=bandwidth,
+    )
+
+    scheduler.configure_resources(5, 2048)
+
+    assert scheduler.snapshot() == SchedulerSnapshot(None, (), 5, 2048)
+    assert bandwidth.speed_limit_kib == 2048
