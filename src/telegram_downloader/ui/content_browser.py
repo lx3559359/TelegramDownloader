@@ -33,6 +33,7 @@ from telegram_downloader.content import (
 from telegram_downloader.content_progress import SearchProgress
 from telegram_downloader.domain import MediaKind
 from telegram_downloader.links import is_telegram_link_candidate
+from telegram_downloader.ui.check_delegate import FullCellCheckDelegate
 from telegram_downloader.ui.content_models import (
     DialogListModel,
     SearchHistoryTableModel,
@@ -234,6 +235,11 @@ class ContentBrowserPage(QWidget):
         self.result_table = QTableView()
         self.result_table.setModel(self.result_model)
         self._configure_table(self.result_table)
+        self.selection_delegate = FullCellCheckDelegate(self.result_table)
+        self.result_table.setItemDelegateForColumn(
+            0,
+            self.selection_delegate,
+        )
         self.result_table.setIconSize(QSize(112, 84))
         self.result_table.verticalHeader().setDefaultSectionSize(96)
         result_header = self.result_table.horizontalHeader()

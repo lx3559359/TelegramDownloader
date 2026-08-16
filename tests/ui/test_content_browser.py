@@ -1,7 +1,7 @@
 from dataclasses import replace
 from datetime import UTC, date, datetime
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QPoint, QSize, Qt
 from PySide6.QtGui import QImage
 
 from telegram_downloader.content import (
@@ -384,6 +384,84 @@ def test_result_preview_double_click_emits_result_id(qtbot) -> None:
         page.result_table.doubleClicked.emit(page.result_model.index(0, 1))
 
     assert caught.args == ["r1"]
+
+
+def test_selection_cell_click_and_space_toggle_once(qtbot) -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    page = ContentBrowserPage()
+    page.resize(996, 650)
+    qtbot.addWidget(page)
+    page.show()
+    page.set_results([result(now, "r1", 1)])
+    index = page.result_model.index(0, 0)
+    qtbot.waitUntil(lambda: page.result_table.visualRect(index).isValid())
+    changed: list[tuple[str, bool]] = []
+    page.result_model.selection_changed.connect(
+        lambda result_id, selected: changed.append((result_id, selected))
+    )
+    rect = page.result_table.visualRect(index)
+    full_cell_target = QPoint(rect.right() - 6, rect.center().y())
+
+    qtbot.mouseClick(
+        page.result_table.viewport(),
+        Qt.MouseButton.LeftButton,
+        pos=full_cell_target,
+    )
+
+    assert (
+        page.result_model.data(index, Qt.ItemDataRole.CheckStateRole)
+        == Qt.CheckState.Checked
+    )
+    assert changed == [("r1", True)]
+
+    page.result_table.setCurrentIndex(index)
+    page.result_table.setFocus()
+    qtbot.keyClick(page.result_table, Qt.Key.Key_Space)
+
+    assert (
+        page.result_model.data(index, Qt.ItemDataRole.CheckStateRole)
+        == Qt.CheckState.Unchecked
+    )
+    assert changed == [("r1", True), ("r1", False)]
+
+
+def test_disabled_selection_cells_ignore_mouse_and_keyboard(qtbot) -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    page = ContentBrowserPage()
+    page.resize(996, 650)
+    qtbot.addWidget(page)
+    page.show()
+    page.set_results(
+        [
+            replace(result(now, "unavailable", 1), available=False),
+            replace(result(now, "queued", 2), queued=True),
+        ]
+    )
+    changed: list[tuple[str, bool]] = []
+    page.result_model.selection_changed.connect(
+        lambda result_id, selected: changed.append((result_id, selected))
+    )
+
+    for row in range(2):
+        index = page.result_model.index(row, 0)
+        qtbot.waitUntil(
+            lambda index=index: page.result_table.visualRect(index).isValid()
+        )
+        rect = page.result_table.visualRect(index)
+        qtbot.mouseClick(
+            page.result_table.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=QPoint(rect.right() - 6, rect.center().y()),
+        )
+        page.result_table.setCurrentIndex(index)
+        page.result_table.setFocus()
+        qtbot.keyClick(page.result_table, Qt.Key.Key_Space)
+        assert (
+            page.result_model.data(index, Qt.ItemDataRole.CheckStateRole)
+            == Qt.CheckState.Unchecked
+        )
+
+    assert changed == []
 
 
 def test_real_mouse_double_click_on_preview_emits_result_id(qtbot) -> None:
