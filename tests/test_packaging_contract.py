@@ -58,6 +58,10 @@ def test_chinese_guide_documents_portable_data_and_security() -> None:
         "校验所选",
         "重新下载所选",
         ".corrupt",
+        "优先下载",
+        "总下载限速",
+        "等待中 · 第",
+        "文件并发",
     ):
         assert required in readme
 
@@ -99,7 +103,7 @@ def test_subscription_modules_do_not_escape_project_local_storage() -> None:
         assert all(value not in source for value in diagnostic_forbidden), module.name
 
 
-def test_v010_version_and_diagnostics_runtime_contract_are_consistent() -> None:
+def test_v011_version_and_download_resource_runtime_contract_are_consistent() -> None:
     root = Path(__file__).parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     package_init = (root / "src/telegram_downloader/__init__.py").read_text(
@@ -112,11 +116,11 @@ def test_v010_version_and_diagnostics_runtime_contract_are_consistent() -> None:
     spec = (root / "TelegramDownloader.spec").read_text(encoding="utf-8")
     app = (root / "src/telegram_downloader/app.py").read_text(encoding="utf-8")
     readme = (root / "README.md").read_text(encoding="utf-8")
-    release_notes = root / "docs/releases/v0.10.0.md"
+    release_notes = root / "docs/releases/v0.11.0.md"
 
-    assert project["project"]["version"] == "0.10.0"
-    assert '__version__ = "0.10.0"' in package_init
-    assert '#define AppVersion "0.10.0"' in installer
+    assert project["project"]["version"] == "0.11.0"
+    assert '__version__ = "0.11.0"' in package_init
+    assert '#define AppVersion "0.11.0"' in installer
     assert "qrcode==8.2" in requirements
     assert '"qrcode"' in spec
     assert "app_version=__version__" in gateway
@@ -125,12 +129,15 @@ def test_v010_version_and_diagnostics_runtime_contract_are_consistent() -> None:
     assert '"telegram_downloader.ui.subscription_diagnostics"' in spec
     assert '"telegram_downloader.ui.models"' in spec
     assert '"telegram_downloader.startup"' in spec
+    assert "import AsyncBandwidthLimiter" in app
+    assert "bandwidth=bandwidth" in app
+    assert "resource_settings.speed_limit_kib" in app
     assert all(
         term in readme
         for term in ("健康诊断", "开始自检", "导出诊断包", "data/diagnostics")
     )
     assert release_notes.is_file()
-    assert "# TelegramDownloader v0.10.0" in release_notes.read_text(encoding="utf-8")
+    assert "# TelegramDownloader v0.11.0" in release_notes.read_text(encoding="utf-8")
     assert "v0.1.0 · stable" not in main
     for component in (
         "ContentBrowserService",

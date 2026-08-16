@@ -9,7 +9,7 @@ def test_self_test_reports_only_paths_under_root(tmp_path: Path) -> None:
     report = run_self_test(tmp_path)
 
     assert report["ok"] is True
-    assert report["version"] == "0.10.0"
+    assert report["version"] == "0.11.0"
     root = tmp_path.resolve()
     assert all(
         Path(value).is_relative_to(root)
