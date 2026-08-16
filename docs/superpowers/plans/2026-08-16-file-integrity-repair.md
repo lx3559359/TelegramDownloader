@@ -463,17 +463,17 @@ git commit -m "test: cover integrity repair end to end"
 - Create: `docs/verification/v0.9.0-file-integrity-repair.md`
 - Modify: `tests/test_packaging_contract.py`
 
-- [ ] **Step 1: Write failing version/package contract assertions**
+- [x] **Step 1: Write failing version/package contract assertions**
 
 Require 0.9.0 consistently, the release note file, README terms `SHA-256 完整性`, `校验所选`, `重新下载所选`, and the integrity module import in `app.py`.
 
-- [ ] **Step 2: Run contract test and confirm RED**
+- [x] **Step 2: Run contract test and confirm RED**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_packaging_contract.py -q`
 
 Expected: version remains 0.8.0 and documentation is absent.
 
-- [ ] **Step 3: Update version and user documentation**
+- [x] **Step 3: Update version and user documentation**
 
 Set 0.9.0 in all three version sources. Document migration, manual verification cost, `.corrupt*` retention, selected repair, no startup full-disk hash, and project-local data boundaries. Do not claim formal hashes until the release pipeline produces them.
 
