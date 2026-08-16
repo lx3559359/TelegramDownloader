@@ -25,11 +25,18 @@ class Repo:
         self.task_updates = []
         self.task_errors = []
         self.recovered = False
+        self.list_item_calls = 0
+        self.get_item_calls = []
 
     def list_items(self, task_id, statuses=None):
+        self.list_item_calls += 1
         if statuses is None:
             return self.items
         return [item for item in self.items if item.status in statuses]
+
+    def get_item(self, item_id):
+        self.get_item_calls.append(item_id)
+        return next(item for item in self.items if item.id == item_id)
 
     def update_item_progress(
         self,
@@ -84,6 +91,21 @@ async def test_flood_wait_sleeps_exact_seconds_then_retries() -> None:
     assert sleeps == [4]
     assert repo.items[0].retry_count == 0
     assert repo.task_updates[-1] is TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_successful_item_state_updates_use_direct_item_lookup() -> None:
+    class Downloader:
+        async def download(self, item, should_pause):
+            pass
+
+    repo = Repo(count=3)
+    scheduler = DownloadScheduler(repo, Downloader(), concurrency=1)
+
+    await scheduler.run_task("t")
+
+    assert repo.list_item_calls == 1
+    assert repo.get_item_calls == ["i0", "i1", "i2"]
 
 
 @pytest.mark.asyncio

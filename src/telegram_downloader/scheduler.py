@@ -29,6 +29,8 @@ class RetryPolicy:
 
 
 class SchedulerRepository(Protocol):
+    def get_item(self, item_id: str) -> MediaItem: ...
+
     def list_items(
         self,
         task_id: str,
@@ -261,10 +263,7 @@ class DownloadScheduler:
         error: str | None = None,
         retry_count: int | None = None,
     ) -> None:
-        current = next(
-            (item for item in self.repository.list_items(task_id) if item.id == item_id),
-            None,
-        )
+        current = self.repository.get_item(item_id)
         downloaded = getattr(current, "downloaded_bytes", 0)
         self.repository.update_item_progress(
             item_id,
