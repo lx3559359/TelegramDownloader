@@ -2,10 +2,13 @@ from datetime import UTC, datetime
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage
+from PySide6.QtWidgets import QGraphicsDropShadowEffect
 
 from telegram_downloader.content import SearchResult
 from telegram_downloader.domain import MediaKind
+from telegram_downloader.ui.effects import ElevationLevel
 from telegram_downloader.ui.media_preview import MediaPreviewDialog
+from telegram_downloader.ui.theme import APP_STYLESHEET
 
 
 def result(now: datetime, result_id: str, message_id: int) -> SearchResult:
@@ -37,6 +40,10 @@ def test_image_preview_scales_without_losing_aspect_ratio(qtbot, tmp_path) -> No
     )
     qtbot.addWidget(dialog)
 
+    assert dialog.styleSheet() == APP_STYLESHEET
+    assert dialog.dialog_surface.objectName() == "dialogSurface"
+    assert dialog.dialog_surface.property("elevation") == ElevationLevel.MAJOR.value
+    assert isinstance(dialog.dialog_surface.graphicsEffect(), QGraphicsDropShadowEffect)
     pixmap = dialog.preview_label.pixmap()
     assert pixmap is not None
     assert pixmap.size().width() >= 400

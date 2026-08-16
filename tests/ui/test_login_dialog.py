@@ -1,16 +1,27 @@
 from datetime import UTC, datetime, timedelta
 
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtWidgets import QApplication, QLabel, QLineEdit
+from PySide6.QtWidgets import (
+    QApplication,
+    QGraphicsDropShadowEffect,
+    QLabel,
+    QLineEdit,
+)
 
 from telegram_downloader.settings import ProxySettings
+from telegram_downloader.ui.effects import ElevationLevel
 from telegram_downloader.ui.login import LoginDialog, LoginPage
+from telegram_downloader.ui.theme import APP_STYLESHEET
 
 
 def test_login_pages_mask_sensitive_fields(qtbot) -> None:
     dialog = LoginDialog()
     qtbot.addWidget(dialog)
 
+    assert dialog.styleSheet() == APP_STYLESHEET
+    assert dialog.dialog_surface.objectName() == "dialogSurface"
+    assert dialog.dialog_surface.property("elevation") == ElevationLevel.MAJOR.value
+    assert isinstance(dialog.dialog_surface.graphicsEffect(), QGraphicsDropShadowEffect)
     assert dialog.api_hash.echoMode() is QLineEdit.EchoMode.Password
     assert dialog.proxy_password.echoMode() is QLineEdit.EchoMode.Password
     assert dialog.password.echoMode() is QLineEdit.EchoMode.Password

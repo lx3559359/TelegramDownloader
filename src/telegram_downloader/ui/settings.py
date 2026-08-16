@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -16,7 +17,8 @@ from PySide6.QtWidgets import (
 )
 
 from telegram_downloader.settings import AppSettings, ProxySettings, SettingsError
-from telegram_downloader.ui.theme import DARK_STYLESHEET, ensure_cjk_font
+from telegram_downloader.ui.effects import ElevationLevel, apply_elevation
+from telegram_downloader.ui.theme import APP_STYLESHEET, ensure_cjk_font
 
 
 class SettingsDialog(QDialog):
@@ -33,12 +35,18 @@ class SettingsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         ensure_cjk_font()
-        self.setStyleSheet(DARK_STYLESHEET)
+        self.setStyleSheet(APP_STYLESHEET)
         self.setWindowTitle("设置")
         self.setModal(True)
         self.setMinimumWidth(520)
 
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 16, 16, 18)
+        self.dialog_surface = QFrame(self)
+        self.dialog_surface.setObjectName("dialogSurface")
+        apply_elevation(self.dialog_surface, ElevationLevel.MAJOR)
+        outer.addWidget(self.dialog_surface)
+        layout = QVBoxLayout(self.dialog_surface)
         layout.setContentsMargins(24, 22, 24, 20)
         layout.setSpacing(13)
         title = QLabel("应用设置")

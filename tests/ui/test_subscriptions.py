@@ -27,6 +27,7 @@ from telegram_downloader.ui.subscriptions import (
     SubscriptionEditorDialog,
     SubscriptionPage,
 )
+from telegram_downloader.ui.theme import APP_STYLESHEET
 
 
 def test_subscription_page_uses_major_and_nested_silver_cards(qtbot) -> None:
@@ -141,6 +142,10 @@ def test_subscription_model_exposes_status_schedule_and_rule_id(qtbot) -> None:
 def test_rule_editor_validates_then_returns_trimmed_draft(qtbot) -> None:
     editor = SubscriptionEditorDialog([dialog()])
     qtbot.addWidget(editor)
+    assert editor.styleSheet() == APP_STYLESHEET
+    assert editor.dialog_surface.objectName() == "dialogSurface"
+    assert editor.dialog_surface.property("elevation") == ElevationLevel.MAJOR.value
+    assert isinstance(editor.dialog_surface.graphicsEffect(), QGraphicsDropShadowEffect)
     editor.show()
     save = editor.buttons.button(QDialogButtonBox.StandardButton.Save)
 

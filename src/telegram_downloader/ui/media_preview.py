@@ -6,6 +6,7 @@ from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -16,6 +17,8 @@ from PySide6.QtWidgets import (
 
 from telegram_downloader.content import SearchResult
 from telegram_downloader.domain import MediaKind
+from telegram_downloader.ui.effects import ElevationLevel, apply_elevation
+from telegram_downloader.ui.theme import APP_STYLESHEET, ensure_cjk_font
 
 _MEDIA_LABELS = {
     MediaKind.PHOTO: "图片",
@@ -35,6 +38,8 @@ class MediaPreviewDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        ensure_cjk_font()
+        self.setStyleSheet(APP_STYLESHEET)
         self.result_id = result.id
         self.setWindowTitle(f"媒体预览 · {result.original_name}")
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -42,7 +47,13 @@ class MediaPreviewDialog(QDialog):
         self._fit_to_window = True
         self._source_pixmap = self._load_pixmap(path)
 
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 16, 16, 18)
+        self.dialog_surface = QFrame(self)
+        self.dialog_surface.setObjectName("dialogSurface")
+        apply_elevation(self.dialog_surface, ElevationLevel.MAJOR)
+        outer.addWidget(self.dialog_surface)
+        layout = QVBoxLayout(self.dialog_surface)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 

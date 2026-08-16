@@ -40,6 +40,7 @@ from telegram_downloader.ui.subscription_diagnostics import (
     SubscriptionRunHistoryModel,
 )
 from telegram_downloader.ui.subscription_models import SubscriptionTableModel
+from telegram_downloader.ui.theme import APP_STYLESHEET, ensure_cjk_font
 
 _MEDIA_LABELS = {
     MediaKind.PHOTO: "图片",
@@ -59,11 +60,19 @@ class SubscriptionEditorDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        ensure_cjk_font()
+        self.setStyleSheet(APP_STYLESHEET)
         self.setWindowTitle("编辑自动订阅" if rule is not None else "新建自动订阅")
         self.setMinimumWidth(520)
         self._draft: SubscriptionDraft | None = None
 
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 16, 16, 18)
+        self.dialog_surface = QFrame(self)
+        self.dialog_surface.setObjectName("dialogSurface")
+        apply_elevation(self.dialog_surface, ElevationLevel.MAJOR)
+        outer.addWidget(self.dialog_surface)
+        layout = QVBoxLayout(self.dialog_surface)
         form = QFormLayout()
         self.dialog_combo = QComboBox()
         for item in sorted(
