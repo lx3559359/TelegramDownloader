@@ -6,6 +6,7 @@ import json
 import os
 import sys
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -147,6 +148,30 @@ def _can_import(module: str) -> bool:
 
 def _standard_button_selected(answer: object, expected: object) -> bool:
     return answer == expected
+
+
+def _startup_status(indicator: object | None, text: str) -> None:
+    method = getattr(indicator, "set_status", None)
+    if not callable(method):
+        return
+    with suppress(Exception):
+        method(text)
+
+
+def _startup_finish(indicator: object | None, window: object) -> None:
+    method = getattr(indicator, "finish", None)
+    if not callable(method):
+        return
+    with suppress(Exception):
+        method(window)
+
+
+def _startup_close(indicator: object | None) -> None:
+    method = getattr(indicator, "close", None)
+    if not callable(method):
+        return
+    with suppress(Exception):
+        method()
 
 
 def create_application(root: Path):
@@ -618,13 +643,20 @@ def datetime_now_timezone():
     return datetime.now().astimezone().tzinfo
 
 
-def run(root: Path, instance_guard: WindowsInstanceGuard | None = None) -> int:
+def run(
+    root: Path,
+    instance_guard: WindowsInstanceGuard | None = None,
+    *,
+    startup_indicator: object | None = None,
+) -> int:
     guard = instance_guard or WindowsInstanceGuard()
     if not guard.acquire():
         guard.notify_already_running()
+        _startup_close(startup_indicator)
         return 2
 
     try:
+        _startup_status(startup_indicator, "正在准备本地数据…")
         application, loop, controller = create_application(root)
         graceful_shutdown, close_filter = _install_graceful_shutdown(
             application,
@@ -634,8 +666,10 @@ def run(root: Path, instance_guard: WindowsInstanceGuard | None = None) -> int:
         with loop:
 
             async def start_application() -> None:
-                await controller.start()
+                _startup_status(startup_indicator, "正在恢复任务与账号…")
                 controller.window.show()
+                _startup_finish(startup_indicator, controller.window)
+                await controller.start()
 
             startup_task = loop.create_task(start_application())
 
@@ -656,4 +690,5 @@ def run(root: Path, instance_guard: WindowsInstanceGuard | None = None) -> int:
         del close_filter
         return 0
     finally:
+        _startup_close(startup_indicator)
         guard.release()

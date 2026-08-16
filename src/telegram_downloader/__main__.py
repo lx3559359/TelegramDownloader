@@ -8,6 +8,23 @@ from pathlib import Path
 from telegram_downloader.bootstrap import configure_process, runtime_root
 
 
+def _default_startup_factory():
+    from telegram_downloader.startup import create_startup_indicator
+
+    return create_startup_indicator()
+
+
+def _run_gui(root: Path, *, startup_factory=None, runner=None) -> int:
+    indicator = (startup_factory or _default_startup_factory)()
+    try:
+        indicator.set_status("正在加载运行组件…")
+        if runner is None:
+            from telegram_downloader.app import run as runner
+        return runner(root, startup_indicator=indicator)
+    finally:
+        indicator.close()
+
+
 def main() -> int:
     root = configure_process(runtime_root())
     parser = argparse.ArgumentParser(prog="TelegramDownloader")
@@ -33,9 +50,7 @@ def main() -> int:
         print(json.dumps(report, ensure_ascii=False, separators=(",", ":")))
         return 0 if report.get("ok") is True else 1
 
-    from telegram_downloader.app import run
-
-    return run(root)
+    return _run_gui(root)
 
 
 if __name__ == "__main__":

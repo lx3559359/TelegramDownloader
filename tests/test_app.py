@@ -85,9 +85,14 @@ def test_run_keeps_startup_inside_the_continuous_event_loop() -> None:
 
     assert "run_until_complete(controller.start())" not in source
     assert "loop.create_task(start_application())" in source
+    assert source.index("controller.window.show()") < source.index(
+        "await controller.start()"
+    )
 
 
 def test_duplicate_instance_exits_before_application_construction(tmp_path, monkeypatch) -> None:
+    events: list[str] = []
+
     class Guard:
         def acquire(self) -> bool:
             return False
@@ -98,6 +103,10 @@ def test_duplicate_instance_exits_before_application_construction(tmp_path, monk
         def release(self) -> None:
             raise AssertionError("unowned guard must not be released")
 
+    class StartupIndicator:
+        def close(self) -> None:
+            events.append("close")
+
     guard = Guard()
     monkeypatch.setattr(
         app,
@@ -105,8 +114,16 @@ def test_duplicate_instance_exits_before_application_construction(tmp_path, monk
         lambda _root: (_ for _ in ()).throw(AssertionError()),
     )
 
-    assert app.run(tmp_path, instance_guard=guard) == 2
+    assert (
+        app.run(
+            tmp_path,
+            instance_guard=guard,
+            startup_indicator=StartupIndicator(),
+        )
+        == 2
+    )
     assert guard.notified is True
+    assert events == ["close"]
 
 
 def test_create_application_initializes_project_local_content_services(
