@@ -30,7 +30,7 @@ def test_workbench_contains_required_controls(qtbot) -> None:
     assert window.limit_input.value() == 500
     assert window.task_table.model().columnCount() == 7
     assert window.account_badge.text() == "未登录"
-    assert window.version_label.text() == "v0.11.1 · stable"
+    assert window.version_label.text() == "v0.11.2 · stable"
     assert set(window.media_checks) == set(MediaKind)
     assert all(check.isChecked() for check in window.media_checks.values())
 
