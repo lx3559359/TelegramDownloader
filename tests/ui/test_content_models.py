@@ -212,6 +212,28 @@ def test_result_model_selection_roles_and_disabled_rows(qtbot) -> None:
     assert model.data(model.index(3, 6)) == "已入队"
 
 
+def test_result_model_accepts_integer_check_state_once(qtbot) -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    model = SearchResultTableModel()
+    values = search_results(now)
+    model.set_results(values)
+    changed: list[tuple[str, bool]] = []
+    model.selection_changed.connect(
+        lambda result_id, selected: changed.append((result_id, selected))
+    )
+    index = model.index(0, 0)
+
+    assert model.setData(index, 2, Qt.ItemDataRole.CheckStateRole)
+    assert (
+        model.data(index, Qt.ItemDataRole.CheckStateRole)
+        == Qt.CheckState.Checked
+    )
+    assert changed == [(values[0].id, True)]
+
+    assert model.setData(index, 2, Qt.ItemDataRole.CheckStateRole)
+    assert changed == [(values[0].id, True)]
+
+
 def test_result_model_uses_thumbnail_then_media_fallback(
     qtbot,
     tmp_path: Path,

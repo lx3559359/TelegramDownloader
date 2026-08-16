@@ -274,7 +274,11 @@ class SearchResultTableModel(QAbstractTableModel):
             or not self.flags(index) & Qt.ItemFlag.ItemIsUserCheckable
         ):
             return False
-        requested = value == Qt.CheckState.Checked
+        try:
+            requested_state = Qt.CheckState(value)
+        except (TypeError, ValueError):
+            return False
+        requested = requested_state == Qt.CheckState.Checked
         result = self._results[index.row()]
         if result.selected == requested:
             return True
