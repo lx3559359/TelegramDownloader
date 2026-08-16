@@ -8,6 +8,12 @@
 
 **Tech Stack:** Python 3.12, asyncio, sqlite3, pathlib, zipfile, PySide6, qasync, pytest/pytest-asyncio/pytest-qt, Ruff, PyInstaller, Inno Setup, Ed25519 signed GitHub/ModelScope release tooling.
 
+## Execution status
+
+- Tasks 1–8: completed with test-driven commits.
+- Task 9 step 1: completed; review range `63042ff..fa5a86f`, no unresolved Critical or Important findings.
+- Task 9 steps 2–8: in progress.
+
 ---
 
 ## File map
