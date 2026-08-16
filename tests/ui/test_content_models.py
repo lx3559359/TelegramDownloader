@@ -222,8 +222,12 @@ def test_result_model_accepts_integer_check_state_once(qtbot) -> None:
     values = search_results(now)
     model.set_results(values)
     changed: list[tuple[str, bool]] = []
+    data_changes: list[list[int]] = []
     model.selection_changed.connect(
         lambda result_id, selected: changed.append((result_id, selected))
+    )
+    model.dataChanged.connect(
+        lambda _top_left, _bottom_right, roles: data_changes.append(list(roles))
     )
     index = model.index(0, 0)
 
@@ -233,9 +237,11 @@ def test_result_model_accepts_integer_check_state_once(qtbot) -> None:
         == Qt.CheckState.Checked
     )
     assert changed == [(values[0].id, True)]
+    assert data_changes == [[Qt.ItemDataRole.CheckStateRole]]
 
     assert model.setData(index, 2, Qt.ItemDataRole.CheckStateRole)
     assert changed == [(values[0].id, True)]
+    assert data_changes == [[Qt.ItemDataRole.CheckStateRole]]
 
 
 def test_result_model_uses_thumbnail_then_media_fallback(
