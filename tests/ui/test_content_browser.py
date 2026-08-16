@@ -16,7 +16,8 @@ from telegram_downloader.content import (
 from telegram_downloader.content_progress import SearchProgress
 from telegram_downloader.domain import MediaKind, ScanFilters
 from telegram_downloader.ui.content_browser import ContentBrowserPage
-from telegram_downloader.ui.theme import DARK_STYLESHEET
+from telegram_downloader.ui.effects import ElevationLevel
+from telegram_downloader.ui.theme import APP_STYLESHEET
 
 
 def dialog(now: datetime, *, available: bool = True) -> ContentDialog:
@@ -108,9 +109,9 @@ def test_account_content_card_structure_keeps_filter_minimums(qtbot) -> None:
     qtbot.addWidget(page)
 
     assert page.objectName() == "accountContentPage"
-    assert page.dialog_card.objectName() == "accountContentCard"
-    assert page.filter_card.objectName() == "accountContentCard"
-    assert page.results_card.objectName() == "accountContentCard"
+    assert page.dialog_card.objectName() == "elevatedCard"
+    assert page.filter_card.objectName() == "elevatedCard"
+    assert page.results_card.objectName() == "elevatedCard"
     assert page.dialog_card.minimumWidth() == 210
     assert page.dialog_card.maximumWidth() == 270
     assert page.search_column.minimumWidth() >= 680
@@ -149,19 +150,19 @@ def test_result_columns_do_not_squeeze_fixed_text_at_minimum_size(qtbot) -> None
     assert page.result_table.columnWidth(3) > 0
 
 
-def test_account_content_cards_use_w3_shadows_and_scoped_theme(qtbot) -> None:
+def test_account_content_cards_use_shared_major_elevation(qtbot) -> None:
     page = ContentBrowserPage()
     qtbot.addWidget(page)
 
+    effects = []
     for card in (page.dialog_card, page.filter_card, page.results_card):
+        assert card.objectName() == "elevatedCard"
+        assert card.property("elevation") == ElevationLevel.MAJOR.value
         effect = card.graphicsEffect()
         assert isinstance(effect, QGraphicsDropShadowEffect)
-        assert 36 <= effect.blurRadius() <= 42
-        assert 6 <= effect.yOffset() <= 8
-
-    assert "QWidget#accountContentPage" in DARK_STYLESHEET
-    assert "QFrame#accountContentCard" in DARK_STYLESHEET
-    assert "QFrame#contentPanel" in DARK_STYLESHEET
+        effects.append(effect)
+    assert len({id(effect) for effect in effects}) == 3
+    assert "QFrame#elevatedCard" in APP_STYLESHEET
 
 
 def test_progress_and_retry_widgets_show_honest_operation_state(qtbot) -> None:

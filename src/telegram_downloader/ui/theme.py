@@ -40,7 +40,6 @@ QWidget {
 }
 QWidget#navRail, QWidget#statsRail,
 QFrame#elevatedCard, QFrame#dialogSurface,
-QFrame#accountContentCard, QFrame#contentPanel,
 QFrame#card, QFrame#statCard {
     border: 1px solid #CCD5DF;
     border-radius: 14px;

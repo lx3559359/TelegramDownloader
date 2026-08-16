@@ -4,13 +4,11 @@ from datetime import date
 from pathlib import Path
 
 from PySide6.QtCore import QDate, QModelIndex, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QDateEdit,
     QFrame,
-    QGraphicsDropShadowEffect,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
@@ -42,6 +40,7 @@ from telegram_downloader.ui.content_models import (
     SearchHistoryTableModel,
     SearchResultTableModel,
 )
+from telegram_downloader.ui.effects import ElevationLevel, apply_elevation
 from telegram_downloader.ui.media_preview import MediaPreviewDialog
 
 _MEDIA_LABELS = {
@@ -135,20 +134,12 @@ class ContentBrowserPage(QWidget):
         self.content_splitter.setStretchFactor(1, 1)
         self.content_splitter.setSizes([262, 758])
         for card in (self.dialog_card, self.filter_card, self.results_card):
-            self._apply_card_shadow(card)
+            apply_elevation(card, ElevationLevel.MAJOR)
         root.addWidget(self.content_splitter, 1)
-
-    @staticmethod
-    def _apply_card_shadow(card: QFrame) -> None:
-        shadow = QGraphicsDropShadowEffect(card)
-        shadow.setBlurRadius(40)
-        shadow.setOffset(0, 7)
-        shadow.setColor(QColor(35, 50, 70, 78))
-        card.setGraphicsEffect(shadow)
 
     def _build_dialog_panel(self) -> QFrame:
         panel = QFrame()
-        panel.setObjectName("accountContentCard")
+        panel.setObjectName("elevatedCard")
         panel.setMinimumWidth(210)
         panel.setMaximumWidth(270)
         layout = QVBoxLayout(panel)
@@ -200,7 +191,7 @@ class ContentBrowserPage(QWidget):
 
     def _build_filter_card(self) -> QFrame:
         panel = QFrame()
-        panel.setObjectName("accountContentCard")
+        panel.setObjectName("elevatedCard")
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
@@ -278,7 +269,7 @@ class ContentBrowserPage(QWidget):
 
     def _build_results_card(self) -> QFrame:
         panel = QFrame()
-        panel.setObjectName("accountContentCard")
+        panel.setObjectName("elevatedCard")
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
