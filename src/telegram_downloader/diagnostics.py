@@ -128,6 +128,7 @@ class DiagnosticReport:
 class DiagnosticProbe(Protocol):
     id: str
     title: str
+    cancel_active: bool
 
     async def run(self, cancel_event: asyncio.Event) -> DiagnosticResult: ...
 
@@ -170,6 +171,7 @@ class DiagnosticsService:
         self._lock = asyncio.Lock()
         self._active_task: asyncio.Task[DiagnosticReport] | None = None
         self._active_child: asyncio.Task[DiagnosticResult] | None = None
+        self._active_child_cancellable = True
         self._cancel_event: asyncio.Event | None = None
 
     async def run(
@@ -190,6 +192,7 @@ class DiagnosticsService:
                 if self._active_task is task and task.done():
                     self._active_task = None
                     self._active_child = None
+                    self._active_child_cancellable = True
                     self._cancel_event = None
 
     async def cancel(self) -> None:
@@ -200,7 +203,11 @@ class DiagnosticsService:
             if task is None or task.done() or cancel_event is None:
                 return
             cancel_event.set()
-            if child is not None and not child.done():
+            if (
+                child is not None
+                and not child.done()
+                and self._active_child_cancellable
+            ):
                 child.cancel()
         await asyncio.shield(task)
 
@@ -259,6 +266,9 @@ class DiagnosticsService:
         started = self.monotonic()
         child = asyncio.create_task(probe.run(cancel_event))
         self._active_child = child
+        self._active_child_cancellable = bool(
+            getattr(probe, "cancel_active", True)
+        )
         try:
             item = await child
             if item.id != probe.id or item.title != probe.title:
@@ -279,6 +289,7 @@ class DiagnosticsService:
         finally:
             if self._active_child is child:
                 self._active_child = None
+                self._active_child_cancellable = True
         duration_ms = max(0, int(round((self.monotonic() - started) * 1000)))
         return replace(item, duration_ms=duration_ms)
 

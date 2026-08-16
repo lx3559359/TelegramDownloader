@@ -114,6 +114,39 @@ QLabel#contentHint {
     color: #93c5d7;
 }
 
+QLabel#diagnosticStatus {
+    padding: 8px 11px;
+    border: 1px solid #45566e;
+    border-radius: 7px;
+    background: #172234;
+    color: #cbd5e1;
+    font-weight: 650;
+}
+
+QLabel#diagnosticStatus[status="running"] {
+    border-color: #2d7284;
+    background: #102d3a;
+    color: #67e8f9;
+}
+
+QLabel#diagnosticStatus[status="passed"] {
+    border-color: #26725f;
+    background: #123329;
+    color: #6ee7b7;
+}
+
+QLabel#diagnosticStatus[status="warning"] {
+    border-color: #8a651c;
+    background: #332710;
+    color: #fbbf24;
+}
+
+QLabel#diagnosticStatus[status="failed"] {
+    border-color: #7c3d49;
+    background: #301923;
+    color: #fda4af;
+}
+
 QLabel#errorText {
     padding: 8px 11px;
     border: 1px solid #7c3d49;

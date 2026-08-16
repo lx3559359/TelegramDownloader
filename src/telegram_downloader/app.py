@@ -64,6 +64,7 @@ class _FunctionDiagnosticProbe:
         self.title = title
         self.action = action
         self.threaded = threaded
+        self.cancel_active = not threaded
 
     async def run(self, cancel_event: asyncio.Event) -> DiagnosticResult:
         if cancel_event.is_set():

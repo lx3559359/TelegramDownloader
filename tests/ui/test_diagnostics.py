@@ -57,6 +57,7 @@ def test_result_model_exposes_four_columns_status_labels_and_stable_id() -> None
         assert model.headerData(2, Qt.Orientation.Horizontal) == "耗时"
         assert model.headerData(3, Qt.Orientation.Horizontal) == "说明"
         assert model.data(model.index(0, 1)) == STATUS_LABELS[status]
+        assert model.data(model.index(0, 1), Qt.ItemDataRole.ForegroundRole) is not None
         assert model.data(model.index(0, 2)) == "123 ms"
         assert (
             model.data(model.index(0, 0), Qt.ItemDataRole.UserRole)
@@ -76,10 +77,12 @@ def test_page_button_state_tracks_run_report_and_history(qtbot) -> None:
     assert page.cancel_button.isEnabled()
     assert not page.export_button.isEnabled()
     page.set_report(diagnostic_report(), historical=True)
-    assert "上次自检" in page.report_context_label.text()
+    assert "历史结果" in page.report_context_label.text()
+    assert "2026-08-16" in page.report_context_label.text()
     page.set_running(False)
     assert page.export_button.isEnabled()
     assert "检查完成" in page.status_banner.text()
+    assert page.status_banner.property("status") == "passed"
 
 
 def test_page_progress_is_bounded_and_shows_current_check(qtbot) -> None:
@@ -97,8 +100,9 @@ def test_page_progress_is_bounded_and_shows_current_check(qtbot) -> None:
 
     assert (page.progress_bar.minimum(), page.progress_bar.maximum()) == (0, 9)
     assert page.progress_bar.value() == 2
-    assert page.progress_bar.format() == "2 / 9"
+    assert page.progress_bar.format() == "2 / 9 · 22%"
     assert "磁盘空间" in page.progress_label.text()
+    assert page.status_banner.property("status") == "running"
 
 
 def test_page_emits_intent_only_signals_and_displays_safe_error(qtbot) -> None:

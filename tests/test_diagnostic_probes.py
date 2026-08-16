@@ -488,3 +488,28 @@ async def test_update_probe_reports_fixed_dual_source_health() -> None:
         DiagnosticStatus.FAILED,
         "update-source-invalid",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        SourceCheck(UpdateSourceId.GITHUB, SourceStatus.VALID, 1.0),
+        source_check(UpdateSourceId.GITHUB, SourceStatus.VALID, latency_ms=-1.0),
+        source_check(UpdateSourceId.GITHUB, SourceStatus.VALID, latency_ms=float("inf")),
+    ],
+)
+async def test_update_probe_rejects_structurally_invalid_source_checks(
+    malformed: SourceCheck,
+) -> None:
+    checks = (
+        malformed,
+        source_check(UpdateSourceId.MODELSCOPE, SourceStatus.VALID),
+    )
+
+    result = await probe_update_sources(UpdateChecks(checks))
+
+    assert (result.status, result.code) == (
+        DiagnosticStatus.FAILED,
+        "update-source-invalid",
+    )

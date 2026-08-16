@@ -28,6 +28,304 @@ _TELEGRAM_URL = re.compile(
     r"(?i)(?:tg://|https?://(?:www\.)?(?:t\.me|telegram\.me)/)"
 )
 _DRIVE_PATH = re.compile(r"(?i)[a-z]:[\\/]")
+_ALLOWED_METRICS = {
+    "environment": frozenset(
+        {"frozen", "windowsX64", "nonSystemVolume", "guardedPathCount"}
+    ),
+    "project-write": frozenset(),
+    "disk": frozenset({"totalBytes", "freeBytes"}),
+    "components": frozenset(
+        {"pyside6", "telethon", "qasync", "qrcode", "sqlite", "dpapi"}
+    ),
+    "task-database": frozenset(
+        {
+            "taskCount",
+            "mediaCount",
+            "schemaCompatible",
+            "taskStatusQueued",
+            "taskStatusScanning",
+            "taskStatusDownloading",
+            "taskStatusWaitingRetry",
+            "taskStatusPaused",
+            "taskStatusCompleted",
+            "taskStatusPartialFailure",
+            "taskStatusOther",
+            "itemStatusQueued",
+            "itemStatusDownloading",
+            "itemStatusWaitingRetry",
+            "itemStatusPaused",
+            "itemStatusCompleted",
+            "itemStatusFailed",
+            "itemStatusOther",
+            "integrityStatusUnverified",
+            "integrityStatusVerified",
+            "integrityStatusMissing",
+            "integrityStatusSizeMismatch",
+            "integrityStatusHashMismatch",
+            "integrityStatusReadError",
+            "integrityStatusOther",
+        }
+    ),
+    "content-database": frozenset(
+        {
+            "schemaVersion",
+            "schemaCompatible",
+            "accountCount",
+            "dialogCount",
+            "searchCount",
+            "searchResultCount",
+            "subscriptionCount",
+            "subscriptionRunCount",
+        }
+    ),
+    "credentials": frozenset(
+        {"settingsReadable", "secretsPresent", "secretsDecryptable"}
+    ),
+    "telegram": frozenset(),
+    "updates": frozenset(
+        {
+            "githubStatus",
+            "githubLatencyMs",
+            "githubVersion",
+            "modelscopeStatus",
+            "modelscopeLatencyMs",
+            "modelscopeVersion",
+        }
+    ),
+}
+_STATUS_TEXT = {
+    DiagnosticStatus.PASSED: "正常",
+    DiagnosticStatus.WARNING: "需关注",
+    DiagnosticStatus.FAILED: "异常",
+    DiagnosticStatus.SKIPPED: "已跳过",
+    DiagnosticStatus.CANCELLED: "已取消",
+}
+_BOOLEAN_METRICS = frozenset(
+    {
+        "frozen",
+        "windowsX64",
+        "nonSystemVolume",
+        "schemaCompatible",
+        "pyside6",
+        "telethon",
+        "qasync",
+        "qrcode",
+        "sqlite",
+        "dpapi",
+        "settingsReadable",
+        "secretsPresent",
+        "secretsDecryptable",
+    }
+)
+_SOURCE_STATUS_METRICS = frozenset({"githubStatus", "modelscopeStatus"})
+_VERSION_METRICS = frozenset({"githubVersion", "modelscopeVersion"})
+_SAFE_VERSION = re.compile(r"\d+\.\d+\.\d+\Z")
+_RESULT_TITLES = {
+    "environment": "运行环境与路径",
+    "project-write": "项目内写入",
+    "disk": "磁盘空间",
+    "components": "运行组件",
+    "task-database": "下载任务数据库",
+    "content-database": "账号内容数据库",
+    "credentials": "登录凭据",
+    "telegram": "Telegram 连接",
+    "updates": "签名更新源",
+}
+_GENERIC_VARIANTS = frozenset(
+    {
+        (DiagnosticStatus.FAILED, "probe-failed", "检查执行失败"),
+        (DiagnosticStatus.CANCELLED, "check-cancelled", "检查已取消"),
+    }
+)
+_RESULT_VARIANTS = {
+    "environment": frozenset(
+        {
+            (
+                DiagnosticStatus.FAILED,
+                "runtime-path-invalid",
+                "应用写入路径未通过安全边界检查",
+            ),
+            (
+                DiagnosticStatus.FAILED,
+                "runtime-unsupported",
+                "当前运行环境不是受支持的 Windows x64",
+            ),
+            (
+                DiagnosticStatus.FAILED,
+                "runtime-system-volume",
+                "正式程序位于系统盘，必须迁移到非系统盘",
+            ),
+            (
+                DiagnosticStatus.WARNING,
+                "source-system-volume",
+                "源码开发环境位于系统盘",
+            ),
+            (
+                DiagnosticStatus.PASSED,
+                "runtime-paths-ok",
+                "运行环境和项目内路径正常",
+            ),
+        }
+    ),
+    "project-write": frozenset(
+        {
+            (
+                DiagnosticStatus.PASSED,
+                "project-write-ok",
+                "项目内临时写入和读取正常",
+            ),
+            (
+                DiagnosticStatus.FAILED,
+                "project-write-failed",
+                "项目内临时写入检查失败",
+            ),
+        }
+    ),
+    "disk": frozenset(
+        {
+            (
+                DiagnosticStatus.FAILED,
+                "disk-unavailable",
+                "无法读取应用所在磁盘的空间信息",
+            ),
+            (
+                DiagnosticStatus.FAILED,
+                "disk-space-critical",
+                "磁盘可用空间低于 256 MiB",
+            ),
+            (DiagnosticStatus.WARNING, "disk-space-low", "磁盘可用空间低于 1 GiB"),
+            (DiagnosticStatus.PASSED, "disk-space-ok", "磁盘可用空间正常"),
+        }
+    ),
+    "components": frozenset(
+        {
+            (
+                DiagnosticStatus.FAILED,
+                "component-missing",
+                "一个或多个必要运行组件不可用",
+            ),
+            (DiagnosticStatus.PASSED, "components-ok", "必要运行组件全部可用"),
+        }
+    ),
+    "task-database": frozenset(
+        {
+            (DiagnosticStatus.FAILED, "database-missing", "数据库文件不存在"),
+            (DiagnosticStatus.FAILED, "database-corrupt", "数据库完整性检查失败"),
+            (DiagnosticStatus.FAILED, "database-unreadable", "数据库无法读取"),
+            (
+                DiagnosticStatus.FAILED,
+                "database-schema-incompatible",
+                "下载任务数据库结构不兼容",
+            ),
+            (
+                DiagnosticStatus.PASSED,
+                "task-database-ok",
+                "下载任务数据库结构和聚合状态正常",
+            ),
+        }
+    ),
+    "content-database": frozenset(
+        {
+            (DiagnosticStatus.FAILED, "database-missing", "数据库文件不存在"),
+            (DiagnosticStatus.FAILED, "database-corrupt", "数据库完整性检查失败"),
+            (DiagnosticStatus.FAILED, "database-unreadable", "数据库无法读取"),
+            (
+                DiagnosticStatus.FAILED,
+                "database-schema-incompatible",
+                "账号内容数据库结构不兼容",
+            ),
+            (
+                DiagnosticStatus.PASSED,
+                "content-database-ok",
+                "账号内容数据库结构和聚合状态正常",
+            ),
+        }
+    ),
+    "credentials": frozenset(
+        {
+            (DiagnosticStatus.FAILED, "settings-unreadable", "应用设置无法读取"),
+            (
+                DiagnosticStatus.WARNING,
+                "credentials-not-configured",
+                "尚未配置 Telegram 登录凭据",
+            ),
+            (
+                DiagnosticStatus.FAILED,
+                "credentials-unreadable",
+                "Telegram 登录凭据无法解密",
+            ),
+            (DiagnosticStatus.PASSED, "credentials-ok", "Telegram 登录凭据可用"),
+        }
+    ),
+    "telegram": frozenset(
+        {
+            (
+                DiagnosticStatus.SKIPPED,
+                "telegram-not-configured",
+                "尚未建立可检查的 Telegram 会话",
+            ),
+            (
+                DiagnosticStatus.FAILED,
+                "telegram-session-expired",
+                "Telegram 登录会话已失效",
+            ),
+            (
+                DiagnosticStatus.WARNING,
+                "telegram-network-unavailable",
+                "暂时无法连接 Telegram 服务",
+            ),
+            (
+                DiagnosticStatus.FAILED,
+                "telegram-check-failed",
+                "Telegram 连接检查失败",
+            ),
+            (
+                DiagnosticStatus.PASSED,
+                "telegram-connected",
+                "Telegram 登录会话和连接正常",
+            ),
+        }
+    ),
+    "updates": frozenset(
+        {
+            (
+                DiagnosticStatus.SKIPPED,
+                "update-check-unavailable",
+                "当前未配置签名更新检查",
+            ),
+            (
+                DiagnosticStatus.WARNING,
+                "update-sources-unavailable",
+                "暂时无法检查签名更新源",
+            ),
+            (
+                DiagnosticStatus.FAILED,
+                "update-source-invalid",
+                "签名更新源返回结构无效",
+            ),
+            (
+                DiagnosticStatus.FAILED,
+                "update-source-invalid",
+                "签名更新源验证失败或内容不一致",
+            ),
+            (
+                DiagnosticStatus.WARNING,
+                "update-sources-unavailable",
+                "两个签名更新源暂时均不可用",
+            ),
+            (
+                DiagnosticStatus.WARNING,
+                "update-source-degraded",
+                "一个签名更新源暂时不可用",
+            ),
+            (
+                DiagnosticStatus.PASSED,
+                "update-sources-ok",
+                "GitHub 与魔搭签名更新源正常",
+            ),
+        }
+    ),
+}
 
 
 class DiagnosticPrivacyError(ValueError):
@@ -72,6 +370,7 @@ class DiagnosticReportStore:
         )
 
     def serialize(self, report: DiagnosticReport) -> bytes:
+        _validate_report_contract(report)
         document = _report_document(report)
         self.validate_value(document)
         return (
@@ -87,7 +386,9 @@ class DiagnosticReportStore:
     def deserialize(self, payload: bytes) -> DiagnosticReport:
         value = json.loads(payload.decode("utf-8"))
         self.validate_value(value)
-        return _parse_report(value)
+        report = _parse_report(value)
+        _validate_report_contract(report)
+        return report
 
     def save(self, report: DiagnosticReport) -> Path:
         payload = self.serialize(report)
@@ -128,6 +429,7 @@ class DiagnosticReportStore:
             with ZipFile(temporary, "x", compression=ZIP_DEFLATED) as archive:
                 archive.writestr("diagnostic-report.json", report_payload)
                 archive.writestr("diagnostic-summary.txt", summary_payload)
+            _sync_file(temporary)
             self._verify_export(temporary, report_payload, summary_payload)
             os.replace(temporary, destination)
         except Exception:
@@ -174,13 +476,13 @@ class DiagnosticReportStore:
         lines = [
             "Telegram Downloader 健康诊断摘要",
             f"应用版本：{report.app_version}",
-            f"报告状态：{report.status.value}",
+            f"报告状态：{_STATUS_TEXT[report.status]}",
             f"开始时间：{_utc_text(report.started_at)}",
             f"结束时间：{_utc_text(report.finished_at)}",
             "",
         ]
         lines.extend(
-            f"- [{item.status.value}] {item.title}：{item.summary}（{item.duration_ms} ms）"
+            f"- [{_STATUS_TEXT[item.status]}] {item.title}：{item.summary}（{item.duration_ms} ms）"
             for item in report.results
         )
         return "\n".join(lines) + "\n"
@@ -236,6 +538,39 @@ def _report_document(report: DiagnosticReport) -> dict[str, object]:
             for item in report.results
         ],
     }
+
+
+def _validate_report_contract(report: DiagnosticReport) -> None:
+    for result in report.results:
+        allowed = _ALLOWED_METRICS.get(result.id)
+        if allowed is None:
+            raise DiagnosticPrivacyError("诊断检查项不在白名单")
+        if result.title != _RESULT_TITLES[result.id]:
+            raise DiagnosticPrivacyError("诊断检查项标题不在白名单")
+        variant = (result.status, result.code, result.summary)
+        if variant not in _RESULT_VARIANTS[result.id] | _GENERIC_VARIANTS:
+            raise DiagnosticPrivacyError("诊断结果说明不在白名单")
+        if not set(result.metrics) <= allowed:
+            raise DiagnosticPrivacyError("诊断指标不在白名单")
+        for key, value in result.metrics.items():
+            if key in _BOOLEAN_METRICS:
+                valid = isinstance(value, bool)
+            elif key in _SOURCE_STATUS_METRICS:
+                valid = isinstance(value, str) and value in {
+                    "valid",
+                    "unavailable",
+                    "invalid",
+                }
+            elif key in _VERSION_METRICS:
+                valid = isinstance(value, str) and _SAFE_VERSION.fullmatch(value) is not None
+            else:
+                valid = (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                )
+            if not valid:
+                raise DiagnosticPrivacyError("诊断指标类型不符合白名单")
 
 
 def _parse_report(value: object) -> DiagnosticReport:
@@ -308,5 +643,11 @@ def _required_int(value: object) -> int:
 def _durable_write(path: Path, payload: bytes) -> None:
     with path.open("xb") as stream:
         stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _sync_file(path: Path) -> None:
+    with path.open("r+b") as stream:
         stream.flush()
         os.fsync(stream.fileno())

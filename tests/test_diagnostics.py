@@ -224,6 +224,36 @@ async def test_diagnostics_cancel_keeps_completed_and_marks_remaining() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancel_waits_for_non_cancellable_local_probe_to_converge() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class LocalProbe(Probe):
+        cancel_active = False
+
+    local = LocalProbe("database", started=started, release=release)
+    remaining = Probe("updates")
+    service = DiagnosticsService(
+        (local, remaining),
+        app_version="0.10.0",
+        utc_now=lambda: NOW,
+    )
+
+    running = asyncio.create_task(service.run())
+    await started.wait()
+    cancelling = asyncio.create_task(service.cancel())
+    await asyncio.sleep(0)
+
+    assert not cancelling.done()
+    release.set()
+    await cancelling
+    report = await running
+
+    assert report.results[0].status is DiagnosticStatus.PASSED
+    assert report.results[1].status is DiagnosticStatus.CANCELLED
+
+
+@pytest.mark.asyncio
 async def test_diagnostics_maps_unexpected_probe_error_to_safe_failure() -> None:
     class BrokenProbe:
         id = "telegram"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import math
 import os
 import secrets
 import shutil
@@ -497,6 +498,14 @@ async def probe_update_sources(coordinator: UpdateSourceProbe | None) -> Diagnos
             "签名更新源返回结构无效",
         )
     ordered = (by_source[UpdateSourceId.GITHUB], by_source[UpdateSourceId.MODELSCOPE])
+    if not all(_source_check_valid(item) for item in ordered):
+        return _result(
+            "updates",
+            "签名更新源",
+            DiagnosticStatus.FAILED,
+            "update-source-invalid",
+            "签名更新源返回结构无效",
+        )
     metrics: dict[str, bool | int | float | str] = {}
     for check in ordered:
         prefix = "github" if check.source is UpdateSourceId.GITHUB else "modelscope"
@@ -554,6 +563,27 @@ def _sources_conflict(checks: tuple[SourceCheck, SourceCheck]) -> bool:
     return (
         left.verified.canonical != right.verified.canonical
         or left.verified.signature != right.verified.signature
+    )
+
+
+def _source_check_valid(check: SourceCheck) -> bool:
+    latency = check.latency_ms
+    if (
+        not isinstance(check.status, SourceStatus)
+        or not isinstance(latency, (int, float))
+        or isinstance(latency, bool)
+        or not math.isfinite(float(latency))
+        or latency < 0
+    ):
+        return False
+    if check.status is not SourceStatus.VALID:
+        return check.verified is None
+    verified = check.verified
+    return (
+        verified is not None
+        and isinstance(getattr(verified, "canonical", None), bytes)
+        and isinstance(getattr(verified, "signature", None), bytes)
+        and isinstance(getattr(getattr(verified, "manifest", None), "version", None), str)
     )
 
 
