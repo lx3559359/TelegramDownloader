@@ -504,6 +504,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release/release.ps1 
 
 Require `RELEASE_PUBLISHED v0.9.0`. Independently verify GitHub main, ModelScope source, both tag objects, seven GitHub assets, both latest pointers, Ed25519 manifest signature, runtime/installer SHA-256, and the program's own `UpdateCoordinator` discovering 0.9.0 from both sources when current version is 0.8.0.
 
-- [ ] **Step 8: Record public hashes without moving the release tag**
+- [x] **Step 8: Record public hashes without moving the release tag**
 
 Append formal URLs, sizes, hashes, tag commit, direct-run QA, and D/F volume status to the verification document. Commit the evidence after the tag and push only GitHub `main` and ModelScope `source`; prove the release tag still points to the release code commit.
