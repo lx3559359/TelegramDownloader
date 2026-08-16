@@ -675,3 +675,19 @@ def test_subscription_navigation_switches_page_and_emits_activation(qtbot) -> No
     assert window.page_stack.currentWidget() is window.subscriptions_page
     assert window.statistics_panel.isHidden() is True
     assert window.subscriptions_nav_button.property("active") is True
+
+
+def test_diagnostics_navigation_switches_page_and_emits_activation(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.resize(1180, 720)
+    window.show()
+
+    with qtbot.waitSignal(window.diagnostics_activated, timeout=500):
+        qtbot.mouseClick(window.diagnostics_nav_button, Qt.MouseButton.LeftButton)
+
+    assert window.page_stack.currentWidget() is window.diagnostics_page
+    assert window.statistics_panel.isHidden() is True
+    assert window.diagnostics_nav_button.property("active") is True
+    assert window.diagnostics_page.start_button.isVisible()
+    assert window.diagnostics_page.open_button.isVisible()
