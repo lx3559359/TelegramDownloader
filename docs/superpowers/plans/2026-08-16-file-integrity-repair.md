@@ -493,7 +493,7 @@ Require `PACKAGED_SMOKE_OK` and `INSTALLER_SMOKE_OK`; inspect ZIP entries for ze
 
 Commit code/release notes, obtain review, fast-forward local main, and run one fresh full suite on main. Preserve the v0.8.0 direct-run data while creating `dist/release/v0.9.0-portable` from the clean runtime and copied `data`/`downloads`; verify settings/secrets/download hashes before and after.
 
-- [ ] **Step 7: Publish the signed dual-source release**
+- [x] **Step 7: Publish the signed dual-source release**
 
 From clean main run:
 
