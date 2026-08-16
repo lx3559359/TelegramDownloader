@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QGraphicsDropShadowEffect
 
 from telegram_downloader.diagnostics import (
     DiagnosticProgress,
@@ -16,6 +17,23 @@ from telegram_downloader.ui.diagnostics import (
     DiagnosticResultModel,
     DiagnosticsPage,
 )
+from telegram_downloader.ui.effects import ElevationLevel
+
+
+def test_diagnostics_page_separates_progress_results_and_actions(qtbot) -> None:
+    page = DiagnosticsPage()
+    qtbot.addWidget(page)
+
+    for card in (page.progress_card, page.results_card):
+        assert isinstance(card.graphicsEffect(), QGraphicsDropShadowEffect)
+        assert card.objectName() == "elevatedCard"
+        assert card.property("elevation") == ElevationLevel.MAJOR.value
+    assert isinstance(page.actions_card.graphicsEffect(), QGraphicsDropShadowEffect)
+    assert page.actions_card.objectName() == "elevatedSubCard"
+    assert page.actions_card.property("elevation") == ElevationLevel.SECONDARY.value
+    assert page.status_banner.graphicsEffect() is None
+    assert page.results_card.isAncestorOf(page.table)
+    assert page.actions_card.isAncestorOf(page.start_button)
 
 NOW = datetime(2026, 8, 16, 8, 0, tzinfo=UTC)
 

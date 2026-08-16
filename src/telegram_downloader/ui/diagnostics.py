@@ -23,6 +23,7 @@ from telegram_downloader.diagnostics import (
     DiagnosticResult,
     DiagnosticStatus,
 )
+from telegram_downloader.ui.effects import ElevationLevel, apply_elevation
 
 _INVALID_INDEX = QModelIndex()
 
@@ -133,9 +134,10 @@ class DiagnosticsPage(QWidget):
         self.status_banner.setProperty("status", DiagnosticStatus.PENDING.value)
         layout.addWidget(self.status_banner)
 
-        progress_card = QFrame()
-        progress_card.setObjectName("card")
-        progress_layout = QVBoxLayout(progress_card)
+        self.progress_card = QFrame()
+        self.progress_card.setObjectName("elevatedCard")
+        apply_elevation(self.progress_card, ElevationLevel.MAJOR)
+        progress_layout = QVBoxLayout(self.progress_card)
         progress_layout.setContentsMargins(14, 12, 14, 13)
         progress_layout.setSpacing(8)
         progress_heading = QHBoxLayout()
@@ -152,7 +154,14 @@ class DiagnosticsPage(QWidget):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("0 / 0")
         progress_layout.addWidget(self.progress_bar)
-        layout.addWidget(progress_card)
+        layout.addWidget(self.progress_card)
+
+        self.results_card = QFrame()
+        self.results_card.setObjectName("elevatedCard")
+        apply_elevation(self.results_card, ElevationLevel.MAJOR)
+        results_layout = QVBoxLayout(self.results_card)
+        results_layout.setContentsMargins(14, 12, 14, 14)
+        results_layout.setSpacing(10)
 
         self.model = DiagnosticResultModel()
         self.table = QTableView()
@@ -169,22 +178,26 @@ class DiagnosticsPage(QWidget):
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        layout.addWidget(self.table, 1)
+        results_layout.addWidget(self.table, 1)
 
         privacy = QLabel(
             "诊断不会修改任务或账号数据。导出包只包含聚合状态与固定说明，不包含日志、凭据、群组、消息或文件路径。"
         )
         privacy.setObjectName("muted")
         privacy.setWordWrap(True)
-        layout.addWidget(privacy)
+        results_layout.addWidget(privacy)
 
         self.error_label = QLabel()
         self.error_label.setObjectName("errorText")
         self.error_label.setWordWrap(True)
         self.error_label.hide()
-        layout.addWidget(self.error_label)
+        results_layout.addWidget(self.error_label)
 
-        actions = QHBoxLayout()
+        self.actions_card = QFrame(self.results_card)
+        self.actions_card.setObjectName("elevatedSubCard")
+        apply_elevation(self.actions_card, ElevationLevel.SECONDARY)
+        actions = QHBoxLayout(self.actions_card)
+        actions.setContentsMargins(10, 8, 10, 8)
         self.start_button = QPushButton("开始自检")
         self.start_button.setObjectName("primaryButton")
         self.cancel_button = QPushButton("取消")
@@ -195,7 +208,8 @@ class DiagnosticsPage(QWidget):
         actions.addStretch()
         actions.addWidget(self.export_button)
         actions.addWidget(self.open_button)
-        layout.addLayout(actions)
+        results_layout.addWidget(self.actions_card)
+        layout.addWidget(self.results_card, 1)
 
         self.start_button.clicked.connect(self.run_requested.emit)
         self.cancel_button.clicked.connect(self.cancel_requested.emit)

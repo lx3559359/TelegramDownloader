@@ -34,6 +34,7 @@ from telegram_downloader.subscriptions import (
     SubscriptionRule,
     SubscriptionRun,
 )
+from telegram_downloader.ui.effects import ElevationLevel, apply_elevation
 from telegram_downloader.ui.subscription_diagnostics import (
     SubscriptionProbeSampleModel,
     SubscriptionRunHistoryModel,
@@ -197,9 +198,10 @@ class SubscriptionPage(QWidget):
         self.connection_label.setObjectName("muted")
         layout.addWidget(self.connection_label)
 
-        card = QFrame()
-        card.setObjectName("card")
-        card_layout = QVBoxLayout(card)
+        self.subscription_card = QFrame()
+        self.subscription_card.setObjectName("elevatedCard")
+        apply_elevation(self.subscription_card, ElevationLevel.MAJOR)
+        card_layout = QVBoxLayout(self.subscription_card)
         card_layout.setContentsMargins(14, 14, 14, 14)
         card_layout.setSpacing(10)
         header = QHBoxLayout()
@@ -273,10 +275,11 @@ class SubscriptionPage(QWidget):
         rules_layout.addLayout(actions)
         self.detail_splitter.addWidget(rules_panel)
 
-        detail_panel = QFrame()
-        detail_panel.setObjectName("subCard")
-        detail_panel.setMinimumHeight(210)
-        detail_layout = QVBoxLayout(detail_panel)
+        self.diagnostic_card = QFrame()
+        self.diagnostic_card.setObjectName("elevatedSubCard")
+        apply_elevation(self.diagnostic_card, ElevationLevel.SECONDARY)
+        self.diagnostic_card.setMinimumHeight(210)
+        detail_layout = QVBoxLayout(self.diagnostic_card)
         detail_layout.setContentsMargins(10, 10, 10, 10)
         detail_layout.setSpacing(7)
 
@@ -301,9 +304,11 @@ class SubscriptionPage(QWidget):
         diagnostics = QSplitter(Qt.Orientation.Horizontal)
         diagnostics.setChildrenCollapsible(False)
 
-        history_panel = QWidget()
-        history_layout = QVBoxLayout(history_panel)
-        history_layout.setContentsMargins(0, 0, 4, 0)
+        self.history_card = QFrame()
+        self.history_card.setObjectName("elevatedSubCard")
+        apply_elevation(self.history_card, ElevationLevel.SECONDARY)
+        history_layout = QVBoxLayout(self.history_card)
+        history_layout.setContentsMargins(10, 10, 10, 10)
         history_layout.setSpacing(5)
         history_layout.addWidget(QLabel("最近 20 次运行"))
         self.run_history_table = QTableView()
@@ -317,11 +322,13 @@ class SubscriptionPage(QWidget):
                 QHeaderView.ResizeMode.ResizeToContents,
             )
         history_layout.addWidget(self.run_history_table, 1)
-        diagnostics.addWidget(history_panel)
+        diagnostics.addWidget(self.history_card)
 
-        probe_panel = QWidget()
-        probe_layout = QVBoxLayout(probe_panel)
-        probe_layout.setContentsMargins(4, 0, 0, 0)
+        self.probe_card = QFrame()
+        self.probe_card.setObjectName("elevatedSubCard")
+        apply_elevation(self.probe_card, ElevationLevel.SECONDARY)
+        probe_layout = QVBoxLayout(self.probe_card)
+        probe_layout.setContentsMargins(10, 10, 10, 10)
         probe_layout.setSpacing(5)
         self.probe_progress_label = QLabel("")
         self.probe_progress_label.setObjectName("muted")
@@ -348,17 +355,17 @@ class SubscriptionPage(QWidget):
                 QHeaderView.ResizeMode.ResizeToContents,
             )
         probe_layout.addWidget(self.probe_sample_table, 1)
-        diagnostics.addWidget(probe_panel)
+        diagnostics.addWidget(self.probe_card)
         diagnostics.setStretchFactor(0, 1)
         diagnostics.setStretchFactor(1, 1)
         detail_layout.addWidget(diagnostics, 1)
 
-        self.detail_splitter.addWidget(detail_panel)
+        self.detail_splitter.addWidget(self.diagnostic_card)
         self.detail_splitter.setStretchFactor(0, 1)
         self.detail_splitter.setStretchFactor(1, 1)
         self.detail_splitter.setSizes([260, 260])
         card_layout.addWidget(self.detail_splitter, 1)
-        layout.addWidget(card, 1)
+        layout.addWidget(self.subscription_card, 1)
 
         self.error_label = QLabel("")
         self.error_label.setObjectName("errorBanner")

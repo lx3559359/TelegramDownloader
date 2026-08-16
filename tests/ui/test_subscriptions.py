@@ -3,7 +3,11 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QDialogButtonBox, QMessageBox
+from PySide6.QtWidgets import (
+    QDialogButtonBox,
+    QGraphicsDropShadowEffect,
+    QMessageBox,
+)
 
 from telegram_downloader.content import ContentDialog, DialogKind
 from telegram_downloader.domain import MediaKind
@@ -17,11 +21,28 @@ from telegram_downloader.subscriptions import (
     SubscriptionRunStatus,
     SubscriptionState,
 )
+from telegram_downloader.ui.effects import ElevationLevel
 from telegram_downloader.ui.subscription_models import SubscriptionTableModel
 from telegram_downloader.ui.subscriptions import (
     SubscriptionEditorDialog,
     SubscriptionPage,
 )
+
+
+def test_subscription_page_uses_major_and_nested_silver_cards(qtbot) -> None:
+    page = SubscriptionPage()
+    qtbot.addWidget(page)
+
+    assert isinstance(page.subscription_card.graphicsEffect(), QGraphicsDropShadowEffect)
+    assert page.subscription_card.objectName() == "elevatedCard"
+    assert page.subscription_card.property("elevation") == ElevationLevel.MAJOR.value
+    for card in (page.diagnostic_card, page.history_card, page.probe_card):
+        assert isinstance(card.graphicsEffect(), QGraphicsDropShadowEffect)
+        assert card.objectName() == "elevatedSubCard"
+        assert card.property("elevation") == ElevationLevel.SECONDARY.value
+    assert page.subscription_card.isAncestorOf(page.rule_table)
+    assert page.diagnostic_card.isAncestorOf(page.run_history_table)
+    assert page.diagnostic_card.isAncestorOf(page.probe_sample_table)
 
 NOW = datetime(2026, 8, 15, 9, 0, tzinfo=UTC)
 
