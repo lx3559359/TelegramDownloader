@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,6 +45,27 @@ class FakeRepository:
 
     def complete_item(self, item_id, downloaded_bytes, sha256, verified_at):
         self.completed.append((item_id, downloaded_bytes, sha256, verified_at))
+
+
+class RecordingBandwidth:
+    def __init__(self, part: Path) -> None:
+        self.part = part
+        self.byte_counts: list[int] = []
+        self.part_sizes: list[int] = []
+
+    async def acquire(self, byte_count: int) -> None:
+        self.byte_counts.append(byte_count)
+        self.part_sizes.append(self.part.stat().st_size if self.part.exists() else 0)
+
+
+class CancellingBandwidth:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def acquire(self, _byte_count: int) -> None:
+        self.calls += 1
+        if self.calls == 2:
+            raise asyncio.CancelledError
 
 
 def item(target: Path, size: int | None = 6) -> MediaItem:
@@ -198,6 +220,48 @@ async def test_fresh_download_records_sha256(tmp_path: Path) -> None:
         6,
         hashlib.sha256(b"abcdef").hexdigest(),
     )
+
+
+@pytest.mark.asyncio
+async def test_downloader_accounts_every_chunk_before_writing(tmp_path: Path) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    target = paths.downloads / "x.mp4"
+    part = target.with_suffix(".mp4.part")
+    bandwidth = RecordingBandwidth(part)
+    repo = FakeRepository()
+
+    await downloader(
+        paths,
+        FakeGateway([b"abc", b"de"]),
+        repo,
+        bandwidth=bandwidth,
+    ).download(item(target, size=5))
+
+    assert bandwidth.byte_counts == [3, 2]
+    assert bandwidth.part_sizes == [0, 3]
+    assert target.read_bytes() == b"abcde"
+
+
+@pytest.mark.asyncio
+async def test_limiter_cancellation_preserves_partial_progress(tmp_path: Path) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    target = paths.downloads / "x.mp4"
+    repo = FakeRepository()
+
+    with pytest.raises(asyncio.CancelledError):
+        await downloader(
+            paths,
+            FakeGateway([b"ab", b"cd"]),
+            repo,
+            bandwidth=CancellingBandwidth(),
+        ).download(item(target, size=4))
+
+    assert target.with_suffix(".mp4.part").read_bytes() == b"ab"
+    assert not target.exists()
+    assert repo.updates[-1] == ("i", 2, ItemStatus.PAUSED)
+    assert repo.completed == []
 
 
 @pytest.mark.asyncio

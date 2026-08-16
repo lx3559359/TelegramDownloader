@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from telegram_downloader.resource_control import validate_speed_limit_kib
+
 
 class SettingsError(ValueError):
     """Raised when project-local settings are malformed or unsafe."""
@@ -35,6 +37,7 @@ class AppSettings:
     concurrency: int = 3
     proxy: ProxySettings = ProxySettings()
     check_updates_on_startup: bool = True
+    speed_limit_kib: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.api_id, int) or isinstance(self.api_id, bool) or self.api_id < 0:
@@ -49,6 +52,10 @@ class AppSettings:
             raise SettingsError("代理设置格式无效")
         if not isinstance(self.check_updates_on_startup, bool):
             raise SettingsError("自动检查更新必须是布尔值")
+        try:
+            validate_speed_limit_kib(self.speed_limit_kib)
+        except ValueError as exc:
+            raise SettingsError("总下载限速设置无效") from exc
 
 
 class SettingsStore:

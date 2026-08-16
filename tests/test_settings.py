@@ -30,6 +30,40 @@ def test_missing_settings_use_safe_defaults(tmp_path) -> None:
     assert SettingsStore(tmp_path / "missing.json").load() == AppSettings()
 
 
+def test_old_settings_default_to_unlimited_speed(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "api_id": 1,
+                "concurrency": 3,
+                "proxy": {},
+                "check_updates_on_startup": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert SettingsStore(path).load().speed_limit_kib == 0
+
+
+def test_speed_limit_round_trip_preserves_positional_settings_contract(tmp_path) -> None:
+    store = SettingsStore(tmp_path / "settings.json")
+    expected = AppSettings(
+        1,
+        4,
+        ProxySettings(),
+        False,
+        speed_limit_kib=2048,
+    )
+
+    store.save(expected)
+
+    assert store.load() == expected
+    assert expected.check_updates_on_startup is False
+    assert expected.speed_limit_kib == 2048
+
+
 @pytest.mark.parametrize(
     "settings",
     [
@@ -40,6 +74,14 @@ def test_missing_settings_use_safe_defaults(tmp_path) -> None:
             "api_id": 1,
             "concurrency": 3,
             "proxy": {"kind": "socks5", "host": "", "port": 1080},
+        },
+        {"api_id": 1, "concurrency": 3, "proxy": {}, "speed_limit_kib": -1},
+        {"api_id": 1, "concurrency": 3, "proxy": {}, "speed_limit_kib": True},
+        {
+            "api_id": 1,
+            "concurrency": 3,
+            "proxy": {},
+            "speed_limit_kib": 1_048_577,
         },
     ],
 )

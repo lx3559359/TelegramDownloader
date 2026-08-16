@@ -13,6 +13,7 @@ from typing import Protocol
 from telegram_downloader.domain import ItemStatus, MediaItem
 from telegram_downloader.gateway import TelegramGateway
 from telegram_downloader.paths import PortablePaths
+from telegram_downloader.resource_control import AsyncBandwidthLimiter
 
 
 class DownloadPaused(RuntimeError):
@@ -71,6 +72,7 @@ class MediaDownloader:
         free_bytes: Callable[[Path], int] | None = None,
         reserve_bytes: int = 512 * 1024 * 1024,
         progress_interval: float = 0.5,
+        bandwidth: AsyncBandwidthLimiter | None = None,
     ) -> None:
         if reserve_bytes < 0 or progress_interval < 0:
             raise ValueError("磁盘预留和进度间隔不能为负数")
@@ -80,6 +82,7 @@ class MediaDownloader:
         self.free_bytes = free_bytes or (lambda path: shutil.disk_usage(path).free)
         self.reserve_bytes = reserve_bytes
         self.progress_interval = progress_interval
+        self.bandwidth = bandwidth or AsyncBandwidthLimiter()
 
     async def download(
         self,
@@ -142,6 +145,7 @@ class MediaDownloader:
                     item.message_id,
                     offset,
                 ):
+                    await self.bandwidth.acquire(len(chunk))
                     stream.write(chunk)
                     digest.update(chunk)
                     stream.flush()
