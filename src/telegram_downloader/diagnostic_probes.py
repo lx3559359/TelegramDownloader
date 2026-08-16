@@ -567,7 +567,7 @@ def _open_read_only_database(database: Path) -> sqlite3.Connection | DiagnosticR
             "数据库文件不存在",
         )
     try:
-        uri = f"{database.resolve().as_uri()}?mode=ro"
+        uri = f"{database.resolve().as_uri()}?mode=ro&immutable=1"
         connection = sqlite3.connect(uri, uri=True, timeout=2)
         connection.execute("PRAGMA query_only=ON")
         connection.execute("PRAGMA busy_timeout=2000")
