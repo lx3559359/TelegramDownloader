@@ -80,9 +80,13 @@ async def test_preview_summarizes_without_persisting_until_commit(tmp_path: Path
     assert preview.known_bytes == 100
     assert preview.unknown_size_count == 1
     assert repo.saved is None
-    queued = planner.commit(preview)
-    assert queued.status is TaskStatus.QUEUED
-    assert repo.saved[0] == queued
+    committed = planner.commit(preview)
+    assert committed.task.status is TaskStatus.QUEUED
+    assert committed.accepted_keys == frozenset(
+        {("peer", 9, "m9"), ("peer", 8, "m8")}
+    )
+    assert committed.skipped_count == 0
+    assert repo.saved[0] == committed.task
     assert [item.message_id for item in repo.saved[1]] == [9, 8]
 
 
@@ -371,6 +375,116 @@ def test_commit_selected_rolls_back_when_every_item_loses_race(
 
     with pytest.raises(EmptyScanError, match="所选媒体已全部存在于下载队列"):
         planner.commit_selected(preview)
+
+    with pytest.raises(KeyError):
+        repo.get_task(preview.task.id)
+
+
+@pytest.mark.asyncio
+async def test_link_commit_accepts_remaining_items_after_confirmation_race(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    repo = TaskRepository(tmp_path / "tasks.sqlite3")
+    repo.initialize()
+    media = [
+        RemoteMedia(
+            "-1001", "资料群", 9, None, "m9", MediaKind.VIDEO, "a.mp4", 10, now
+        ),
+        RemoteMedia(
+            "-1001", "资料群", 8, None, "m8", MediaKind.VIDEO, "b.mp4", 20, now
+        ),
+    ]
+    planner = TaskPlanner(
+        FakeGateway(media),
+        repo,
+        tmp_path / "downloads",
+        uuid_factory=iter(["link", "item-9", "item-8"]).__next__,
+        clock=lambda: now,
+    )
+    filters = ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 500)
+    preview = await planner.scan(parse_telegram_link("https://t.me/example"), filters)
+    occupied_task = TaskRecord(
+        "occupied",
+        SourceKind.CHANNEL_OR_GROUP,
+        "-1001",
+        "资料群",
+        "telegram://peer/-1001",
+        filters,
+        TaskStatus.QUEUED,
+        now,
+        now,
+    )
+    occupied_item = MediaItem(
+        "occupied-item",
+        occupied_task.id,
+        "-1001",
+        8,
+        None,
+        "m8",
+        MediaKind.VIDEO,
+        "b.mp4",
+        tmp_path / "occupied.mp4",
+        20,
+        now,
+    )
+    repo.create_task(occupied_task, [occupied_item])
+
+    committed = planner.commit(preview)
+
+    assert committed.task.status is TaskStatus.QUEUED
+    assert committed.accepted_keys == frozenset({("-1001", 9, "m9")})
+    assert committed.skipped_count == 1
+    assert [item.message_id for item in repo.list_items(preview.task.id)] == [9]
+
+
+@pytest.mark.asyncio
+async def test_link_commit_rolls_back_when_every_item_loses_confirmation_race(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    repo = TaskRepository(tmp_path / "tasks.sqlite3")
+    repo.initialize()
+    remote = RemoteMedia(
+        "-1001", "资料群", 9, None, "m9", MediaKind.VIDEO, "a.mp4", 10, now
+    )
+    planner = TaskPlanner(
+        FakeGateway([remote]),
+        repo,
+        tmp_path / "downloads",
+        uuid_factory=iter(["link", "link-item"]).__next__,
+        clock=lambda: now,
+    )
+    filters = ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 500)
+    preview = await planner.scan(parse_telegram_link("https://t.me/example"), filters)
+    occupied_task = TaskRecord(
+        "occupied",
+        SourceKind.CHANNEL_OR_GROUP,
+        "-1001",
+        "资料群",
+        "telegram://peer/-1001",
+        filters,
+        TaskStatus.QUEUED,
+        now,
+        now,
+    )
+    occupied_item = MediaItem(
+        "occupied-item",
+        occupied_task.id,
+        "-1001",
+        9,
+        None,
+        "m9",
+        MediaKind.VIDEO,
+        "a.mp4",
+        tmp_path / "occupied.mp4",
+        10,
+        now,
+    )
+    repo.create_task(occupied_task, [occupied_item])
+
+    with pytest.raises(EmptyScanError, match="扫描媒体已全部存在于下载队列"):
+        planner.commit(preview)
 
     with pytest.raises(KeyError):
         repo.get_task(preview.task.id)

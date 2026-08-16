@@ -938,7 +938,11 @@ async def test_confirmed_scan_starts_persisted_task() -> None:
             return "preview"
 
         def commit(self, preview):
-            return type("Task", (), {"id": "task-1", "status": TaskStatus.QUEUED})()
+            return SimpleNamespace(
+                task=SimpleNamespace(id="task-1", status=TaskStatus.QUEUED),
+                accepted_keys=frozenset({("peer", 42, "media")}),
+                skipped_count=2,
+            )
 
     class Scheduler:
         def __init__(self):
@@ -961,6 +965,10 @@ async def test_confirmed_scan_starts_persisted_task() -> None:
         controller.default_filters(datetime(2026, 8, 13, tzinfo=UTC)),
     )
     await asyncio.wait_for(scheduler.started.wait(), timeout=1)
+
+    assert controller.window.message.last_message == (
+        "加入 1 项，跳过重复 2 项；任务已开始下载"
+    )
 
 
 @pytest.mark.asyncio

@@ -216,16 +216,23 @@ class TaskPlanner:
             sum(item.expected_size is None for item in remote),
         )
 
-    def commit(self, preview: ScanPreview) -> TaskRecord:
-        queued = replace(
-            preview.task,
-            status=TaskStatus.QUEUED,
-            updated_at=self.clock(),
+    def commit(self, preview: ScanPreview) -> SelectedCommit:
+        return self._commit_deduplicating(
+            preview,
+            "扫描媒体已全部存在于下载队列",
         )
-        self.repository.create_task(queued, list(preview.items))
-        return queued
 
     def commit_selected(self, preview: ScanPreview) -> SelectedCommit:
+        return self._commit_deduplicating(
+            preview,
+            "所选媒体已全部存在于下载队列",
+        )
+
+    def _commit_deduplicating(
+        self,
+        preview: ScanPreview,
+        empty_message: str,
+    ) -> SelectedCommit:
         queued = replace(
             preview.task,
             status=TaskStatus.QUEUED,
@@ -237,7 +244,7 @@ class TaskPlanner:
                 list(preview.items),
             )
         except AllMediaAlreadyExists as exc:
-            raise EmptyScanError("所选媒体已全部存在于下载队列") from exc
+            raise EmptyScanError(empty_message) from exc
         accepted_keys = frozenset(
             (item.peer_ref, item.message_id, item.media_id) for item in accepted
         )

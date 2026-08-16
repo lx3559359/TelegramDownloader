@@ -747,11 +747,13 @@ class AppController:
             if not await self._confirm_download_preview(preview):
                 self._show_status("已取消创建任务")
                 return
-            task = self.planner.commit(preview)
+            committed = self.planner.commit(preview)
             self.refresh_tasks()
-            if task is not None:
-                self._start_task(task.id)
-            self._show_status("任务已加入下载队列")
+            self._start_task(committed.task.id)
+            self._show_status(
+                f"加入 {len(committed.accepted_keys)} 项，"
+                f"跳过重复 {committed.skipped_count} 项；任务已开始下载"
+            )
         except (InvalidTelegramLink, ValueError, GatewayError) as error:
             safe = self._safe_error(error)
             _LOGGER.warning("scan rejected (%s): %s", type(error).__name__, safe)
