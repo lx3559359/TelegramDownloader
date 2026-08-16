@@ -43,13 +43,8 @@ class DiagnosticReportStore:
         environment_username: str | None = None,
     ) -> None:
         self.paths = paths
-        self.secrets = tuple(
-            sorted(
-                {value.casefold() for value in secrets if isinstance(value, str) and value},
-                key=len,
-                reverse=True,
-            )
-        )
+        self.secrets: tuple[str, ...] = ()
+        self.register_secrets(secrets)
         username = environment_username
         if username is None:
             username = os.environ.get("USERNAME") or os.environ.get("USER") or ""
@@ -59,6 +54,21 @@ class DiagnosticReportStore:
             marker.casefold()
             for marker in {root, root.replace("\\", "/"), root.replace("/", "\\")}
             if marker
+        )
+
+    def register_secrets(self, values: Iterable[str]) -> None:
+        registered = set(self.secrets)
+        registered.update(
+            value.casefold()
+            for value in values
+            if isinstance(value, str) and value
+        )
+        self.secrets = tuple(
+            sorted(
+                registered,
+                key=len,
+                reverse=True,
+            )
         )
 
     def serialize(self, report: DiagnosticReport) -> bytes:

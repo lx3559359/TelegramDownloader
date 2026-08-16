@@ -155,6 +155,15 @@ def test_privacy_validator_rejects_registered_values_root_and_username(
             store.validate_value(unsafe)
 
 
+def test_runtime_credentials_can_be_added_before_export(tmp_path: Path) -> None:
+    store = DiagnosticReportStore(PortablePaths(tmp_path), secrets=set())
+
+    store.register_secrets({"new-session-secret"})
+
+    with pytest.raises(DiagnosticPrivacyError):
+        store.validate_value("new-session-secret")
+
+
 def test_export_contains_exact_allowlisted_entries_and_uses_collision_suffix(
     tmp_path: Path,
 ) -> None:

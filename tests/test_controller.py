@@ -15,6 +15,12 @@ from telegram_downloader.content import (
 )
 from telegram_downloader.content_progress import DialogSyncProgress, SearchProgress
 from telegram_downloader.controller import AppController
+from telegram_downloader.diagnostics import (
+    DiagnosticProgress,
+    DiagnosticReport,
+    DiagnosticResult,
+    DiagnosticStatus,
+)
 from telegram_downloader.domain import (
     IntegrityStatus,
     ItemStatus,
@@ -2907,3 +2913,131 @@ def test_local_dates_become_inclusive_utc_boundaries() -> None:
 
     assert filters.date_from_utc.isoformat() == "2026-07-31T16:00:00+00:00"
     assert filters.date_to_utc.isoformat() == "2026-08-02T15:59:59.999999+00:00"
+
+
+def diagnostic_report() -> DiagnosticReport:
+    now = datetime(2026, 8, 16, tzinfo=UTC)
+    return DiagnosticReport.build(
+        "0.10.0",
+        now,
+        now,
+        (
+            DiagnosticResult(
+                "environment",
+                "运行环境与路径",
+                DiagnosticStatus.PASSED,
+                "runtime-paths-ok",
+                "检查完成",
+                1,
+            ),
+        ),
+    )
+
+
+class DiagnosticPage:
+    def __init__(self) -> None:
+        self.report = None
+        self.progress = None
+        self.running: list[bool] = []
+        self.errors: list[str] = []
+        self.historical = None
+
+    def set_report(self, report, *, historical: bool) -> None:
+        self.report = report
+        self.historical = historical
+
+    def set_progress(self, progress) -> None:
+        self.progress = progress
+
+    def set_running(self, running: bool) -> None:
+        self.running.append(running)
+
+    def show_error(self, message: str) -> None:
+        self.errors.append(message)
+
+
+@pytest.mark.asyncio
+async def test_controller_loads_history_runs_persists_exports_and_opens_directory(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    completed = diagnostic_report()
+    progress = DiagnosticProgress(
+        0,
+        1,
+        "environment",
+        "运行环境与路径",
+        DiagnosticStatus.RUNNING,
+    )
+
+    class Diagnostics:
+        def __init__(self) -> None:
+            self.runs = 0
+            self.cancelled = 0
+
+        async def run(self, callback):
+            self.runs += 1
+            callback(progress)
+            return completed
+
+        async def cancel(self) -> None:
+            self.cancelled += 1
+
+    class Store:
+        def __init__(self) -> None:
+            self.saved = []
+            self.exported = []
+
+        def load_latest(self):
+            return completed
+
+        def save(self, value):
+            self.saved.append(value)
+
+        def export(self, value):
+            self.exported.append(value)
+            return tmp_path / "data" / "diagnostics" / "diagnostics.zip"
+
+    class StatusBar:
+        def __init__(self) -> None:
+            self.message = ""
+
+        def showMessage(self, message, _timeout=0):
+            self.message = message
+
+    page = DiagnosticPage()
+    status = StatusBar()
+    window = SimpleNamespace(diagnostics_page=page, statusBar=lambda: status)
+    diagnostics = Diagnostics()
+    store = Store()
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    opened = []
+    monkeypatch.setattr(controller_module.os, "startfile", opened.append)
+    controller = AppController.for_test(
+        window=window,
+        paths=paths,
+        diagnostics=diagnostics,
+        diagnostic_store=store,
+    )
+
+    controller.activate_diagnostics()
+    assert diagnostics.runs == 0
+    assert page.report is completed
+    assert page.historical is True
+
+    await controller.run_diagnostics()
+    controller.export_diagnostics()
+    controller.open_diagnostics_directory()
+
+    assert diagnostics.runs == 1
+    assert page.progress is progress
+    assert page.running == [True, False]
+    assert page.historical is False
+    assert store.saved == [completed]
+    assert store.exported == [completed]
+    assert status.message == "诊断目录已打开"
+    assert opened == [paths.diagnostics]
+
+    await controller.shutdown()
+    assert diagnostics.cancelled == 1

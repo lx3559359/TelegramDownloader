@@ -240,6 +240,22 @@ class _NullSubscriptionPage:
         pass
 
 
+class _NullDiagnosticsPage:
+    report = None
+
+    def set_report(self, report: object | None, *, historical: bool) -> None:
+        self.report = report
+
+    def set_progress(self, _progress: object | None) -> None:
+        pass
+
+    def set_running(self, _running: bool) -> None:
+        pass
+
+    def show_error(self, _message: str) -> None:
+        pass
+
+
 class _NullRepository:
     def list_task_snapshots(self, *, include_archived: bool = False) -> list[object]:
         return []
@@ -346,6 +362,8 @@ class AppController:
         subscriptions: Any | None = None,
         subscription_scheduler: Any | None = None,
         integrity_service: Any | None = None,
+        diagnostics: Any | None = None,
+        diagnostic_store: Any | None = None,
         paths: PortablePaths | None = None,
         gateway_factory: Callable[..., TelegramGateway] | None = None,
         service_builder: Callable[
@@ -380,6 +398,9 @@ class AppController:
         self.subscriptions = subscriptions or _NullSubscriptionService()
         self.subscription_scheduler = subscription_scheduler or _NullSubscriptionScheduler()
         self.integrity_service = integrity_service or _NullIntegrityService()
+        self.diagnostics = diagnostics
+        self.diagnostic_store = diagnostic_store
+        self._diagnostic_report: Any | None = None
         self.paths = paths
         self.gateway_factory = gateway_factory
         self.service_builder = service_builder
@@ -432,6 +453,8 @@ class AppController:
             subscriptions=dependencies.pop("subscriptions", None),
             subscription_scheduler=dependencies.pop("subscription_scheduler", None),
             integrity_service=dependencies.pop("integrity_service", None),
+            diagnostics=dependencies.pop("diagnostics", None),
+            diagnostic_store=dependencies.pop("diagnostic_store", None),
             paths=dependencies.pop("paths", None),
             gateway_factory=dependencies.pop("gateway_factory", None),
             service_builder=dependencies.pop("service_builder", None),
@@ -1337,6 +1360,80 @@ class AppController:
             )
         )
 
+    def activate_diagnostics(self) -> None:
+        page = self._diagnostics_page()
+        if self.diagnostic_store is None:
+            page.set_report(None, historical=True)
+            return
+        try:
+            report = self.diagnostic_store.load_latest()
+        except Exception:
+            page.show_error("无法读取上次诊断报告")
+            return
+        self._diagnostic_report = report
+        page.set_report(report, historical=True)
+
+    async def run_diagnostics(self) -> None:
+        page = self._diagnostics_page()
+        if self.diagnostics is None or self.diagnostic_store is None:
+            page.show_error("健康诊断服务不可用")
+            return
+        page.set_running(True)
+        page.set_progress(None)
+        try:
+            report = await self.diagnostics.run(page.set_progress)
+            register = getattr(self.diagnostic_store, "register_secrets", None)
+            if callable(register):
+                register(self.secrets.values())
+            self.diagnostic_store.save(report)
+            self._diagnostic_report = report
+            page.set_report(report, historical=False)
+            self._show_status("健康诊断已完成")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            page.show_error(f"健康诊断失败（{type(error).__name__}）")
+        finally:
+            page.set_running(False)
+
+    async def cancel_diagnostics(self) -> None:
+        if self.diagnostics is not None:
+            await self.diagnostics.cancel()
+
+    def export_diagnostics(self) -> None:
+        page = self._diagnostics_page()
+        if self.diagnostic_store is None:
+            page.show_error("诊断导出服务不可用")
+            return
+        report = self._diagnostic_report or getattr(page, "report", None)
+        if report is None:
+            page.show_error("请先完成一次健康诊断")
+            return
+        try:
+            register = getattr(self.diagnostic_store, "register_secrets", None)
+            if callable(register):
+                register(self.secrets.values())
+            package = self.diagnostic_store.export(report)
+        except Exception as error:
+            page.show_error(f"诊断包导出失败（{type(error).__name__}）")
+            return
+        self._show_status(f"诊断包已导出：{package.name}")
+
+    def open_diagnostics_directory(self) -> None:
+        page = self._diagnostics_page()
+        if self.paths is None:
+            page.show_error("诊断目录不可用")
+            return
+        try:
+            directory = self.paths.guard(self.paths.diagnostics)
+            directory.mkdir(parents=True, exist_ok=True)
+            startfile = getattr(os, "startfile", None)
+            if startfile is not None:
+                startfile(directory)
+            self._show_status("诊断目录已打开")
+        except (OSError, ValueError):
+            page.show_error("Windows 无法打开诊断目录")
+
     async def test_proxy(self, proxy: ProxySettings, password: str) -> None:
         api_hash = self.secrets.get("api_hash", "")
         if self.gateway_factory is None or self.settings.api_id <= 0 or not api_hash:
@@ -1647,6 +1744,9 @@ class AppController:
         if self._shutting_down:
             return
         self._shutting_down = True
+        if self.diagnostics is not None:
+            with suppress(Exception):
+                await self.diagnostics.cancel()
         await self._cancel_integrity_for_shutdown()
         await self._cancel_connection_monitor()
         await self._cancel_qr_wait()
@@ -1874,6 +1974,13 @@ class AppController:
             self.window,
             "subscriptions_page",
             _NullSubscriptionPage(),
+        )
+
+    def _diagnostics_page(self):
+        return getattr(
+            self.window,
+            "diagnostics_page",
+            _NullDiagnosticsPage(),
         )
 
     def _reload_subscriptions(self) -> None:

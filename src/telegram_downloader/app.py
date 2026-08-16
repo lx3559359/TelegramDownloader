@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import json
 import os
+import platform
 import sys
 from collections.abc import Callable
 from contextlib import suppress
@@ -16,6 +17,21 @@ from telegram_downloader.catalog import CatalogRepository
 from telegram_downloader.content import ContentSearchQuery
 from telegram_downloader.content_browser import ContentBrowserService
 from telegram_downloader.controller import AppController
+from telegram_downloader.diagnostic_probes import (
+    component_availability,
+    managed_writable_paths,
+    probe_components,
+    probe_content_database,
+    probe_credentials,
+    probe_disk,
+    probe_environment,
+    probe_project_write,
+    probe_task_database,
+    probe_telegram,
+    probe_update_sources,
+)
+from telegram_downloader.diagnostic_store import DiagnosticReportStore
+from telegram_downloader.diagnostics import DiagnosticResult, DiagnosticsService
 from telegram_downloader.downloader import MediaDownloader
 from telegram_downloader.file_integrity import FileIntegrityService
 from telegram_downloader.gateway import TelethonGateway
@@ -33,6 +49,28 @@ from telegram_downloader.thumbnail_cache import ThumbnailCache
 from telegram_downloader.update import HttpBytesClient, UpdateCoordinator
 from telegram_downloader.update_contract import load_trusted_keys
 from telegram_downloader.update_download import ResumableUpdateDownloader
+
+
+class _FunctionDiagnosticProbe:
+    def __init__(
+        self,
+        probe_id: str,
+        title: str,
+        action: Callable[[], Any],
+        *,
+        threaded: bool,
+    ) -> None:
+        self.id = probe_id
+        self.title = title
+        self.action = action
+        self.threaded = threaded
+
+    async def run(self, cancel_event: asyncio.Event) -> DiagnosticResult:
+        if cancel_event.is_set():
+            raise asyncio.CancelledError
+        if self.threaded:
+            return await asyncio.to_thread(self.action)
+        return await self.action()
 
 
 class _GracefulShutdown:
@@ -94,30 +132,27 @@ def run_self_test(root: Path) -> dict[str, object]:
     catalog.recover_interrupted_subscriptions(datetime.now(UTC))
     ThumbnailCache(paths.thumbnail_cache)
 
-    writable = {
-        "settings": paths.settings,
-        "secrets": paths.secrets,
-        "database": paths.database,
-        "catalog_database": paths.catalog_database,
-        "log": paths.log,
-        "cache": paths.cache,
-        "thumbnail_cache": paths.thumbnail_cache,
-        "temp": paths.temp,
-        "downloads": paths.downloads,
-        "update_staging": paths.update_staging,
-        "update_backup": paths.update_backup,
-        "update_helper": paths.update_helper,
-        "update_journal": paths.update_journal,
+    managed = managed_writable_paths(paths)
+    public_names = {
+        "settings": "settings",
+        "secrets": "secrets",
+        "database": "database",
+        "catalog_database": "catalogDatabase",
+        "log": "log",
+        "cache": "cache",
+        "thumbnail_cache": "thumbnailCache",
+        "temp": "temp",
+        "downloads": "downloads",
+        "update_staging": "updateStaging",
+        "update_backup": "updateBackup",
+        "update_helper": "updateHelper",
+        "update_journal": "updateJournal",
     }
-    resolved = {name: str(paths.guard(path)) for name, path in writable.items()}
-    components = {
-        "pyside6": _can_import("PySide6"),
-        "telethon": _can_import("telethon"),
-        "qasync": _can_import("qasync"),
-        "qrcode": _can_import("qrcode"),
-        "sqlite": _can_import("sqlite3"),
-        "dpapi": os.name == "nt",
+    resolved = {
+        public: str(paths.guard(managed[internal]))
+        for public, internal in public_names.items()
     }
+    components = component_availability()
     report: dict[str, object] = {
         "ok": all(components.values()),
         "version": __version__,
@@ -302,11 +337,111 @@ def create_application(root: Path):
         HttpBytesClient(),
         ResumableUpdateDownloader(),
     )
+    diagnostic_store = DiagnosticReportStore(paths, secrets=set(secrets.values()))
 
     def confirm_update(manifest) -> bool:
         return UpdateDialog(manifest, window).exec() == UpdateDialog.DialogCode.Accepted
 
     controller_ref: dict[str, AppController] = {}
+
+    def credential_health() -> DiagnosticResult:
+        try:
+            settings_store.load()
+            current_settings_readable = True
+        except SettingsError:
+            current_settings_readable = False
+        current_secrets_present = paths.secrets.is_file()
+        try:
+            vault.load()
+            current_secrets_decryptable = True
+        except SecretsError:
+            current_secrets_decryptable = False
+        return probe_credentials(
+            settings_readable=current_settings_readable,
+            secrets_present=current_secrets_present,
+            secrets_decrypted=current_secrets_decryptable,
+        )
+
+    async def telegram_health() -> DiagnosticResult:
+        controller = controller_ref["controller"]
+        gateway_value = controller.gateway
+        if gateway_value is None:
+            return await probe_telegram(None)
+
+        class RecoveredConnection:
+            async def test_connection(self) -> None:
+                await controller.connection_recovery.ensure_connected(gateway_value)
+                await gateway_value.test_connection()
+
+        return await probe_telegram(RecoveredConnection())
+
+    diagnostics = DiagnosticsService(
+        (
+            _FunctionDiagnosticProbe(
+                "environment",
+                "运行环境与路径",
+                lambda: probe_environment(
+                    paths,
+                    frozen=bool(getattr(sys, "frozen", False)),
+                    windows_x64=(
+                        sys.platform == "win32"
+                        and platform.machine().casefold() in {"amd64", "x86_64"}
+                    ),
+                    system_drive=os.environ.get("SYSTEMDRIVE", "C:"),
+                ),
+                threaded=True,
+            ),
+            _FunctionDiagnosticProbe(
+                "project-write",
+                "项目内写入",
+                lambda: probe_project_write(paths),
+                threaded=True,
+            ),
+            _FunctionDiagnosticProbe(
+                "disk",
+                "磁盘空间",
+                lambda: probe_disk(paths),
+                threaded=True,
+            ),
+            _FunctionDiagnosticProbe(
+                "components",
+                "运行组件",
+                lambda: probe_components(component_availability()),
+                threaded=True,
+            ),
+            _FunctionDiagnosticProbe(
+                "task-database",
+                "下载任务数据库",
+                lambda: probe_task_database(paths.database),
+                threaded=True,
+            ),
+            _FunctionDiagnosticProbe(
+                "content-database",
+                "账号内容数据库",
+                lambda: probe_content_database(paths.catalog_database),
+                threaded=True,
+            ),
+            _FunctionDiagnosticProbe(
+                "credentials",
+                "登录凭据",
+                credential_health,
+                threaded=True,
+            ),
+            _FunctionDiagnosticProbe(
+                "telegram",
+                "Telegram 连接",
+                telegram_health,
+                threaded=False,
+            ),
+            _FunctionDiagnosticProbe(
+                "updates",
+                "签名更新源",
+                lambda: probe_update_sources(update_coordinator),
+                threaded=False,
+            ),
+        ),
+        app_version=__version__,
+    )
     subscription_scheduler = SubscriptionScheduler(
         subscriptions,
         foreground_busy=lambda: (
@@ -340,6 +475,8 @@ def create_application(root: Path):
         subscriptions=subscriptions,
         subscription_scheduler=subscription_scheduler,
         integrity_service=integrity_service,
+        diagnostics=diagnostics,
+        diagnostic_store=diagnostic_store,
         paths=paths,
         gateway_factory=gateway_factory,
         service_builder=build_services,
@@ -538,6 +675,11 @@ def create_application(root: Path):
     window.subscriptions_page.rule_selected.connect(controller.show_subscription_details)
     window.subscriptions_page.probe_requested.connect(subscription_probe_requested)
     window.subscriptions_page.probe_cancel_requested.connect(controller.cancel_subscription_probe)
+    window.diagnostics_activated.connect(controller.activate_diagnostics)
+    window.diagnostics_page.export_requested.connect(controller.export_diagnostics)
+    window.diagnostics_page.open_directory_requested.connect(
+        controller.open_diagnostics_directory
+    )
     login_dialog.credentials_submitted.connect(credentials_submitted)
     login_dialog.phone_submitted.connect(phone_submitted)
     login_dialog.code_submitted.connect(code_submitted)
@@ -565,6 +707,28 @@ def create_application(root: Path):
         lambda: controller.activate_subscriptions_page(),
         hooks=ActionHooks(
             failed=lambda error: window.subscriptions_page.show_error(controller._safe_error(error))
+        ),
+    )
+    async_actions.connect(
+        window.diagnostics_page.run_requested,
+        "diagnostics.run",
+        lambda: controller.run_diagnostics(),
+        hooks=ActionHooks(
+            started=lambda: window.diagnostics_page.set_running(True),
+            failed=lambda error: window.diagnostics_page.show_error(
+                controller._safe_error(error)
+            ),
+            finished=lambda: window.diagnostics_page.set_running(False),
+        ),
+    )
+    async_actions.connect(
+        window.diagnostics_page.cancel_requested,
+        "diagnostics.cancel",
+        lambda: controller.cancel_diagnostics(),
+        hooks=ActionHooks(
+            failed=lambda error: window.diagnostics_page.show_error(
+                controller._safe_error(error)
+            )
         ),
     )
 

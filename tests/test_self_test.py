@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from telegram_downloader import app
 from telegram_downloader.app import run_self_test
 
 
@@ -48,3 +49,28 @@ def test_self_test_verifies_frozen_runtime_components_without_secrets(tmp_path: 
     assert "account_id" not in serialized
     assert "keyword" not in serialized
     assert "message_text" not in serialized
+
+
+def test_self_test_reuses_diagnostic_component_and_path_helpers(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+    original_paths = app.managed_writable_paths
+    original_components = app.component_availability
+
+    def paths_probe(paths):
+        calls.append("paths")
+        return original_paths(paths)
+
+    def component_probe():
+        calls.append("components")
+        return original_components()
+
+    monkeypatch.setattr(app, "managed_writable_paths", paths_probe)
+    monkeypatch.setattr(app, "component_availability", component_probe)
+
+    report = run_self_test(tmp_path)
+
+    assert calls == ["paths", "components"]
+    assert len(report["writable_paths"]) == 13

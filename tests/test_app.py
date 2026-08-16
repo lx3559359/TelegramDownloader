@@ -157,7 +157,9 @@ def test_create_application_initializes_project_local_content_services(
         assert "content_preview_requested" in slot_names
         assert "subscription_probe_requested" in slot_names
         assert controller._async_actions.active_keys == frozenset()
-        assert len(controller._async_actions._slots) == 13
+        assert len(controller._async_actions._slots) == 15
+        assert controller.diagnostics is not None
+        assert controller.diagnostic_store.paths.root == tmp_path.resolve()
         controller.window.content_page.link_requested.emit("https://t.me/example/1#fragment")
         assert controller.window.content_page.error_label.text() == ("请输入有效的 t.me 链接")
 
@@ -450,6 +452,38 @@ def test_repeated_task_resume_clicks_share_one_async_action(
         loop.run_until_complete(emit_actions())
         assert calls == [["paused"]]
         assert controller._async_actions.active_keys == frozenset()
+    finally:
+        loop.run_until_complete(controller._async_actions.shutdown())
+        controller.window.close()
+        loop.close()
+        application.processEvents()
+
+
+def test_repeated_diagnostics_clicks_share_one_async_action(tmp_path, monkeypatch) -> None:
+    application, loop, controller = app.create_application(tmp_path)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def run_diagnostics() -> None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(controller, "run_diagnostics", run_diagnostics)
+
+    async def emit_actions() -> None:
+        controller.window.diagnostics_page.run_requested.emit()
+        await started.wait()
+        controller.window.diagnostics_page.run_requested.emit()
+        assert controller._async_actions.active_keys == frozenset({"diagnostics.run"})
+        release.set()
+        await controller._async_actions.wait_idle()
+
+    try:
+        loop.run_until_complete(emit_actions())
+        assert calls == 1
     finally:
         loop.run_until_complete(controller._async_actions.shutdown())
         controller.window.close()
