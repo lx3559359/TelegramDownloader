@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import os
 import secrets
@@ -12,7 +13,9 @@ from typing import Protocol
 from uuid import uuid4
 
 from telegram_downloader.diagnostics import DiagnosticResult, DiagnosticStatus
+from telegram_downloader.gateway import SessionExpiredError, TransientNetworkError
 from telegram_downloader.paths import PortablePaths
+from telegram_downloader.update_sources import SourceCheck, SourceStatus, UpdateSourceId
 
 MIB = 1024 * 1024
 GIB = 1024 * MIB
@@ -21,6 +24,14 @@ GIB = 1024 * MIB
 class DiskUsage(Protocol):
     total: int
     free: int
+
+
+class ConnectionProbe(Protocol):
+    async def test_connection(self) -> None: ...
+
+
+class UpdateSourceProbe(Protocol):
+    async def check_sources(self) -> tuple[SourceCheck, SourceCheck]: ...
 
 
 def managed_writable_paths(paths: PortablePaths) -> dict[str, Path]:
@@ -406,6 +417,143 @@ def probe_credentials(
         "credentials-ok",
         "Telegram 登录凭据可用",
         metrics,
+    )
+
+
+async def probe_telegram(gateway: ConnectionProbe | None) -> DiagnosticResult:
+    if gateway is None:
+        return _result(
+            "telegram",
+            "Telegram 连接",
+            DiagnosticStatus.SKIPPED,
+            "telegram-not-configured",
+            "尚未建立可检查的 Telegram 会话",
+        )
+    try:
+        await gateway.test_connection()
+    except asyncio.CancelledError:
+        raise
+    except SessionExpiredError:
+        return _result(
+            "telegram",
+            "Telegram 连接",
+            DiagnosticStatus.FAILED,
+            "telegram-session-expired",
+            "Telegram 登录会话已失效",
+        )
+    except TransientNetworkError:
+        return _result(
+            "telegram",
+            "Telegram 连接",
+            DiagnosticStatus.WARNING,
+            "telegram-network-unavailable",
+            "暂时无法连接 Telegram 服务",
+        )
+    except Exception:
+        return _result(
+            "telegram",
+            "Telegram 连接",
+            DiagnosticStatus.FAILED,
+            "telegram-check-failed",
+            "Telegram 连接检查失败",
+        )
+    return _result(
+        "telegram",
+        "Telegram 连接",
+        DiagnosticStatus.PASSED,
+        "telegram-connected",
+        "Telegram 登录会话和连接正常",
+    )
+
+
+async def probe_update_sources(coordinator: UpdateSourceProbe | None) -> DiagnosticResult:
+    if coordinator is None:
+        return _result(
+            "updates",
+            "签名更新源",
+            DiagnosticStatus.SKIPPED,
+            "update-check-unavailable",
+            "当前未配置签名更新检查",
+        )
+    try:
+        checks = await coordinator.check_sources()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return _result(
+            "updates",
+            "签名更新源",
+            DiagnosticStatus.WARNING,
+            "update-sources-unavailable",
+            "暂时无法检查签名更新源",
+        )
+    by_source = {item.source: item for item in checks}
+    if set(by_source) != {UpdateSourceId.GITHUB, UpdateSourceId.MODELSCOPE}:
+        return _result(
+            "updates",
+            "签名更新源",
+            DiagnosticStatus.FAILED,
+            "update-source-invalid",
+            "签名更新源返回结构无效",
+        )
+    ordered = (by_source[UpdateSourceId.GITHUB], by_source[UpdateSourceId.MODELSCOPE])
+    metrics: dict[str, bool | int | float | str] = {}
+    for check in ordered:
+        prefix = "github" if check.source is UpdateSourceId.GITHUB else "modelscope"
+        metrics[f"{prefix}Status"] = check.status.value
+        metrics[f"{prefix}LatencyMs"] = max(0, int(round(check.latency_ms)))
+        if check.status is SourceStatus.VALID and check.verified is not None:
+            metrics[f"{prefix}Version"] = check.verified.manifest.version
+    if any(item.status is SourceStatus.INVALID for item in ordered) or _sources_conflict(
+        ordered
+    ):
+        return _result(
+            "updates",
+            "签名更新源",
+            DiagnosticStatus.FAILED,
+            "update-source-invalid",
+            "签名更新源验证失败或内容不一致",
+            metrics,
+        )
+    unavailable = sum(item.status is SourceStatus.UNAVAILABLE for item in ordered)
+    if unavailable:
+        code = "update-sources-unavailable" if unavailable == 2 else "update-source-degraded"
+        summary = (
+            "两个签名更新源暂时均不可用"
+            if unavailable == 2
+            else "一个签名更新源暂时不可用"
+        )
+        return _result(
+            "updates",
+            "签名更新源",
+            DiagnosticStatus.WARNING,
+            code,
+            summary,
+            metrics,
+        )
+    return _result(
+        "updates",
+        "签名更新源",
+        DiagnosticStatus.PASSED,
+        "update-sources-ok",
+        "GitHub 与魔搭签名更新源正常",
+        metrics,
+    )
+
+
+def _sources_conflict(checks: tuple[SourceCheck, SourceCheck]) -> bool:
+    left, right = checks
+    if (
+        left.status is not SourceStatus.VALID
+        or right.status is not SourceStatus.VALID
+        or left.verified is None
+        or right.verified is None
+        or left.verified.manifest.version != right.verified.manifest.version
+    ):
+        return False
+    return (
+        left.verified.canonical != right.verified.canonical
+        or left.verified.signature != right.verified.signature
     )
 
 

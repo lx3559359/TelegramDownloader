@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import namedtuple
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,8 @@ from telegram_downloader.diagnostic_probes import (
     probe_environment,
     probe_project_write,
     probe_task_database,
+    probe_telegram,
+    probe_update_sources,
 )
 from telegram_downloader.diagnostics import DiagnosticStatus
 from telegram_downloader.domain import (
@@ -32,8 +35,10 @@ from telegram_downloader.domain import (
     TaskRecord,
     TaskStatus,
 )
+from telegram_downloader.gateway import SessionExpiredError, TransientNetworkError
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.repository import TaskRepository
+from telegram_downloader.update_sources import SourceCheck, SourceStatus, UpdateSourceId
 
 DiskUsage = namedtuple("DiskUsage", "total used free")
 
@@ -377,4 +382,109 @@ def test_credentials_probe_exposes_only_boolean_state() -> None:
     assert (settings_error.status, settings_error.code) == (
         DiagnosticStatus.FAILED,
         "settings-unreadable",
+    )
+
+
+class Gateway:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+
+    async def test_connection(self) -> None:
+        if self.error is not None:
+            raise self.error
+
+
+@pytest.mark.asyncio
+async def test_telegram_probe_maps_connection_outcomes_without_error_text() -> None:
+    skipped = await probe_telegram(None)
+    ready = await probe_telegram(Gateway())
+    expired = await probe_telegram(Gateway(SessionExpiredError("private-session")))
+    offline = await probe_telegram(Gateway(TransientNetworkError("private-network")))
+    broken = await probe_telegram(Gateway(RuntimeError("private-unknown")))
+
+    assert (skipped.status, skipped.code) == (
+        DiagnosticStatus.SKIPPED,
+        "telegram-not-configured",
+    )
+    assert (ready.status, ready.code) == (
+        DiagnosticStatus.PASSED,
+        "telegram-connected",
+    )
+    assert (expired.status, expired.code) == (
+        DiagnosticStatus.FAILED,
+        "telegram-session-expired",
+    )
+    assert (offline.status, offline.code) == (
+        DiagnosticStatus.WARNING,
+        "telegram-network-unavailable",
+    )
+    assert (broken.status, broken.code) == (
+        DiagnosticStatus.FAILED,
+        "telegram-check-failed",
+    )
+    assert all(
+        "private" not in item.summary
+        for item in (skipped, ready, expired, offline, broken)
+    )
+
+
+class UpdateChecks:
+    def __init__(self, checks: tuple[SourceCheck, SourceCheck]) -> None:
+        self.checks = checks
+
+    async def check_sources(self) -> tuple[SourceCheck, SourceCheck]:
+        return self.checks
+
+
+def source_check(
+    source: UpdateSourceId,
+    status: SourceStatus,
+    *,
+    version: str = "0.10.0",
+    latency_ms: float = 12.6,
+) -> SourceCheck:
+    verified = (
+        SimpleNamespace(
+            manifest=SimpleNamespace(version=version),
+            canonical=b"same",
+            signature=b"same",
+        )
+        if status is SourceStatus.VALID
+        else None
+    )
+    return SourceCheck(source, status, latency_ms, verified=verified)
+
+
+@pytest.mark.asyncio
+async def test_update_probe_reports_fixed_dual_source_health() -> None:
+    valid = (
+        source_check(UpdateSourceId.GITHUB, SourceStatus.VALID),
+        source_check(UpdateSourceId.MODELSCOPE, SourceStatus.VALID),
+    )
+    degraded = (valid[0], source_check(UpdateSourceId.MODELSCOPE, SourceStatus.UNAVAILABLE))
+    invalid = (valid[0], source_check(UpdateSourceId.MODELSCOPE, SourceStatus.INVALID))
+
+    passed = await probe_update_sources(UpdateChecks(valid))
+    warning = await probe_update_sources(UpdateChecks(degraded))
+    failed = await probe_update_sources(UpdateChecks(invalid))
+
+    assert (passed.status, passed.code) == (
+        DiagnosticStatus.PASSED,
+        "update-sources-ok",
+    )
+    assert passed.metrics == {
+        "githubStatus": "valid",
+        "githubLatencyMs": 13,
+        "githubVersion": "0.10.0",
+        "modelscopeStatus": "valid",
+        "modelscopeLatencyMs": 13,
+        "modelscopeVersion": "0.10.0",
+    }
+    assert (warning.status, warning.code) == (
+        DiagnosticStatus.WARNING,
+        "update-source-degraded",
+    )
+    assert (failed.status, failed.code) == (
+        DiagnosticStatus.FAILED,
+        "update-source-invalid",
     )

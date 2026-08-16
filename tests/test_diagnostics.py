@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
 from telegram_downloader.diagnostics import (
+    DiagnosticProgress,
     DiagnosticReport,
     DiagnosticResult,
+    DiagnosticsService,
     DiagnosticStatus,
     reduce_status,
 )
@@ -139,3 +142,101 @@ def test_report_requires_ordered_utc_timestamps_and_results() -> None:
         )
     with pytest.raises(ValueError, match="检查结果"):
         DiagnosticReport.build("0.10.0", NOW, NOW, ())
+
+
+class Probe:
+    def __init__(
+        self,
+        probe_id: str,
+        response: DiagnosticResult | None = None,
+        *,
+        started: asyncio.Event | None = None,
+        release: asyncio.Event | None = None,
+    ) -> None:
+        self.id = probe_id
+        self.title = probe_id
+        self.response = response or result(probe_id)
+        self.started = started
+        self.release = release
+        self.calls = 0
+
+    async def run(self, cancel_event: asyncio.Event) -> DiagnosticResult:
+        self.calls += 1
+        if self.started is not None:
+            self.started.set()
+        if self.release is not None:
+            await self.release.wait()
+        return self.response
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_repeated_runs_share_one_active_task_and_progress() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    probe = Probe("telegram", started=started, release=release)
+    progress: list[DiagnosticProgress] = []
+    service = DiagnosticsService(
+        (probe,),
+        app_version="0.10.0",
+        utc_now=lambda: NOW,
+    )
+
+    first = asyncio.create_task(service.run(progress.append))
+    await started.wait()
+    second = asyncio.create_task(service.run())
+    await asyncio.sleep(0)
+    release.set()
+    first_report, second_report = await asyncio.gather(first, second)
+
+    assert first_report is second_report
+    assert probe.calls == 1
+    assert [(item.completed, item.current_id, item.status) for item in progress] == [
+        (0, "telegram", DiagnosticStatus.RUNNING),
+        (1, "telegram", DiagnosticStatus.PASSED),
+        (1, None, DiagnosticStatus.PASSED),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_cancel_keeps_completed_and_marks_remaining() -> None:
+    started = asyncio.Event()
+    blocker = Probe("telegram", started=started, release=asyncio.Event())
+    never_started = Probe("updates")
+    service = DiagnosticsService(
+        (Probe("paths"), blocker, never_started),
+        app_version="0.10.0",
+        utc_now=lambda: NOW,
+    )
+
+    running = asyncio.create_task(service.run())
+    await started.wait()
+    await service.cancel()
+    report = await running
+    await service.cancel()
+
+    assert [item.status for item in report.results] == [
+        DiagnosticStatus.PASSED,
+        DiagnosticStatus.CANCELLED,
+        DiagnosticStatus.CANCELLED,
+    ]
+    assert report.status is DiagnosticStatus.CANCELLED
+    assert never_started.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_maps_unexpected_probe_error_to_safe_failure() -> None:
+    class BrokenProbe:
+        id = "telegram"
+        title = "Telegram"
+
+        async def run(self, cancel_event: asyncio.Event) -> DiagnosticResult:
+            raise RuntimeError(r"D:\\private\\session secret")
+
+    report = await DiagnosticsService(
+        (BrokenProbe(),),
+        app_version="0.10.0",
+        utc_now=lambda: NOW,
+    ).run()
+
+    assert report.results[0].code == "probe-failed"
+    assert "private" not in report.results[0].summary
