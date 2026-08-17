@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -12,7 +12,15 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QColor, QIcon, QPixmap
 
-from telegram_downloader.content import ContentDialog, SearchResult, SearchSession
+from telegram_downloader.content import (
+    ALL_DIALOGS_SCOPE_REF,
+    ALL_DIALOGS_TITLE,
+    ContentDialog,
+    ContentSourceKind,
+    SearchResult,
+    SearchScope,
+    SearchSession,
+)
 from telegram_downloader.domain import MediaKind
 
 _INVALID_INDEX = QModelIndex()
@@ -35,12 +43,30 @@ _MEDIA_COLORS = {
     MediaKind.ARCHIVE: "#fb923c",
 }
 
+_SOURCE_LABELS = {
+    ContentSourceKind.GROUP: "群组",
+    ContentSourceKind.CHANNEL: "频道",
+    ContentSourceKind.PRIVATE: "私聊",
+    ContentSourceKind.BOT: "机器人",
+    ContentSourceKind.SAVED: "收藏夹",
+    ContentSourceKind.UNKNOWN: "未知来源",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class DialogChoice:
+    scope: SearchScope
+    peer_ref: str
+    title: str
+    available: bool
+    dialog: ContentDialog | None = None
+
 
 class DialogListModel(QAbstractListModel):
     def __init__(self) -> None:
         super().__init__()
         self._all: tuple[ContentDialog, ...] = ()
-        self._visible: tuple[ContentDialog, ...] = ()
+        self._visible: tuple[DialogChoice, ...] = ()
         self._filter = ""
 
     def rowCount(self, parent: QModelIndex = _INVALID_INDEX) -> int:
@@ -53,8 +79,11 @@ class DialogListModel(QAbstractListModel):
     ):
         if not index.isValid() or not 0 <= index.row() < len(self._visible):
             return None
-        item = self._visible[index.row()]
+        choice = self._visible[index.row()]
+        item = choice.dialog
         if role == Qt.ItemDataRole.DisplayRole:
+            if item is None:
+                return choice.title
             suffixes = []
             if item.archived:
                 suffixes.append("已归档")
@@ -63,8 +92,10 @@ class DialogListModel(QAbstractListModel):
             suffix = f"  · {' · '.join(suffixes)}" if suffixes else ""
             return item.title + suffix
         if role == Qt.ItemDataRole.UserRole:
-            return item.peer_ref
+            return choice.peer_ref
         if role == Qt.ItemDataRole.ToolTipRole:
+            if item is None:
+                return "搜索当前账号的全部云端会话"
             username = f"@{item.username}" if item.username else item.peer_ref
             return f"{item.title}\n{username}"
         return None
@@ -93,22 +124,46 @@ class DialogListModel(QAbstractListModel):
         self._visible = self._filtered()
         self.endResetModel()
 
-    def dialog_at(self, row: int) -> ContentDialog:
+    def choice_at(self, row: int) -> DialogChoice:
         return self._visible[row]
 
-    def _filtered(self) -> tuple[ContentDialog, ...]:
-        if not self._filter:
-            return self._all
-        return tuple(
-            item
-            for item in self._all
-            if self._filter in item.title.casefold()
-            or self._filter in item.username.casefold()
+    def dialog_at(self, row: int) -> ContentDialog:
+        dialog = self.choice_at(row).dialog
+        if dialog is None:
+            raise ValueError("全部会话不是单一会话")
+        return dialog
+
+    def _filtered(self) -> tuple[DialogChoice, ...]:
+        all_dialogs = DialogChoice(
+            SearchScope.ALL_DIALOGS,
+            ALL_DIALOGS_SCOPE_REF,
+            ALL_DIALOGS_TITLE,
+            True,
+        )
+        visible = (
+            self._all
+            if not self._filter
+            else tuple(
+                item
+                for item in self._all
+                if self._filter in item.title.casefold()
+                or self._filter in item.username.casefold()
+            )
+        )
+        return (all_dialogs,) + tuple(
+            DialogChoice(
+                SearchScope.SINGLE_DIALOG,
+                item.peer_ref,
+                item.title,
+                item.available,
+                item,
+            )
+            for item in visible
         )
 
 
 class SearchHistoryTableModel(QAbstractTableModel):
-    HEADERS = ("群组/频道", "关键词", "筛选", "状态", "结果数", "更新时间")
+    HEADERS = ("搜索范围", "关键词", "筛选", "状态", "结果数", "更新时间")
     _STATUS_LABELS = {
         "running": "搜索中",
         "completed": "已完成",
@@ -154,7 +209,11 @@ class SearchHistoryTableModel(QAbstractTableModel):
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         values = (
-            session.dialog_title,
+            (
+                ALL_DIALOGS_TITLE
+                if session.scope is SearchScope.ALL_DIALOGS
+                else session.dialog_title
+            ),
             session.query.keyword,
             self._filter_summary(session),
             self._STATUS_LABELS[session.status.value],
@@ -186,7 +245,7 @@ class SearchHistoryTableModel(QAbstractTableModel):
 
 
 class SearchResultTableModel(QAbstractTableModel):
-    HEADERS = ("选择", "预览", "日期", "摘要", "类型", "大小", "状态")
+    HEADERS = ("选择", "预览", "日期", "来源", "摘要", "类型", "大小", "状态")
     selection_changed = Signal(str, bool)
 
     def __init__(self) -> None:
@@ -239,6 +298,12 @@ class SearchResultTableModel(QAbstractTableModel):
                     return icon
             return self._fallback_icon(result.media_kind)
         if role == Qt.ItemDataRole.ToolTipRole:
+            if index.column() == 3:
+                source_title = result.source_title or result.peer_ref
+                return (
+                    f"{_SOURCE_LABELS[result.source_kind]}：{source_title}"
+                    f"\n会话标识：{result.peer_ref}"
+                )
             return result.original_name
         if role != Qt.ItemDataRole.DisplayRole:
             return None
@@ -246,6 +311,7 @@ class SearchResultTableModel(QAbstractTableModel):
             "",
             "",
             result.message_date_utc.strftime("%Y-%m-%d %H:%M"),
+            result.source_title or result.peer_ref,
             result.excerpt,
             _MEDIA_LABELS[result.media_kind],
             self._format_bytes(result.expected_size),

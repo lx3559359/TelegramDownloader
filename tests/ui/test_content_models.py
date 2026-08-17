@@ -6,10 +6,14 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QIcon, QPixmap
 
 from telegram_downloader.content import (
+    ALL_DIALOGS_SCOPE_REF,
+    ALL_DIALOGS_TITLE,
     ContentDialog,
     ContentSearchQuery,
+    ContentSourceKind,
     DialogKind,
     SearchResult,
+    SearchScope,
     SearchSession,
     SearchStatus,
 )
@@ -132,16 +136,16 @@ def test_dialog_model_filters_by_title_or_username() -> None:
     model.set_dialogs(dialogs(now))
     model.set_filter("DOCS")
 
-    assert model.rowCount() == 1
-    index = model.index(0, 0)
+    assert model.rowCount() == 2
+    index = model.index(1, 0)
     assert model.data(index, Qt.ItemDataRole.DisplayRole).startswith("资料频道")
     assert "已归档" in model.data(index, Qt.ItemDataRole.DisplayRole)
     assert model.data(index, Qt.ItemDataRole.UserRole) == "-1002"
-    assert model.dialog_at(0).username == "docs"
+    assert model.choice_at(1).dialog.username == "docs"
 
     model.set_filter("ä")
-    assert model.rowCount() == 1
-    assert "不可用" in model.data(model.index(0, 0), Qt.ItemDataRole.DisplayRole)
+    assert model.rowCount() == 2
+    assert "不可用" in model.data(model.index(1, 0), Qt.ItemDataRole.DisplayRole)
 
 
 def test_dialog_model_sorts_available_before_unavailable_then_title() -> None:
@@ -150,11 +154,29 @@ def test_dialog_model_sorts_available_before_unavailable_then_title() -> None:
     values = dialogs(now)
     model.set_dialogs([values[2], values[1], values[0]])
 
-    assert [model.dialog_at(row).peer_ref for row in range(model.rowCount())] == [
+    assert [model.choice_at(row).peer_ref for row in range(model.rowCount())] == [
+        ALL_DIALOGS_SCOPE_REF,
         "-1001",
         "-1002",
         "-1003",
     ]
+
+
+def test_dialog_model_keeps_all_dialogs_first_during_filtering() -> None:
+    now = datetime(2026, 8, 17, tzinfo=UTC)
+    model = DialogListModel()
+    model.set_dialogs(dialogs(now))
+
+    first = model.choice_at(0)
+    assert first.scope is SearchScope.ALL_DIALOGS
+    assert first.peer_ref == ALL_DIALOGS_SCOPE_REF
+    assert model.data(model.index(0, 0)) == ALL_DIALOGS_TITLE
+
+    model.set_filter("docs")
+
+    assert model.rowCount() == 2
+    assert model.choice_at(0).scope is SearchScope.ALL_DIALOGS
+    assert model.choice_at(1).dialog.username == "docs"
 
 
 def test_history_model_exposes_columns_status_id_and_safe_error() -> None:
@@ -164,7 +186,7 @@ def test_history_model_exposes_columns_status_id_and_safe_error() -> None:
     model.set_sessions([session])
 
     assert model.HEADERS == (
-        "群组/频道",
+        "搜索范围",
         "关键词",
         "筛选",
         "状态",
@@ -193,7 +215,16 @@ def test_result_model_selection_roles_and_disabled_rows(qtbot) -> None:
     model.set_results(results)
     select_index = model.index(0, 0)
 
-    assert model.HEADERS == ("选择", "预览", "日期", "摘要", "类型", "大小", "状态")
+    assert model.HEADERS == (
+        "选择",
+        "预览",
+        "日期",
+        "来源",
+        "摘要",
+        "类型",
+        "大小",
+        "状态",
+    )
     assert model.flags(select_index) & Qt.ItemFlag.ItemIsUserCheckable
     assert model.setData(
         select_index,
@@ -202,14 +233,49 @@ def test_result_model_selection_roles_and_disabled_rows(qtbot) -> None:
     )
     assert changed == [(results[0].id, True)]
     assert model.data(select_index, Qt.ItemDataRole.UserRole) == results[0].id
-    assert model.data(model.index(1, 5)) == "未知"
+    assert model.data(model.index(1, 6)) == "未知"
     assert not (
         model.flags(model.index(2, 0)) & Qt.ItemFlag.ItemIsUserCheckable
     )
     assert not (
         model.flags(model.index(3, 0)) & Qt.ItemFlag.ItemIsUserCheckable
     )
-    assert model.data(model.index(3, 6)) == "已入队"
+    assert model.data(model.index(3, 7)) == "已入队"
+
+
+def test_result_model_displays_source_name_kind_and_peer_tooltip(qtbot) -> None:
+    now = datetime(2026, 8, 17, tzinfo=UTC)
+    model = SearchResultTableModel()
+    item = replace(
+        search_results(now)[0],
+        source_title="联系人",
+        source_kind=ContentSourceKind.PRIVATE,
+        peer_ref="42",
+    )
+    model.set_results([item])
+
+    assert model.data(model.index(0, 3)) == "联系人"
+    tooltip = model.data(model.index(0, 3), Qt.ItemDataRole.ToolTipRole)
+    assert "私聊" in tooltip
+    assert "42" in tooltip
+
+
+def test_history_model_labels_account_scope() -> None:
+    now = datetime(2026, 8, 17, tzinfo=UTC)
+    model = SearchHistoryTableModel()
+    model.set_sessions(
+        [
+            replace(
+                search_session(now),
+                scope=SearchScope.ALL_DIALOGS,
+                peer_ref=ALL_DIALOGS_SCOPE_REF,
+                dialog_title=ALL_DIALOGS_TITLE,
+            )
+        ]
+    )
+
+    assert model.HEADERS[0] == "搜索范围"
+    assert model.data(model.index(0, 0)) == ALL_DIALOGS_TITLE
 
 
 def test_result_model_uses_thumbnail_then_media_fallback(
