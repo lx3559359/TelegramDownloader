@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import mimetypes
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Protocol
@@ -163,6 +163,14 @@ class TelegramGateway(Protocol):
         on_progress: Callable[[SearchProgress], None] | None = None,
     ) -> RemoteSearchPage: ...
 
+    async def search_all_media_page(
+        self,
+        query: ContentSearchQuery,
+        cursor: SearchCursor | None,
+        *,
+        on_progress: Callable[[SearchProgress], None] | None = None,
+    ) -> RemoteSearchPage: ...
+
     async def latest_message_id(self, entity_ref: str) -> int: ...
 
     async def recent_messages(
@@ -223,7 +231,7 @@ class TelethonGateway:
         proxy: ProxySettings | None = None,
         proxy_password: str = "",
     ) -> None:
-        from telethon import TelegramClient, errors, functions, utils
+        from telethon import TelegramClient, errors, functions, types, utils
         from telethon.sessions import StringSession
 
         self._client = TelegramClient(
@@ -264,6 +272,9 @@ class TelethonGateway:
         )
         self._check_invite_request = functions.messages.CheckChatInviteRequest
         self._peer_id_getter = utils.get_peer_id
+        self._search_global_request_factory = functions.messages.SearchGlobalRequest
+        self._input_peer_empty_factory = types.InputPeerEmpty
+        self._input_messages_filter_empty_factory = types.InputMessagesFilterEmpty
         self._qr_login: object | None = None
         self._connected = False
         self._entity_cache: dict[str, object] = {}
@@ -284,6 +295,9 @@ class TelethonGateway:
             TimeoutError,
         ),
         peer_id_getter=None,
+        search_global_request_factory=None,
+        input_peer_empty_factory=None,
+        input_messages_filter_empty_factory=None,
         connected: bool = True,
     ) -> TelethonGateway:
         gateway = cls.__new__(cls)
@@ -296,6 +310,11 @@ class TelethonGateway:
         gateway._transient_errors = transient_errors
         gateway._check_invite_request = None
         gateway._peer_id_getter = peer_id_getter or (lambda entity: entity)
+        gateway._search_global_request_factory = search_global_request_factory
+        gateway._input_peer_empty_factory = input_peer_empty_factory
+        gateway._input_messages_filter_empty_factory = (
+            input_messages_filter_empty_factory
+        )
         gateway._qr_login = None
         gateway._connected = connected
         gateway._entity_cache = {}
@@ -600,6 +619,10 @@ class TelethonGateway:
                     remote = self.remote_media_from_message(peer_ref, message, title)
                     if remote is None or remote.kind not in query.filters.media_kinds:
                         continue
+                    remote = replace(
+                        remote,
+                        source_kind=self._content_source_kind(entity),
+                    )
                     items.append(self._search_hit(remote, message))
                     matched = True
                 finally:
@@ -618,6 +641,111 @@ class TelethonGateway:
             else SearchCursor(last_inspected_id)
         )
         return RemoteSearchPage(tuple(items), next_cursor, exhausted)
+
+    async def search_all_media_page(
+        self,
+        query: ContentSearchQuery,
+        cursor: SearchCursor | None,
+        *,
+        on_progress: Callable[[SearchProgress], None] | None = None,
+    ) -> RemoteSearchPage:
+        if (
+            self._search_global_request_factory is None
+            or self._input_peer_empty_factory is None
+            or self._input_messages_filter_empty_factory is None
+        ):
+            raise GatewayError("全账号搜索请求未配置")
+
+        reporter = SearchProgressReporter(on_progress) if on_progress else None
+        items: list[RemoteSearchHit] = []
+        last_message_id: int | None = None
+        last_peer_ref: str | None = None
+        try:
+            if cursor is not None and cursor.offset_peer_ref is not None:
+                offset_entity = await self._resolve_entity(cursor.offset_peer_ref)
+                get_input_entity = getattr(self._client, "get_input_entity", None)
+                offset_peer = (
+                    await get_input_entity(offset_entity)
+                    if callable(get_input_entity)
+                    else offset_entity
+                )
+            else:
+                offset_peer = self._input_peer_empty_factory()
+            response = await self._client(
+                self._search_global_request_factory(
+                    q=query.keyword,
+                    filter=self._input_messages_filter_empty_factory(),
+                    min_date=query.filters.date_from_utc,
+                    max_date=query.filters.date_to_utc,
+                    offset_rate=cursor.offset_rate if cursor else 0,
+                    offset_peer=offset_peer,
+                    offset_id=cursor.offset_id if cursor else 0,
+                    limit=self._SEARCH_PAGE_SIZE,
+                    broadcasts_only=None,
+                    groups_only=None,
+                    users_only=None,
+                    folder_id=None,
+                )
+            )
+            entities = {
+                self._peer_id_getter(entity): entity
+                for entity in (
+                    *tuple(getattr(response, "users", ()) or ()),
+                    *tuple(getattr(response, "chats", ()) or ()),
+                )
+            }
+            for message in tuple(getattr(response, "messages", ()) or ()):
+                matched = False
+                try:
+                    finish_init = getattr(message, "_finish_init", None)
+                    if callable(finish_init):
+                        finish_init(self._client, entities, None)
+                    message_id = getattr(message, "id", None)
+                    peer_id = getattr(message, "peer_id", None)
+                    if not isinstance(message_id, int) or message_id <= 0 or peer_id is None:
+                        continue
+                    peer_key = self._peer_id_getter(peer_id)
+                    peer_ref = str(peer_key)
+                    last_message_id = message_id
+                    last_peer_ref = peer_ref
+                    entity = entities.get(peer_key) or getattr(message, "chat", None)
+                    title = self._entity_title(entity, peer_ref)
+                    message_date = self._utc_datetime(getattr(message, "date", None))
+                    if message_date is None:
+                        continue
+                    if not (
+                        query.filters.date_from_utc
+                        <= message_date
+                        <= query.filters.date_to_utc
+                    ):
+                        continue
+                    remote = self.remote_media_from_message(peer_ref, message, title)
+                    if remote is None or remote.kind not in query.filters.media_kinds:
+                        continue
+                    remote = replace(
+                        remote,
+                        source_kind=self._content_source_kind(entity),
+                    )
+                    items.append(self._search_hit(remote, message))
+                    matched = True
+                finally:
+                    if reporter is not None:
+                        reporter.record(matched=matched)
+        except Exception as exc:
+            self._raise_mapped(exc)
+
+        if reporter is not None:
+            reporter.finish("正在整理结果")
+
+        next_rate = getattr(response, "next_rate", None)
+        next_cursor = (
+            SearchCursor(last_message_id, int(next_rate), last_peer_ref)
+            if last_message_id is not None
+            and last_peer_ref is not None
+            and next_rate is not None
+            else None
+        )
+        return RemoteSearchPage(tuple(items), next_cursor, next_cursor is None)
 
     async def latest_message_id(self, entity_ref: str) -> int:
         try:
@@ -713,6 +841,10 @@ class TelethonGateway:
                     continue
                 remote = self.remote_media_from_message(peer_ref, message, title)
                 if remote is not None:
+                    remote = replace(
+                        remote,
+                        source_kind=self._content_source_kind(entity),
+                    )
                     grouped[remote.message_id] = self._search_hit(remote, message)
         except Exception as exc:
             self._raise_mapped(exc)
@@ -814,12 +946,10 @@ class TelethonGateway:
                 if entity is None:
                     raise AccessDeniedError("请先使用 Telegram 加入该邀请链接")
             else:
-                reference: str | int = entity_ref
-                if entity_ref.startswith("-100") and entity_ref[1:].isdigit():
-                    reference = int(entity_ref)
-                    entity = await self._resolve_private_entity(reference)
+                if entity_ref.lstrip("-").isdigit():
+                    entity = await self._resolve_private_entity(int(entity_ref))
                 else:
-                    entity = await self._client.get_entity(reference)
+                    entity = await self._client.get_entity(entity_ref)
         except AccessDeniedError:
             raise
         except Exception as exc:
@@ -860,6 +990,25 @@ class TelethonGateway:
             last = getattr(entity, "last_name", "") or ""
             title = " ".join(part for part in (first, last) if part)
         return sanitize_component(str(title or fallback))
+
+    @staticmethod
+    def _content_source_kind(entity: object) -> ContentSourceKind:
+        if bool(getattr(entity, "is_self", False)):
+            return ContentSourceKind.SAVED
+        if bool(getattr(entity, "bot", False)):
+            return ContentSourceKind.BOT
+        if bool(getattr(entity, "megagroup", False)):
+            return ContentSourceKind.GROUP
+        class_name = type(entity).__name__
+        if class_name == "Chat" or class_name.endswith("Chat"):
+            return ContentSourceKind.GROUP
+        if bool(getattr(entity, "broadcast", False)) or class_name == "Channel":
+            return ContentSourceKind.CHANNEL
+        if class_name == "User" or any(
+            hasattr(entity, attribute) for attribute in ("first_name", "last_name")
+        ):
+            return ContentSourceKind.PRIVATE
+        return ContentSourceKind.UNKNOWN
 
     @staticmethod
     def _utc_datetime(value: object) -> datetime | None:

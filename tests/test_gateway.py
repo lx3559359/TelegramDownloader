@@ -8,6 +8,7 @@ import telegram_downloader.gateway as gateway_module
 from telegram_downloader.content import (
     AccountProfile,
     ContentSearchQuery,
+    ContentSourceKind,
     DialogKind,
     SearchCursor,
 )
@@ -699,7 +700,7 @@ async def test_search_media_page_uses_server_search_and_raw_message_cursor() -> 
 
         async def get_entity(self, entity):
             assert entity == -1001
-            return SimpleNamespace(title="资料群")
+            return SimpleNamespace(title="资料群", megagroup=True)
 
         def iter_messages(self, entity, **kwargs):
             self.calls.append(kwargs)
@@ -732,6 +733,7 @@ async def test_search_media_page_uses_server_search_and_raw_message_cursor() -> 
     }
     assert len(page.items) == 50
     assert all(item.remote.kind is MediaKind.VIDEO for item in page.items)
+    assert all(item.remote.source_kind is ContentSourceKind.GROUP for item in page.items)
     assert all(len(item.excerpt) <= 500 for item in page.items)
     assert page.items[0].excerpt.startswith("安装 教程 ")
     assert not any(ord(char) < 32 for char in page.items[0].excerpt)
@@ -768,6 +770,151 @@ async def test_search_media_page_marks_short_page_exhausted_without_cursor() -> 
     assert [item.remote.message_id for item in page.items] == [2, 1]
     assert page.next_cursor is None
     assert page.exhausted is True
+
+
+@pytest.mark.asyncio
+async def test_global_search_uses_raw_composite_cursor_and_maps_sources() -> None:
+    now = datetime(2026, 8, 17, 12, tzinfo=UTC)
+    entities = [
+        SimpleNamespace(peer_ref=-1001, title="资料群", megagroup=True),
+        SimpleNamespace(peer_ref=-1002, title="公告频道", broadcast=True),
+        SimpleNamespace(peer_ref=42, first_name="联系人", bot=False, is_self=False),
+        SimpleNamespace(peer_ref=43, first_name="机器人", bot=True, is_self=False),
+        SimpleNamespace(peer_ref=44, first_name="我", bot=False, is_self=True),
+    ]
+    messages = []
+    for message_id, entity in enumerate(entities, start=80):
+        message = media_message(message_id, now)
+        message.message = f"安装资源 {message_id}"
+        message.peer_id = SimpleNamespace(peer_ref=entity.peer_ref)
+        messages.append(message)
+
+    class Client:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def __call__(self, request):
+            self.requests.append(request)
+            return SimpleNamespace(
+                messages=messages,
+                users=entities[2:],
+                chats=entities[:2],
+                next_rate=31,
+            )
+
+        async def get_entity(self, value):
+            return next(item for item in entities if item.peer_ref == int(value))
+
+    client = Client()
+    gateway = TelethonGateway.from_client_for_test(
+        client,
+        peer_id_getter=lambda value: int(value.peer_ref),
+        search_global_request_factory=lambda **values: SimpleNamespace(**values),
+        input_peer_empty_factory=lambda: SimpleNamespace(empty=True),
+        input_messages_filter_empty_factory=lambda: SimpleNamespace(empty_filter=True),
+    )
+    query = ContentSearchQuery(
+        "安装",
+        ScanFilters(now - timedelta(days=1), now, frozenset(MediaKind), 500),
+    )
+
+    page = await gateway.search_all_media_page(query, None)
+
+    request = client.requests[0]
+    assert request.q == "安装"
+    assert request.min_date == query.filters.date_from_utc
+    assert request.max_date == query.filters.date_to_utc
+    assert request.offset_rate == 0
+    assert request.offset_id == 0
+    assert request.offset_peer.empty is True
+    assert request.folder_id is None
+    assert [item.remote.source_kind for item in page.items] == [
+        ContentSourceKind.GROUP,
+        ContentSourceKind.CHANNEL,
+        ContentSourceKind.PRIVATE,
+        ContentSourceKind.BOT,
+        ContentSourceKind.SAVED,
+    ]
+    assert [item.remote.source_title for item in page.items] == [
+        "资料群",
+        "公告频道",
+        "联系人",
+        "机器人",
+        "我",
+    ]
+    assert page.next_cursor == SearchCursor(84, 31, "44")
+    assert page.exhausted is False
+
+
+@pytest.mark.asyncio
+async def test_global_search_restores_private_offset_peer() -> None:
+    now = datetime(2026, 8, 17, 12, tzinfo=UTC)
+    cursor = SearchCursor(87, 13, "42")
+
+    class Client:
+        def __init__(self) -> None:
+            self.requests = []
+            self.converted_peer = None
+
+        async def __call__(self, request):
+            self.requests.append(request)
+            return SimpleNamespace(messages=[], users=[], chats=[])
+
+        async def get_entity(self, value):
+            assert value == 42
+            return SimpleNamespace(peer_ref=42, first_name="联系人")
+
+        async def get_input_entity(self, entity):
+            self.converted_peer = entity
+            return SimpleNamespace(input_peer_ref=entity.peer_ref)
+
+    client = Client()
+    gateway = TelethonGateway.from_client_for_test(
+        client,
+        peer_id_getter=lambda value: int(value.peer_ref),
+        search_global_request_factory=lambda **values: SimpleNamespace(**values),
+        input_peer_empty_factory=lambda: SimpleNamespace(empty=True),
+        input_messages_filter_empty_factory=lambda: SimpleNamespace(empty_filter=True),
+    )
+    query = ContentSearchQuery(
+        "安装",
+        ScanFilters(now - timedelta(days=1), now, frozenset(MediaKind), 500),
+    )
+
+    page = await gateway.search_all_media_page(query, cursor)
+
+    request = client.requests[0]
+    assert request.offset_id == 87
+    assert request.offset_rate == 13
+    assert client.converted_peer.first_name == "联系人"
+    assert request.offset_peer.input_peer_ref == 42
+    assert page.exhausted is True
+    assert page.next_cursor is None
+
+
+@pytest.mark.asyncio
+async def test_global_search_maps_access_error_without_server_text() -> None:
+    now = datetime(2026, 8, 17, 12, tzinfo=UTC)
+
+    class RawAccessError(Exception):
+        pass
+
+    class Client:
+        async def __call__(self, request):
+            raise RawAccessError("private server detail")
+
+    gateway = TelethonGateway.from_client_for_test(
+        Client(),
+        access_errors=(RawAccessError,),
+        search_global_request_factory=lambda **values: SimpleNamespace(**values),
+        input_peer_empty_factory=lambda: SimpleNamespace(empty=True),
+        input_messages_filter_empty_factory=lambda: SimpleNamespace(empty_filter=True),
+    )
+
+    with pytest.raises(AccessDeniedError) as caught:
+        await gateway.search_all_media_page(make_search_query(now), None)
+
+    assert "private server detail" not in str(caught.value)
 
 
 @pytest.mark.asyncio
@@ -1012,7 +1159,7 @@ async def test_expand_album_returns_matching_media_in_message_order() -> None:
     class Client:
         async def get_entity(self, entity):
             assert entity == -1001
-            return SimpleNamespace(title="资料群")
+            return SimpleNamespace(title="资料群", megagroup=True)
 
         def iter_messages(self, entity, **kwargs):
             assert kwargs == {"min_id": 29, "max_id": 71}
@@ -1029,6 +1176,7 @@ async def test_expand_album_returns_matching_media_in_message_order() -> None:
 
     assert [item.remote.message_id for item in found] == [49, 50, 51]
     assert all(item.remote.grouped_id == 900 for item in found)
+    assert all(item.remote.source_kind is ContentSourceKind.GROUP for item in found)
 
 
 @pytest.mark.asyncio
