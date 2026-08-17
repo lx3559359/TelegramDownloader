@@ -9,11 +9,14 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from telegram_downloader.catalog import CatalogRepository
 from telegram_downloader.content import (
+    ALL_DIALOGS_SCOPE_REF,
+    ALL_DIALOGS_TITLE,
     AccountProfile,
     ContentDialog,
     ContentSearchQuery,
     SearchCursor,
     SearchResult,
+    SearchScope,
     SearchSession,
     SearchStatus,
 )
@@ -194,21 +197,29 @@ class ContentBrowserService:
         peer_ref: str,
         query: ContentSearchQuery,
         *,
+        scope: SearchScope = SearchScope.SINGLE_DIALOG,
         on_progress: Callable[[SearchProgress], None] | None = None,
     ) -> tuple[SearchSession, list[SearchResult]]:
         async with self._search_lock:
             account = self._require_account()
             self._require_online()
-            dialog = self.catalog.get_dialog(account.account_id, peer_ref)
-            if not dialog.available:
-                raise ValueError("该群组或频道当前不可用")
+            if scope is SearchScope.ALL_DIALOGS:
+                search_peer_ref = ALL_DIALOGS_SCOPE_REF
+                dialog_title = ALL_DIALOGS_TITLE
+            else:
+                dialog = self.catalog.get_dialog(account.account_id, peer_ref)
+                if not dialog.available:
+                    raise ValueError("该群组或频道当前不可用")
+                search_peer_ref = peer_ref
+                dialog_title = dialog.title
             session = self.catalog.begin_search(
                 self.uuid_factory(),
                 account.account_id,
-                peer_ref,
-                dialog.title,
+                search_peer_ref,
+                dialog_title,
                 query,
                 self.clock(),
+                scope=scope,
             )
             return await self._fetch_page(session, on_progress=on_progress)
 
@@ -235,27 +246,37 @@ class ContentBrowserService:
         account = self._require_account()
         gateway, planner = self._require_online()
         try:
-            page = await gateway.search_media_page(
-                session.peer_ref,
-                session.query,
-                session.cursor,
-                on_progress=on_progress,
-            )
+            if session.scope is SearchScope.ALL_DIALOGS:
+                page = await gateway.search_all_media_page(
+                    session.query,
+                    session.cursor,
+                    on_progress=on_progress,
+                )
+            else:
+                page = await gateway.search_media_page(
+                    session.peer_ref,
+                    session.query,
+                    session.cursor,
+                    on_progress=on_progress,
+                )
             expanded = list(page.items)
-            group_triggers: dict[int, int] = {}
+            group_triggers: dict[tuple[str, int], int] = {}
             for hit in page.items:
                 grouped_id = hit.remote.grouped_id
                 if grouped_id is None:
                     continue
-                group_triggers.setdefault(grouped_id, hit.remote.message_id)
+                group_triggers.setdefault(
+                    (hit.remote.peer_ref, grouped_id),
+                    hit.remote.message_id,
+                )
 
             async def expand(
-                trigger: tuple[int, int],
+                trigger: tuple[tuple[str, int], int],
             ) -> tuple[RemoteSearchHit, ...]:
-                grouped_id, message_id = trigger
+                (peer_ref, grouped_id), message_id = trigger
                 async with self._album_semaphore:
                     return await gateway.expand_album(
-                        session.peer_ref,
+                        peer_ref,
                         message_id,
                         grouped_id,
                     )
@@ -299,7 +320,10 @@ class ContentBrowserService:
                 if len(new_items) > remaining_page:
                     grouped_id = new_items[0].remote.grouped_id
                     trigger = (
-                        group_triggers.get(grouped_id, new_items[0].remote.message_id)
+                        group_triggers.get(
+                            (new_items[0].remote.peer_ref, grouped_id),
+                            new_items[0].remote.message_id,
+                        )
                         if grouped_id is not None
                         else new_items[0].remote.message_id
                     )
@@ -578,9 +602,10 @@ class ContentBrowserService:
         return result.peer_ref, result.message_id, result.media_id
 
     @staticmethod
-    def _hit_sort_key(hit: RemoteSearchHit) -> tuple[float, int, str]:
+    def _hit_sort_key(hit: RemoteSearchHit) -> tuple[float, str, int, str]:
         return (
             -hit.remote.message_date_utc.timestamp(),
+            hit.remote.peer_ref,
             -hit.remote.message_id,
             hit.remote.media_id,
         )
@@ -600,20 +625,23 @@ class ContentBrowserService:
         cls,
         hits: list[RemoteSearchHit],
     ) -> list[list[RemoteSearchHit]]:
-        albums: dict[int, list[RemoteSearchHit]] = {}
+        albums: dict[tuple[str, int], list[RemoteSearchHit]] = {}
         for hit in hits:
             grouped_id = hit.remote.grouped_id
             if grouped_id is not None:
-                albums.setdefault(grouped_id, []).append(hit)
+                albums.setdefault((hit.remote.peer_ref, grouped_id), []).append(hit)
         units: list[list[RemoteSearchHit]] = []
-        emitted: set[int] = set()
+        emitted: set[tuple[str, int]] = set()
         for hit in hits:
             grouped_id = hit.remote.grouped_id
             if grouped_id is None:
                 units.append([hit])
-            elif grouped_id not in emitted:
-                emitted.add(grouped_id)
-                units.append(sorted(albums[grouped_id], key=cls._hit_sort_key))
+            else:
+                album_key = (hit.remote.peer_ref, grouped_id)
+                if album_key in emitted:
+                    continue
+                emitted.add(album_key)
+                units.append(sorted(albums[album_key], key=cls._hit_sort_key))
         return units
 
     @staticmethod
@@ -646,6 +674,8 @@ class ContentBrowserService:
             selected=False,
             available=True,
             queued=queued,
+            source_title=remote.source_title,
+            source_kind=remote.source_kind,
         )
 
     @staticmethod
@@ -655,7 +685,7 @@ class ContentBrowserService:
     ) -> RemoteMedia:
         return RemoteMedia(
             peer_ref=result.peer_ref,
-            source_title=session.dialog_title,
+            source_title=result.source_title or session.dialog_title,
             message_id=result.message_id,
             grouped_id=result.grouped_id,
             media_id=result.media_id,
@@ -663,6 +693,7 @@ class ContentBrowserService:
             original_name=result.original_name,
             expected_size=result.expected_size,
             message_date_utc=result.message_date_utc,
+            source_kind=result.source_kind,
         )
 
     @staticmethod

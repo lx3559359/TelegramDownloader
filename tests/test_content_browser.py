@@ -7,12 +7,16 @@ import pytest
 
 from telegram_downloader.catalog import CatalogRepository
 from telegram_downloader.content import (
+    ALL_DIALOGS_SCOPE_REF,
+    ALL_DIALOGS_TITLE,
     AccountProfile,
     ContentDialog,
     ContentSearchQuery,
+    ContentSourceKind,
     DialogKind,
     SearchCursor,
     SearchResult,
+    SearchScope,
     SearchStatus,
 )
 from telegram_downloader.content_browser import (
@@ -63,10 +67,12 @@ def make_hit(
     *,
     grouped_id: int | None = None,
     peer_ref: str = "-1001",
+    source_title: str = "资料群",
+    source_kind: ContentSourceKind = ContentSourceKind.GROUP,
 ) -> RemoteSearchHit:
     remote = RemoteMedia(
         peer_ref,
-        "资料群",
+        source_title,
         message_id,
         grouped_id,
         f"m{message_id}",
@@ -74,6 +80,7 @@ def make_hit(
         f"{message_id}.mp4",
         10,
         now,
+        source_kind,
     )
     return RemoteSearchHit(
         remote,
@@ -87,11 +94,13 @@ class FakeGateway:
         self.profile = profile
         self.dialogs: list[ContentDialog] = []
         self.pages: list[RemoteSearchPage | BaseException] = []
-        self.albums: dict[int, tuple[RemoteSearchHit, ...]] = {}
+        self.all_pages: list[RemoteSearchPage | BaseException] = []
+        self.albums: dict[tuple[str, int], tuple[RemoteSearchHit, ...]] = {}
         self.thumbnail_values: dict[int, bytes | BaseException | None] = {}
         self.profile_calls = 0
         self.search_cursors: list[SearchCursor | None] = []
-        self.album_calls: list[int] = []
+        self.all_search_cursors: list[SearchCursor | None] = []
+        self.album_calls: list[tuple[str, int]] = []
         self.thumbnail_calls: list[int] = []
 
     async def account_profile(self) -> AccountProfile:
@@ -114,9 +123,18 @@ class FakeGateway:
             on_progress(SearchProgress(len(value.items), len(value.items), "正在整理结果"))
         return value
 
+    async def search_all_media_page(self, query, cursor, *, on_progress=None):
+        self.all_search_cursors.append(cursor)
+        value = self.all_pages.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        if on_progress is not None:
+            on_progress(SearchProgress(len(value.items), len(value.items), "正在整理结果"))
+        return value
+
     async def expand_album(self, peer_ref, message_id, grouped_id):
-        self.album_calls.append(grouped_id)
-        return self.albums.get(grouped_id, ())
+        self.album_calls.append((peer_ref, grouped_id))
+        return self.albums.get((peer_ref, grouped_id), ())
 
     async def load_thumbnail(self, peer_ref, message_id, media_id):
         self.thumbnail_calls.append(message_id)
@@ -548,7 +566,7 @@ async def test_search_pages_expand_albums_deduplicate_and_persist_cursor(
         ),
         RemoteSearchPage((make_hit(8, now), make_hit(7, now)), None, True),
     ]
-    gateway.albums[900] = (
+    gateway.albums[("-1001", 900)] = (
         make_hit(11, now, grouped_id=900),
         make_hit(10, now, grouped_id=900),
         make_hit(9, now, grouped_id=900),
@@ -568,7 +586,7 @@ async def test_search_pages_expand_albums_deduplicate_and_persist_cursor(
 
     assert session.status is SearchStatus.RUNNING
     assert [item.message_id for item in first_page] == [11, 10, 9, 8]
-    assert gateway.album_calls == [900]
+    assert gateway.album_calls == [("-1001", 900)]
     assert catalog.get_session("a1", session.id).cursor == SearchCursor(700)
     queued = next(item for item in first_page if item.message_id == 8)
     assert queued.queued is True
@@ -582,6 +600,116 @@ async def test_search_pages_expand_albums_deduplicate_and_persist_cursor(
     assert len(
         {(item.peer_ref, item.message_id, item.media_id) for item in all_results}
     ) == len(all_results)
+
+
+@pytest.mark.asyncio
+async def test_global_search_dispatches_without_a_dialog_and_keeps_sources(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 17, tzinfo=UTC)
+    gateway = FakeGateway(AccountProfile("a1", "账号"))
+    gateway.all_pages = [
+        RemoteSearchPage(
+            (
+                make_hit(
+                    10,
+                    now,
+                    peer_ref="-1001",
+                    source_title="资料群",
+                    source_kind=ContentSourceKind.GROUP,
+                ),
+                make_hit(
+                    10,
+                    now,
+                    peer_ref="42",
+                    source_title="联系人",
+                    source_kind=ContentSourceKind.PRIVATE,
+                ),
+            ),
+            SearchCursor(10, 7, "42"),
+            False,
+        )
+    ]
+    service = await prepared_online_service(tmp_path, now, gateway)
+
+    session, results = await service.start_search(
+        ALL_DIALOGS_SCOPE_REF,
+        make_query(now),
+        scope=SearchScope.ALL_DIALOGS,
+    )
+
+    assert session.scope is SearchScope.ALL_DIALOGS
+    assert session.peer_ref == ALL_DIALOGS_SCOPE_REF
+    assert session.dialog_title == ALL_DIALOGS_TITLE
+    assert gateway.all_search_cursors == [None]
+    assert {item.peer_ref for item in results} == {"-1001", "42"}
+    assert {item.source_title for item in results} == {"资料群", "联系人"}
+    assert {item.source_kind for item in results} == {
+        ContentSourceKind.GROUP,
+        ContentSourceKind.PRIVATE,
+    }
+
+
+@pytest.mark.asyncio
+async def test_global_albums_with_equal_grouped_id_expand_per_peer(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 17, tzinfo=UTC)
+    gateway = FakeGateway(AccountProfile("a1", "账号"))
+    gateway.all_pages = [
+        RemoteSearchPage(
+            (
+                make_hit(20, now, grouped_id=900, peer_ref="-1001"),
+                make_hit(
+                    30,
+                    now,
+                    grouped_id=900,
+                    peer_ref="42",
+                    source_title="联系人",
+                    source_kind=ContentSourceKind.PRIVATE,
+                ),
+            ),
+            None,
+            True,
+        )
+    ]
+    gateway.albums[("-1001", 900)] = (
+        make_hit(20, now, grouped_id=900, peer_ref="-1001"),
+        make_hit(19, now, grouped_id=900, peer_ref="-1001"),
+    )
+    gateway.albums[("42", 900)] = (
+        make_hit(
+            30,
+            now,
+            grouped_id=900,
+            peer_ref="42",
+            source_title="联系人",
+            source_kind=ContentSourceKind.PRIVATE,
+        ),
+        make_hit(
+            29,
+            now,
+            grouped_id=900,
+            peer_ref="42",
+            source_title="联系人",
+            source_kind=ContentSourceKind.PRIVATE,
+        ),
+    )
+    service = await prepared_online_service(tmp_path, now, gateway)
+
+    _session, results = await service.start_search(
+        ALL_DIALOGS_SCOPE_REF,
+        make_query(now),
+        scope=SearchScope.ALL_DIALOGS,
+    )
+
+    assert gateway.album_calls == [("-1001", 900), ("42", 900)]
+    assert {(item.peer_ref, item.message_id) for item in results} == {
+        ("-1001", 20),
+        ("-1001", 19),
+        ("42", 30),
+        ("42", 29),
+    }
 
 
 @pytest.mark.asyncio
@@ -655,7 +783,7 @@ async def test_album_is_deferred_or_skipped_instead_of_split(tmp_path: Path) -> 
         ),
         RemoteSearchPage((trigger,), None, True),
     ]
-    gateway.albums[900] = album
+    gateway.albums[("-1001", 900)] = album
     service = ContentBrowserService(
         catalog,
         ThumbnailCache(tmp_path / "deferred-thumbs"),
@@ -697,7 +825,7 @@ async def test_album_is_deferred_or_skipped_instead_of_split(tmp_path: Path) -> 
             True,
         )
     ]
-    limited_gateway.albums[900] = album
+    limited_gateway.albums[("-1001", 900)] = album
     limited_service = ContentBrowserService(
         limited_catalog,
         ThumbnailCache(tmp_path / "skipped-thumbs"),
