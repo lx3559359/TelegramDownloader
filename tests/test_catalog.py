@@ -8,12 +8,16 @@ import pytest
 from telegram_downloader import catalog as catalog_module
 from telegram_downloader.catalog import CatalogError, CatalogRepository, StaleSearchError
 from telegram_downloader.content import (
+    ALL_DIALOGS_SCOPE_REF,
+    ALL_DIALOGS_TITLE,
     AccountProfile,
     ContentDialog,
     ContentSearchQuery,
+    ContentSourceKind,
     DialogKind,
     SearchCursor,
     SearchResult,
+    SearchScope,
     SearchStatus,
 )
 from telegram_downloader.domain import MediaKind, ScanFilters
@@ -153,6 +157,77 @@ def create_v2_catalog_with_run(database: Path, now: datetime) -> None:
         )
 
 
+def create_v3_catalog_with_search(database: Path, now: datetime) -> None:
+    with sqlite3.connect(database) as connection:
+        connection.executescript(catalog_module._SCHEMA_V1)
+        connection.executescript(catalog_module._SCHEMA_V2_MIGRATION)
+        connection.executescript(catalog_module._SCHEMA_V3_MIGRATION)
+        connection.execute(
+            "INSERT INTO accounts(account_id, display_name, last_used_at) "
+            "VALUES(?, ?, ?)",
+            ("a1", "旧账号", now.isoformat()),
+        )
+        connection.execute(
+            "INSERT INTO dialogs(account_id, peer_ref, title, username, kind, "
+            "archived, available, last_synced_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            ("a1", "-1001", "旧群组", "", "group", 0, 1, now.isoformat()),
+        )
+        connection.execute(
+            "INSERT INTO search_sessions(id, account_id, peer_ref, dialog_title, "
+            "keyword, normalized_keyword, date_from_utc, date_to_utc, media_kinds, "
+            "item_limit, filters_fingerprint, status, generation, next_offset_id, "
+            "exhausted, result_count, created_at, updated_at, last_error) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "legacy-search",
+                "a1",
+                "-1001",
+                "旧群组",
+                "安装",
+                "安装",
+                now.isoformat(),
+                now.isoformat(),
+                "video",
+                20,
+                "fingerprint",
+                "incomplete",
+                1,
+                7,
+                0,
+                1,
+                now.isoformat(),
+                now.isoformat(),
+                None,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO search_results(id, search_id, account_id, peer_ref, "
+            "message_id, grouped_id, media_id, media_kind, original_name, "
+            "expected_size, message_date_utc, excerpt, thumbnail_key, selected, "
+            "available, queued, generation) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, ?, ?, ?, ?, ?)",
+            (
+                "legacy-result",
+                "legacy-search",
+                "a1",
+                "-1001",
+                7,
+                None,
+                "m7",
+                "video",
+                "7.mp4",
+                12,
+                now.isoformat(),
+                "安装教程",
+                "thumb-7",
+                1,
+                1,
+                0,
+                1,
+            ),
+        )
+
+
 def test_dialog_sync_is_account_scoped_and_marks_missing_unavailable(
     tmp_path: Path,
 ) -> None:
@@ -205,13 +280,13 @@ def test_most_recent_account_supports_offline_history(tmp_path: Path) -> None:
 def test_initialize_rejects_unknown_newer_schema(tmp_path: Path) -> None:
     database = tmp_path / "catalog.sqlite3"
     with sqlite3.connect(database) as connection:
-        connection.execute("PRAGMA user_version=4")
+        connection.execute("PRAGMA user_version=5")
 
     with pytest.raises(CatalogError, match="版本"):
         CatalogRepository(database).initialize()
 
 
-def test_catalog_schema_v3_keeps_existing_search_tables(tmp_path: Path) -> None:
+def test_catalog_schema_v4_keeps_existing_search_tables(tmp_path: Path) -> None:
     now = datetime(2026, 8, 14, tzinfo=UTC)
     database = tmp_path / "catalog.sqlite3"
     repo = CatalogRepository(database)
@@ -227,8 +302,85 @@ def test_catalog_schema_v3_keeps_existing_search_tables(tmp_path: Path) -> None:
     reopened.initialize()
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
     assert reopened.list_sessions("a1")[0].query.keyword == "资料"
+
+
+def test_catalog_migrates_v3_searches_to_v4_without_losing_state(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 17, tzinfo=UTC)
+    database = tmp_path / "catalog.sqlite3"
+    create_v3_catalog_with_search(database, now)
+
+    repository = CatalogRepository(database)
+    repository.initialize()
+
+    assert repository.schema_version() == 4
+    session = repository.get_session("a1", "legacy-search")
+    saved = repository.list_results("a1", session.id)
+    assert session.scope is SearchScope.SINGLE_DIALOG
+    assert session.cursor == SearchCursor(7)
+    assert saved[0].source_title == "旧群组"
+    assert saved[0].source_kind is ContentSourceKind.GROUP
+    assert saved[0].selected is True
+
+
+def test_global_search_round_trips_composite_cursor_and_multiple_peers(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 17, tzinfo=UTC)
+    repository = CatalogRepository(tmp_path / "catalog.sqlite3")
+    repository.initialize()
+    repository.upsert_account(AccountProfile("a1", "账号"), now)
+    query = ContentSearchQuery(
+        "安装",
+        ScanFilters(now, now, frozenset(MediaKind), 20),
+    )
+    session = repository.begin_search(
+        "global-1",
+        "a1",
+        ALL_DIALOGS_SCOPE_REF,
+        ALL_DIALOGS_TITLE,
+        query,
+        now,
+        scope=SearchScope.ALL_DIALOGS,
+    )
+    first = replace(
+        result(session.id, "a1", now),
+        source_title="资料群",
+        source_kind=ContentSourceKind.GROUP,
+    )
+    second = replace(
+        result(session.id, "a1", now, result_id="private", message_id=8),
+        peer_ref="42",
+        source_title="联系人",
+        source_kind=ContentSourceKind.PRIVATE,
+    )
+    cursor = SearchCursor(8, 19, "42")
+
+    repository.save_search_page(
+        "a1",
+        session.id,
+        session.generation,
+        [first, second],
+    )
+    repository.finish_search(
+        "a1",
+        session.id,
+        session.generation,
+        cursor,
+        False,
+        now,
+    )
+
+    restored = repository.get_session("a1", session.id)
+    assert restored.scope is SearchScope.ALL_DIALOGS
+    assert restored.cursor == cursor
+    assert {item.peer_ref for item in repository.list_results("a1", session.id)} == {
+        "-1001",
+        "42",
+    }
 
 
 def test_catalog_migrates_existing_v1_database_without_losing_accounts(
@@ -246,7 +398,7 @@ def test_catalog_migrates_existing_v1_database_without_losing_accounts(
     repo = CatalogRepository(database)
     repo.initialize()
 
-    assert repo.schema_version() == 3
+    assert repo.schema_version() == 4
     assert repo.most_recent_account() == AccountProfile("a1", "旧账号")
     assert repo.list_subscriptions("a1") == []
 
@@ -367,7 +519,7 @@ def test_catalog_migrates_v2_subscription_runs_to_v3(tmp_path: Path) -> None:
     repository = CatalogRepository(database)
     repository.initialize()
 
-    assert repository.schema_version() == 3
+    assert repository.schema_version() == 4
     run = repository.list_subscription_runs("a1", "r1")[0]
     assert run.keyword_hits == 0
     assert (run.inspected, run.matched, run.queued, run.duplicate) == (5, 2, 1, 1)

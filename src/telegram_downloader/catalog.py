@@ -10,9 +10,11 @@ from telegram_downloader.content import (
     AccountProfile,
     ContentDialog,
     ContentSearchQuery,
+    ContentSourceKind,
     DialogKind,
     SearchCursor,
     SearchResult,
+    SearchScope,
     SearchSession,
     SearchStatus,
 )
@@ -148,6 +150,31 @@ ALTER TABLE subscription_runs
 PRAGMA user_version=3;
 """
 
+_SCHEMA_V4_MIGRATION = """
+ALTER TABLE search_sessions
+    ADD COLUMN scope TEXT NOT NULL DEFAULT 'single_dialog';
+ALTER TABLE search_sessions
+    ADD COLUMN cursor_json TEXT;
+ALTER TABLE search_results
+    ADD COLUMN source_title TEXT NOT NULL DEFAULT '';
+ALTER TABLE search_results
+    ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'unknown';
+UPDATE search_results
+SET source_title = COALESCE(
+    (SELECT dialog_title FROM search_sessions
+     WHERE search_sessions.id = search_results.search_id),
+    peer_ref
+);
+UPDATE search_results
+SET source_kind = COALESCE(
+    (SELECT kind FROM dialogs
+     WHERE dialogs.account_id = search_results.account_id
+       AND dialogs.peer_ref = search_results.peer_ref),
+    'unknown'
+);
+PRAGMA user_version=4;
+"""
+
 
 class CatalogRepository:
     def __init__(self, database: Path) -> None:
@@ -180,7 +207,10 @@ class CatalogRepository:
             if version == 2:
                 connection.executescript(_SCHEMA_V3_MIGRATION)
                 version = 3
-            if version != 3:
+            if version == 3:
+                connection.executescript(_SCHEMA_V4_MIGRATION)
+                version = 4
+            if version != 4:
                 raise CatalogError(f"不支持的内容目录版本：{version}")
 
     def schema_version(self) -> int:
@@ -275,6 +305,8 @@ class CatalogRepository:
         dialog_title: str,
         query: ContentSearchQuery,
         now: datetime,
+        *,
+        scope: SearchScope = SearchScope.SINGLE_DIALOG,
     ) -> SearchSession:
         kinds = ",".join(sorted(kind.value for kind in query.filters.media_kinds))
         with self._connection() as connection:
@@ -283,12 +315,14 @@ class CatalogRepository:
                 "keyword, normalized_keyword, date_from_utc, date_to_utc, "
                 "media_kinds, item_limit, filters_fingerprint, status, generation, "
                 "next_offset_id, exhausted, result_count, created_at, updated_at, "
-                "last_error) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, "
-                "0, 0, ?, ?, NULL) ON CONFLICT(account_id, peer_ref, "
+                "last_error, scope, cursor_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, ?, 1, NULL, 0, 0, ?, ?, NULL, ?, NULL) "
+                "ON CONFLICT(account_id, peer_ref, "
                 "normalized_keyword, filters_fingerprint) DO UPDATE SET "
                 "dialog_title=excluded.dialog_title, keyword=excluded.keyword, "
                 "status=excluded.status, generation=search_sessions.generation+1, "
-                "next_offset_id=NULL, exhausted=0, result_count=0, "
+                "next_offset_id=NULL, cursor_json=NULL, exhausted=0, result_count=0, "
+                "scope=excluded.scope, "
                 "updated_at=excluded.updated_at, last_error=NULL",
                 (
                     search_id,
@@ -305,6 +339,7 @@ class CatalogRepository:
                     SearchStatus.RUNNING.value,
                     now.isoformat(),
                     now.isoformat(),
+                    scope.value,
                 ),
             )
             row = connection.execute(
@@ -354,21 +389,24 @@ class CatalogRepository:
             raise ValueError("搜索结果不属于当前搜索")
         with self._connection() as connection:
             session = connection.execute(
-                "SELECT peer_ref, generation FROM search_sessions "
+                "SELECT peer_ref, generation, scope FROM search_sessions "
                 "WHERE account_id=? AND id=?",
                 (account_id, search_id),
             ).fetchone()
             if session is None or int(session["generation"]) != generation:
                 raise StaleSearchError("搜索结果已被更新的搜索代次取代")
-            if any(item.peer_ref != str(session["peer_ref"]) for item in results):
+            if SearchScope(str(session["scope"])) is SearchScope.SINGLE_DIALOG and any(
+                item.peer_ref != str(session["peer_ref"]) for item in results
+            ):
                 raise ValueError("搜索结果不属于当前会话")
             for item in results:
                 connection.execute(
                     "INSERT INTO search_results(id, search_id, account_id, peer_ref, "
                     "message_id, grouped_id, media_id, media_kind, original_name, "
                     "expected_size, message_date_utc, excerpt, thumbnail_key, "
-                    "selected, available, queued, generation) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "selected, available, queued, source_title, source_kind, "
+                    "generation) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "?, ?, ?, ?, ?) "
                     "ON CONFLICT(search_id, peer_ref, message_id, media_id) "
                     "DO UPDATE SET grouped_id=excluded.grouped_id, "
                     "media_kind=excluded.media_kind, "
@@ -376,6 +414,8 @@ class CatalogRepository:
                     "expected_size=excluded.expected_size, "
                     "message_date_utc=excluded.message_date_utc, "
                     "excerpt=excluded.excerpt, thumbnail_key=excluded.thumbnail_key, "
+                    "source_title=excluded.source_title, "
+                    "source_kind=excluded.source_kind, "
                     "available=excluded.available, "
                     "queued=MAX(search_results.queued, excluded.queued), "
                     "selected=CASE WHEN excluded.queued=1 THEN 0 "
@@ -398,6 +438,8 @@ class CatalogRepository:
                         int(item.selected),
                         int(item.available),
                         int(item.queued),
+                        item.source_title,
+                        item.source_kind.value,
                         generation,
                     ),
                 )
@@ -430,12 +472,13 @@ class CatalogRepository:
                 ).fetchone()[0]
             )
             connection.execute(
-                "UPDATE search_sessions SET status=?, next_offset_id=?, exhausted=?, "
-                "result_count=?, updated_at=?, last_error=? "
+                "UPDATE search_sessions SET status=?, next_offset_id=?, cursor_json=?, "
+                "exhausted=?, result_count=?, updated_at=?, last_error=? "
                 "WHERE account_id=? AND id=? AND generation=?",
                 (
                     status.value,
                     cursor.offset_id if cursor else None,
+                    cursor.to_json() if cursor else None,
                     int(exhausted),
                     count,
                     now.isoformat(),
@@ -918,7 +961,15 @@ class CatalogRepository:
             ),
             int(row["item_limit"]),
         )
+        cursor_json = row["cursor_json"]
         cursor_value = row["next_offset_id"]
+        cursor = (
+            SearchCursor.from_json(str(cursor_json))
+            if cursor_json is not None
+            else SearchCursor(int(cursor_value))
+            if cursor_value is not None
+            else None
+        )
         return SearchSession(
             id=str(row["id"]),
             account_id=str(row["account_id"]),
@@ -927,7 +978,7 @@ class CatalogRepository:
             query=ContentSearchQuery(str(row["keyword"]), filters),
             status=SearchStatus(str(row["status"])),
             generation=int(row["generation"]),
-            cursor=SearchCursor(int(cursor_value)) if cursor_value is not None else None,
+            cursor=cursor,
             exhausted=bool(row["exhausted"]),
             result_count=int(row["result_count"]),
             created_at=datetime.fromisoformat(str(row["created_at"])),
@@ -935,6 +986,7 @@ class CatalogRepository:
             last_error=(
                 str(row["last_error"]) if row["last_error"] is not None else None
             ),
+            scope=SearchScope(str(row["scope"])),
         )
 
     @staticmethod
@@ -958,6 +1010,8 @@ class CatalogRepository:
             selected=bool(row["selected"]),
             available=bool(row["available"]),
             queued=bool(row["queued"]),
+            source_title=str(row["source_title"]),
+            source_kind=ContentSourceKind(str(row["source_kind"])),
         )
 
     @staticmethod

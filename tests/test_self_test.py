@@ -22,7 +22,7 @@ def test_self_test_reports_only_paths_under_root(tmp_path: Path) -> None:
 def test_self_test_includes_update_storage_and_database(tmp_path: Path) -> None:
     report = run_self_test(tmp_path)
 
-    assert report["catalog_schema_version"] == 3
+    assert report["catalog_schema_version"] == 4
     assert "update_staging" in report["writable_paths"]
     assert "catalog_database" in report["writable_paths"]
     assert "thumbnail_cache" in report["writable_paths"]
