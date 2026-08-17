@@ -13,7 +13,7 @@ from time import monotonic as monotonic_clock
 from typing import Any
 
 from telegram_downloader.connectivity import ConnectionRecovery
-from telegram_downloader.content import ContentSearchQuery, SearchResult
+from telegram_downloader.content import ContentSearchQuery, SearchResult, SearchScope
 from telegram_downloader.content_browser import NothingToQueueError
 from telegram_downloader.content_progress import DialogSyncProgress, SearchProgress
 from telegram_downloader.domain import (
@@ -914,6 +914,8 @@ class AppController:
         self,
         peer_ref: str,
         query: ContentSearchQuery,
+        *,
+        scope: SearchScope = SearchScope.SINGLE_DIALOG,
     ) -> None:
         if self.content_browser is None:
             self._show_error("内容浏览服务不可用")
@@ -931,6 +933,7 @@ class AppController:
             session, results = await self.content_browser.start_search(
                 peer_ref,
                 query,
+                scope=scope,
                 on_progress=page.set_search_progress,
             )
             search_id = session.id

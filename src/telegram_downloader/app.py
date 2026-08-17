@@ -13,7 +13,7 @@ from typing import Any
 
 from telegram_downloader import __version__
 from telegram_downloader.catalog import CatalogRepository
-from telegram_downloader.content import ContentSearchQuery
+from telegram_downloader.content import ContentSearchQuery, SearchScope
 from telegram_downloader.content_browser import ContentBrowserService
 from telegram_downloader.controller import AppController
 from telegram_downloader.downloader import MediaDownloader
@@ -419,8 +419,9 @@ def create_application(root: Path):
     async def content_dialog_selected(peer_ref: str) -> None:
         await controller.select_content_dialog(peer_ref)
 
-    @qasync.asyncSlot(str, str, object, object, object, int)
+    @qasync.asyncSlot(str, str, str, object, object, object, int)
     async def content_search_requested(
+        scope_value: str,
         peer_ref: str,
         keyword: str,
         date_from: object,
@@ -428,6 +429,7 @@ def create_application(root: Path):
         media_kinds: object,
         item_limit: int,
     ) -> None:
+        scope = SearchScope(scope_value)
         filters = AppController.filters_from_dates(
             date_from,
             date_to,
@@ -438,6 +440,7 @@ def create_application(root: Path):
         await controller.search_content(
             peer_ref,
             ContentSearchQuery(keyword, filters),
+            scope=scope,
         )
 
     @qasync.asyncSlot(str)

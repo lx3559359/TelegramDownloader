@@ -8,8 +8,11 @@ import pytest
 import telegram_downloader.controller as controller_module
 from telegram_downloader.connectivity import ConnectionRecovery
 from telegram_downloader.content import (
+    ALL_DIALOGS_SCOPE_REF,
+    ALL_DIALOGS_TITLE,
     AccountProfile,
     ContentSearchQuery,
+    SearchScope,
     SearchSession,
     SearchStatus,
 )
@@ -1538,7 +1541,14 @@ async def test_search_progress_is_forwarded_and_always_stops() -> None:
             return True
 
     class Browser:
-        async def start_search(self, _peer_ref, _query, *, on_progress=None):
+        async def start_search(
+            self,
+            _peer_ref,
+            _query,
+            *,
+            scope=SearchScope.SINGLE_DIALOG,
+            on_progress=None,
+        ):
             on_progress(SearchProgress(20, 3, "正在整理结果"))
             return session, []
 
@@ -1561,6 +1571,56 @@ async def test_search_progress_is_forwarded_and_always_stops() -> None:
     assert window.content_page.search_progress[0] == SearchProgress(0, 0, "正在连接 Telegram")
     assert window.content_page.search_progress[-2].inspected == 20
     assert window.content_page.search_progress[-1] is None
+
+
+@pytest.mark.asyncio
+async def test_controller_forwards_global_scope_to_content_service() -> None:
+    now = datetime(2026, 8, 17, tzinfo=UTC)
+    query = ContentSearchQuery(
+        "安装",
+        ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 500),
+    )
+    session = SearchSession(
+        "global-1",
+        "a1",
+        ALL_DIALOGS_SCOPE_REF,
+        ALL_DIALOGS_TITLE,
+        query,
+        SearchStatus.COMPLETED,
+        1,
+        None,
+        True,
+        0,
+        now,
+        now,
+        scope=SearchScope.ALL_DIALOGS,
+    )
+    calls = []
+
+    class Browser:
+        async def start_search(self, peer_ref, query, *, scope, on_progress=None):
+            calls.append((scope, peer_ref, query.keyword))
+            return session, []
+
+        def list_sessions(self):
+            return [session]
+
+        def list_results(self, _search_id):
+            return []
+
+    controller = AppController.for_test(
+        gateway=ConnectedGateway(),
+        content_browser=Browser(),
+        window=ContentWindowFake(),
+    )
+
+    await controller.search_content(
+        ALL_DIALOGS_SCOPE_REF,
+        query,
+        scope=SearchScope.ALL_DIALOGS,
+    )
+
+    assert calls == [(SearchScope.ALL_DIALOGS, ALL_DIALOGS_SCOPE_REF, "安装")]
 
 
 @pytest.mark.asyncio
@@ -1596,7 +1656,14 @@ async def test_new_search_cancels_the_running_search_before_replacement() -> Non
             return True
 
     class Browser:
-        async def start_search(self, _peer_ref, query, *, on_progress=None):
+        async def start_search(
+            self,
+            _peer_ref,
+            query,
+            *,
+            scope=SearchScope.SINGLE_DIALOG,
+            on_progress=None,
+        ):
             calls.append(query.keyword)
             if query.keyword == "first":
                 first_started.set()
@@ -1746,7 +1813,14 @@ async def test_offline_search_reconnects_then_continues() -> None:
             calls.append("connect")
 
     class ContentService:
-        async def start_search(self, peer_ref, query, *, on_progress=None):
+        async def start_search(
+            self,
+            peer_ref,
+            query,
+            *,
+            scope=SearchScope.SINGLE_DIALOG,
+            on_progress=None,
+        ):
             calls.append(("search", peer_ref, query))
             return active, []
 
@@ -1785,7 +1859,14 @@ async def test_failed_reconnect_keeps_cached_content_and_skips_search() -> None:
         def __init__(self):
             self.search_calls = 0
 
-        async def start_search(self, _peer_ref, _query, *, on_progress=None):
+        async def start_search(
+            self,
+            _peer_ref,
+            _query,
+            *,
+            scope=SearchScope.SINGLE_DIALOG,
+            on_progress=None,
+        ):
             self.search_calls += 1
 
         def list_sessions(self):
@@ -2070,7 +2151,14 @@ async def test_content_search_selection_and_queue_flow() -> None:
     calls = []
 
     class ContentService:
-        async def start_search(self, peer_ref, received_query, *, on_progress=None):
+        async def start_search(
+            self,
+            peer_ref,
+            received_query,
+            *,
+            scope=SearchScope.SINGLE_DIALOG,
+            on_progress=None,
+        ):
             calls.append(("search", peer_ref, received_query))
             return active, first_page
 
@@ -2221,7 +2309,14 @@ async def test_cancel_content_search_restores_page_busy_state() -> None:
     started = asyncio.Event()
 
     class ContentService:
-        async def start_search(self, peer_ref, query, *, on_progress=None):
+        async def start_search(
+            self,
+            peer_ref,
+            query,
+            *,
+            scope=SearchScope.SINGLE_DIALOG,
+            on_progress=None,
+        ):
             started.set()
             await asyncio.Event().wait()
 
@@ -2249,7 +2344,14 @@ async def test_content_search_expired_session_rebuilds_gateway_for_qr_login() ->
     calls = []
 
     class ContentService:
-        async def start_search(self, _peer_ref, _query, *, on_progress=None):
+        async def start_search(
+            self,
+            _peer_ref,
+            _query,
+            *,
+            scope=SearchScope.SINGLE_DIALOG,
+            on_progress=None,
+        ):
             raise SessionExpiredError("Telegram 登录已失效，请重新扫码登录")
 
         def go_offline(self):
@@ -2412,7 +2514,14 @@ async def test_shutdown_cancels_content_operations_before_services() -> None:
             started["sync"].set()
             await asyncio.Event().wait()
 
-        async def start_search(self, peer_ref, query, *, on_progress=None):
+        async def start_search(
+            self,
+            peer_ref,
+            query,
+            *,
+            scope=SearchScope.SINGLE_DIALOG,
+            on_progress=None,
+        ):
             started["search"].set()
             await asyncio.Event().wait()
 

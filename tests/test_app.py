@@ -1,5 +1,5 @@
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from inspect import getsource, isawaitable
 from types import SimpleNamespace
 
@@ -9,7 +9,13 @@ from PySide6.QtWidgets import QMessageBox
 from telegram_downloader import app
 from telegram_downloader.catalog import CatalogRepository
 from telegram_downloader.connectivity import ConnectionRecovery
-from telegram_downloader.content import AccountProfile, ContentDialog, DialogKind
+from telegram_downloader.content import (
+    ALL_DIALOGS_SCOPE_REF,
+    AccountProfile,
+    ContentDialog,
+    DialogKind,
+    SearchScope,
+)
 from telegram_downloader.content_browser import ContentBrowserService
 from telegram_downloader.domain import MediaKind
 from telegram_downloader.paths import PortablePaths
@@ -176,6 +182,41 @@ def test_create_application_initializes_project_local_content_services(
         report = app.run_self_test(tmp_path)
         for value in report["writable_paths"].values():
             assert str(value).startswith(str(tmp_path.resolve()))
+    finally:
+        loop.run_until_complete(controller._async_actions.shutdown())
+        controller.window.close()
+        loop.close()
+        application.processEvents()
+
+
+def test_account_search_signal_reaches_controller_with_typed_scope(tmp_path) -> None:
+    application, loop, controller = app.create_application(tmp_path)
+    calls = []
+    completed = asyncio.Event()
+
+    async def record(peer_ref, query, *, scope):
+        calls.append((scope, peer_ref, query.keyword))
+        completed.set()
+
+    controller.search_content = record
+
+    async def emit_and_wait() -> None:
+        controller.window.content_page.search_requested.emit(
+            SearchScope.ALL_DIALOGS.value,
+            ALL_DIALOGS_SCOPE_REF,
+            "安装",
+            date(2026, 8, 1),
+            date(2026, 8, 17),
+            frozenset({MediaKind.VIDEO}),
+            500,
+        )
+        await asyncio.wait_for(completed.wait(), timeout=1)
+
+    try:
+        loop.run_until_complete(emit_and_wait())
+        assert calls == [
+            (SearchScope.ALL_DIALOGS, ALL_DIALOGS_SCOPE_REF, "安装")
+        ]
     finally:
         loop.run_until_complete(controller._async_actions.shutdown())
         controller.window.close()

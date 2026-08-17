@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 from telegram_downloader.content import (
     ContentDialog,
     SearchResult,
+    SearchScope,
     SearchSession,
     SearchStatus,
 )
@@ -34,6 +35,7 @@ from telegram_downloader.content_progress import SearchProgress
 from telegram_downloader.domain import MediaKind
 from telegram_downloader.links import is_telegram_link_candidate
 from telegram_downloader.ui.content_models import (
+    DialogChoice,
     DialogListModel,
     SearchHistoryTableModel,
     SearchResultTableModel,
@@ -55,7 +57,7 @@ class ContentBrowserPage(QWidget):
     connection_retry_requested = Signal()
     dialog_selected = Signal(str)
     link_requested = Signal(str)
-    search_requested = Signal(str, str, object, object, object, int)
+    search_requested = Signal(str, str, str, object, object, object, int)
     cancel_search_requested = Signal()
     load_more_requested = Signal(str)
     history_open_requested = Signal(str)
@@ -94,12 +96,14 @@ class ContentBrowserPage(QWidget):
 
         title = QLabel("账号内容")
         title.setObjectName("pageTitle")
-        subtitle = QLabel("浏览已加入的群组和频道，搜索后选择性下载媒体")
+        subtitle = QLabel("搜索全部云端会话或指定群组/频道，并选择性下载媒体")
         subtitle.setObjectName("muted")
         root.addWidget(title)
         root.addWidget(subtitle)
 
-        self.empty_hint = QLabel("登录 Telegram 后可同步群组并搜索；本地历史仍可查看")
+        self.empty_hint = QLabel(
+            "登录 Telegram 后可搜索全部会话或同步群组；本地历史仍可查看"
+        )
         self.empty_hint.setObjectName("contentHint")
         self.empty_hint.setWordWrap(True)
         root.addWidget(self.empty_hint)
@@ -135,7 +139,7 @@ class ContentBrowserPage(QWidget):
         layout.setSpacing(10)
 
         heading = QHBoxLayout()
-        label = QLabel("群组与频道")
+        label = QLabel("搜索范围")
         label.setObjectName("sectionTitle")
         self.refresh_button = QPushButton("刷新")
         heading.addWidget(label)
@@ -169,7 +173,7 @@ class ContentBrowserPage(QWidget):
         layout.setSpacing(10)
 
         form_header = QHBoxLayout()
-        self.current_dialog_label = QLabel("请选择群组或频道")
+        self.current_dialog_label = QLabel("请选择搜索范围")
         self.current_dialog_label.setObjectName("sectionTitle")
         form_header.addWidget(self.current_dialog_label)
         form_header.addStretch()
@@ -237,10 +241,10 @@ class ContentBrowserPage(QWidget):
         self.result_table.setIconSize(QSize(112, 84))
         self.result_table.verticalHeader().setDefaultSectionSize(96)
         result_header = self.result_table.horizontalHeader()
-        result_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        result_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         result_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         self.result_table.setColumnWidth(1, 124)
-        for column in (0, 2, 4, 5, 6):
+        for column in (0, 2, 3, 5, 6, 7):
             result_header.setSectionResizeMode(
                 column,
                 QHeaderView.ResizeMode.ResizeToContents,
@@ -335,7 +339,7 @@ class ContentBrowserPage(QWidget):
     def set_logged_in(self, logged_in: bool) -> None:
         self._logged_in = logged_in
         self.empty_hint.setText(
-            "请选择群组或频道开始搜索"
+            "可直接搜索全部会话，或选择一个群组/频道"
             if logged_in
             else "请先登录 Telegram；已保存的搜索历史仍可查看"
         )
@@ -359,13 +363,19 @@ class ContentBrowserPage(QWidget):
     def set_dialogs(self, dialogs: list[ContentDialog]) -> None:
         selected_peer = self._current_peer_ref()
         self.dialog_model.set_dialogs(dialogs)
+        target_row = 0
         if selected_peer is not None:
             for row in range(self.dialog_model.rowCount()):
-                if self.dialog_model.dialog_at(row).peer_ref == selected_peer:
-                    self.dialog_list.setCurrentIndex(
-                        self.dialog_model.index(row, 0)
-                    )
+                if self.dialog_model.choice_at(row).peer_ref == selected_peer:
+                    target_row = row
                     break
+        if self.dialog_model.rowCount() > 0:
+            self.dialog_list.setCurrentIndex(
+                self.dialog_model.index(target_row, 0)
+            )
+            self.current_dialog_label.setText(
+                self.dialog_model.choice_at(target_row).title
+            )
         self._refresh_actions()
 
     def set_sync_state(
@@ -478,15 +488,15 @@ class ContentBrowserPage(QWidget):
         _previous: QModelIndex,
     ) -> None:
         if current.isValid():
-            dialog = self.dialog_model.dialog_at(current.row())
-            self.current_dialog_label.setText(dialog.title)
-            self.dialog_selected.emit(dialog.peer_ref)
+            choice = self.dialog_model.choice_at(current.row())
+            self.current_dialog_label.setText(choice.title)
+            self.dialog_selected.emit(choice.peer_ref)
         else:
-            self.current_dialog_label.setText("请选择群组或频道")
+            self.current_dialog_label.setText("请选择搜索范围")
         self._refresh_actions()
 
     def _emit_search(self) -> None:
-        dialog = self._current_dialog()
+        choice = self._current_choice()
         keyword = self.keyword_input.text().strip()
         if is_telegram_link_candidate(keyword):
             self.show_error("")
@@ -497,8 +507,10 @@ class ContentBrowserPage(QWidget):
         kinds = frozenset(
             kind for kind, check in self.media_checks.items() if check.isChecked()
         )
-        if dialog is None or not dialog.available:
-            self.show_error("请选择一个当前可用的群组或频道")
+        if choice is None or (
+            choice.scope is SearchScope.SINGLE_DIALOG and not choice.available
+        ):
+            self.show_error("请选择一个当前可用的搜索范围")
             return
         if not keyword:
             self.show_error("搜索关键词不能为空")
@@ -511,7 +523,8 @@ class ContentBrowserPage(QWidget):
             return
         self.show_error("")
         self.search_requested.emit(
-            dialog.peer_ref,
+            choice.scope.value,
+            choice.peer_ref,
             keyword,
             start,
             end,
@@ -588,15 +601,15 @@ class ContentBrowserPage(QWidget):
         value = self.history_model.data(rows[0], Qt.ItemDataRole.UserRole)
         return str(value) if value else None
 
-    def _current_dialog(self) -> ContentDialog | None:
+    def _current_choice(self) -> DialogChoice | None:
         index = self.dialog_list.currentIndex()
         if not index.isValid():
             return None
-        return self.dialog_model.dialog_at(index.row())
+        return self.dialog_model.choice_at(index.row())
 
     def _current_peer_ref(self) -> str | None:
-        dialog = self._current_dialog()
-        return dialog.peer_ref if dialog is not None else None
+        choice = self._current_choice()
+        return choice.peer_ref if choice is not None else None
 
     def _update_selection_summary(self) -> None:
         selected = self.result_model.selected_results()
@@ -635,8 +648,8 @@ class ContentBrowserPage(QWidget):
             check.setChecked(kind in selected)
 
     def _refresh_actions(self, *_args) -> None:
-        dialog = self._current_dialog()
-        dialog_available = dialog is not None and dialog.available
+        choice = self._current_choice()
+        choice_available = choice is not None and choice.available
         online_ready = self._logged_in and not self._search_busy
         form_ready = not self._search_busy
         selectable = any(
@@ -652,14 +665,14 @@ class ContentBrowserPage(QWidget):
         self.keyword_input.setEnabled(form_ready)
         self.cancel_button.setVisible(self._search_busy)
         self.select_all_button.setEnabled(
-            online_ready and dialog_available and has_eligible_results
+            online_ready and choice_available and has_eligible_results
         )
         self.invert_button.setEnabled(
-            online_ready and dialog_available and has_eligible_results
+            online_ready and choice_available and has_eligible_results
         )
         self.queue_button.setEnabled(
             online_ready
-            and dialog_available
+            and choice_available
             and self.active_search_id is not None
             and selectable
             and not self._queue_busy

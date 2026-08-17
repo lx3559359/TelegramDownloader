@@ -127,12 +127,6 @@ class DialogListModel(QAbstractListModel):
     def choice_at(self, row: int) -> DialogChoice:
         return self._visible[row]
 
-    def dialog_at(self, row: int) -> ContentDialog:
-        dialog = self.choice_at(row).dialog
-        if dialog is None:
-            raise ValueError("全部会话不是单一会话")
-        return dialog
-
     def _filtered(self) -> tuple[DialogChoice, ...]:
         all_dialogs = DialogChoice(
             SearchScope.ALL_DIALOGS,

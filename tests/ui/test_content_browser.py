@@ -5,10 +5,13 @@ from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QImage
 
 from telegram_downloader.content import (
+    ALL_DIALOGS_SCOPE_REF,
+    ALL_DIALOGS_TITLE,
     ContentDialog,
     ContentSearchQuery,
     DialogKind,
     SearchResult,
+    SearchScope,
     SearchSession,
     SearchStatus,
 )
@@ -195,7 +198,7 @@ def test_dialog_selection_emits_peer_and_restores_search_form(qtbot) -> None:
     page.set_dialogs([dialog(now)])
 
     with qtbot.waitSignal(page.dialog_selected, timeout=500) as caught:
-        page.dialog_list.setCurrentIndex(page.dialog_model.index(0, 0))
+        page.dialog_list.setCurrentIndex(page.dialog_model.index(1, 0))
 
     assert caught.args == ["-1001"]
 
@@ -229,19 +232,20 @@ def test_valid_search_emits_trimmed_parameters_and_invalid_input_stays_local(
     qtbot.addWidget(page)
     page.set_logged_in(True)
     page.set_dialogs([dialog(now)])
-    page.dialog_list.setCurrentIndex(page.dialog_model.index(0, 0))
+    page.dialog_list.setCurrentIndex(page.dialog_model.index(1, 0))
     page.keyword_input.setText("  安装教程  ")
     page.date_from.setDate(page.date_from.date().addDays(-1))
 
     with qtbot.waitSignal(page.search_requested, timeout=500) as caught:
         qtbot.mouseClick(page.search_button, Qt.MouseButton.LeftButton)
 
-    assert caught.args[0] == "-1001"
-    assert caught.args[1] == "安装教程"
-    assert isinstance(caught.args[2], date)
+    assert caught.args[0] == SearchScope.SINGLE_DIALOG.value
+    assert caught.args[1] == "-1001"
+    assert caught.args[2] == "安装教程"
     assert isinstance(caught.args[3], date)
-    assert caught.args[4] == frozenset(MediaKind)
-    assert caught.args[5] == 500
+    assert isinstance(caught.args[4], date)
+    assert caught.args[5] == frozenset(MediaKind)
+    assert caught.args[6] == 500
 
     emissions = []
     page.search_requested.connect(lambda *args: emissions.append(args))
@@ -256,6 +260,26 @@ def test_valid_search_emits_trimmed_parameters_and_invalid_input_stays_local(
     qtbot.mouseClick(page.search_button, Qt.MouseButton.LeftButton)
     assert emissions == []
     assert "媒体类型" in page.error_label.text()
+
+
+def test_all_dialogs_is_selected_by_default_and_emits_global_scope(qtbot) -> None:
+    now = datetime(2026, 8, 17, tzinfo=UTC)
+    page = ContentBrowserPage()
+    qtbot.addWidget(page)
+    page.set_logged_in(True)
+    page.set_dialogs([dialog(now)])
+    page.keyword_input.setText("安装教程")
+
+    choice = page.dialog_model.choice_at(page.dialog_list.currentIndex().row())
+    assert choice.scope is SearchScope.ALL_DIALOGS
+    assert page.current_dialog_label.text() == ALL_DIALOGS_TITLE
+
+    with qtbot.waitSignal(page.search_requested, timeout=500) as caught:
+        qtbot.mouseClick(page.search_button, Qt.MouseButton.LeftButton)
+
+    assert caught.args[0] == SearchScope.ALL_DIALOGS.value
+    assert caught.args[1] == ALL_DIALOGS_SCOPE_REF
+    assert caught.args[2] == "安装教程"
 
 
 def test_selection_summary_and_queue_signal_skip_unavailable_and_queued(
