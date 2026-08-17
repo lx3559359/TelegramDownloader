@@ -3,7 +3,11 @@ from pathlib import Path
 
 import pytest
 
-from telegram_downloader.content import ContentSearchQuery
+from telegram_downloader.content import (
+    ALL_DIALOGS_SCOPE_REF,
+    ALL_DIALOGS_TITLE,
+    ContentSearchQuery,
+)
 from telegram_downloader.domain import (
     MediaItem,
     MediaKind,
@@ -235,6 +239,59 @@ def test_plan_selected_rejects_empty_and_fully_existing_input(tmp_path: Path) ->
         planner.plan_selected("-1001", "资料群", query, [remote])
 
     assert repo.saved is None
+
+
+def test_plan_account_search_uses_one_task_and_real_source_directories(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 17, tzinfo=UTC)
+    query = ContentSearchQuery(
+        "安装",
+        ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 20),
+    )
+
+    def remote_media(
+        peer_ref: str,
+        source_title: str,
+        message_id: int,
+    ) -> RemoteMedia:
+        return RemoteMedia(
+            peer_ref,
+            source_title,
+            message_id,
+            None,
+            f"m{message_id}",
+            MediaKind.VIDEO,
+            f"{message_id}.mp4",
+            12,
+            now,
+        )
+
+    selected = [
+        remote_media("-1001", "资料群", 10),
+        remote_media("42", "联系人", 11),
+    ]
+    repository = TaskRepository(tmp_path / "tasks.sqlite3")
+    repository.initialize()
+    planner = TaskPlanner(
+        object(),
+        repository,
+        tmp_path / "downloads",
+        uuid_factory=iter(("task", "item-1", "item-2")).__next__,
+        clock=lambda: now,
+    )
+
+    preview = planner.plan_account_search(query, selected)
+
+    assert preview.task.source_kind is SourceKind.ACCOUNT_SEARCH
+    assert preview.task.source_ref == ALL_DIALOGS_SCOPE_REF
+    assert preview.task.source_title == ALL_DIALOGS_TITLE
+    assert preview.task.display_title == "全部会话（搜索：安装）"
+    assert {item.peer_ref for item in preview.items} == {"-1001", "42"}
+    assert {item.target_path.parts[-4] for item in preview.items} == {
+        "资料群",
+        "联系人",
+    }
 
 
 def test_plan_subscription_uses_automatic_title_and_archive_layout(

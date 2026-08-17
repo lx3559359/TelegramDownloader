@@ -523,13 +523,17 @@ class ContentBrowserService:
                 initial_duplicates,
                 len(unavailable),
             )
+        remote = [self._remote_from_result(session, item) for item in remaining]
         try:
-            preview = planner.plan_selected(
-                session.peer_ref,
-                session.dialog_title,
-                session.query,
-                [self._remote_from_result(session, item) for item in remaining],
-            )
+            if session.scope is SearchScope.ALL_DIALOGS:
+                preview = planner.plan_account_search(session.query, remote)
+            else:
+                preview = planner.plan_selected(
+                    session.peer_ref,
+                    session.dialog_title,
+                    session.query,
+                    remote,
+                )
         except EmptyScanError as error:
             raise NothingToQueueError(
                 len(selected),

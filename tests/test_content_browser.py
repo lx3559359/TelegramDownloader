@@ -2,6 +2,7 @@ import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1065,6 +1066,66 @@ def make_saved_result(
         available,
         False,
     )
+
+
+def test_prepare_global_download_uses_account_planner(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 17, tzinfo=UTC)
+    catalog = initialized_catalog(tmp_path)
+    catalog.upsert_account(AccountProfile("a1", "账号"), now)
+    query = make_query(now)
+    session = catalog.begin_search(
+        "global-1",
+        "a1",
+        ALL_DIALOGS_SCOPE_REF,
+        ALL_DIALOGS_TITLE,
+        query,
+        now,
+        scope=SearchScope.ALL_DIALOGS,
+    )
+    values = [
+        replace(
+            make_saved_result(session.id, now, "r1", 10),
+            peer_ref="-1001",
+            source_title="资料群",
+            source_kind=ContentSourceKind.GROUP,
+        ),
+        replace(
+            make_saved_result(session.id, now, "r2", 11),
+            peer_ref="42",
+            source_title="联系人",
+            source_kind=ContentSourceKind.PRIVATE,
+        ),
+    ]
+    catalog.save_search_page("a1", session.id, session.generation, values)
+
+    class Planner:
+        def __init__(self) -> None:
+            self.selected = []
+
+        def existing_media_keys(self, keys):
+            return set()
+
+        def plan_account_search(self, received_query, selected):
+            assert received_query == query
+            self.selected = selected
+            return SimpleNamespace(items=tuple(selected))
+
+        def plan_selected(self, source_ref, source_title, received_query, selected):
+            raise AssertionError("全账号搜索不应调用单会话计划器")
+
+    planner = Planner()
+    service = ContentBrowserService(
+        catalog,
+        ThumbnailCache(tmp_path / "thumbs"),
+        planner=planner,
+        clock=lambda: now,
+    )
+    service.account = AccountProfile("a1", "账号")
+
+    preparation = service.prepare_download(session.id)
+
+    assert len(preparation.preview.items) == 2
+    assert {item.source_title for item in planner.selected} == {"资料群", "联系人"}
 
 
 @pytest.mark.asyncio

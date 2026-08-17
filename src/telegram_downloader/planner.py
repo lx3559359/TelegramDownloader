@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 
-from telegram_downloader.content import ContentSearchQuery
+from telegram_downloader.content import (
+    ALL_DIALOGS_SCOPE_REF,
+    ALL_DIALOGS_TITLE,
+    ContentSearchQuery,
+)
 from telegram_downloader.domain import (
     MediaItem,
     ParsedLink,
@@ -106,6 +110,23 @@ class TaskPlanner:
             skip_existing=True,
         )
 
+    def plan_account_search(
+        self,
+        query: ContentSearchQuery,
+        selected: list[RemoteMedia],
+    ) -> ScanPreview:
+        return self._build_preview(
+            source_kind=SourceKind.ACCOUNT_SEARCH,
+            source_ref=ALL_DIALOGS_SCOPE_REF,
+            source_title=ALL_DIALOGS_TITLE,
+            source_url="account-search://all-dialogs",
+            filters=query.filters,
+            remote=selected,
+            display_title=f"{ALL_DIALOGS_TITLE}（搜索：{query.keyword}）",
+            empty_message="所选媒体已全部存在于下载队列",
+            skip_existing=True,
+        )
+
     def plan_subscription(
         self,
         source_ref: str,
@@ -186,7 +207,7 @@ class TaskPlanner:
         for item in remote:
             target = archive_target(
                 self.downloads,
-                source_title,
+                item.source_title,
                 item.message_date_utc,
                 item.kind,
                 item.original_name,
