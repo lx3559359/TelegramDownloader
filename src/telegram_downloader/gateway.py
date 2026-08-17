@@ -13,6 +13,7 @@ from telegram_downloader.content import (
     AccountProfile,
     ContentDialog,
     ContentSearchQuery,
+    ContentSourceKind,
     DialogKind,
     SearchCursor,
 )
@@ -39,6 +40,7 @@ class RemoteMedia:
     original_name: str
     expected_size: int | None
     message_date_utc: datetime
+    source_kind: ContentSourceKind = ContentSourceKind.UNKNOWN
 
 
 @dataclass(frozen=True, slots=True)

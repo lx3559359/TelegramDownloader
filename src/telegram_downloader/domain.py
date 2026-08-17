@@ -9,6 +9,7 @@ from pathlib import Path
 class SourceKind(StrEnum):
     SINGLE_MESSAGE = "single_message"
     CHANNEL_OR_GROUP = "channel_or_group"
+    ACCOUNT_SEARCH = "account_search"
 
 
 class MediaKind(StrEnum):
