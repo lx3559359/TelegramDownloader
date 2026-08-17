@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from telegram_downloader import app
+from telegram_downloader import __version__, app
 from telegram_downloader.app import run_self_test
 
 
@@ -9,7 +9,7 @@ def test_self_test_reports_only_paths_under_root(tmp_path: Path) -> None:
     report = run_self_test(tmp_path)
 
     assert report["ok"] is True
-    assert report["version"] == "0.11.2"
+    assert report["version"] == __version__
     root = tmp_path.resolve()
     assert all(
         Path(value).is_relative_to(root)

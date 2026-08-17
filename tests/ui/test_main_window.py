@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
 )
 
+from telegram_downloader import __version__
 from telegram_downloader.domain import IntegrityStatus, ItemStatus, MediaKind, TaskStatus
 from telegram_downloader.file_integrity import IntegrityProgress
 from telegram_downloader.ui.effects import ElevationLevel
@@ -90,7 +91,7 @@ def test_workbench_contains_required_controls(qtbot) -> None:
     assert window.limit_input.value() == 500
     assert window.task_table.model().columnCount() == 7
     assert window.account_badge.text() == "未登录"
-    assert window.version_label.text() == "v0.11.2 · stable"
+    assert window.version_label.text() == f"v{__version__} · stable"
     assert set(window.media_checks) == set(MediaKind)
     assert all(check.isChecked() for check in window.media_checks.values())
 
