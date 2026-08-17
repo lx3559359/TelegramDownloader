@@ -20,6 +20,7 @@ from telegram_downloader.domain import (
     ItemStatus,
     MediaKind,
     ScanFilters,
+    SourceKind,
     TaskStatus,
 )
 from telegram_downloader.gateway import (
@@ -1460,7 +1461,12 @@ class AppController:
         if self.paths is None:
             return
         task = self.repository.get_task(task_id)
-        directory = self.paths.guard(self.paths.downloads / task.source_title)
+        directory = (
+            self.paths.downloads
+            if task.source_kind is SourceKind.ACCOUNT_SEARCH
+            else self.paths.downloads / task.source_title
+        )
+        directory = self.paths.guard(directory)
         directory.mkdir(parents=True, exist_ok=True)
         startfile = getattr(os, "startfile", None)
         if startfile is not None:

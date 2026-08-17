@@ -18,7 +18,13 @@ from telegram_downloader.content import (
 )
 from telegram_downloader.content_progress import DialogSyncProgress, SearchProgress
 from telegram_downloader.controller import AppController
-from telegram_downloader.domain import ItemStatus, MediaKind, ScanFilters, TaskStatus
+from telegram_downloader.domain import (
+    ItemStatus,
+    MediaKind,
+    ScanFilters,
+    SourceKind,
+    TaskStatus,
+)
 from telegram_downloader.gateway import (
     AccessDeniedError,
     AuthState,
@@ -1106,6 +1112,7 @@ def test_refresh_tasks_calculates_speed_and_remaining_time() -> None:
 def test_search_task_uses_display_title_but_opens_source_directory(tmp_path, monkeypatch) -> None:
     task = SimpleNamespace(
         id="task-1",
+        source_kind=SourceKind.CHANNEL_OR_GROUP,
         source_title="资料群",
         display_title="资料群（搜索：安装）",
         status=TaskStatus.QUEUED,
@@ -1166,6 +1173,34 @@ def test_search_task_uses_display_title_but_opens_source_directory(tmp_path, mon
     assert window.tasks[0].title == "资料群（搜索：安装）"
     assert opened == [(paths.downloads / "资料群").resolve()]
     assert not (paths.downloads / "资料群（搜索：安装）").exists()
+
+
+def test_account_search_task_opens_download_root(tmp_path, monkeypatch) -> None:
+    task = SimpleNamespace(
+        id="account-search",
+        source_kind=SourceKind.ACCOUNT_SEARCH,
+        source_title=ALL_DIALOGS_TITLE,
+    )
+
+    class Repository:
+        def get_task(self, task_id):
+            assert task_id == task.id
+            return task
+
+    opened = []
+    monkeypatch.setattr(
+        controller_module.os,
+        "startfile",
+        lambda directory: opened.append(directory),
+        raising=False,
+    )
+    paths = PortablePaths(tmp_path)
+    controller = AppController.for_test(repository=Repository(), paths=paths)
+
+    controller.open_task_directory(task.id)
+
+    assert opened == [paths.downloads.resolve()]
+    assert not (paths.downloads / ALL_DIALOGS_TITLE).exists()
 
 
 def test_task_detail_selection_loads_only_one_selected_task() -> None:
