@@ -26,6 +26,8 @@ from telegram_downloader.subscriptions import (
     SubscriptionState,
 )
 
+CATALOG_SCHEMA_VERSION = 4
+
 
 class CatalogError(RuntimeError):
     pass
@@ -210,7 +212,7 @@ class CatalogRepository:
             if version == 3:
                 connection.executescript(_SCHEMA_V4_MIGRATION)
                 version = 4
-            if version != 4:
+            if version != CATALOG_SCHEMA_VERSION:
                 raise CatalogError(f"不支持的内容目录版本：{version}")
 
     def schema_version(self) -> int:

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QColor
 
-from telegram_downloader.domain import ItemStatus, MediaKind, TaskStatus
+from telegram_downloader.domain import (
+    IntegrityStatus,
+    ItemStatus,
+    MediaKind,
+    TaskStatus,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +32,7 @@ class TaskSummary:
     speed_bps: float = 0.0
     remaining_seconds: int | None = None
     archived: bool = False
+    queue_position: int | None = None
 
 
 class TaskFilter(StrEnum):
@@ -47,6 +54,8 @@ class TaskItemSummary:
     expected_size: int | None
     retry_count: int
     error_text: str
+    integrity_status: IntegrityStatus = IntegrityStatus.UNVERIFIED
+    verified_at: datetime | None = None
 
 
 _STATUS_LABELS = {
@@ -85,6 +94,23 @@ _ITEM_STATUS_COLORS = {
     ItemStatus.FAILED: QColor("#fb923c"),
 }
 
+_INTEGRITY_LABELS = {
+    IntegrityStatus.UNVERIFIED: "未校验",
+    IntegrityStatus.VERIFIED: "已校验",
+    IntegrityStatus.MISSING: "文件缺失",
+    IntegrityStatus.SIZE_MISMATCH: "大小异常",
+    IntegrityStatus.HASH_MISMATCH: "哈希异常",
+    IntegrityStatus.READ_ERROR: "无法读取",
+}
+
+_INTEGRITY_COLORS = {
+    IntegrityStatus.VERIFIED: QColor("#5eead4"),
+    IntegrityStatus.MISSING: QColor("#fb923c"),
+    IntegrityStatus.SIZE_MISMATCH: QColor("#fb923c"),
+    IntegrityStatus.HASH_MISMATCH: QColor("#fb923c"),
+    IntegrityStatus.READ_ERROR: QColor("#fbbf24"),
+}
+
 _MEDIA_LABELS = {
     MediaKind.PHOTO: "图片",
     MediaKind.VIDEO: "视频",
@@ -121,7 +147,7 @@ class TaskTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.DisplayRole:
             values = (
                 task.title,
-                _STATUS_LABELS[task.status],
+                self._status_text(task),
                 task.progress_text,
                 task.size_text,
                 task.speed_text,
@@ -134,7 +160,7 @@ class TaskTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.TextAlignmentRole and index.column() > 0:
             return int(Qt.AlignmentFlag.AlignCenter)
         if role == Qt.ItemDataRole.ToolTipRole:
-            summary = f"{task.title} · {_STATUS_LABELS[task.status]}"
+            summary = f"{task.title} · {self._status_text(task)}"
             return summary if task.error_text == "—" else f"{summary} · {task.error_text}"
         return None
 
@@ -184,6 +210,17 @@ class TaskTableModel(QAbstractTableModel):
             None,
         )
 
+    @staticmethod
+    def _status_text(task: TaskSummary) -> str:
+        label = _STATUS_LABELS[task.status]
+        if (
+            task.status is TaskStatus.QUEUED
+            and task.queue_position is not None
+            and task.queue_position > 0
+        ):
+            return f"{label} · 第 {task.queue_position} 位"
+        return label
+
     def _filtered_tasks(self) -> list[TaskSummary]:
         return [
             task
@@ -219,7 +256,7 @@ class TaskTableModel(QAbstractTableModel):
 
 
 class TaskItemTableModel(QAbstractTableModel):
-    HEADERS = ("文件", "类型", "状态", "进度", "大小", "重试", "错误")
+    HEADERS = ("文件", "类型", "状态", "完整性", "进度", "大小", "重试", "错误")
 
     def __init__(self) -> None:
         super().__init__()
@@ -242,6 +279,7 @@ class TaskItemTableModel(QAbstractTableModel):
                 item.name,
                 _MEDIA_LABELS[item.kind],
                 _ITEM_STATUS_LABELS[item.status],
+                _INTEGRITY_LABELS[item.integrity_status],
                 self._progress_text(item),
                 self._size_text(item),
                 str(item.retry_count),
@@ -250,10 +288,20 @@ class TaskItemTableModel(QAbstractTableModel):
             return values[index.column()]
         if role == Qt.ItemDataRole.ForegroundRole and index.column() == 2:
             return _ITEM_STATUS_COLORS.get(item.status)
+        if role == Qt.ItemDataRole.ForegroundRole and index.column() == 3:
+            return _INTEGRITY_COLORS.get(item.integrity_status)
         if role == Qt.ItemDataRole.TextAlignmentRole and index.column() > 0:
             return int(Qt.AlignmentFlag.AlignCenter)
         if role == Qt.ItemDataRole.ToolTipRole:
-            summary = f"{item.name} · {_ITEM_STATUS_LABELS[item.status]}"
+            summary = (
+                f"{item.name} · {_ITEM_STATUS_LABELS[item.status]}"
+                f" · {_INTEGRITY_LABELS[item.integrity_status]}"
+            )
+            if item.verified_at is not None:
+                checked = item.verified_at.astimezone(UTC).strftime(
+                    "%Y-%m-%d %H:%M UTC"
+                )
+                summary += f" · {checked}"
             return summary if item.error_text == "—" else f"{summary} · {item.error_text}"
         return None
 

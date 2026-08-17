@@ -174,6 +174,40 @@ async def test_signed_older_release_is_no_update_not_invalid(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_public_source_checks_are_reused_by_update_reconciliation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    runtime = b"runtime"
+    documents, keys = release_documents("0.9.0", runtime)
+    coordinator = UpdateCoordinator(
+        PortablePaths(tmp_path),
+        "0.8.0",
+        keys,
+        BytesClient(documents),
+        Downloader(runtime),
+    )
+
+    checks = await coordinator.check_sources()
+    calls = 0
+
+    async def recorded_checks():
+        nonlocal calls
+        calls += 1
+        return checks
+
+    monkeypatch.setattr(coordinator, "check_sources", recorded_checks)
+    update = await coordinator.check_for_update()
+
+    assert {item.source for item in checks} == {
+        UpdateSourceId.GITHUB,
+        UpdateSourceId.MODELSCOPE,
+    }
+    assert update.version == "0.9.0"
+    assert calls == 1
+
+
+@pytest.mark.asyncio
 async def test_newer_release_requiring_newer_updater_is_blocked(tmp_path) -> None:
     runtime = b"runtime"
     documents, keys = release_documents(

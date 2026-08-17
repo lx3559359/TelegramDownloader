@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -16,7 +17,8 @@ from PySide6.QtWidgets import (
 )
 
 from telegram_downloader.settings import AppSettings, ProxySettings, SettingsError
-from telegram_downloader.ui.theme import DARK_STYLESHEET, ensure_cjk_font
+from telegram_downloader.ui.effects import ElevationLevel, apply_elevation
+from telegram_downloader.ui.theme import APP_STYLESHEET, ensure_cjk_font
 
 
 class SettingsDialog(QDialog):
@@ -33,12 +35,18 @@ class SettingsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         ensure_cjk_font()
-        self.setStyleSheet(DARK_STYLESHEET)
+        self.setStyleSheet(APP_STYLESHEET)
         self.setWindowTitle("设置")
         self.setModal(True)
         self.setMinimumWidth(520)
 
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 16, 16, 18)
+        self.dialog_surface = QFrame(self)
+        self.dialog_surface.setObjectName("dialogSurface")
+        apply_elevation(self.dialog_surface, ElevationLevel.MAJOR)
+        outer.addWidget(self.dialog_surface)
+        layout = QVBoxLayout(self.dialog_surface)
         layout.setContentsMargins(24, 22, 24, 20)
         layout.setSpacing(13)
         title = QLabel("应用设置")
@@ -57,6 +65,28 @@ class SettingsDialog(QDialog):
         self.concurrency = QSpinBox()
         self.concurrency.setRange(1, 5)
         self.concurrency.setValue(settings.concurrency)
+        self.speed_limit = QComboBox()
+        speed_presets = (
+            ("不限速", 0),
+            ("256 KiB/s", 256),
+            ("512 KiB/s", 512),
+            ("1 MiB/s", 1024),
+            ("2 MiB/s", 2048),
+            ("5 MiB/s", 5120),
+            ("10 MiB/s", 10240),
+            ("20 MiB/s", 20480),
+            ("50 MiB/s", 51200),
+        )
+        for label, value in speed_presets:
+            self.speed_limit.addItem(label, value)
+        selected_speed = self.speed_limit.findData(settings.speed_limit_kib)
+        if selected_speed < 0:
+            self.speed_limit.addItem(
+                f"自定义 {settings.speed_limit_kib} KiB/s",
+                settings.speed_limit_kib,
+            )
+            selected_speed = self.speed_limit.count() - 1
+        self.speed_limit.setCurrentIndex(selected_speed)
         self.check_updates = QCheckBox("启动后自动检查正式版更新")
         self.check_updates.setChecked(settings.check_updates_on_startup)
         self.proxy_kind = QComboBox()
@@ -72,7 +102,9 @@ class SettingsDialog(QDialog):
         self.proxy_password = QLineEdit(proxy_password)
         self.proxy_password.setEchoMode(QLineEdit.EchoMode.Password)
         form.addRow("API ID", self.api_id)
-        form.addRow("并发下载", self.concurrency)
+        self.concurrency_label = QLabel("文件并发")
+        form.addRow(self.concurrency_label, self.concurrency)
+        form.addRow("总下载限速", self.speed_limit)
         form.addRow("在线更新", self.check_updates)
         form.addRow("代理类型", self.proxy_kind)
         form.addRow("代理地址", self.proxy_host)
@@ -135,6 +167,7 @@ class SettingsDialog(QDialog):
             self.concurrency.value(),
             self.proxy_values(),
             self.check_updates.isChecked(),
+            speed_limit_kib=int(self.speed_limit.currentData()),
         )
 
     def _update_proxy_fields(self) -> None:

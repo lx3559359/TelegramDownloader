@@ -27,8 +27,11 @@ from PySide6.QtWidgets import (
 )
 
 from telegram_downloader import __version__
-from telegram_downloader.domain import ItemStatus, MediaKind, TaskStatus
+from telegram_downloader.domain import IntegrityStatus, ItemStatus, MediaKind, TaskStatus
+from telegram_downloader.file_integrity import IntegrityProgress
 from telegram_downloader.ui.content_browser import ContentBrowserPage
+from telegram_downloader.ui.diagnostics import DiagnosticsPage
+from telegram_downloader.ui.effects import ElevationLevel, apply_elevation
 from telegram_downloader.ui.models import (
     TaskFilter,
     TaskItemSummary,
@@ -37,7 +40,7 @@ from telegram_downloader.ui.models import (
     TaskTableModel,
 )
 from telegram_downloader.ui.subscriptions import SubscriptionPage
-from telegram_downloader.ui.theme import DARK_STYLESHEET, ensure_cjk_font
+from telegram_downloader.ui.theme import APP_STYLESHEET, ensure_cjk_font
 
 _MEDIA_LABELS = {
     MediaKind.PHOTO: "图片",
@@ -57,11 +60,21 @@ _TASK_FILTER_LABELS = {
     TaskFilter.ARCHIVED: "已归档",
 }
 
+_INTEGRITY_FAILURES = frozenset(
+    {
+        IntegrityStatus.MISSING,
+        IntegrityStatus.SIZE_MISMATCH,
+        IntegrityStatus.HASH_MISMATCH,
+        IntegrityStatus.READ_ERROR,
+    }
+)
+
 
 class MainWindow(QMainWindow):
     scan_requested = Signal(str)
     content_activated = Signal()
     subscriptions_activated = Signal()
+    diagnostics_activated = Signal()
     pause_requested = Signal(str)
     resume_requested = Signal(str)
     retry_failed_requested = Signal(str)
@@ -70,9 +83,14 @@ class MainWindow(QMainWindow):
     pause_tasks_requested = Signal(object)
     resume_tasks_requested = Signal(object)
     retry_tasks_requested = Signal(object)
+    prioritize_task_requested = Signal(str)
     archive_tasks_requested = Signal(object)
     restore_tasks_requested = Signal(object)
     open_media_requested = Signal(str)
+    verify_media_requested = Signal(object)
+    repair_media_requested = Signal(object)
+    verify_tasks_requested = Signal(object)
+    integrity_cancel_requested = Signal()
     settings_requested = Signal()
     login_requested = Signal()
 
@@ -80,26 +98,32 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._restoring_task_selection = False
         self._detail_task_id: str | None = None
+        self._integrity_busy = False
         self.setWindowTitle("Telegram 下载器")
         self.setMinimumSize(1180, 720)
         self.resize(1280, 780)
         ensure_cjk_font()
-        self.setStyleSheet(DARK_STYLESHEET)
+        self.setStyleSheet(APP_STYLESHEET)
 
         root = QWidget()
         root_layout = QHBoxLayout(root)
-        root_layout.setContentsMargins(0, 0, 0, 0)
-        root_layout.setSpacing(0)
-        root_layout.addWidget(self._build_navigation())
+        root_layout.setContentsMargins(12, 12, 12, 12)
+        root_layout.setSpacing(12)
+        self.navigation_panel = self._build_navigation()
+        apply_elevation(self.navigation_panel, ElevationLevel.SECONDARY)
+        root_layout.addWidget(self.navigation_panel)
         self.task_page = self._build_workspace()
         self.content_page = ContentBrowserPage()
         self.subscriptions_page = SubscriptionPage()
+        self.diagnostics_page = DiagnosticsPage()
         self.page_stack = QStackedWidget()
         self.page_stack.addWidget(self.task_page)
         self.page_stack.addWidget(self.content_page)
         self.page_stack.addWidget(self.subscriptions_page)
+        self.page_stack.addWidget(self.diagnostics_page)
         root_layout.addWidget(self.page_stack, 1)
         self.statistics_panel = self._build_statistics()
+        apply_elevation(self.statistics_panel, ElevationLevel.SECONDARY)
         root_layout.addWidget(self.statistics_panel)
         self.setCentralWidget(root)
         self.statusBar().showMessage("准备就绪")
@@ -123,20 +147,30 @@ class MainWindow(QMainWindow):
                 self.retry_failed_requested.emit,
             )
         )
+        self.prioritize_button.clicked.connect(
+            lambda: self._emit_for_selected(self.prioritize_task_requested.emit)
+        )
         self.open_button.clicked.connect(
             lambda: self._emit_for_selected(self.open_directory_requested.emit)
         )
         self.archive_button.clicked.connect(self._confirm_archive)
         self.restore_button.clicked.connect(self._confirm_restore)
         self.open_file_button.clicked.connect(self._emit_selected_media)
+        self.verify_media_button.clicked.connect(self._emit_verify_media)
+        self.repair_media_button.clicked.connect(self._confirm_repair_media)
+        self.verify_tasks_button.clicked.connect(self._emit_verify_tasks)
+        self.integrity_cancel_button.clicked.connect(self._emit_integrity_cancel)
         self.task_search.textChanged.connect(self._apply_task_filter)
         self.task_filter.currentIndexChanged.connect(self._apply_task_filter)
         self.task_table.selectionModel().selectionChanged.connect(self._task_selection_changed)
-        self.task_item_table.selectionModel().selectionChanged.connect(self._update_open_file_state)
+        self.task_item_table.selectionModel().selectionChanged.connect(
+            self._update_media_action_state
+        )
         self.task_item_table.doubleClicked.connect(self._emit_open_media)
         self.tasks_nav_button.clicked.connect(lambda: self.show_page("tasks"))
         self.content_nav_button.clicked.connect(lambda: self.show_page("content"))
         self.subscriptions_nav_button.clicked.connect(lambda: self.show_page("subscriptions"))
+        self.diagnostics_nav_button.clicked.connect(lambda: self.show_page("diagnostics"))
         self._update_action_state()
         self._update_task_filter_labels()
 
@@ -170,6 +204,7 @@ class MainWindow(QMainWindow):
         self.tasks_nav_button = self._nav_button("任务中心", active=True)
         self.content_nav_button = self._nav_button("账号内容")
         self.subscriptions_nav_button = self._nav_button("自动订阅")
+        self.diagnostics_nav_button = self._nav_button("健康诊断")
         self.login_nav_button = self._nav_button("账号登录")
         self.settings_nav_button = self._nav_button("设置")
         self.login_nav_button.clicked.connect(self.login_requested.emit)
@@ -177,6 +212,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.tasks_nav_button)
         layout.addWidget(self.content_nav_button)
         layout.addWidget(self.subscriptions_nav_button)
+        layout.addWidget(self.diagnostics_nav_button)
         layout.addWidget(self.login_nav_button)
         layout.addWidget(self.settings_nav_button)
         layout.addStretch()
@@ -213,7 +249,16 @@ class MainWindow(QMainWindow):
         header.addWidget(self.account_badge, 0, Qt.AlignmentFlag.AlignTop)
         layout.addLayout(header)
 
-        layout.addWidget(self._build_source_card())
+        self.source_card = self._build_source_card()
+        apply_elevation(self.source_card, ElevationLevel.MAJOR)
+        layout.addWidget(self.source_card)
+
+        self.task_queue_card = QFrame()
+        self.task_queue_card.setObjectName("elevatedCard")
+        apply_elevation(self.task_queue_card, ElevationLevel.MAJOR)
+        task_queue_layout = QVBoxLayout(self.task_queue_card)
+        task_queue_layout.setContentsMargins(14, 12, 14, 14)
+        task_queue_layout.setSpacing(9)
 
         queue_header = QHBoxLayout()
         queue_header.addWidget(self._section_label("任务队列"))
@@ -221,7 +266,7 @@ class MainWindow(QMainWindow):
         hint = QLabel("支持暂停、断网与程序重启后续传")
         hint.setObjectName("muted")
         queue_header.addWidget(hint)
-        layout.addLayout(queue_header)
+        task_queue_layout.addLayout(queue_header)
 
         task_filters = QHBoxLayout()
         task_filters.setSpacing(9)
@@ -234,7 +279,7 @@ class MainWindow(QMainWindow):
             self.task_filter.addItem(_TASK_FILTER_LABELS[selected], selected.value)
         task_filters.addWidget(self.task_search, 1)
         task_filters.addWidget(self.task_filter)
-        layout.addLayout(task_filters)
+        task_queue_layout.addLayout(task_filters)
 
         self.task_model = TaskTableModel()
         self.task_table = QTableView()
@@ -251,19 +296,39 @@ class MainWindow(QMainWindow):
         for column in range(1, self.task_model.columnCount()):
             header_view.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
 
-        task_panel = QWidget()
-        task_panel_layout = QVBoxLayout(task_panel)
-        task_panel_layout.setContentsMargins(0, 0, 0, 0)
-        task_panel_layout.setSpacing(5)
         self.task_empty_hint = QLabel("尚无下载任务")
         self.task_empty_hint.setObjectName("muted")
         self.task_empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        task_panel_layout.addWidget(self.task_table, 1)
-        task_panel_layout.addWidget(self.task_empty_hint)
+        task_queue_layout.addWidget(self.task_table, 1)
+        task_queue_layout.addWidget(self.task_empty_hint)
 
-        detail_panel = QFrame()
-        detail_panel.setObjectName("card")
-        detail_layout = QVBoxLayout(detail_panel)
+        actions = QHBoxLayout()
+        self.pause_button = QPushButton("暂停")
+        self.resume_button = QPushButton("继续")
+        self.prioritize_button = QPushButton("优先下载")
+        self.retry_button = QPushButton("重试失败项")
+        self.verify_tasks_button = QPushButton("校验文件")
+        self.archive_button = QPushButton("归档所选")
+        self.restore_button = QPushButton("恢复所选")
+        self.open_button = QPushButton("打开目录")
+        for button in (
+            self.pause_button,
+            self.resume_button,
+            self.prioritize_button,
+            self.retry_button,
+            self.verify_tasks_button,
+            self.archive_button,
+            self.restore_button,
+            self.open_button,
+        ):
+            actions.addWidget(button)
+        actions.addStretch()
+        task_queue_layout.addLayout(actions)
+
+        self.task_detail_card = QFrame()
+        self.task_detail_card.setObjectName("elevatedCard")
+        apply_elevation(self.task_detail_card, ElevationLevel.MAJOR)
+        detail_layout = QVBoxLayout(self.task_detail_card)
         detail_layout.setContentsMargins(12, 9, 12, 10)
         detail_layout.setSpacing(7)
         detail_header = QHBoxLayout()
@@ -275,16 +340,38 @@ class MainWindow(QMainWindow):
         detail_header.addSpacing(8)
         detail_header.addWidget(self.task_detail_hint)
         detail_header.addStretch()
+        self.verify_media_button = QPushButton("校验所选")
+        self.repair_media_button = QPushButton("重新下载所选")
         self.open_file_button = QPushButton("打开文件")
+        detail_header.addWidget(self.verify_media_button)
+        detail_header.addWidget(self.repair_media_button)
         detail_header.addWidget(self.open_file_button)
         detail_layout.addLayout(detail_header)
+
+        self.integrity_progress_panel = QFrame()
+        self.integrity_progress_panel.setObjectName("elevatedSubCard")
+        apply_elevation(self.integrity_progress_panel, ElevationLevel.SECONDARY)
+        integrity_progress_layout = QHBoxLayout(self.integrity_progress_panel)
+        integrity_progress_layout.setContentsMargins(8, 7, 8, 7)
+        integrity_progress_layout.setSpacing(8)
+        self.integrity_progress_label = QLabel("正在准备校验…")
+        self.integrity_progress_label.setObjectName("muted")
+        self.integrity_progress = QProgressBar()
+        self.integrity_progress.setTextVisible(True)
+        self.integrity_progress.setMinimumWidth(180)
+        self.integrity_cancel_button = QPushButton("取消校验")
+        integrity_progress_layout.addWidget(self.integrity_progress_label)
+        integrity_progress_layout.addWidget(self.integrity_progress, 1)
+        integrity_progress_layout.addWidget(self.integrity_cancel_button)
+        self.integrity_progress_panel.hide()
+        detail_layout.addWidget(self.integrity_progress_panel)
 
         self.task_item_model = TaskItemTableModel()
         self.task_item_table = QTableView()
         self.task_item_table.setModel(self.task_item_model)
         self.task_item_table.setAlternatingRowColors(True)
         self.task_item_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.task_item_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.task_item_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.task_item_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.task_item_table.setShowGrid(False)
         self.task_item_table.verticalHeader().hide()
@@ -300,36 +387,17 @@ class MainWindow(QMainWindow):
 
         self.task_splitter = QSplitter(Qt.Orientation.Vertical)
         self.task_splitter.setChildrenCollapsible(False)
-        self.task_splitter.addWidget(task_panel)
-        self.task_splitter.addWidget(detail_panel)
+        self.task_splitter.addWidget(self.task_queue_card)
+        self.task_splitter.addWidget(self.task_detail_card)
         self.task_splitter.setStretchFactor(0, 3)
         self.task_splitter.setStretchFactor(1, 2)
         self.task_splitter.setSizes([300, 190])
         layout.addWidget(self.task_splitter, 1)
-
-        actions = QHBoxLayout()
-        self.pause_button = QPushButton("暂停")
-        self.resume_button = QPushButton("继续")
-        self.retry_button = QPushButton("重试失败项")
-        self.archive_button = QPushButton("归档所选")
-        self.restore_button = QPushButton("恢复所选")
-        self.open_button = QPushButton("打开目录")
-        for button in (
-            self.pause_button,
-            self.resume_button,
-            self.retry_button,
-            self.archive_button,
-            self.restore_button,
-            self.open_button,
-        ):
-            actions.addWidget(button)
-        actions.addStretch()
-        layout.addLayout(actions)
         return workspace
 
     def _build_source_card(self) -> QFrame:
         card = QFrame()
-        card.setObjectName("card")
+        card.setObjectName("elevatedCard")
         layout = QVBoxLayout(card)
         layout.setContentsMargins(16, 14, 16, 15)
         layout.setSpacing(11)
@@ -394,16 +462,26 @@ class MainWindow(QMainWindow):
         speed_card, self.speed_value = self._stat_card("总速度", "0 B/s", accent=True)
         completed_card, self.completed_value = self._stat_card("已完成", "0")
         remaining_card, self.remaining_value = self._stat_card("队列剩余", "0")
+        self.stat_cards = (speed_card, completed_card, remaining_card)
+        for card in self.stat_cards:
+            card.setObjectName("elevatedSubCard")
+            apply_elevation(card, ElevationLevel.SECONDARY)
         layout.addWidget(speed_card)
         layout.addWidget(completed_card)
         layout.addWidget(remaining_card)
 
         current = QFrame()
-        current.setObjectName("card")
+        self.current_task_card = current
+        self.current_task_card.setObjectName("elevatedSubCard")
+        apply_elevation(self.current_task_card, ElevationLevel.SECONDARY)
         current_layout = QVBoxLayout(current)
         current_layout.setContentsMargins(13, 13, 13, 14)
         current_layout.setSpacing(9)
         current_layout.addWidget(self._section_label("当前任务"))
+        self.scheduler_summary = QLabel("调度：空闲 · 文件并发 3 · 不限速")
+        self.scheduler_summary.setObjectName("muted")
+        self.scheduler_summary.setWordWrap(True)
+        current_layout.addWidget(self.scheduler_summary)
         self.current_task_label = QLabel("暂无活动任务")
         self.current_task_label.setObjectName("muted")
         self.current_task_label.setWordWrap(True)
@@ -447,7 +525,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _stat_card(title: str, value: str, *, accent: bool = False) -> tuple[QFrame, QLabel]:
         card = QFrame()
-        card.setObjectName("statCard")
+        card.setObjectName("elevatedSubCard")
         layout = QVBoxLayout(card)
         layout.setContentsMargins(13, 12, 13, 13)
         layout.setSpacing(5)
@@ -503,8 +581,21 @@ class MainWindow(QMainWindow):
         self.resume_button.setEnabled(
             any(not task.archived and task.status is TaskStatus.PAUSED for task in tasks)
         )
+        self.prioritize_button.setEnabled(
+            len(tasks) == 1
+            and not tasks[0].archived
+            and tasks[0].status is TaskStatus.QUEUED
+        )
         self.retry_button.setEnabled(
             any(not task.archived and task.status is TaskStatus.PARTIAL_FAILURE for task in tasks)
+        )
+        self.verify_tasks_button.setEnabled(
+            not self._integrity_busy
+            and any(
+                not task.archived
+                and task.status in {TaskStatus.COMPLETED, TaskStatus.PARTIAL_FAILURE}
+                for task in tasks
+            )
         )
         self.archive_button.setEnabled(
             bool(tasks)
@@ -512,7 +603,7 @@ class MainWindow(QMainWindow):
         )
         self.restore_button.setEnabled(bool(tasks) and all(task.archived for task in tasks))
         self.open_button.setEnabled(len(tasks) == 1)
-        self._update_open_file_state()
+        self._update_media_action_state()
 
     def _selected_task_summary(self) -> TaskSummary | None:
         tasks = self._selected_task_summaries()
@@ -587,6 +678,28 @@ class MainWindow(QMainWindow):
             detail += f" · 剩余 {active.remaining_text}"
         self.current_detail.setText(detail)
 
+    def set_scheduler_summary(
+        self,
+        *,
+        active: int,
+        queued: int,
+        concurrency: int,
+        speed_limit_kib: int,
+    ) -> None:
+        activity = (
+            f"{active} 个下载中 · {queued} 个等待"
+            if active > 0
+            else "空闲"
+        )
+        speed = (
+            "不限速"
+            if speed_limit_kib == 0
+            else f"限速 {self._format_rate(speed_limit_kib * 1024)}"
+        )
+        self.scheduler_summary.setText(
+            f"调度：{activity} · 文件并发 {concurrency} · {speed}"
+        )
+
     def set_task_items(
         self,
         task_id: str,
@@ -595,11 +708,15 @@ class MainWindow(QMainWindow):
         tasks = self._selected_task_summaries()
         if len(tasks) != 1 or tasks[0].id != task_id:
             return
+        selected_media_ids = (
+            self.selected_media_ids() if self._detail_task_id == task_id else []
+        )
         self._detail_task_id = task_id
         self.task_detail_title.setText(tasks[0].title)
         self.task_detail_hint.setText(f"共 {len(items)} 个媒体文件")
         self.task_item_model.set_items(items)
-        self._update_open_file_state()
+        self._restore_media_selection(selected_media_ids)
+        self._update_media_action_state()
 
     def _task_selection_changed(self, *_args) -> None:
         if self._restoring_task_selection:
@@ -627,7 +744,7 @@ class MainWindow(QMainWindow):
         self.task_detail_title.setText(title)
         self.task_detail_hint.setText(hint)
         self.task_item_model.set_items([])
-        self._update_open_file_state()
+        self._update_media_action_state()
 
     def _restore_task_selection(self, task_ids: list[str]) -> None:
         selection = self.task_table.selectionModel()
@@ -636,6 +753,17 @@ class MainWindow(QMainWindow):
             row = self.task_model.row_for_task_id(task_id)
             if row is not None:
                 selection.select(self.task_model.index(row, 0), flags)
+
+    def _restore_media_selection(self, item_ids: list[str]) -> None:
+        wanted = set(item_ids)
+        if not wanted:
+            return
+        selection = self.task_item_table.selectionModel()
+        flags = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+        for row in range(self.task_item_model.rowCount()):
+            item = self.task_item_model.item_at(row)
+            if item is not None and item.id in wanted:
+                selection.select(self.task_item_model.index(row, 0), flags)
 
     def _apply_task_filter(self, *_args) -> None:
         selected_task_ids = self.selected_task_ids()
@@ -692,25 +820,132 @@ class MainWindow(QMainWindow):
         if answer is QMessageBox.StandardButton.Yes:
             self.restore_tasks_requested.emit(task_ids)
 
-    def _selected_media_summary(self) -> TaskItemSummary | None:
-        rows = self.task_item_table.selectionModel().selectedRows()
-        if not rows:
-            return None
-        return self.task_item_model.item_at(rows[0].row())
+    def _selected_media_summaries(self) -> list[TaskItemSummary]:
+        items: list[TaskItemSummary] = []
+        rows = sorted(
+            {index.row() for index in self.task_item_table.selectionModel().selectedRows()}
+        )
+        for row in rows:
+            item = self.task_item_model.item_at(row)
+            if item is not None:
+                items.append(item)
+        return items
 
-    def _update_open_file_state(self, *_args) -> None:
-        item = self._selected_media_summary()
-        self.open_file_button.setEnabled(item is not None and item.status is ItemStatus.COMPLETED)
+    def _selected_media_summary(self) -> TaskItemSummary | None:
+        items = self._selected_media_summaries()
+        return items[0] if len(items) == 1 else None
+
+    def selected_media_ids(self) -> list[str]:
+        return [item.id for item in self._selected_media_summaries()]
+
+    @staticmethod
+    def _can_open_media(item: TaskItemSummary) -> bool:
+        return (
+            item.status is ItemStatus.COMPLETED
+            and item.integrity_status not in _INTEGRITY_FAILURES
+        )
+
+    @staticmethod
+    def _can_verify_media(item: TaskItemSummary) -> bool:
+        return (
+            item.status is ItemStatus.COMPLETED
+            or item.integrity_status in _INTEGRITY_FAILURES
+        )
+
+    def _update_media_action_state(self, *_args) -> None:
+        items = self._selected_media_summaries()
+        single = items[0] if len(items) == 1 else None
+        self.open_file_button.setEnabled(
+            single is not None and self._can_open_media(single)
+        )
+        self.verify_media_button.setEnabled(
+            not self._integrity_busy and any(self._can_verify_media(item) for item in items)
+        )
+        self.repair_media_button.setEnabled(
+            not self._integrity_busy
+            and any(item.integrity_status in _INTEGRITY_FAILURES for item in items)
+        )
 
     def _emit_selected_media(self) -> None:
         item = self._selected_media_summary()
-        if item is not None and item.status is ItemStatus.COMPLETED:
+        if item is not None and self._can_open_media(item):
             self.open_media_requested.emit(item.id)
 
     def _emit_open_media(self, index) -> None:
         item = self.task_item_model.item_at(index.row())
-        if item is not None and item.status is ItemStatus.COMPLETED:
+        if item is not None and self._can_open_media(item):
             self.open_media_requested.emit(item.id)
+
+    def _emit_verify_media(self) -> None:
+        item_ids = [
+            item.id
+            for item in self._selected_media_summaries()
+            if self._can_verify_media(item)
+        ]
+        if item_ids and not self._integrity_busy:
+            self.verify_media_requested.emit(item_ids)
+
+    def _confirm_repair_media(self) -> None:
+        item_ids = [
+            item.id
+            for item in self._selected_media_summaries()
+            if item.integrity_status in _INTEGRITY_FAILURES
+        ]
+        if not item_ids or self._integrity_busy:
+            return
+        answer = QMessageBox.question(
+            self,
+            "重新下载异常文件",
+            f"重新下载所选 {len(item_ids)} 个异常文件？"
+            "现有文件和分片会先保留为 .corrupt* 留档。",
+        )
+        if answer is QMessageBox.StandardButton.Yes:
+            self.repair_media_requested.emit(item_ids)
+
+    def _emit_verify_tasks(self) -> None:
+        task_ids = [
+            task.id
+            for task in self._selected_task_summaries()
+            if not task.archived
+            and task.status in {TaskStatus.COMPLETED, TaskStatus.PARTIAL_FAILURE}
+        ]
+        if task_ids and not self._integrity_busy:
+            self.verify_tasks_requested.emit(task_ids)
+
+    def _emit_integrity_cancel(self) -> None:
+        if not self._integrity_busy:
+            return
+        self.integrity_progress_label.setText("正在取消校验…")
+        self.integrity_cancel_button.setEnabled(False)
+        self.integrity_cancel_requested.emit()
+
+    def set_integrity_busy(self, busy: bool) -> None:
+        self._integrity_busy = bool(busy)
+        if busy:
+            self.integrity_progress_label.setText("正在准备校验…")
+            self.integrity_progress.setRange(0, 0)
+            self.integrity_progress_panel.show()
+            self.integrity_cancel_button.setEnabled(True)
+        else:
+            self.integrity_progress_panel.hide()
+            self.integrity_progress.setRange(0, 1)
+            self.integrity_progress.setValue(0)
+            self.integrity_cancel_button.setEnabled(False)
+        self._update_action_state()
+        self._update_media_action_state()
+
+    def set_integrity_progress(self, progress: IntegrityProgress | None) -> None:
+        if progress is None:
+            if not self._integrity_busy:
+                self.integrity_progress_panel.hide()
+            return
+        self.integrity_progress_panel.show()
+        self.integrity_progress_label.setText(f"正在校验 {progress.file_name}")
+        self.integrity_progress.setRange(0, max(1, progress.total))
+        self.integrity_progress.setValue(progress.completed)
+        self.integrity_progress.setFormat(
+            f"{progress.completed} / {progress.total}"
+        )
 
     @staticmethod
     def _format_rate(value: float) -> str:
@@ -734,20 +969,25 @@ class MainWindow(QMainWindow):
     def show_page(self, name: str) -> None:
         content = name == "content"
         subscriptions = name == "subscriptions"
+        diagnostics = name == "diagnostics"
         page = (
             self.content_page
             if content
             else self.subscriptions_page
             if subscriptions
+            else self.diagnostics_page
+            if diagnostics
             else self.task_page
         )
         self.page_stack.setCurrentWidget(page)
-        self.statistics_panel.setVisible(not (content or subscriptions))
+        self.statistics_panel.setVisible(not (content or subscriptions or diagnostics))
         active = (
             self.content_nav_button
             if content
             else self.subscriptions_nav_button
             if subscriptions
+            else self.diagnostics_nav_button
+            if diagnostics
             else self.tasks_nav_button
         )
         self._set_nav_active(active)
@@ -755,6 +995,8 @@ class MainWindow(QMainWindow):
             self.content_activated.emit()
         elif subscriptions:
             self.subscriptions_activated.emit()
+        elif diagnostics:
+            self.diagnostics_activated.emit()
 
     def open_link_preview(self, link: str) -> None:
         self.link_input.setText(link)
@@ -766,6 +1008,7 @@ class MainWindow(QMainWindow):
             self.tasks_nav_button,
             self.content_nav_button,
             self.subscriptions_nav_button,
+            self.diagnostics_nav_button,
         ):
             button.setProperty("active", button is active_button)
             button.style().unpolish(button)

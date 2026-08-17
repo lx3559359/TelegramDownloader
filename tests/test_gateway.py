@@ -15,6 +15,7 @@ from telegram_downloader.content import (
 from telegram_downloader.domain import MediaKind, ScanFilters
 from telegram_downloader.gateway import (
     AccessDeniedError,
+    AuthorizationFailureReason,
     AuthState,
     EmptyMediaError,
     GatewayError,
@@ -568,25 +569,67 @@ async def test_account_profile_requires_logged_in_account_id() -> None:
         await gateway.account_profile()
 
 
+@pytest.mark.parametrize(
+    ("error_type", "expected_reason"),
+    [
+        (
+            type("AuthKeyDuplicatedError", (Exception,), {}),
+            AuthorizationFailureReason.AUTH_KEY_DUPLICATED,
+        ),
+        (
+            type("AuthKeyInvalidError", (Exception,), {}),
+            AuthorizationFailureReason.AUTH_KEY_INVALID,
+        ),
+        (
+            type("AuthKeyUnregisteredError", (Exception,), {}),
+            AuthorizationFailureReason.AUTH_KEY_UNREGISTERED,
+        ),
+        (
+            type("SessionRevokedError", (Exception,), {}),
+            AuthorizationFailureReason.SESSION_REVOKED,
+        ),
+    ],
+)
 @pytest.mark.asyncio
-async def test_account_profile_maps_unregistered_auth_key_to_expired_login() -> None:
-    class AuthKeyUnregisteredError(Exception):
-        pass
-
+async def test_account_profile_maps_authorization_errors_to_safe_reason(
+    error_type: type[Exception],
+    expected_reason: AuthorizationFailureReason,
+) -> None:
     class Client:
         async def get_me(self):
-            raise AuthKeyUnregisteredError("secret server detail")
+            raise error_type("secret server detail")
 
     gateway = TelethonGateway.from_client_for_test(
         Client(),
-        authorization_errors=(AuthKeyUnregisteredError,),
+        authorization_errors=(error_type,),
+        authorization_error_reasons={error_type: expected_reason},
     )
 
     with pytest.raises(
         SessionExpiredError,
         match="Telegram 登录已失效，请重新扫码登录",
-    ):
+    ) as raised:
         await gateway.account_profile()
+
+    assert raised.value.reason is expected_reason
+    assert "secret server detail" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_connection_rejects_connected_but_unauthorized_account() -> None:
+    class Client:
+        async def connect(self) -> None:
+            return None
+
+        async def get_me(self):
+            return None
+
+    gateway = TelethonGateway.from_client_for_test(Client())
+
+    with pytest.raises(SessionExpiredError) as raised:
+        await gateway.test_connection()
+
+    assert raised.value.reason is AuthorizationFailureReason.NOT_AUTHORIZED
 
 
 @pytest.mark.asyncio

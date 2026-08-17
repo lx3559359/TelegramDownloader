@@ -18,15 +18,28 @@ from telegram_downloader.content import (
 )
 from telegram_downloader.content_progress import DialogSyncProgress, SearchProgress
 from telegram_downloader.controller import AppController
+from telegram_downloader.diagnostics import (
+    DiagnosticProgress,
+    DiagnosticReport,
+    DiagnosticResult,
+    DiagnosticStatus,
+)
 from telegram_downloader.domain import (
+    IntegrityStatus,
     ItemStatus,
     MediaKind,
     ScanFilters,
     SourceKind,
     TaskStatus,
 )
+from telegram_downloader.file_integrity import (
+    IntegrityProgress,
+    IntegritySummary,
+    RepairPreparation,
+)
 from telegram_downloader.gateway import (
     AccessDeniedError,
+    AuthorizationFailureReason,
     AuthState,
     GatewayError,
     QrLoginInfo,
@@ -34,6 +47,7 @@ from telegram_downloader.gateway import (
     TransientNetworkError,
 )
 from telegram_downloader.paths import PortablePaths
+from telegram_downloader.scheduler import SchedulerSnapshot
 from telegram_downloader.settings import AppSettings, ProxySettings
 from telegram_downloader.ui.login import LoginPage
 
@@ -119,6 +133,120 @@ async def test_transient_offline_state_keeps_session_and_never_opens_login() -> 
 
 
 @pytest.mark.asyncio
+async def test_connected_transport_requires_authorized_account() -> None:
+    class Gateway:
+        def is_connected(self) -> bool:
+            return True
+
+        async def test_connection(self) -> None:
+            raise SessionExpiredError(
+                reason=AuthorizationFailureReason.AUTH_KEY_INVALID
+            )
+
+        async def disconnect(self) -> None:
+            pass
+
+    vault = Vault()
+    vault.value = {"session": "saved", "api_hash": "hash"}
+    window = ContentWindowFake()
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        vault=vault,
+        secrets=vault.load(),
+        window=window,
+    )
+    shown: list[str] = []
+    controller.show_login = lambda: shown.append("login")
+
+    assert await controller.ensure_telegram_online() is False
+    assert "连接正常" not in window.content_page.connection_states
+    assert window.content_page.logged_in is False
+    assert "session" not in controller.secrets
+    assert shown == ["login"]
+
+
+@pytest.mark.asyncio
+async def test_authorization_check_network_failure_keeps_saved_session() -> None:
+    class Gateway:
+        def is_connected(self) -> bool:
+            return True
+
+        async def test_connection(self) -> None:
+            raise TransientNetworkError("offline")
+
+    vault = Vault()
+    vault.value = {"session": "saved", "api_hash": "hash"}
+    window = ContentWindowFake()
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        vault=vault,
+        secrets=vault.load(),
+        window=window,
+    )
+
+    assert await controller.ensure_telegram_online() is False
+    assert controller.secrets["session"] == "saved"
+    assert vault.load()["session"] == "saved"
+    assert window.content_page.connection_retryable[-1] is True
+
+
+@pytest.mark.asyncio
+async def test_concurrent_session_expiry_runs_one_relogin_flow(monkeypatch) -> None:
+    class Gateway:
+        def __init__(self) -> None:
+            self.disconnects = 0
+
+        async def disconnect(self) -> None:
+            self.disconnects += 1
+
+    class Logger:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def warning(self, template, *args) -> None:
+            self.calls.append((template, args))
+
+    logger = Logger()
+    monkeypatch.setattr(controller_module, "_LOGGER", logger)
+    gateway = Gateway()
+    vault = Vault()
+    vault.value = {"session": "saved", "api_hash": "hash"}
+    window = ContentWindowFake()
+    subscription_login_states: list[bool] = []
+    window.subscriptions_page = SimpleNamespace(
+        set_logged_in=subscription_login_states.append
+    )
+    controller = AppController.for_test(
+        gateway=gateway,
+        vault=vault,
+        secrets=vault.load(),
+        window=window,
+    )
+    shown: list[str] = []
+    controller.show_login = lambda: shown.append("login")
+    error = SessionExpiredError(
+        "private server text",
+        reason=AuthorizationFailureReason.AUTH_KEY_DUPLICATED,
+    )
+
+    await asyncio.gather(
+        controller._handle_session_expired(error),
+        controller._handle_session_expired(error),
+    )
+
+    assert gateway.disconnects == 1
+    assert shown == ["login"]
+    assert subscription_login_states == [False]
+    assert controller.last_authorization_failure_reason is (
+        AuthorizationFailureReason.AUTH_KEY_DUPLICATED
+    )
+    serialized = repr(logger.calls)
+    assert "auth-key-duplicated" in serialized
+    assert "private server text" not in serialized
+    assert "private server text" not in repr(window.content_page.errors)
+
+
+@pytest.mark.asyncio
 async def test_connection_monitor_waits_30_seconds_and_shutdown_cancels_it() -> None:
     sleeping = asyncio.Event()
     blocker = asyncio.Event()
@@ -176,12 +304,18 @@ async def test_successful_login_starts_connection_monitor_after_logged_out_start
         gateway=Gateway(),
         connection_sleeper=sleep,
     )
+    controller._session_expiry_handled = True
+    controller._last_authorization_failure_reason = (
+        AuthorizationFailureReason.SESSION_REVOKED
+    )
 
     assert controller._connection_monitor_task is None
     await controller._finish_login()
 
     task = controller._connection_monitor_task
     assert task is not None
+    assert controller._session_expiry_handled is False
+    assert controller.last_authorization_failure_reason is None
     await sleeping.wait()
     assert task.done() is False
     await controller.shutdown()
@@ -1213,6 +1347,8 @@ def test_task_detail_selection_loads_only_one_selected_task() -> None:
         expected_size=10,
         retry_count=2,
         last_error="safe-error",
+        integrity_status=IntegrityStatus.HASH_MISMATCH,
+        verified_at=datetime(2026, 8, 16, tzinfo=UTC),
     )
 
     class Repository:
@@ -1244,6 +1380,307 @@ def test_task_detail_selection_loads_only_one_selected_task() -> None:
     assert len(summaries) == 1
     assert summaries[0].id == item.id
     assert summaries[0].error_text == "safe-error"
+    assert summaries[0].integrity_status is IntegrityStatus.HASH_MISMATCH
+    assert summaries[0].verified_at == item.verified_at
+
+
+def _integrity_item(
+    item_id: str,
+    task_id: str = "task",
+    *,
+    status: ItemStatus = ItemStatus.COMPLETED,
+    integrity_status: IntegrityStatus = IntegrityStatus.UNVERIFIED,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=item_id,
+        task_id=task_id,
+        original_name=f"{item_id}.bin",
+        media_kind=MediaKind.DOCUMENT,
+        status=status,
+        downloaded_bytes=4,
+        expected_size=4,
+        retry_count=0,
+        last_error=None,
+        integrity_status=integrity_status,
+        verified_at=None,
+    )
+
+
+class _IntegrityWindow:
+    def __init__(self) -> None:
+        self.busy: list[bool] = []
+        self.progress = []
+        self.task_refreshes = 0
+        self.details = []
+        self.message = ""
+
+    def set_integrity_busy(self, value):
+        self.busy.append(value)
+
+    def set_integrity_progress(self, value):
+        self.progress.append(value)
+
+    def set_task_summaries(self, _summaries):
+        self.task_refreshes += 1
+
+    def set_task_items(self, task_id, items):
+        self.details.append((task_id, items))
+
+    def statusBar(self):
+        return self
+
+    def showMessage(self, message, _timeout=0):
+        self.message = message
+
+
+@pytest.mark.asyncio
+async def test_verify_media_forwards_progress_suppresses_duplicate_and_refreshes() -> None:
+    item = _integrity_item("media")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class Repository:
+        def get_item(self, item_id):
+            assert item_id == item.id
+            return item
+
+        def list_items(self, task_id, statuses=None):
+            assert task_id == item.task_id
+            return [item]
+
+        def list_task_snapshots(self, *, include_archived=False):
+            assert include_archived is True
+            return []
+
+    class Integrity:
+        def __init__(self):
+            self.calls = []
+
+        async def verify(self, item_ids, *, progress, cancelled):
+            self.calls.append(item_ids)
+            entered.set()
+            await release.wait()
+            progress(
+                IntegrityProgress(
+                    1,
+                    1,
+                    item.id,
+                    item.original_name,
+                    IntegrityStatus.VERIFIED,
+                )
+            )
+            return IntegritySummary(baselined=1)
+
+    window = _IntegrityWindow()
+    integrity = Integrity()
+    controller = AppController.for_test(
+        repository=Repository(),
+        window=window,
+        integrity_service=integrity,
+    )
+    controller.select_task_details([item.task_id])
+
+    active = asyncio.create_task(controller.verify_media([item.id, item.id]))
+    await entered.wait()
+    await controller.verify_media([item.id])
+    release.set()
+    await active
+
+    assert integrity.calls == [[item.id]]
+    assert window.busy == [True, False]
+    assert next(value for value in window.progress if value is not None).item_id == item.id
+    assert window.progress[-1] is None
+    assert window.task_refreshes == 1
+    assert window.details[-1][0] == item.task_id
+    assert "建立基线 1" in window.message
+
+
+@pytest.mark.asyncio
+async def test_verify_tasks_expands_media_and_cancel_stops_operation() -> None:
+    items = [_integrity_item("one", "a"), _integrity_item("two", "b")]
+    entered = asyncio.Event()
+
+    class Repository:
+        def list_items(self, task_id, statuses=None):
+            return [item for item in items if item.task_id == task_id]
+
+        def list_task_snapshots(self, *, include_archived=False):
+            return []
+
+    class Integrity:
+        def __init__(self):
+            self.ids = []
+
+        async def verify(self, item_ids, *, progress, cancelled):
+            self.ids = item_ids
+            entered.set()
+            while not cancelled.is_set():
+                await asyncio.sleep(0)
+            return IntegritySummary(cancelled=len(item_ids))
+
+    integrity = Integrity()
+    window = _IntegrityWindow()
+    controller = AppController.for_test(
+        repository=Repository(),
+        window=window,
+        integrity_service=integrity,
+    )
+
+    operation = asyncio.create_task(controller.verify_tasks(["a", "b", "a"]))
+    await entered.wait()
+    controller.cancel_integrity()
+    await operation
+
+    assert integrity.ids == ["one", "two"]
+    assert window.busy == [True, False]
+    assert "取消" in window.message
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_active_integrity_operation() -> None:
+    entered = asyncio.Event()
+
+    class Integrity:
+        async def verify(self, item_ids, *, progress, cancelled):
+            entered.set()
+            await asyncio.Event().wait()
+
+    class Repository:
+        def list_task_snapshots(self, *, include_archived=False):
+            return []
+
+    controller = AppController.for_test(
+        repository=Repository(),
+        window=_IntegrityWindow(),
+        integrity_service=Integrity(),
+    )
+    operation = asyncio.create_task(controller.verify_media(["media"]))
+    await entered.wait()
+
+    await controller.shutdown()
+
+    try:
+        assert operation.cancelled() is True
+    finally:
+        if not operation.done():
+            operation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+
+
+@pytest.mark.asyncio
+async def test_repair_selected_media_runs_only_prepared_ids() -> None:
+    broken = _integrity_item(
+        "broken",
+        status=ItemStatus.FAILED,
+        integrity_status=IntegrityStatus.MISSING,
+    )
+    healthy = _integrity_item(
+        "healthy",
+        status=ItemStatus.COMPLETED,
+        integrity_status=IntegrityStatus.VERIFIED,
+    )
+    items = {item.id: item for item in (broken, healthy)}
+
+    class Repository:
+        def get_item(self, item_id):
+            return items[item_id]
+
+        def list_items(self, task_id, statuses=None):
+            return list(items.values())
+
+        def list_task_snapshots(self, *, include_archived=False):
+            return []
+
+    class Integrity:
+        def prepare_repairs(self, item_ids):
+            assert item_ids == [broken.id, healthy.id]
+            broken.status = ItemStatus.QUEUED
+            broken.integrity_status = IntegrityStatus.UNVERIFIED
+            return RepairPreparation((broken.id,), skipped=1)
+
+    class Scheduler:
+        def __init__(self):
+            self.selected_runs = []
+
+        async def run_items(self, task_id, item_ids):
+            self.selected_runs.append((task_id, item_ids))
+            items[item_ids[0]].status = ItemStatus.COMPLETED
+
+    scheduler = Scheduler()
+    window = _IntegrityWindow()
+    controller = AppController.for_test(
+        repository=Repository(),
+        scheduler=scheduler,
+        window=window,
+        integrity_service=Integrity(),
+    )
+    controller.select_task_details([broken.task_id])
+
+    await controller.repair_media([broken.id, healthy.id])
+
+    assert scheduler.selected_runs == [(broken.task_id, [broken.id])]
+    assert "成功 1" in window.message
+    assert "跳过 1" in window.message
+
+
+@pytest.mark.asyncio
+async def test_cancel_integrity_pauses_active_repair_download() -> None:
+    broken = _integrity_item(
+        "broken",
+        status=ItemStatus.FAILED,
+        integrity_status=IntegrityStatus.MISSING,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class Repository:
+        def get_item(self, _item_id):
+            return broken
+
+        def list_items(self, task_id, statuses=None):
+            return [broken]
+
+        def list_task_snapshots(self, *, include_archived=False):
+            return []
+
+    class Integrity:
+        def prepare_repairs(self, item_ids):
+            broken.status = ItemStatus.QUEUED
+            broken.integrity_status = IntegrityStatus.UNVERIFIED
+            return RepairPreparation((broken.id,), 0)
+
+    class Scheduler:
+        def __init__(self):
+            self.paused = []
+
+        async def run_items(self, task_id, item_ids):
+            entered.set()
+            await release.wait()
+
+        def pause_task(self, task_id):
+            self.paused.append(task_id)
+            broken.status = ItemStatus.PAUSED
+            release.set()
+
+    scheduler = Scheduler()
+    controller = AppController.for_test(
+        repository=Repository(),
+        scheduler=scheduler,
+        window=_IntegrityWindow(),
+        integrity_service=Integrity(),
+    )
+    operation = asyncio.create_task(controller.repair_media([broken.id]))
+    await entered.wait()
+
+    controller.cancel_integrity()
+    await asyncio.sleep(0)
+
+    try:
+        assert scheduler.paused == [broken.task_id]
+    finally:
+        release.set()
+        await operation
 
 
 @pytest.mark.asyncio
@@ -2420,8 +2857,9 @@ async def test_content_search_expired_session_rebuilds_gateway_for_qr_login() ->
         calls.append(("factory", api_id, api_hash, session))
         return fresh
 
-    def service_builder(gateway, concurrency):
-        calls.append(("services", gateway, concurrency))
+    def service_builder(gateway, resource_settings):
+        assert isinstance(resource_settings, AppSettings)
+        calls.append(("services", gateway, resource_settings))
         return "planner", "scheduler", content
 
     controller = AppController.for_test(
@@ -2448,7 +2886,7 @@ async def test_content_search_expired_session_rebuilds_gateway_for_qr_login() ->
         "disconnect-old",
         ("factory", 12345, "saved-api-hash", ""),
         "connect-fresh",
-        ("services", fresh, 3),
+        ("services", fresh, AppSettings(api_id=12345)),
         "show-login",
     ]
     assert window.account is None
@@ -2642,6 +3080,259 @@ async def test_scan_failure_is_persistent_and_releases_busy_state() -> None:
     assert window.busy_states == [True, False]
 
 
+def test_refresh_tasks_exposes_queue_positions_and_scheduler_summary() -> None:
+    queued_task = SimpleNamespace(
+        id="queued",
+        source_title="Queued",
+        display_title=None,
+        status=TaskStatus.QUEUED,
+        last_error=None,
+        archived_at=None,
+    )
+    active_task = SimpleNamespace(
+        id="active",
+        source_title="Active",
+        display_title=None,
+        status=TaskStatus.DOWNLOADING,
+        last_error=None,
+        archived_at=None,
+    )
+
+    class Repository:
+        def list_task_snapshots(self, *, include_archived=False):
+            assert include_archived is True
+            return [
+                SimpleNamespace(
+                    task=task,
+                    total_items=1,
+                    completed_items=0,
+                    downloaded_bytes=0,
+                    known_size=1,
+                    unknown_size_count=0,
+                    item_error=None,
+                )
+                for task in (queued_task, active_task)
+            ]
+
+    class Scheduler:
+        def snapshot(self):
+            return SchedulerSnapshot("active", ("queued",), 4, 2048)
+
+        def queue_positions(self):
+            return {"queued": 1}
+
+    class Window:
+        def __init__(self):
+            self.tasks = []
+            self.scheduler_summary = None
+
+        def set_task_summaries(self, summaries):
+            self.tasks = summaries
+
+        def set_scheduler_summary(self, **summary):
+            self.scheduler_summary = summary
+
+    window = Window()
+    controller = AppController.for_test(
+        repository=Repository(),
+        scheduler=Scheduler(),
+        window=window,
+    )
+
+    controller.refresh_tasks(now=1.0)
+
+    assert window.tasks[0].queue_position == 1
+    assert window.tasks[1].queue_position is None
+    assert window.scheduler_summary == {
+        "active": 1,
+        "queued": 1,
+        "concurrency": 4,
+        "speed_limit_kib": 2048,
+    }
+
+
+def test_prioritize_task_persists_before_reordering_and_reports_position() -> None:
+    events: list[str] = []
+    task = SimpleNamespace(
+        id="queued",
+        status=TaskStatus.QUEUED,
+        archived_at=None,
+    )
+
+    class Repository:
+        def get_task(self, task_id):
+            assert task_id == task.id
+            return task
+
+        def prioritize_task(self, task_id):
+            events.append(f"repository:{task_id}")
+            return True
+
+        def list_task_snapshots(self, *, include_archived=False):
+            return []
+
+    class Scheduler:
+        def prioritize_task(self, task_id):
+            events.append(f"scheduler:{task_id}")
+            return True
+
+        def queue_positions(self):
+            return {task.id: 1}
+
+        def snapshot(self):
+            return SchedulerSnapshot(None, (task.id,), 3, 0)
+
+    controller = AppController.for_test(
+        repository=Repository(),
+        scheduler=Scheduler(),
+    )
+
+    controller.prioritize_task(task.id)
+
+    assert events == ["repository:queued", "scheduler:queued"]
+    assert "第 1 位" in controller.window.message.last_message
+
+
+def test_prioritize_task_handles_state_race_without_duplicate_start() -> None:
+    task = SimpleNamespace(
+        id="queued",
+        status=TaskStatus.QUEUED,
+        archived_at=None,
+    )
+
+    class Repository:
+        def get_task(self, _task_id):
+            return task
+
+        def prioritize_task(self, _task_id):
+            return True
+
+        def list_task_snapshots(self, *, include_archived=False):
+            return []
+
+    class Scheduler:
+        def prioritize_task(self, _task_id):
+            return False
+
+        def queue_positions(self):
+            return {}
+
+        def snapshot(self):
+            return SchedulerSnapshot(task.id, (), 3, 0)
+
+    controller = AppController.for_test(
+        repository=Repository(),
+        scheduler=Scheduler(),
+    )
+
+    controller.prioritize_task(task.id)
+
+    assert "已经开始下载" in controller.window.message.last_message
+
+
+def test_apply_settings_reconfigures_active_scheduler_after_persistence() -> None:
+    events: list[object] = []
+
+    class Store:
+        def load(self):
+            return AppSettings(api_id=1)
+
+        def save(self, value):
+            events.append(("settings", value))
+
+    class SecretStore:
+        def load(self):
+            return {}
+
+        def save(self, value):
+            events.append(("secrets", value))
+
+    class Scheduler:
+        def configure_resources(self, concurrency, speed_limit_kib):
+            events.append(("scheduler", concurrency, speed_limit_kib))
+
+    updated = AppSettings(api_id=1, concurrency=5, speed_limit_kib=2048)
+    controller = AppController.for_test(
+        settings_store=Store(),
+        vault=SecretStore(),
+        scheduler=Scheduler(),
+    )
+
+    controller.apply_settings(updated, "")
+
+    assert events == [
+        ("settings", updated),
+        ("secrets", {}),
+        ("scheduler", 5, 2048),
+    ]
+    assert controller.settings == updated
+    assert "即时应用" in controller.window.message.last_message
+
+
+@pytest.mark.asyncio
+async def test_restore_uses_persistent_dispatch_order() -> None:
+    ordered = [SimpleNamespace(id="priority"), SimpleNamespace(id="oldest")]
+
+    class Repository:
+        def list_queued_for_dispatch(self):
+            return ordered
+
+    controller = AppController.for_test(
+        gateway=ConnectedGateway(),
+        repository=Repository(),
+    )
+    started: list[str] = []
+
+    async def online() -> bool:
+        return True
+
+    async def account_name() -> str:
+        return "Synthetic account"
+
+    async def activate() -> None:
+        return None
+
+    controller.ensure_telegram_online = online
+    controller._account_name = account_name
+    controller.activate_content_account = activate
+    controller._start_task = started.append
+
+    await controller._restore_saved_session()
+
+    assert started == ["priority", "oldest"]
+
+
+@pytest.mark.asyncio
+async def test_waiting_run_does_not_poll_database_until_completion() -> None:
+    release = asyncio.Event()
+
+    class Scheduler:
+        async def run_task(self, _task_id):
+            await release.wait()
+
+        def is_active(self, _task_id):
+            return False
+
+    controller = AppController.for_test(
+        scheduler=Scheduler(),
+        progress_refresh_interval=0.01,
+    )
+    refreshes = 0
+
+    def refresh() -> None:
+        nonlocal refreshes
+        refreshes += 1
+
+    controller.refresh_tasks = refresh
+    operation = asyncio.create_task(controller._run_and_refresh("waiting"))
+    await asyncio.sleep(0.03)
+    assert refreshes == 0
+
+    release.set()
+    await operation
+    assert refreshes == 1
+
+
 @pytest.mark.asyncio
 async def test_unexpected_scan_failure_is_logged_without_secret(
     caplog: pytest.LogCaptureFixture,
@@ -2737,3 +3428,131 @@ def test_local_dates_become_inclusive_utc_boundaries() -> None:
 
     assert filters.date_from_utc.isoformat() == "2026-07-31T16:00:00+00:00"
     assert filters.date_to_utc.isoformat() == "2026-08-02T15:59:59.999999+00:00"
+
+
+def diagnostic_report() -> DiagnosticReport:
+    now = datetime(2026, 8, 16, tzinfo=UTC)
+    return DiagnosticReport.build(
+        "0.10.0",
+        now,
+        now,
+        (
+            DiagnosticResult(
+                "environment",
+                "运行环境与路径",
+                DiagnosticStatus.PASSED,
+                "runtime-paths-ok",
+                "检查完成",
+                1,
+            ),
+        ),
+    )
+
+
+class DiagnosticPage:
+    def __init__(self) -> None:
+        self.report = None
+        self.progress = None
+        self.running: list[bool] = []
+        self.errors: list[str] = []
+        self.historical = None
+
+    def set_report(self, report, *, historical: bool) -> None:
+        self.report = report
+        self.historical = historical
+
+    def set_progress(self, progress) -> None:
+        self.progress = progress
+
+    def set_running(self, running: bool) -> None:
+        self.running.append(running)
+
+    def show_error(self, message: str) -> None:
+        self.errors.append(message)
+
+
+@pytest.mark.asyncio
+async def test_controller_loads_history_runs_persists_exports_and_opens_directory(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    completed = diagnostic_report()
+    progress = DiagnosticProgress(
+        0,
+        1,
+        "environment",
+        "运行环境与路径",
+        DiagnosticStatus.RUNNING,
+    )
+
+    class Diagnostics:
+        def __init__(self) -> None:
+            self.runs = 0
+            self.cancelled = 0
+
+        async def run(self, callback):
+            self.runs += 1
+            callback(progress)
+            return completed
+
+        async def cancel(self) -> None:
+            self.cancelled += 1
+
+    class Store:
+        def __init__(self) -> None:
+            self.saved = []
+            self.exported = []
+
+        def load_latest(self):
+            return completed
+
+        def save(self, value):
+            self.saved.append(value)
+
+        def export(self, value):
+            self.exported.append(value)
+            return tmp_path / "data" / "diagnostics" / "diagnostics.zip"
+
+    class StatusBar:
+        def __init__(self) -> None:
+            self.message = ""
+
+        def showMessage(self, message, _timeout=0):
+            self.message = message
+
+    page = DiagnosticPage()
+    status = StatusBar()
+    window = SimpleNamespace(diagnostics_page=page, statusBar=lambda: status)
+    diagnostics = Diagnostics()
+    store = Store()
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    opened = []
+    monkeypatch.setattr(controller_module.os, "startfile", opened.append)
+    controller = AppController.for_test(
+        window=window,
+        paths=paths,
+        diagnostics=diagnostics,
+        diagnostic_store=store,
+    )
+
+    controller.activate_diagnostics()
+    assert diagnostics.runs == 0
+    assert page.report is completed
+    assert page.historical is True
+
+    await controller.run_diagnostics()
+    controller.export_diagnostics()
+    controller.open_diagnostics_directory()
+
+    assert diagnostics.runs == 1
+    assert page.progress is progress
+    assert page.running == [True, False]
+    assert page.historical is False
+    assert store.saved == [completed]
+    assert store.exported == [completed]
+    assert status.message == "诊断目录已打开"
+    assert opened == [paths.diagnostics]
+
+    await controller.shutdown()
+    assert diagnostics.cancelled == 1

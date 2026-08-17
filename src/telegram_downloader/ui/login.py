@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -22,8 +23,9 @@ from PySide6.QtWidgets import (
 )
 
 from telegram_downloader.settings import ProxySettings, SettingsError
+from telegram_downloader.ui.effects import ElevationLevel, apply_elevation
 from telegram_downloader.ui.qr import render_qr_image
-from telegram_downloader.ui.theme import DARK_STYLESHEET, ensure_cjk_font
+from telegram_downloader.ui.theme import APP_STYLESHEET, ensure_cjk_font
 
 _PHONE = re.compile(r"^\+\d{5,15}$")
 
@@ -50,7 +52,7 @@ class LoginDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         ensure_cjk_font()
-        self.setStyleSheet(DARK_STYLESHEET)
+        self.setStyleSheet(APP_STYLESHEET)
         self.setWindowTitle("登录 Telegram")
         self.setModal(True)
         self.setMinimumWidth(520)
@@ -60,7 +62,13 @@ class LoginDialog(QDialog):
         self.qr_countdown_timer.setInterval(1000)
         self.qr_countdown_timer.timeout.connect(self._tick_qr_countdown)
 
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 16, 16, 18)
+        self.dialog_surface = QFrame(self)
+        self.dialog_surface.setObjectName("dialogSurface")
+        apply_elevation(self.dialog_surface, ElevationLevel.MAJOR)
+        outer.addWidget(self.dialog_surface)
+        layout = QVBoxLayout(self.dialog_surface)
         layout.setContentsMargins(24, 22, 24, 20)
         layout.setSpacing(13)
         title = QLabel("连接你的 Telegram 账号")

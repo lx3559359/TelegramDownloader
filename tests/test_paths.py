@@ -19,6 +19,10 @@ def test_ensure_layout_creates_every_managed_directory(tmp_path: Path) -> None:
     assert paths.thumbnail_cache == tmp_path / "data" / "cache" / "thumbnails"
     assert paths.thumbnail_cache.is_dir()
     assert paths.temp.is_dir()
+    assert paths.diagnostics == tmp_path / "data" / "diagnostics"
+    assert paths.diagnostics.is_dir()
+    assert paths.diagnostic_temp == tmp_path / "data" / "temp" / "diagnostics"
+    assert paths.diagnostic_temp.is_dir()
     assert paths.update_staging.is_dir()
     assert paths.update_backup.is_dir()
     assert paths.update_helper.is_dir()

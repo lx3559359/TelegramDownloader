@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import shutil
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
 from telegram_downloader.domain import ItemStatus, MediaItem
 from telegram_downloader.gateway import TelegramGateway
 from telegram_downloader.paths import PortablePaths
+from telegram_downloader.resource_control import AsyncBandwidthLimiter
 
 
 class DownloadPaused(RuntimeError):
@@ -35,9 +38,32 @@ class ProgressWriter(Protocol):
         retry_count: int | None = None,
     ) -> None: ...
 
+    def complete_item(
+        self,
+        item_id: str,
+        downloaded_bytes: int,
+        sha256: str,
+        verified_at: datetime,
+    ) -> None: ...
+
+
+class _Digest(Protocol):
+    def update(self, data: bytes) -> None: ...
+
+    def hexdigest(self) -> str: ...
+
+
+def _hash_file(path: Path) -> _Digest:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest
+
 
 class MediaDownloader:
     _DISK_RECHECK_BYTES = 16 * 1024 * 1024
+    _PAUSE_POLL_SECONDS = 0.05
 
     def __init__(
         self,
@@ -47,6 +73,7 @@ class MediaDownloader:
         free_bytes: Callable[[Path], int] | None = None,
         reserve_bytes: int = 512 * 1024 * 1024,
         progress_interval: float = 0.5,
+        bandwidth: AsyncBandwidthLimiter | None = None,
     ) -> None:
         if reserve_bytes < 0 or progress_interval < 0:
             raise ValueError("磁盘预留和进度间隔不能为负数")
@@ -56,6 +83,7 @@ class MediaDownloader:
         self.free_bytes = free_bytes or (lambda path: shutil.disk_usage(path).free)
         self.reserve_bytes = reserve_bytes
         self.progress_interval = progress_interval
+        self.bandwidth = bandwidth or AsyncBandwidthLimiter()
 
     async def download(
         self,
@@ -69,10 +97,12 @@ class MediaDownloader:
         if target.exists():
             actual_size = target.stat().st_size
             if item.expected_size is None or actual_size == item.expected_size:
-                self.repository.update_item_progress(
+                digest = await asyncio.to_thread(_hash_file, target)
+                self.repository.complete_item(
                     item.id,
                     actual_size,
-                    ItemStatus.COMPLETED,
+                    digest.hexdigest(),
+                    datetime.now(UTC),
                 )
                 return target
             raise SizeMismatchError(
@@ -105,13 +135,32 @@ class MediaDownloader:
         last_progress = time.monotonic()
 
         try:
+            digest = (
+                await asyncio.to_thread(_hash_file, part)
+                if offset
+                else hashlib.sha256()
+            )
             with part.open("ab") as stream:
                 async for chunk in self.gateway.stream_media(
                     item.peer_ref,
                     item.message_id,
                     offset,
                 ):
+                    bandwidth_ready = await self._acquire_bandwidth(
+                        len(chunk),
+                        pause_requested,
+                    )
+                    if not bandwidth_ready or pause_requested():
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                        self.repository.update_item_progress(
+                            item.id,
+                            downloaded,
+                            ItemStatus.PAUSED,
+                        )
+                        raise DownloadPaused("下载已暂停")
                     stream.write(chunk)
+                    digest.update(chunk)
                     stream.flush()
                     downloaded += len(chunk)
                     bytes_since_disk_check += len(chunk)
@@ -164,12 +213,34 @@ class MediaDownloader:
                 f"下载大小不符: 期望 {item.expected_size}，实际 {downloaded}"
             )
         os.replace(part, target)
-        self.repository.update_item_progress(
+        self.repository.complete_item(
             item.id,
             downloaded,
-            ItemStatus.COMPLETED,
+            digest.hexdigest(),
+            datetime.now(UTC),
         )
         return target
+
+    async def _acquire_bandwidth(
+        self,
+        byte_count: int,
+        pause_requested: Callable[[], bool],
+    ) -> bool:
+        operation = asyncio.ensure_future(self.bandwidth.acquire(byte_count))
+        try:
+            while not operation.done():
+                if pause_requested():
+                    return False
+                await asyncio.wait(
+                    (operation,),
+                    timeout=self._PAUSE_POLL_SECONDS,
+                )
+            await operation
+            return not pause_requested()
+        finally:
+            if not operation.done():
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
 
     def _ensure_space(
         self,

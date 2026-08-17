@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QDateEdit,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -34,12 +35,14 @@ from telegram_downloader.content import (
 from telegram_downloader.content_progress import SearchProgress
 from telegram_downloader.domain import MediaKind
 from telegram_downloader.links import is_telegram_link_candidate
+from telegram_downloader.ui.check_delegate import FullCellCheckDelegate
 from telegram_downloader.ui.content_models import (
     DialogChoice,
     DialogListModel,
     SearchHistoryTableModel,
     SearchResultTableModel,
 )
+from telegram_downloader.ui.effects import ElevationLevel, apply_elevation
 from telegram_downloader.ui.media_preview import MediaPreviewDialog
 
 _MEDIA_LABELS = {
@@ -70,7 +73,7 @@ class ContentBrowserPage(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setObjectName("contentBrowserPage")
+        self.setObjectName("accountContentPage")
         self.dialog_model = DialogListModel()
         self.history_model = SearchHistoryTableModel()
         self.result_model = SearchResultTableModel()
@@ -115,25 +118,34 @@ class ContentBrowserPage(QWidget):
             Qt.AlignmentFlag.AlignLeft,
         )
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setObjectName("contentSplitter")
-        splitter.addWidget(self._build_dialog_panel())
-        splitter.addWidget(self._build_search_panel())
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([260, 760])
-        root.addWidget(splitter, 1)
+        self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.content_splitter.setObjectName("contentSplitter")
 
-        self.error_label = QLabel("")
-        self.error_label.setObjectName("errorText")
-        self.error_label.setWordWrap(True)
-        self.error_label.hide()
-        root.addWidget(self.error_label)
+        self.dialog_column = QWidget()
+        self.dialog_column.setObjectName("accountContentDialogColumn")
+        dialog_column_layout = QVBoxLayout(self.dialog_column)
+        dialog_column_layout.setContentsMargins(16, 16, 16, 16)
+        self.dialog_card = self._build_dialog_panel()
+        dialog_column_layout.addWidget(self.dialog_card)
+        self.dialog_column.setMinimumWidth(242)
+        self.dialog_column.setMaximumWidth(302)
 
-    def _build_dialog_panel(self) -> QWidget:
+        self.search_column = self._build_search_panel()
+        self.search_column.setMinimumWidth(680)
+        self.content_splitter.addWidget(self.dialog_column)
+        self.content_splitter.addWidget(self.search_column)
+        self.content_splitter.setStretchFactor(0, 0)
+        self.content_splitter.setStretchFactor(1, 1)
+        self.content_splitter.setSizes([262, 758])
+        for card in (self.dialog_card, self.filter_card, self.results_card):
+            apply_elevation(card, ElevationLevel.MAJOR)
+        root.addWidget(self.content_splitter, 1)
+
+    def _build_dialog_panel(self) -> QFrame:
         panel = QFrame()
-        panel.setObjectName("contentPanel")
-        panel.setMinimumWidth(230)
+        panel.setObjectName("elevatedCard")
+        panel.setMinimumWidth(210)
+        panel.setMaximumWidth(270)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
@@ -162,12 +174,28 @@ class ContentBrowserPage(QWidget):
         self.dialog_list = QListView()
         self.dialog_list.setModel(self.dialog_model)
         self.dialog_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.dialog_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.dialog_list.setTextElideMode(Qt.TextElideMode.ElideRight)
         layout.addWidget(self.dialog_list, 1)
         return panel
 
     def _build_search_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setObjectName("accountContentSearchColumn")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+        self.filter_card = self._build_filter_card()
+        self.results_card = self._build_results_card()
+        layout.addWidget(self.filter_card)
+        layout.addWidget(self.results_card, 1)
+        return panel
+
+    def _build_filter_card(self) -> QFrame:
         panel = QFrame()
-        panel.setObjectName("contentPanel")
+        panel.setObjectName("elevatedCard")
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
@@ -191,24 +219,29 @@ class ContentBrowserPage(QWidget):
         query_row.addWidget(self.cancel_button)
         layout.addLayout(query_row)
 
-        filter_row = QHBoxLayout()
-        filter_row.addWidget(QLabel("开始日期"))
+        filter_grid = QGridLayout()
+        filter_grid.setContentsMargins(0, 0, 0, 0)
+        filter_grid.setHorizontalSpacing(8)
+        filter_grid.addWidget(QLabel("开始日期"), 0, 0)
         self.date_from = QDateEdit(QDate.currentDate().addDays(-7))
         self.date_from.setCalendarPopup(True)
         self.date_from.setDisplayFormat("yyyy-MM-dd")
-        filter_row.addWidget(self.date_from)
-        filter_row.addWidget(QLabel("结束日期（含）"))
+        self.date_from.setMinimumWidth(132)
+        filter_grid.addWidget(self.date_from, 0, 1)
+        filter_grid.addWidget(QLabel("结束日期（含）"), 0, 2)
         self.date_to = QDateEdit(QDate.currentDate())
         self.date_to.setCalendarPopup(True)
         self.date_to.setDisplayFormat("yyyy-MM-dd")
-        filter_row.addWidget(self.date_to)
-        filter_row.addWidget(QLabel("数量上限"))
+        self.date_to.setMinimumWidth(132)
+        filter_grid.addWidget(self.date_to, 0, 3)
+        filter_grid.addWidget(QLabel("数量上限"), 0, 4)
         self.limit_input = QSpinBox()
         self.limit_input.setRange(1, 10_000)
         self.limit_input.setValue(500)
-        filter_row.addWidget(self.limit_input)
-        filter_row.addStretch()
-        layout.addLayout(filter_row)
+        self.limit_input.setMinimumWidth(90)
+        filter_grid.addWidget(self.limit_input, 0, 5)
+        filter_grid.setColumnStretch(6, 1)
+        layout.addLayout(filter_grid)
 
         media_row = QHBoxLayout()
         media_row.addWidget(QLabel("媒体类型"))
@@ -231,24 +264,54 @@ class ContentBrowserPage(QWidget):
         self.search_progress.hide()
         layout.addWidget(self.search_progress)
 
+        self.error_label = QLabel("", panel)
+        self.error_label.setObjectName("errorText")
+        self.error_label.setWordWrap(True)
+        self.error_label.hide()
+        layout.addWidget(self.error_label)
+        return panel
+
+    def _build_results_card(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("elevatedCard")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
         self.tabs = QTabWidget()
         self.results_tab = QWidget()
+        self.results_tab.setObjectName("accountContentTabPage")
         results_layout = QVBoxLayout(self.results_tab)
         results_layout.setContentsMargins(0, 8, 0, 0)
         self.result_table = QTableView()
         self.result_table.setModel(self.result_model)
         self._configure_table(self.result_table)
-        self.result_table.setIconSize(QSize(112, 84))
-        self.result_table.verticalHeader().setDefaultSectionSize(96)
+        self.selection_delegate = FullCellCheckDelegate(self.result_table)
+        self.result_table.setItemDelegateForColumn(
+            0,
+            self.selection_delegate,
+        )
+        self.result_table.setIconSize(QSize(88, 60))
+        self.result_table.verticalHeader().setDefaultSectionSize(78)
+        self.result_table.setWordWrap(False)
+        self.result_table.setTextElideMode(Qt.TextElideMode.ElideRight)
         result_header = self.result_table.horizontalHeader()
-        result_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        result_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self.result_table.setColumnWidth(1, 124)
-        for column in (0, 2, 3, 5, 6, 7):
+        result_header.setMinimumSectionSize(40)
+        for column, width in {
+            0: 52,
+            1: 96,
+            2: 132,
+            3: 92,
+            5: 58,
+            6: 82,
+            7: 64,
+        }.items():
             result_header.setSectionResizeMode(
                 column,
-                QHeaderView.ResizeMode.ResizeToContents,
+                QHeaderView.ResizeMode.Fixed,
             )
+            self.result_table.setColumnWidth(column, width)
+        result_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         results_layout.addWidget(self.result_table, 1)
         self.load_more_button = QPushButton("加载更多")
         results_layout.addWidget(
@@ -258,6 +321,7 @@ class ContentBrowserPage(QWidget):
         )
 
         self.history_tab = QWidget()
+        self.history_tab.setObjectName("accountContentTabPage")
         history_layout = QVBoxLayout(self.history_tab)
         history_layout.setContentsMargins(0, 8, 0, 0)
         self.history_table = QTableView()

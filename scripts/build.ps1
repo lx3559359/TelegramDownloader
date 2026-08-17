@@ -17,6 +17,12 @@ $work = Assert-ProjectChild (Join-Path $projectRoot 'build')
 $dist = Assert-ProjectChild (Join-Path $projectRoot 'dist')
 $buildProfile = Assert-ProjectChild (Join-Path $buildTemp 'build-user-profile')
 $existingAppDir = Assert-ProjectChild (Join-Path $dist 'TelegramDownloader')
+$helperOutput = Assert-ProjectChild (Join-Path $dist 'UpdateHelper.exe')
+$ownedBuildOutputs = @(
+    $work,
+    $existingAppDir,
+    $helperOutput
+)
 $preservationRoot = Assert-ProjectChild (Join-Path $buildTemp (
     'build-runtime-preservation-' + [Guid]::NewGuid().ToString('N')
 ))
@@ -73,19 +79,19 @@ foreach ($runtimeData in ('data', 'downloads')) {
 }
 
 try {
-    foreach ($directory in ($work, $dist)) {
-        if (Test-Path -LiteralPath $directory) {
-            Remove-Item -LiteralPath $directory -Recurse -Force
+    foreach ($ownedOutput in $ownedBuildOutputs) {
+        if (Test-Path -LiteralPath $ownedOutput) {
+            Remove-Item -LiteralPath $ownedOutput -Recurse -Force
         }
-        New-Item -ItemType Directory -Force -Path $directory | Out-Null
     }
+    New-Item -ItemType Directory -Force -Path $work, $dist | Out-Null
 
     $python = Join-Path $projectRoot '.venv\Scripts\python.exe'
     & $python -m PyInstaller --noconfirm --clean --workpath $work --distpath $dist (Join-Path $projectRoot 'TelegramDownloader.spec')
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     $appDir = Assert-ProjectChild (Join-Path $dist 'TelegramDownloader')
-    $helperExe = Assert-ProjectChild (Join-Path $dist 'UpdateHelper.exe')
+    $helperExe = $helperOutput
     if (-not (Test-Path -LiteralPath $helperExe -PathType Leaf)) {
         throw "Packaged update helper missing: $helperExe"
     }

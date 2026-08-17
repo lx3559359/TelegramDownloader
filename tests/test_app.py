@@ -3,6 +3,7 @@ from datetime import UTC, date, datetime
 from inspect import getsource, isawaitable
 from types import SimpleNamespace
 
+import pytest
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QMessageBox
 
@@ -18,7 +19,13 @@ from telegram_downloader.content import (
 )
 from telegram_downloader.content_browser import ContentBrowserService
 from telegram_downloader.domain import MediaKind
+from telegram_downloader.file_integrity import FileIntegrityService
+from telegram_downloader.gateway import (
+    AuthorizationFailureReason,
+    SessionExpiredError,
+)
 from telegram_downloader.paths import PortablePaths
+from telegram_downloader.settings import AppSettings
 from telegram_downloader.subscription_scheduler import SubscriptionScheduler
 from telegram_downloader.subscription_service import SubscriptionService
 from telegram_downloader.subscriptions import SubscriptionRule, SubscriptionState
@@ -156,11 +163,15 @@ def test_create_application_initializes_project_local_content_services(
         assert isinstance(controller.subscription_scheduler, SubscriptionScheduler)
         assert controller.window.subscriptions_page is not None
         assert isinstance(controller.connection_recovery, ConnectionRecovery)
+        assert isinstance(controller.integrity_service, FileIntegrityService)
+        assert controller.integrity_service.paths.root == tmp_path.resolve()
         slot_names = {getattr(slot, "__name__", "") for slot in controller._ui_slots}
         assert "content_preview_requested" in slot_names
         assert "subscription_probe_requested" in slot_names
         assert controller._async_actions.active_keys == frozenset()
-        assert len(controller._async_actions._slots) == 10
+        assert len(controller._async_actions._slots) == 15
+        assert controller.diagnostics is not None
+        assert controller.diagnostic_store.paths.root == tmp_path.resolve()
         controller.window.content_page.link_requested.emit("https://t.me/example/1#fragment")
         assert controller.window.content_page.error_label.text() == ("请输入有效的 t.me 链接")
 
@@ -178,6 +189,21 @@ def test_create_application_initializes_project_local_content_services(
         loop.run_until_complete(emit_probe())
         assert probe_calls == ["rule-1"]
         assert controller._async_actions.active_keys == frozenset()
+
+        auth_events: list[AuthorizationFailureReason] = []
+
+        async def record_expiry(error: SessionExpiredError) -> None:
+            auth_events.append(error.reason)
+
+        controller._handle_session_expired = record_expiry
+        loop.run_until_complete(
+            controller.subscription_scheduler.on_session_expired(
+                SessionExpiredError(
+                    reason=AuthorizationFailureReason.SESSION_REVOKED
+                )
+            )
+        )
+        assert auth_events == [AuthorizationFailureReason.SESSION_REVOKED]
 
         report = app.run_self_test(tmp_path)
         for value in report["writable_paths"].values():
@@ -217,6 +243,42 @@ def test_account_search_signal_reaches_controller_with_typed_scope(tmp_path) -> 
         assert calls == [
             (SearchScope.ALL_DIALOGS, ALL_DIALOGS_SCOPE_REF, "安装")
         ]
+    finally:
+        loop.run_until_complete(controller._async_actions.shutdown())
+        controller.window.close()
+        loop.close()
+        application.processEvents()
+
+
+@pytest.mark.asyncio
+async def test_telegram_health_uses_retained_authorization_reason() -> None:
+    controller = SimpleNamespace(
+        gateway=None,
+        last_authorization_failure_reason=(
+            AuthorizationFailureReason.AUTH_KEY_DUPLICATED
+        ),
+    )
+
+    result = await app._telegram_health(controller)
+
+    assert result.code == "telegram-session-expired"
+    assert result.metrics == {
+        "authorizationReason": "auth-key-duplicated"
+    }
+
+
+def test_service_builder_shares_runtime_download_resource_settings(tmp_path) -> None:
+    application, loop, controller = app.create_application(tmp_path)
+    settings = AppSettings(concurrency=4, speed_limit_kib=2048)
+
+    try:
+        planner, scheduler, content = controller.service_builder(object(), settings)
+
+        assert planner is not None
+        assert content is controller.content_browser
+        assert scheduler.snapshot().concurrency == 4
+        assert scheduler.snapshot().speed_limit_kib == 2048
+        assert scheduler.downloader.bandwidth is scheduler._bandwidth
     finally:
         loop.run_until_complete(controller._async_actions.shutdown())
         controller.window.close()
@@ -383,9 +445,11 @@ def test_task_management_signals_route_sync_and_async_actions(
 
     monkeypatch.setattr(controller, "select_task_details", record_sync("select"))
     monkeypatch.setattr(controller, "pause_tasks", record_sync("pause"))
+    monkeypatch.setattr(controller, "prioritize_task", record_sync("priority"))
     monkeypatch.setattr(controller, "archive_tasks", record_sync("archive"))
     monkeypatch.setattr(controller, "restore_tasks", record_sync("restore"))
     monkeypatch.setattr(controller, "open_media_file", record_sync("open"))
+    monkeypatch.setattr(controller, "cancel_integrity", lambda: calls.append(("cancel", None)))
     monkeypatch.setattr(
         controller,
         "resume_tasks",
@@ -396,16 +460,39 @@ def test_task_management_signals_route_sync_and_async_actions(
         "retry_failed_tasks",
         lambda value: record_async("retry", value),
     )
+    monkeypatch.setattr(
+        controller,
+        "verify_media",
+        lambda value: record_async("verify_media", value),
+    )
+    monkeypatch.setattr(
+        controller,
+        "verify_tasks",
+        lambda value: record_async("verify_tasks", value),
+    )
+    monkeypatch.setattr(
+        controller,
+        "repair_media",
+        lambda value: record_async("repair_media", value),
+    )
 
     async def emit_actions() -> None:
         controller.window.task_selection_changed.emit(["one"])
         controller.window.pause_tasks_requested.emit(["one", "two"])
+        controller.window.prioritize_task_requested.emit("queued")
         controller.window.archive_tasks_requested.emit(["done"])
         controller.window.restore_tasks_requested.emit(["old"])
         controller.window.open_media_requested.emit("media")
         controller.window.resume_tasks_requested.emit(["paused"])
         controller.window.retry_tasks_requested.emit(["failed"])
         await controller._async_actions.wait_idle()
+        controller.window.verify_media_requested.emit(["media"])
+        await controller._async_actions.wait_idle()
+        controller.window.verify_tasks_requested.emit(["done"])
+        await controller._async_actions.wait_idle()
+        controller.window.repair_media_requested.emit(["broken"])
+        await controller._async_actions.wait_idle()
+        controller.window.integrity_cancel_requested.emit()
 
     try:
         loop.run_until_complete(emit_actions())
@@ -413,16 +500,24 @@ def test_task_management_signals_route_sync_and_async_actions(
         assert calls == [
             ("select", ["one"]),
             ("pause", ["one", "two"]),
+            ("priority", "queued"),
             ("archive", ["done"]),
             ("restore", ["old"]),
             ("open", "media"),
             ("resume", ["paused"]),
             ("retry", ["failed"]),
+            ("verify_media", ["media"]),
+            ("verify_tasks", ["done"]),
+            ("repair_media", ["broken"]),
+            ("cancel", None),
         ]
         slot_names = {getattr(slot, "__name__", "") for slot in controller._ui_slots}
         assert "task_selection_changed" in slot_names
         assert "resume_tasks_requested" in slot_names
         assert "retry_tasks_requested" in slot_names
+        assert "verify_media_requested" in slot_names
+        assert "verify_tasks_requested" in slot_names
+        assert "repair_media_requested" in slot_names
     finally:
         loop.run_until_complete(controller._async_actions.shutdown())
         controller.window.close()
@@ -458,6 +553,38 @@ def test_repeated_task_resume_clicks_share_one_async_action(
         loop.run_until_complete(emit_actions())
         assert calls == [["paused"]]
         assert controller._async_actions.active_keys == frozenset()
+    finally:
+        loop.run_until_complete(controller._async_actions.shutdown())
+        controller.window.close()
+        loop.close()
+        application.processEvents()
+
+
+def test_repeated_diagnostics_clicks_share_one_async_action(tmp_path, monkeypatch) -> None:
+    application, loop, controller = app.create_application(tmp_path)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def run_diagnostics() -> None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(controller, "run_diagnostics", run_diagnostics)
+
+    async def emit_actions() -> None:
+        controller.window.diagnostics_page.run_requested.emit()
+        await started.wait()
+        controller.window.diagnostics_page.run_requested.emit()
+        assert controller._async_actions.active_keys == frozenset({"diagnostics.run"})
+        release.set()
+        await controller._async_actions.wait_idle()
+
+    try:
+        loop.run_until_complete(emit_actions())
+        assert calls == 1
     finally:
         loop.run_until_complete(controller._async_actions.shutdown())
         controller.window.close()

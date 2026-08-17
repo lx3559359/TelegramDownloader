@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import mimetypes
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -76,8 +76,24 @@ class GatewayError(RuntimeError):
     pass
 
 
+class AuthorizationFailureReason(StrEnum):
+    AUTH_KEY_DUPLICATED = "auth-key-duplicated"
+    AUTH_KEY_INVALID = "auth-key-invalid"
+    AUTH_KEY_UNREGISTERED = "auth-key-unregistered"
+    SESSION_REVOKED = "session-revoked"
+    NOT_AUTHORIZED = "not-authorized"
+    UNKNOWN = "unknown"
+
+
 class SessionExpiredError(GatewayError):
-    pass
+    def __init__(
+        self,
+        message: str = "Telegram 登录已失效，请重新扫码登录",
+        *,
+        reason: AuthorizationFailureReason = AuthorizationFailureReason.UNKNOWN,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class AccessDeniedError(GatewayError):
@@ -247,12 +263,19 @@ class TelethonGateway:
         )
         self._password_needed_error: type[BaseException] = errors.SessionPasswordNeededError
         self._flood_wait_error: type[BaseException] = errors.FloodWaitError
-        self._authorization_errors: tuple[type[BaseException], ...] = (
-            errors.AuthKeyDuplicatedError,
-            errors.AuthKeyInvalidError,
-            errors.AuthKeyUnregisteredError,
-            errors.SessionRevokedError,
-        )
+        self._authorization_error_reasons: dict[
+            type[BaseException], AuthorizationFailureReason
+        ] = {
+            errors.AuthKeyDuplicatedError: (
+                AuthorizationFailureReason.AUTH_KEY_DUPLICATED
+            ),
+            errors.AuthKeyInvalidError: AuthorizationFailureReason.AUTH_KEY_INVALID,
+            errors.AuthKeyUnregisteredError: (
+                AuthorizationFailureReason.AUTH_KEY_UNREGISTERED
+            ),
+            errors.SessionRevokedError: AuthorizationFailureReason.SESSION_REVOKED,
+        }
+        self._authorization_errors = tuple(self._authorization_error_reasons)
         self._reference_expired_errors: tuple[type[BaseException], ...] = (
             errors.FileReferenceExpiredError,
         )
@@ -287,6 +310,10 @@ class TelethonGateway:
         password_needed_error: type[BaseException] = _NoTelethonError,
         flood_wait_error: type[BaseException] = _NoTelethonError,
         authorization_errors: tuple[type[BaseException], ...] = (),
+        authorization_error_reasons: Mapping[
+            type[BaseException], AuthorizationFailureReason
+        ]
+        | None = None,
         reference_expired_errors: tuple[type[BaseException], ...] = (),
         access_errors: tuple[type[BaseException], ...] = (),
         transient_errors: tuple[type[BaseException], ...] = (
@@ -304,6 +331,13 @@ class TelethonGateway:
         gateway._client = client
         gateway._password_needed_error = password_needed_error
         gateway._flood_wait_error = flood_wait_error
+        gateway._authorization_error_reasons = dict(
+            authorization_error_reasons
+            or {
+                error_type: AuthorizationFailureReason.UNKNOWN
+                for error_type in authorization_errors
+            }
+        )
         gateway._authorization_errors = authorization_errors
         gateway._reference_expired_errors = reference_expired_errors
         gateway._access_errors = access_errors
@@ -524,7 +558,9 @@ class TelethonGateway:
         try:
             await self._client.connect()
             if await self._client.get_me() is None:
-                raise GatewayError("Telegram 账号尚未登录")
+                raise SessionExpiredError(
+                    reason=AuthorizationFailureReason.NOT_AUTHORIZED
+                )
         except GatewayError:
             raise
         except Exception as exc:
@@ -968,10 +1004,11 @@ class TelethonGateway:
         raise AccessDeniedError("当前账号未加入该私有频道或群组")
 
     def _raise_mapped(self, error: Exception) -> None:
+        for error_type, reason in self._authorization_error_reasons.items():
+            if isinstance(error, error_type):
+                raise SessionExpiredError(reason=reason) from error
         if isinstance(error, self._authorization_errors):
-            raise SessionExpiredError(
-                "Telegram 登录已失效，请重新扫码登录"
-            ) from error
+            raise SessionExpiredError() from error
         if isinstance(error, self._flood_wait_error):
             raise FloodWaitError(max(1, int(getattr(error, "seconds", 1)))) from error
         if isinstance(error, self._reference_expired_errors):

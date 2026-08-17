@@ -9,6 +9,7 @@ from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from pathlib import Path
+from threading import Event
 from time import monotonic as monotonic_clock
 from typing import Any
 
@@ -17,13 +18,20 @@ from telegram_downloader.content import ContentSearchQuery, SearchResult, Search
 from telegram_downloader.content_browser import NothingToQueueError
 from telegram_downloader.content_progress import DialogSyncProgress, SearchProgress
 from telegram_downloader.domain import (
+    IntegrityStatus,
     ItemStatus,
     MediaKind,
     ScanFilters,
     SourceKind,
     TaskStatus,
 )
+from telegram_downloader.file_integrity import (
+    IntegrityProgress,
+    IntegritySummary,
+    RepairPreparation,
+)
 from telegram_downloader.gateway import (
+    AuthorizationFailureReason,
     AuthState,
     GatewayError,
     SessionExpiredError,
@@ -32,6 +40,7 @@ from telegram_downloader.gateway import (
 )
 from telegram_downloader.links import InvalidTelegramLink, parse_telegram_link
 from telegram_downloader.paths import PortablePaths
+from telegram_downloader.scheduler import SchedulerSnapshot
 from telegram_downloader.settings import AppSettings, ProxySettings
 from telegram_downloader.subscriptions import SubscriptionDraft
 from telegram_downloader.ui.models import TaskItemSummary, TaskSummary
@@ -83,10 +92,26 @@ class _NullWindow:
     def set_task_summaries(self, value: list[TaskSummary]) -> None:
         self.tasks = value
 
+    def set_scheduler_summary(
+        self,
+        *,
+        active: int,
+        queued: int,
+        concurrency: int,
+        speed_limit_kib: int,
+    ) -> None:
+        pass
+
     def set_task_items(self, _task_id: str, _items: list[TaskItemSummary]) -> None:
         pass
 
     def set_scan_busy(self, _busy: bool) -> None:
+        pass
+
+    def set_integrity_busy(self, _busy: bool) -> None:
+        pass
+
+    def set_integrity_progress(self, _progress: IntegrityProgress | None) -> None:
         pass
 
     def statusBar(self) -> _NullStatusBar:
@@ -228,6 +253,22 @@ class _NullSubscriptionPage:
         pass
 
 
+class _NullDiagnosticsPage:
+    report = None
+
+    def set_report(self, report: object | None, *, historical: bool) -> None:
+        self.report = report
+
+    def set_progress(self, _progress: object | None) -> None:
+        pass
+
+    def set_running(self, _running: bool) -> None:
+        pass
+
+    def show_error(self, _message: str) -> None:
+        pass
+
+
 class _NullRepository:
     def list_task_snapshots(self, *, include_archived: bool = False) -> list[object]:
         return []
@@ -255,11 +296,43 @@ class _NullScheduler:
     async def resume_task(self, _task_id: str) -> None:
         pass
 
+    async def run_items(self, _task_id: str, _item_ids: list[str]) -> None:
+        pass
+
     def pause_task(self, _task_id: str) -> None:
+        pass
+
+    def snapshot(self) -> SchedulerSnapshot:
+        return SchedulerSnapshot(None, (), 3, 0)
+
+    def queue_positions(self) -> dict[str, int]:
+        return {}
+
+    def is_active(self, _task_id: str) -> bool:
+        return False
+
+    def prioritize_task(self, _task_id: str) -> bool:
+        return False
+
+    def configure_resources(self, _concurrency: int, _speed_limit_kib: int) -> None:
         pass
 
     async def shutdown(self) -> None:
         pass
+
+
+class _NullIntegrityService:
+    async def verify(
+        self,
+        _item_ids: list[str],
+        *,
+        progress=None,
+        cancelled=None,
+    ) -> IntegritySummary:
+        return IntegritySummary()
+
+    def prepare_repairs(self, _item_ids: list[str]) -> RepairPreparation:
+        return RepairPreparation()
 
 
 class _NullSubscriptionService:
@@ -316,10 +389,13 @@ class AppController:
         content_browser: Any | None = None,
         subscriptions: Any | None = None,
         subscription_scheduler: Any | None = None,
+        integrity_service: Any | None = None,
+        diagnostics: Any | None = None,
+        diagnostic_store: Any | None = None,
         paths: PortablePaths | None = None,
         gateway_factory: Callable[..., TelegramGateway] | None = None,
         service_builder: Callable[
-            [TelegramGateway, int],
+            [TelegramGateway, AppSettings],
             tuple[Any, Any, Any],
         ]
         | None = None,
@@ -349,6 +425,10 @@ class AppController:
         self.content_browser = content_browser
         self.subscriptions = subscriptions or _NullSubscriptionService()
         self.subscription_scheduler = subscription_scheduler or _NullSubscriptionScheduler()
+        self.integrity_service = integrity_service or _NullIntegrityService()
+        self.diagnostics = diagnostics
+        self.diagnostic_store = diagnostic_store
+        self._diagnostic_report: Any | None = None
         self.paths = paths
         self.gateway_factory = gateway_factory
         self.service_builder = service_builder
@@ -376,9 +456,18 @@ class AppController:
         self._subscription_probe_task: asyncio.Task[Any] | None = None
         self._subscription_actions_active = 0
         self._thumbnail_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._integrity_task: asyncio.Task[Any] | None = None
+        self._integrity_cancel_event: Event | None = None
+        self._integrity_repair_task_ids: set[str] = set()
+        self._detail_task_id: str | None = None
         self._progress_refresh_interval = progress_refresh_interval
         self._next_progress_refresh = 0.0
         self._progress_samples: dict[str, tuple[float, int]] = {}
+        self._session_expiry_lock = asyncio.Lock()
+        self._session_expiry_handled = False
+        self._last_authorization_failure_reason: (
+            AuthorizationFailureReason | None
+        ) = None
 
     @classmethod
     def for_test(cls, **dependencies) -> AppController:
@@ -396,6 +485,9 @@ class AppController:
             content_browser=dependencies.pop("content_browser", None),
             subscriptions=dependencies.pop("subscriptions", None),
             subscription_scheduler=dependencies.pop("subscription_scheduler", None),
+            integrity_service=dependencies.pop("integrity_service", None),
+            diagnostics=dependencies.pop("diagnostics", None),
+            diagnostic_store=dependencies.pop("diagnostic_store", None),
             paths=dependencies.pop("paths", None),
             gateway_factory=dependencies.pop("gateway_factory", None),
             service_builder=dependencies.pop("service_builder", None),
@@ -420,31 +512,40 @@ class AppController:
             self.show_login()
             return False
 
-        if self._gateway_is_connected(self.gateway):
-            page.set_logged_in(True)
-            page.set_connection_state("连接正常", retryable=False)
-            return True
+        recovered = False
 
         def attempt(value: tuple[int, int]) -> None:
             number, total = value
             text = "正在连接 Telegram…" if number == 1 else f"正在重连（{number}/{total}）…"
             page.set_connection_state(text, retryable=False)
 
+        if not self._gateway_is_connected(self.gateway):
+            try:
+                await self.connection_recovery.ensure_connected(
+                    self.gateway,
+                    attempt,
+                )
+                recovered = True
+            except SessionExpiredError as error:
+                await self._handle_session_expired(error)
+                return False
+            except TransientNetworkError:
+                self._show_connection_retryable(page)
+                return False
+            except Exception as error:
+                safe = self._safe_error(error)
+                page.set_logged_in(False)
+                page.set_connection_state(f"连接失败：{safe}", retryable=True)
+                self._show_status(f"Telegram 连接失败：{safe}")
+                return False
+
         try:
-            await self.connection_recovery.ensure_connected(
-                self.gateway,
-                attempt,
-            )
+            await self._verify_gateway_authorized(self.gateway)
         except SessionExpiredError as error:
             await self._handle_session_expired(error)
             return False
         except TransientNetworkError:
-            page.set_logged_in(False)
-            page.set_connection_state(
-                "重连失败，请检查网络或代理后重试",
-                retryable=True,
-            )
-            self._show_status("Telegram 重连失败，请检查网络或代理")
+            self._show_connection_retryable(page)
             return False
         except Exception as error:
             safe = self._safe_error(error)
@@ -454,9 +555,27 @@ class AppController:
             return False
 
         page.set_logged_in(True)
-        page.set_connection_state("连接已恢复", retryable=False)
-        self._resume_subscriptions_after_connection()
+        page.set_connection_state(
+            "连接已恢复" if recovered else "连接正常",
+            retryable=False,
+        )
+        if recovered:
+            self._resume_subscriptions_after_connection()
         return True
+
+    @staticmethod
+    async def _verify_gateway_authorized(gateway: object) -> None:
+        method = getattr(gateway, "test_connection", None)
+        if callable(method):
+            await method()
+
+    def _show_connection_retryable(self, page: object) -> None:
+        page.set_logged_in(False)
+        page.set_connection_state(
+            "重连失败，请检查网络或代理后重试",
+            retryable=True,
+        )
+        self._show_status("Telegram 重连失败，请检查网络或代理")
 
     def _resume_subscriptions_after_connection(self) -> None:
         account = getattr(self.subscriptions, "account", None)
@@ -506,9 +625,17 @@ class AppController:
                 return
             self.window.set_account(name)
             await self.activate_content_account()
-            for task in self.repository.list_tasks():
-                if task.status is TaskStatus.QUEUED:
-                    self._start_task(task.id)
+            list_queued = getattr(self.repository, "list_queued_for_dispatch", None)
+            if callable(list_queued):
+                queued_tasks = list_queued()
+            else:
+                queued_tasks = [
+                    task
+                    for task in self.repository.list_tasks()
+                    if task.status is TaskStatus.QUEUED
+                ]
+            for task in queued_tasks:
+                self._start_task(task.id)
         except SessionExpiredError as error:
             await self._handle_session_expired(error)
         except Exception as error:
@@ -572,7 +699,7 @@ class AppController:
             if self.service_builder is not None:
                 services = self.service_builder(
                     gateway,
-                    updated_settings.concurrency,
+                    updated_settings,
                 )
                 if len(services) == 3:
                     self.planner, self.scheduler, self.content_browser = services
@@ -1304,6 +1431,80 @@ class AppController:
             )
         )
 
+    def activate_diagnostics(self) -> None:
+        page = self._diagnostics_page()
+        if self.diagnostic_store is None:
+            page.set_report(None, historical=True)
+            return
+        try:
+            report = self.diagnostic_store.load_latest()
+        except Exception:
+            page.show_error("无法读取上次诊断报告")
+            return
+        self._diagnostic_report = report
+        page.set_report(report, historical=True)
+
+    async def run_diagnostics(self) -> None:
+        page = self._diagnostics_page()
+        if self.diagnostics is None or self.diagnostic_store is None:
+            page.show_error("健康诊断服务不可用")
+            return
+        page.set_running(True)
+        page.set_progress(None)
+        try:
+            report = await self.diagnostics.run(page.set_progress)
+            register = getattr(self.diagnostic_store, "register_secrets", None)
+            if callable(register):
+                register(self.secrets.values())
+            self.diagnostic_store.save(report)
+            self._diagnostic_report = report
+            page.set_report(report, historical=False)
+            self._show_status("健康诊断已完成")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            page.show_error(f"健康诊断失败（{type(error).__name__}）")
+        finally:
+            page.set_running(False)
+
+    async def cancel_diagnostics(self) -> None:
+        if self.diagnostics is not None:
+            await self.diagnostics.cancel()
+
+    def export_diagnostics(self) -> None:
+        page = self._diagnostics_page()
+        if self.diagnostic_store is None:
+            page.show_error("诊断导出服务不可用")
+            return
+        report = self._diagnostic_report or getattr(page, "report", None)
+        if report is None:
+            page.show_error("请先完成一次健康诊断")
+            return
+        try:
+            register = getattr(self.diagnostic_store, "register_secrets", None)
+            if callable(register):
+                register(self.secrets.values())
+            package = self.diagnostic_store.export(report)
+        except Exception as error:
+            page.show_error(f"诊断包导出失败（{type(error).__name__}）")
+            return
+        self._show_status(f"诊断包已导出：{package.name}")
+
+    def open_diagnostics_directory(self) -> None:
+        page = self._diagnostics_page()
+        if self.paths is None:
+            page.show_error("诊断目录不可用")
+            return
+        try:
+            directory = self.paths.guard(self.paths.diagnostics)
+            directory.mkdir(parents=True, exist_ok=True)
+            startfile = getattr(os, "startfile", None)
+            if startfile is not None:
+                startfile(directory)
+            self._show_status("诊断目录已打开")
+        except (OSError, ValueError):
+            page.show_error("Windows 无法打开诊断目录")
+
     async def test_proxy(self, proxy: ProxySettings, password: str) -> None:
         api_hash = self.secrets.get("api_hash", "")
         if self.gateway_factory is None or self.settings.api_id <= 0 or not api_hash:
@@ -1320,6 +1521,10 @@ class AppController:
                 await probe.disconnect()
 
     def apply_settings(self, settings: AppSettings, proxy_password: str) -> None:
+        connection_changed = (
+            settings.api_id != self.settings.api_id
+            or settings.proxy != self.settings.proxy
+        )
         updated_secrets = dict(self.secrets)
         if proxy_password:
             updated_secrets["proxy_password"] = proxy_password
@@ -1329,7 +1534,13 @@ class AppController:
         self.vault.save(updated_secrets)
         self.settings = settings
         self.secrets = updated_secrets
-        self._show_status("设置已保存；代理变更将在下次连接时生效")
+        configure = getattr(self.scheduler, "configure_resources", None)
+        if callable(configure):
+            configure(settings.concurrency, settings.speed_limit_kib)
+        message = "设置已保存；下载资源设置已即时应用"
+        if connection_changed:
+            message += "，API/代理变更将在下次连接时生效"
+        self._show_status(message)
 
     def pause_task(self, task_id: str) -> None:
         self.pause_tasks([task_id])
@@ -1358,6 +1569,33 @@ class AppController:
             accepted += 1
         self.refresh_tasks()
         self._show_status(f"已暂停 {accepted} 个任务，跳过 {len(unique) - accepted} 个")
+
+    def prioritize_task(self, task_id: str) -> None:
+        try:
+            task = self.repository.get_task(task_id)
+        except KeyError:
+            self._show_status("任务不存在或已被移除")
+            return
+        if task.archived_at is not None or task.status is not TaskStatus.QUEUED:
+            self._show_status("任务已经开始下载或状态已变化")
+            return
+
+        prioritize = getattr(self.repository, "prioritize_task", None)
+        persisted = bool(prioritize(task_id)) if callable(prioritize) else False
+        reordered = self.scheduler.prioritize_task(task_id) if persisted else False
+        if not reordered:
+            clear_priority = getattr(self.repository, "clear_task_priority", None)
+            if callable(clear_priority):
+                clear_priority(task_id)
+        self.refresh_tasks()
+        if reordered:
+            position = self.scheduler.queue_positions().get(task_id)
+            if position is not None:
+                self._show_status(f"已将任务移到等待队列第 {position} 位")
+                return
+            self._show_status("已将任务设为优先下载")
+            return
+        self._show_status("任务已经开始下载或状态已变化")
 
     async def resume_tasks(self, task_ids: list[str]) -> None:
         unique = self._unique_task_ids(task_ids)
@@ -1409,6 +1647,7 @@ class AppController:
     def select_task_details(self, task_ids: list[str]) -> None:
         unique = self._unique_task_ids(task_ids)
         if len(unique) != 1:
+            self._detail_task_id = None
             return
         task_id = unique[0]
         try:
@@ -1425,10 +1664,140 @@ class AppController:
                 item.expected_size,
                 item.retry_count,
                 item.last_error or "—",
+                getattr(
+                    item,
+                    "integrity_status",
+                    IntegrityStatus.UNVERIFIED,
+                ),
+                getattr(item, "verified_at", None),
             )
             for item in items
         ]
+        self._detail_task_id = task_id
         self.window.set_task_items(task_id, summaries)
+
+    async def verify_media(self, item_ids: list[str]) -> None:
+        unique = self._unique_task_ids(item_ids)
+        if not unique:
+            self._show_status("请先选择要校验的媒体")
+            return
+        await self._verify_integrity_items(unique)
+
+    async def verify_tasks(self, task_ids: list[str]) -> None:
+        item_ids: list[str] = []
+        for task_id in self._unique_task_ids(task_ids):
+            item_ids.extend(item.id for item in self.repository.list_items(task_id))
+        unique = self._unique_task_ids(item_ids)
+        if not unique:
+            self._show_status("所选任务没有可校验的媒体")
+            return
+        await self._verify_integrity_items(unique)
+
+    async def _verify_integrity_items(self, item_ids: list[str]) -> None:
+        operation = self._begin_integrity_operation()
+        if operation is None:
+            return
+        current, cancelled = operation
+        try:
+            summary = await self.integrity_service.verify(
+                item_ids,
+                progress=self.window.set_integrity_progress,
+                cancelled=cancelled,
+            )
+            self._show_status(self._integrity_summary_text(summary))
+        finally:
+            self._finish_integrity_operation(current)
+            self._refresh_integrity_views()
+
+    async def repair_media(self, item_ids: list[str]) -> None:
+        unique = self._unique_task_ids(item_ids)
+        if not unique:
+            self._show_status("请先选择要重新下载的异常媒体")
+            return
+        operation = self._begin_integrity_operation()
+        if operation is None:
+            return
+        current, _cancelled = operation
+        try:
+            prepared = await asyncio.to_thread(
+                self.integrity_service.prepare_repairs,
+                unique,
+            )
+            grouped: dict[str, list[str]] = {}
+            for item_id in prepared.accepted_ids:
+                item = self.repository.get_item(item_id)
+                grouped.setdefault(item.task_id, []).append(item_id)
+            if grouped:
+                self._integrity_repair_task_ids = set(grouped)
+                await asyncio.gather(
+                    *(
+                        self.scheduler.run_items(task_id, selected)
+                        for task_id, selected in grouped.items()
+                    )
+                )
+            repaired = [
+                self.repository.get_item(item_id)
+                for item_id in prepared.accepted_ids
+            ]
+            succeeded = sum(item.status is ItemStatus.COMPLETED for item in repaired)
+            failed = len(repaired) - succeeded
+            self._show_status(
+                "精准修复完成："
+                f"成功 {succeeded}，失败 {failed}，跳过 {prepared.skipped}"
+            )
+        finally:
+            self._finish_integrity_operation(current)
+            self._refresh_integrity_views()
+
+    def cancel_integrity(self) -> None:
+        event = self._integrity_cancel_event
+        if event is None:
+            return
+        event.set()
+        for task_id in sorted(self._integrity_repair_task_ids):
+            self.scheduler.pause_task(task_id)
+        self._show_status("正在取消文件校验…")
+
+    def _begin_integrity_operation(
+        self,
+    ) -> tuple[asyncio.Task[Any], Event] | None:
+        current = asyncio.current_task()
+        if current is None:
+            raise RuntimeError("完整性操作必须在异步任务中运行")
+        active = self._integrity_task
+        if active is not None and active is not current and not active.done():
+            self._show_status("已有文件完整性操作正在进行")
+            return None
+        cancelled = Event()
+        self._integrity_task = current
+        self._integrity_cancel_event = cancelled
+        self._integrity_repair_task_ids.clear()
+        self.window.set_integrity_busy(True)
+        return current, cancelled
+
+    def _finish_integrity_operation(self, current: asyncio.Task[Any]) -> None:
+        if self._integrity_task is not current:
+            return
+        self._integrity_task = None
+        self._integrity_cancel_event = None
+        self._integrity_repair_task_ids.clear()
+        self.window.set_integrity_progress(None)
+        self.window.set_integrity_busy(False)
+
+    def _refresh_integrity_views(self) -> None:
+        self.refresh_tasks()
+        if self._detail_task_id is not None:
+            self.select_task_details([self._detail_task_id])
+
+    @staticmethod
+    def _integrity_summary_text(summary: IntegritySummary) -> str:
+        prefix = "校验已取消" if summary.cancelled else "校验完成"
+        return (
+            f"{prefix}：通过 {summary.verified}，建立基线 {summary.baselined}，"
+            f"缺失 {summary.missing}，大小异常 {summary.size_mismatch}，"
+            f"哈希异常 {summary.hash_mismatch}，无法读取 {summary.read_error}，"
+            f"跳过 {summary.skipped}，取消 {summary.cancelled}"
+        )
 
     def open_media_file(self, item_id: str) -> None:
         if self.paths is None:
@@ -1438,9 +1807,21 @@ class AppController:
             if item.status is not ItemStatus.COMPLETED:
                 self._show_status("媒体尚未下载完成，不能打开文件")
                 return
+            if getattr(item, "integrity_status", IntegrityStatus.UNVERIFIED) in {
+                IntegrityStatus.MISSING,
+                IntegrityStatus.SIZE_MISMATCH,
+                IntegrityStatus.HASH_MISMATCH,
+                IntegrityStatus.READ_ERROR,
+            }:
+                self._show_status("媒体完整性异常，请先校验或重新下载")
+                return
             target = self.paths.guard(Path(item.target_path))
             if not target.is_file():
                 self._show_status("本地文件不存在；当前操作不会修改任务记录")
+                return
+            expected_size = getattr(item, "expected_size", None)
+            if expected_size is not None and target.stat().st_size != expected_size:
+                self._show_status("本地文件大小异常，请先校验或重新下载")
                 return
             startfile = getattr(os, "startfile", None)
             if startfile is not None:
@@ -1476,6 +1857,10 @@ class AppController:
         if self._shutting_down:
             return
         self._shutting_down = True
+        if self.diagnostics is not None:
+            with suppress(Exception):
+                await self.diagnostics.cancel()
+        await self._cancel_integrity_for_shutdown()
         await self._cancel_connection_monitor()
         await self._cancel_qr_wait()
         await self._cancel_subscription_probe()
@@ -1495,6 +1880,17 @@ class AppController:
         self.subscriptions.go_offline()
         self.subscription_scheduler.set_account(None)
 
+    async def _cancel_integrity_for_shutdown(self) -> None:
+        task = self._integrity_task
+        event = self._integrity_cancel_event
+        if event is not None:
+            event.set()
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
     async def _cancel_connection_monitor(self) -> None:
         task = self._connection_monitor_task
         self._connection_monitor_task = None
@@ -1508,6 +1904,21 @@ class AppController:
         sampled_at = monotonic_clock() if now is None else now
         summaries: list[TaskSummary] = []
         active_ids: set[str] = set()
+        snapshot_method = getattr(self.scheduler, "snapshot", None)
+        scheduler_state = (
+            snapshot_method()
+            if callable(snapshot_method)
+            else SchedulerSnapshot(
+                None,
+                (),
+                self.settings.concurrency,
+                self.settings.speed_limit_kib,
+            )
+        )
+        queue_positions_method = getattr(self.scheduler, "queue_positions", None)
+        queue_positions = (
+            queue_positions_method() if callable(queue_positions_method) else {}
+        )
         snapshots = self.repository.list_task_snapshots(include_archived=True)
         for snapshot in snapshots:
             task = snapshot.task
@@ -1544,6 +1955,9 @@ class AppController:
                     speed,
                     remaining_seconds,
                     archived,
+                    queue_positions.get(task.id)
+                    if task.status is TaskStatus.QUEUED and not archived
+                    else None,
                 )
             )
             if not archived and task.status is TaskStatus.DOWNLOADING:
@@ -1551,6 +1965,14 @@ class AppController:
         for task_id in set(self._progress_samples) - active_ids:
             self._progress_samples.pop(task_id, None)
         self.window.set_task_summaries(summaries)
+        set_scheduler_summary = getattr(self.window, "set_scheduler_summary", None)
+        if callable(set_scheduler_summary):
+            set_scheduler_summary(
+                active=1 if scheduler_state.active_task_id is not None else 0,
+                queued=scheduler_state.queued_count,
+                concurrency=scheduler_state.concurrency,
+                speed_limit_kib=scheduler_state.speed_limit_kib,
+            )
 
     def _sample_speed(
         self,
@@ -1611,6 +2033,8 @@ class AppController:
         self.secrets["session"] = session
         self.vault.save(self.secrets)
         name = await self._account_name() or "已登录"
+        self._session_expiry_handled = False
+        self._last_authorization_failure_reason = None
         self.window.set_account(name)
         self.phone = ""
         self.phone_code_hash = ""
@@ -1626,62 +2050,87 @@ class AppController:
         return await method()
 
     async def _handle_session_expired(self, error: SessionExpiredError) -> None:
-        await self.connection_recovery.cancel()
-        await self._cancel_subscription_probe()
-        await self._cancel_content_operations()
-        page = self._content_page()
-        if self.content_browser is not None:
-            go_offline = getattr(self.content_browser, "go_offline", None)
-            if go_offline is not None:
-                go_offline()
-        self.subscriptions.go_offline()
-        self.subscription_scheduler.set_account(None)
-
-        self.secrets.pop("session", None)
-        self.vault.save(self.secrets)
-        self.window.set_account(None)
-        page.set_logged_in(False)
-        page.show_error(str(error))
-
-        previous_scheduler = self.scheduler
-        previous_gateway = self.gateway
-        self.gateway = None
-        self.planner = None
-        self.scheduler = _NullScheduler()
-        with suppress(Exception):
-            await previous_scheduler.shutdown()
-        if previous_gateway is not None:
-            with suppress(Exception):
-                await previous_gateway.disconnect()
-
-        api_hash = self.secrets.get("api_hash", "")
-        if self.gateway_factory is not None and self.settings.api_id > 0 and api_hash:
-            fresh_gateway = self.gateway_factory(
-                self.settings.api_id,
-                api_hash,
-                "",
-                self.settings.proxy,
-                self.secrets.get("proxy_password", ""),
+        self._last_authorization_failure_reason = error.reason
+        async with self._session_expiry_lock:
+            if self._session_expiry_handled:
+                return
+            self._session_expiry_handled = True
+            _LOGGER.warning(
+                "Telegram authorization expired (reason=%s)",
+                error.reason.value,
             )
-            self.gateway = fresh_gateway
-            try:
-                await fresh_gateway.connect()
-            except Exception as reconnect_error:
-                _LOGGER.warning(
-                    "fresh Telegram connection failed (%s)",
-                    type(reconnect_error).__name__,
-                )
-            if self.service_builder is not None:
-                services = self.service_builder(
-                    fresh_gateway,
-                    self.settings.concurrency,
-                )
-                if len(services) == 3:
-                    self.planner, self.scheduler, self.content_browser = services
-                else:
-                    self.planner, self.scheduler = services
+            await self.connection_recovery.cancel()
+            await self._cancel_subscription_probe()
+            await self._cancel_content_operations()
+            page = self._content_page()
+            subscription_page = self._subscription_page()
+            if self.content_browser is not None:
+                go_offline = getattr(self.content_browser, "go_offline", None)
+                if go_offline is not None:
+                    go_offline()
+            self.subscriptions.go_offline()
+            self.subscription_scheduler.set_account(None)
 
-        self.show_login()
+            self.secrets.pop("session", None)
+            self.vault.save(self.secrets)
+            self.window.set_account(None)
+            page.set_logged_in(False)
+            page.set_connection_state(
+                "Telegram 登录已失效，请重新登录",
+                retryable=False,
+            )
+            subscription_page.set_logged_in(False)
+            page.show_error("Telegram 登录已失效，请重新扫码登录")
+
+            previous_scheduler = self.scheduler
+            previous_gateway = self.gateway
+            self.gateway = None
+            self.planner = None
+            self.scheduler = _NullScheduler()
+            with suppress(Exception):
+                await previous_scheduler.shutdown()
+            if previous_gateway is not None:
+                with suppress(Exception):
+                    await previous_gateway.disconnect()
+
+            api_hash = self.secrets.get("api_hash", "")
+            if (
+                self.gateway_factory is not None
+                and self.settings.api_id > 0
+                and api_hash
+            ):
+                fresh_gateway = self.gateway_factory(
+                    self.settings.api_id,
+                    api_hash,
+                    "",
+                    self.settings.proxy,
+                    self.secrets.get("proxy_password", ""),
+                )
+                self.gateway = fresh_gateway
+                try:
+                    await fresh_gateway.connect()
+                except Exception as reconnect_error:
+                    _LOGGER.warning(
+                        "fresh Telegram connection failed (%s)",
+                        type(reconnect_error).__name__,
+                    )
+                if self.service_builder is not None:
+                    services = self.service_builder(
+                        fresh_gateway,
+                        self.settings,
+                    )
+                    if len(services) == 3:
+                        self.planner, self.scheduler, self.content_browser = services
+                    else:
+                        self.planner, self.scheduler = services
+
+            self.show_login()
+
+    @property
+    def last_authorization_failure_reason(
+        self,
+    ) -> AuthorizationFailureReason | None:
+        return self._last_authorization_failure_reason
 
     def _content_page(self):
         return getattr(self.window, "content_page", _NullContentPage())
@@ -1691,6 +2140,13 @@ class AppController:
             self.window,
             "subscriptions_page",
             _NullSubscriptionPage(),
+        )
+
+    def _diagnostics_page(self):
+        return getattr(
+            self.window,
+            "diagnostics_page",
+            _NullDiagnosticsPage(),
         )
 
     def _reload_subscriptions(self) -> None:
@@ -1785,7 +2241,9 @@ class AppController:
         operation = asyncio.create_task(self.scheduler.run_task(task_id))
         try:
             while not operation.done():
-                self._refresh_tasks_if_due()
+                is_active = getattr(self.scheduler, "is_active", None)
+                if not callable(is_active) or is_active(task_id):
+                    self._refresh_tasks_if_due()
                 try:
                     await asyncio.wait_for(
                         asyncio.shield(operation),

@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import json
 import os
+import platform
 import sys
 from collections.abc import Callable
 from contextlib import suppress
@@ -16,13 +17,30 @@ from telegram_downloader.catalog import CatalogRepository
 from telegram_downloader.content import ContentSearchQuery, SearchScope
 from telegram_downloader.content_browser import ContentBrowserService
 from telegram_downloader.controller import AppController
+from telegram_downloader.diagnostic_probes import (
+    component_availability,
+    managed_writable_paths,
+    probe_components,
+    probe_content_database,
+    probe_credentials,
+    probe_disk,
+    probe_environment,
+    probe_project_write,
+    probe_task_database,
+    probe_telegram,
+    probe_update_sources,
+)
+from telegram_downloader.diagnostic_store import DiagnosticReportStore
+from telegram_downloader.diagnostics import DiagnosticResult, DiagnosticsService
 from telegram_downloader.downloader import MediaDownloader
-from telegram_downloader.gateway import TelethonGateway
+from telegram_downloader.file_integrity import FileIntegrityService
+from telegram_downloader.gateway import SessionExpiredError, TelethonGateway
 from telegram_downloader.instance_guard import WindowsInstanceGuard
 from telegram_downloader.logging import configure_logging
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.planner import ScanPreview, TaskPlanner
 from telegram_downloader.repository import TaskRepository
+from telegram_downloader.resource_control import AsyncBandwidthLimiter
 from telegram_downloader.scheduler import DownloadScheduler
 from telegram_downloader.security import SecretsError, SecretsVault
 from telegram_downloader.settings import AppSettings, SettingsError, SettingsStore
@@ -32,6 +50,45 @@ from telegram_downloader.thumbnail_cache import ThumbnailCache
 from telegram_downloader.update import HttpBytesClient, UpdateCoordinator
 from telegram_downloader.update_contract import load_trusted_keys
 from telegram_downloader.update_download import ResumableUpdateDownloader
+
+
+class _FunctionDiagnosticProbe:
+    def __init__(
+        self,
+        probe_id: str,
+        title: str,
+        action: Callable[[], Any],
+        *,
+        threaded: bool,
+    ) -> None:
+        self.id = probe_id
+        self.title = title
+        self.action = action
+        self.threaded = threaded
+        self.cancel_active = not threaded
+
+    async def run(self, cancel_event: asyncio.Event) -> DiagnosticResult:
+        if cancel_event.is_set():
+            raise asyncio.CancelledError
+        if self.threaded:
+            return await asyncio.to_thread(self.action)
+        return await self.action()
+
+
+async def _telegram_health(controller: AppController) -> DiagnosticResult:
+    reason = controller.last_authorization_failure_reason
+    if reason is not None:
+        return await probe_telegram(None, authorization_reason=reason)
+    gateway_value = controller.gateway
+    if gateway_value is None:
+        return await probe_telegram(None)
+
+    class RecoveredConnection:
+        async def test_connection(self) -> None:
+            await controller.connection_recovery.ensure_connected(gateway_value)
+            await gateway_value.test_connection()
+
+    return await probe_telegram(RecoveredConnection())
 
 
 class _GracefulShutdown:
@@ -93,30 +150,27 @@ def run_self_test(root: Path) -> dict[str, object]:
     catalog.recover_interrupted_subscriptions(datetime.now(UTC))
     ThumbnailCache(paths.thumbnail_cache)
 
-    writable = {
-        "settings": paths.settings,
-        "secrets": paths.secrets,
-        "database": paths.database,
-        "catalog_database": paths.catalog_database,
-        "log": paths.log,
-        "cache": paths.cache,
-        "thumbnail_cache": paths.thumbnail_cache,
-        "temp": paths.temp,
-        "downloads": paths.downloads,
-        "update_staging": paths.update_staging,
-        "update_backup": paths.update_backup,
-        "update_helper": paths.update_helper,
-        "update_journal": paths.update_journal,
+    managed = managed_writable_paths(paths)
+    public_names = {
+        "settings": "settings",
+        "secrets": "secrets",
+        "database": "database",
+        "catalog_database": "catalogDatabase",
+        "log": "log",
+        "cache": "cache",
+        "thumbnail_cache": "thumbnailCache",
+        "temp": "temp",
+        "downloads": "downloads",
+        "update_staging": "updateStaging",
+        "update_backup": "updateBackup",
+        "update_helper": "updateHelper",
+        "update_journal": "updateJournal",
     }
-    resolved = {name: str(paths.guard(path)) for name, path in writable.items()}
-    components = {
-        "pyside6": _can_import("PySide6"),
-        "telethon": _can_import("telethon"),
-        "qasync": _can_import("qasync"),
-        "qrcode": _can_import("qrcode"),
-        "sqlite": _can_import("sqlite3"),
-        "dpapi": os.name == "nt",
+    resolved = {
+        public: str(paths.guard(managed[internal]))
+        for public, internal in public_names.items()
     }
+    components = component_availability()
     report: dict[str, object] = {
         "ok": all(components.values()),
         "version": __version__,
@@ -209,6 +263,7 @@ def create_application(root: Path):
     repository = TaskRepository(paths.database)
     repository.initialize()
     repository.recover_interrupted()
+    integrity_service = FileIntegrityService(repository, paths)
     catalog = CatalogRepository(paths.catalog_database)
     catalog_error: Exception | None = None
     try:
@@ -233,10 +288,16 @@ def create_application(root: Path):
     ) -> TelethonGateway:
         return TelethonGateway(api_id, api_hash, session, proxy, proxy_password)
 
-    def build_services(gateway: TelethonGateway, concurrency: int):
+    def build_services(gateway: TelethonGateway, resource_settings: AppSettings):
         planner = TaskPlanner(gateway, repository, paths.downloads)
-        downloader = MediaDownloader(gateway, repository, paths)
-        scheduler = DownloadScheduler(repository, downloader, concurrency=concurrency)
+        bandwidth = AsyncBandwidthLimiter(resource_settings.speed_limit_kib)
+        downloader = MediaDownloader(gateway, repository, paths, bandwidth=bandwidth)
+        scheduler = DownloadScheduler(
+            repository,
+            downloader,
+            concurrency=resource_settings.concurrency,
+            bandwidth=bandwidth,
+        )
         content_browser.bind_online(gateway, planner)
         subscriptions.bind_online(gateway, planner)
         return planner, scheduler, content_browser
@@ -255,7 +316,7 @@ def create_application(root: Path):
         )
         planner, scheduler, content_browser = build_services(
             gateway,
-            settings.concurrency,
+            settings,
         )
 
     async def confirm_preview(preview: ScanPreview) -> bool:
@@ -300,11 +361,106 @@ def create_application(root: Path):
         HttpBytesClient(),
         ResumableUpdateDownloader(),
     )
+    diagnostic_store = DiagnosticReportStore(paths, secrets=set(secrets.values()))
 
     def confirm_update(manifest) -> bool:
         return UpdateDialog(manifest, window).exec() == UpdateDialog.DialogCode.Accepted
 
     controller_ref: dict[str, AppController] = {}
+
+    def credential_health() -> DiagnosticResult:
+        try:
+            settings_store.load()
+            current_settings_readable = True
+        except SettingsError:
+            current_settings_readable = False
+        current_secrets_present = paths.secrets.is_file()
+        try:
+            vault.load()
+            current_secrets_decryptable = True
+        except SecretsError:
+            current_secrets_decryptable = False
+        return probe_credentials(
+            settings_readable=current_settings_readable,
+            secrets_present=current_secrets_present,
+            secrets_decrypted=current_secrets_decryptable,
+        )
+
+    async def telegram_health() -> DiagnosticResult:
+        return await _telegram_health(controller_ref["controller"])
+
+    diagnostics = DiagnosticsService(
+        (
+            _FunctionDiagnosticProbe(
+                "environment",
+                "运行环境与路径",
+                lambda: probe_environment(
+                    paths,
+                    frozen=bool(getattr(sys, "frozen", False)),
+                    windows_x64=(
+                        sys.platform == "win32"
+                        and platform.machine().casefold() in {"amd64", "x86_64"}
+                    ),
+                    system_drive=os.environ.get("SYSTEMDRIVE", "C:"),
+                ),
+                threaded=True,
+            ),
+            _FunctionDiagnosticProbe(
+                "project-write",
+                "项目内写入",
+                lambda: probe_project_write(paths),
+                threaded=True,
+            ),
+            _FunctionDiagnosticProbe(
+                "disk",
+                "磁盘空间",
+                lambda: probe_disk(paths),
+                threaded=True,
+            ),
+            _FunctionDiagnosticProbe(
+                "components",
+                "运行组件",
+                lambda: probe_components(component_availability()),
+                threaded=True,
+            ),
+            _FunctionDiagnosticProbe(
+                "task-database",
+                "下载任务数据库",
+                lambda: probe_task_database(paths.database),
+                threaded=True,
+            ),
+            _FunctionDiagnosticProbe(
+                "content-database",
+                "账号内容数据库",
+                lambda: probe_content_database(paths.catalog_database),
+                threaded=True,
+            ),
+            _FunctionDiagnosticProbe(
+                "credentials",
+                "登录凭据",
+                credential_health,
+                threaded=True,
+            ),
+            _FunctionDiagnosticProbe(
+                "telegram",
+                "Telegram 连接",
+                telegram_health,
+                threaded=False,
+            ),
+            _FunctionDiagnosticProbe(
+                "updates",
+                "签名更新源",
+                lambda: probe_update_sources(update_coordinator),
+                threaded=False,
+            ),
+        ),
+        app_version=__version__,
+    )
+    async def subscription_session_expired(error: SessionExpiredError) -> None:
+        controller = controller_ref.get("controller")
+        if controller is not None:
+            await controller._handle_session_expired(error)
+
     subscription_scheduler = SubscriptionScheduler(
         subscriptions,
         foreground_busy=lambda: (
@@ -323,6 +479,7 @@ def create_application(root: Path):
             else None
         ),
         on_progress=window.subscriptions_page.set_progress,
+        on_session_expired=subscription_session_expired,
     )
 
     controller = AppController(
@@ -337,6 +494,9 @@ def create_application(root: Path):
         content_browser=content_browser,
         subscriptions=subscriptions,
         subscription_scheduler=subscription_scheduler,
+        integrity_service=integrity_service,
+        diagnostics=diagnostics,
+        diagnostic_store=diagnostic_store,
         paths=paths,
         gateway_factory=gateway_factory,
         service_builder=build_services,
@@ -400,6 +560,9 @@ def create_application(root: Path):
     def pause_tasks_requested(value: object) -> None:
         controller.pause_tasks(_task_ids(value))
 
+    def prioritize_task_requested(task_id: str) -> None:
+        controller.prioritize_task(task_id)
+
     async def resume_tasks_requested(value: object) -> None:
         await controller.resume_tasks(_task_ids(value))
 
@@ -414,6 +577,18 @@ def create_application(root: Path):
 
     def open_media_requested(item_id: str) -> None:
         controller.open_media_file(item_id)
+
+    async def verify_media_requested(value: object) -> None:
+        await controller.verify_media(_task_ids(value))
+
+    async def verify_tasks_requested(value: object) -> None:
+        await controller.verify_tasks(_task_ids(value))
+
+    async def repair_media_requested(value: object) -> None:
+        await controller.repair_media(_task_ids(value))
+
+    def integrity_cancel_requested() -> None:
+        controller.cancel_integrity()
 
     @qasync.asyncSlot(str)
     async def content_dialog_selected(peer_ref: str) -> None:
@@ -499,9 +674,11 @@ def create_application(root: Path):
     window.scan_requested.connect(scan_requested)
     window.task_selection_changed.connect(task_selection_changed)
     window.pause_tasks_requested.connect(pause_tasks_requested)
+    window.prioritize_task_requested.connect(prioritize_task_requested)
     window.archive_tasks_requested.connect(archive_tasks_requested)
     window.restore_tasks_requested.connect(restore_tasks_requested)
     window.open_media_requested.connect(open_media_requested)
+    window.integrity_cancel_requested.connect(integrity_cancel_requested)
     window.open_directory_requested.connect(controller.open_task_directory)
     window.settings_requested.connect(open_settings)
     window.login_requested.connect(controller.show_login)
@@ -525,6 +702,11 @@ def create_application(root: Path):
     window.subscriptions_page.rule_selected.connect(controller.show_subscription_details)
     window.subscriptions_page.probe_requested.connect(subscription_probe_requested)
     window.subscriptions_page.probe_cancel_requested.connect(controller.cancel_subscription_probe)
+    window.diagnostics_activated.connect(controller.activate_diagnostics)
+    window.diagnostics_page.export_requested.connect(controller.export_diagnostics)
+    window.diagnostics_page.open_directory_requested.connect(
+        controller.open_diagnostics_directory
+    )
     login_dialog.credentials_submitted.connect(credentials_submitted)
     login_dialog.phone_submitted.connect(phone_submitted)
     login_dialog.code_submitted.connect(code_submitted)
@@ -554,6 +736,28 @@ def create_application(root: Path):
             failed=lambda error: window.subscriptions_page.show_error(controller._safe_error(error))
         ),
     )
+    async_actions.connect(
+        window.diagnostics_page.run_requested,
+        "diagnostics.run",
+        lambda: controller.run_diagnostics(),
+        hooks=ActionHooks(
+            started=lambda: window.diagnostics_page.set_running(True),
+            failed=lambda error: window.diagnostics_page.show_error(
+                controller._safe_error(error)
+            ),
+            finished=lambda: window.diagnostics_page.set_running(False),
+        ),
+    )
+    async_actions.connect(
+        window.diagnostics_page.cancel_requested,
+        "diagnostics.cancel",
+        lambda: controller.cancel_diagnostics(),
+        hooks=ActionHooks(
+            failed=lambda error: window.diagnostics_page.show_error(
+                controller._safe_error(error)
+            )
+        ),
+    )
 
     def task_failure(error: Exception) -> None:
         window.statusBar().showMessage(controller._safe_error(error), 0)
@@ -568,6 +772,24 @@ def create_application(root: Path):
         window.retry_tasks_requested,
         "tasks.retry",
         retry_tasks_requested,
+        hooks=ActionHooks(failed=task_failure),
+    )
+    async_actions.connect_payload(
+        window.verify_media_requested,
+        "integrity.operation",
+        verify_media_requested,
+        hooks=ActionHooks(failed=task_failure),
+    )
+    async_actions.connect_payload(
+        window.verify_tasks_requested,
+        "integrity.operation",
+        verify_tasks_requested,
+        hooks=ActionHooks(failed=task_failure),
+    )
+    async_actions.connect_payload(
+        window.repair_media_requested,
+        "integrity.operation",
+        repair_media_requested,
         hooks=ActionHooks(failed=task_failure),
     )
     async_actions.connect(
@@ -626,6 +848,10 @@ def create_application(root: Path):
             archive_tasks_requested,
             restore_tasks_requested,
             open_media_requested,
+            verify_media_requested,
+            verify_tasks_requested,
+            repair_media_requested,
+            integrity_cancel_requested,
             content_dialog_selected,
             content_search_requested,
             content_load_more_requested,

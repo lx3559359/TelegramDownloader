@@ -114,11 +114,8 @@ class UpdateCoordinator:
         self.clock = clock
 
     async def check_for_update(self) -> ReconciledUpdate:
-        checks = await asyncio.gather(
-            self._check_source(UpdateSourceId.GITHUB),
-            self._check_source(UpdateSourceId.MODELSCOPE),
-        )
-        update = reconcile_sources((checks[0], checks[1]), self.current_version)
+        checks = await self.check_sources()
+        update = reconcile_sources(checks, self.current_version)
         if (
             update.manifest is not None
             and parse_version(self.current_version)
@@ -126,6 +123,13 @@ class UpdateCoordinator:
         ):
             raise UpdatePolicyError("当前更新器版本过低，无法安全应用该更新")
         return update
+
+    async def check_sources(self) -> tuple[SourceCheck, SourceCheck]:
+        github, modelscope = await asyncio.gather(
+            self._check_source(UpdateSourceId.GITHUB),
+            self._check_source(UpdateSourceId.MODELSCOPE),
+        )
+        return github, modelscope
 
     async def startup(
         self,

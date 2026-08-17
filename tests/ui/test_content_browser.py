@@ -1,8 +1,9 @@
 from dataclasses import replace
 from datetime import UTC, date, datetime
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QPoint, QSize, Qt
 from PySide6.QtGui import QImage
+from PySide6.QtWidgets import QGraphicsDropShadowEffect, QHeaderView
 
 from telegram_downloader.content import (
     ALL_DIALOGS_SCOPE_REF,
@@ -18,6 +19,8 @@ from telegram_downloader.content import (
 from telegram_downloader.content_progress import SearchProgress
 from telegram_downloader.domain import MediaKind, ScanFilters
 from telegram_downloader.ui.content_browser import ContentBrowserPage
+from telegram_downloader.ui.effects import ElevationLevel
+from telegram_downloader.ui.theme import APP_STYLESHEET
 
 
 def dialog(now: datetime, *, available: bool = True) -> ContentDialog:
@@ -89,8 +92,88 @@ def test_page_contains_content_browser_controls(qtbot) -> None:
     assert page.select_all_button.text() == "全选"
     assert page.invert_button.text() == "反选"
     assert page.queue_button.text() == "加入下载队列"
-    assert page.result_table.iconSize() == QSize(112, 84)
-    assert page.result_table.verticalHeader().defaultSectionSize() == 96
+    assert page.result_table.iconSize() == QSize(88, 60)
+    assert page.result_table.verticalHeader().defaultSectionSize() == 78
+    assert page.result_table.wordWrap() is False
+    assert (
+        page.result_table.textElideMode()
+        == Qt.TextElideMode.ElideRight
+    )
+    header = page.result_table.horizontalHeader()
+    fixed_widths = {
+        0: 52,
+        1: 96,
+        2: 132,
+        3: 92,
+        5: 58,
+        6: 82,
+        7: 64,
+    }
+    for column, width in fixed_widths.items():
+        assert header.sectionResizeMode(column) == QHeaderView.ResizeMode.Fixed
+        assert page.result_table.columnWidth(column) == width
+    assert header.sectionResizeMode(4) == QHeaderView.ResizeMode.Stretch
+
+
+def test_account_content_card_structure_keeps_filter_minimums(qtbot) -> None:
+    page = ContentBrowserPage()
+    qtbot.addWidget(page)
+
+    assert page.objectName() == "accountContentPage"
+    assert page.dialog_card.objectName() == "elevatedCard"
+    assert page.filter_card.objectName() == "elevatedCard"
+    assert page.results_card.objectName() == "elevatedCard"
+    assert page.dialog_card.minimumWidth() == 210
+    assert page.dialog_card.maximumWidth() == 270
+    assert page.search_column.minimumWidth() >= 680
+    assert page.date_from.minimumWidth() >= 132
+    assert page.date_to.minimumWidth() >= 132
+    assert page.limit_input.minimumWidth() >= 90
+    assert page.error_label.parentWidget() is page.filter_card
+    assert (
+        page.dialog_list.horizontalScrollBarPolicy()
+        == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    )
+    assert page.dialog_list.textElideMode() == Qt.TextElideMode.ElideRight
+
+
+def test_result_columns_do_not_squeeze_fixed_text_at_minimum_size(qtbot) -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    page = ContentBrowserPage()
+    page.resize(996, 650)
+    qtbot.addWidget(page)
+    page.show()
+    page.set_results(
+        [
+            replace(
+                result(now, "long-summary", 1),
+                excerpt=(
+                    "这是一段很长的摘要，只允许在摘要列内省略，"
+                    "不能挤压日期、类型、大小或状态列。"
+                )
+                * 4,
+            )
+        ]
+    )
+    qtbot.wait(20)
+
+    assert page.result_table.horizontalScrollBar().maximum() == 0
+    assert page.result_table.columnWidth(4) > 0
+
+
+def test_account_content_cards_use_shared_major_elevation(qtbot) -> None:
+    page = ContentBrowserPage()
+    qtbot.addWidget(page)
+
+    effects = []
+    for card in (page.dialog_card, page.filter_card, page.results_card):
+        assert card.objectName() == "elevatedCard"
+        assert card.property("elevation") == ElevationLevel.MAJOR.value
+        effect = card.graphicsEffect()
+        assert isinstance(effect, QGraphicsDropShadowEffect)
+        effects.append(effect)
+    assert len({id(effect) for effect in effects}) == 3
+    assert "QFrame#elevatedCard" in APP_STYLESHEET
 
 
 def test_progress_and_retry_widgets_show_honest_operation_state(qtbot) -> None:
@@ -408,6 +491,84 @@ def test_result_preview_double_click_emits_result_id(qtbot) -> None:
         page.result_table.doubleClicked.emit(page.result_model.index(0, 1))
 
     assert caught.args == ["r1"]
+
+
+def test_selection_cell_click_and_space_toggle_once(qtbot) -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    page = ContentBrowserPage()
+    page.resize(996, 650)
+    qtbot.addWidget(page)
+    page.show()
+    page.set_results([result(now, "r1", 1)])
+    index = page.result_model.index(0, 0)
+    qtbot.waitUntil(lambda: page.result_table.visualRect(index).isValid())
+    changed: list[tuple[str, bool]] = []
+    page.result_model.selection_changed.connect(
+        lambda result_id, selected: changed.append((result_id, selected))
+    )
+    rect = page.result_table.visualRect(index)
+    full_cell_target = QPoint(rect.right() - 6, rect.center().y())
+
+    qtbot.mouseClick(
+        page.result_table.viewport(),
+        Qt.MouseButton.LeftButton,
+        pos=full_cell_target,
+    )
+
+    assert (
+        page.result_model.data(index, Qt.ItemDataRole.CheckStateRole)
+        == Qt.CheckState.Checked
+    )
+    assert changed == [("r1", True)]
+
+    page.result_table.setCurrentIndex(index)
+    page.result_table.setFocus()
+    qtbot.keyClick(page.result_table, Qt.Key.Key_Space)
+
+    assert (
+        page.result_model.data(index, Qt.ItemDataRole.CheckStateRole)
+        == Qt.CheckState.Unchecked
+    )
+    assert changed == [("r1", True), ("r1", False)]
+
+
+def test_disabled_selection_cells_ignore_mouse_and_keyboard(qtbot) -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    page = ContentBrowserPage()
+    page.resize(996, 650)
+    qtbot.addWidget(page)
+    page.show()
+    page.set_results(
+        [
+            replace(result(now, "unavailable", 1), available=False),
+            replace(result(now, "queued", 2), queued=True),
+        ]
+    )
+    changed: list[tuple[str, bool]] = []
+    page.result_model.selection_changed.connect(
+        lambda result_id, selected: changed.append((result_id, selected))
+    )
+
+    for row in range(2):
+        index = page.result_model.index(row, 0)
+        qtbot.waitUntil(
+            lambda index=index: page.result_table.visualRect(index).isValid()
+        )
+        rect = page.result_table.visualRect(index)
+        qtbot.mouseClick(
+            page.result_table.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=QPoint(rect.right() - 6, rect.center().y()),
+        )
+        page.result_table.setCurrentIndex(index)
+        page.result_table.setFocus()
+        qtbot.keyClick(page.result_table, Qt.Key.Key_Space)
+        assert (
+            page.result_model.data(index, Qt.ItemDataRole.CheckStateRole)
+            == Qt.CheckState.Unchecked
+        )
+
+    assert changed == []
 
 
 def test_real_mouse_double_click_on_preview_emits_result_id(qtbot) -> None:

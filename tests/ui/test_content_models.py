@@ -234,6 +234,10 @@ def test_result_model_selection_roles_and_disabled_rows(qtbot) -> None:
     assert changed == [(results[0].id, True)]
     assert model.data(select_index, Qt.ItemDataRole.UserRole) == results[0].id
     assert model.data(model.index(1, 6)) == "未知"
+    assert (
+        model.data(model.index(0, 4), Qt.ItemDataRole.ToolTipRole)
+        == results[0].excerpt
+    )
     assert not (
         model.flags(model.index(2, 0)) & Qt.ItemFlag.ItemIsUserCheckable
     )
@@ -276,6 +280,34 @@ def test_history_model_labels_account_scope() -> None:
 
     assert model.HEADERS[0] == "搜索范围"
     assert model.data(model.index(0, 0)) == ALL_DIALOGS_TITLE
+
+
+def test_result_model_accepts_integer_check_state_once(qtbot) -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    model = SearchResultTableModel()
+    values = search_results(now)
+    model.set_results(values)
+    changed: list[tuple[str, bool]] = []
+    data_changes: list[list[int]] = []
+    model.selection_changed.connect(
+        lambda result_id, selected: changed.append((result_id, selected))
+    )
+    model.dataChanged.connect(
+        lambda _top_left, _bottom_right, roles: data_changes.append(list(roles))
+    )
+    index = model.index(0, 0)
+
+    assert model.setData(index, 2, Qt.ItemDataRole.CheckStateRole)
+    assert (
+        model.data(index, Qt.ItemDataRole.CheckStateRole)
+        == Qt.CheckState.Checked
+    )
+    assert changed == [(values[0].id, True)]
+    assert data_changes == [[Qt.ItemDataRole.CheckStateRole]]
+
+    assert model.setData(index, 2, Qt.ItemDataRole.CheckStateRole)
+    assert changed == [(values[0].id, True)]
+    assert data_changes == [[Qt.ItemDataRole.CheckStateRole]]
 
 
 def test_result_model_uses_thumbnail_then_media_fallback(

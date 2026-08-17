@@ -298,6 +298,8 @@ class SearchResultTableModel(QAbstractTableModel):
                     f"{_SOURCE_LABELS[result.source_kind]}：{source_title}"
                     f"\n会话标识：{result.peer_ref}"
                 )
+            if index.column() == 4:
+                return result.excerpt
             return result.original_name
         if role != Qt.ItemDataRole.DisplayRole:
             return None
@@ -334,7 +336,11 @@ class SearchResultTableModel(QAbstractTableModel):
             or not self.flags(index) & Qt.ItemFlag.ItemIsUserCheckable
         ):
             return False
-        requested = value == Qt.CheckState.Checked
+        try:
+            requested_state = Qt.CheckState(value)
+        except (TypeError, ValueError):
+            return False
+        requested = requested_state == Qt.CheckState.Checked
         result = self._results[index.row()]
         if result.selected == requested:
             return True

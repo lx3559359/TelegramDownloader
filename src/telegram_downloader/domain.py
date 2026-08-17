@@ -41,6 +41,15 @@ class ItemStatus(StrEnum):
     FAILED = "failed"
 
 
+class IntegrityStatus(StrEnum):
+    UNVERIFIED = "unverified"
+    VERIFIED = "verified"
+    MISSING = "missing"
+    SIZE_MISMATCH = "size_mismatch"
+    HASH_MISMATCH = "hash_mismatch"
+    READ_ERROR = "read_error"
+
+
 @dataclass(frozen=True, slots=True)
 class ParsedLink:
     normalized_url: str
@@ -71,6 +80,7 @@ class TaskRecord:
     last_error: str | None = None
     display_title: str | None = None
     archived_at: datetime | None = None
+    queue_priority: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,3 +100,6 @@ class MediaItem:
     status: ItemStatus = ItemStatus.QUEUED
     retry_count: int = 0
     last_error: str | None = None
+    integrity_status: IntegrityStatus = IntegrityStatus.UNVERIFIED
+    content_sha256: str | None = None
+    verified_at: datetime | None = None
