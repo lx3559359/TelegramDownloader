@@ -33,6 +33,7 @@ from telegram_downloader.domain import (
     TaskStatus,
 )
 from telegram_downloader.gateway import (
+    GatewayError,
     RemoteMedia,
     RemoteSearchHit,
     RemoteSearchPage,
@@ -626,8 +627,8 @@ async def test_global_search_dispatches_without_a_dialog_and_keeps_sources(
                     source_kind=ContentSourceKind.PRIVATE,
                 ),
             ),
-            SearchCursor(10, 7, "42"),
-            False,
+            None,
+            True,
         )
     ]
     service = await prepared_online_service(tmp_path, now, gateway)
@@ -710,6 +711,119 @@ async def test_global_albums_with_equal_grouped_id_expand_per_peer(
         ("42", 30),
         ("42", 29),
     }
+
+
+@pytest.mark.asyncio
+async def test_global_search_fills_one_application_page_from_sparse_server_pages(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 17, tzinfo=UTC)
+    gateway = FakeGateway(AccountProfile("a1", "账号"))
+    first_cursor = SearchCursor(900, 1, "-1001")
+    second_cursor = SearchCursor(800, 2, "42")
+    gateway.all_pages = [
+        RemoteSearchPage(
+            tuple(make_hit(value, now) for value in range(1, 11)),
+            first_cursor,
+            False,
+        ),
+        RemoteSearchPage(
+            tuple(make_hit(value, now, peer_ref="42") for value in range(101, 191)),
+            second_cursor,
+            False,
+        ),
+    ]
+    service = await prepared_online_service(tmp_path, now, gateway)
+    events: list[SearchProgress] = []
+
+    session, results = await service.start_search(
+        ALL_DIALOGS_SCOPE_REF,
+        make_query(now, limit=150),
+        scope=SearchScope.ALL_DIALOGS,
+        on_progress=events.append,
+    )
+
+    assert len(results) == 100
+    assert gateway.all_search_cursors == [None, first_cursor]
+    assert session.cursor == second_cursor
+    assert session.status is SearchStatus.RUNNING
+    assert [event.inspected for event in events] == [10, 100]
+
+
+@pytest.mark.asyncio
+async def test_global_result_limit_is_account_wide_and_cursor_stall_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 17, tzinfo=UTC)
+    stalled = SearchCursor(50, 9, "42")
+    gateway = FakeGateway(AccountProfile("a1", "账号"))
+    gateway.all_pages = [
+        RemoteSearchPage(
+            tuple(make_hit(value, now) for value in range(1, 61)),
+            stalled,
+            False,
+        ),
+        RemoteSearchPage(
+            tuple(make_hit(value, now, peer_ref="42") for value in range(101, 161)),
+            stalled,
+            False,
+        ),
+    ]
+    service = await prepared_online_service(tmp_path, now, gateway)
+
+    with pytest.raises(GatewayError, match="分页未前进"):
+        await service.start_search(
+            ALL_DIALOGS_SCOPE_REF,
+            make_query(now, limit=100),
+            scope=SearchScope.ALL_DIALOGS,
+        )
+
+    saved = service.list_sessions()[0]
+    assert saved.scope is SearchScope.ALL_DIALOGS
+    assert saved.status is SearchStatus.INCOMPLETE
+    assert saved.cursor == stalled
+    assert len(service.list_results(saved.id)) == 60
+
+
+@pytest.mark.asyncio
+async def test_global_limit_and_progress_are_account_wide(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 17, tzinfo=UTC)
+    gateway = FakeGateway(AccountProfile("a1", "账号"))
+    gateway.all_pages = [
+        RemoteSearchPage(
+            tuple(make_hit(value, now, peer_ref="-1001") for value in range(1, 101)),
+            SearchCursor(100, 4, "-1001"),
+            False,
+        ),
+        RemoteSearchPage(
+            tuple(make_hit(value, now, peer_ref="42") for value in range(101, 106)),
+            SearchCursor(105, 5, "42"),
+            False,
+        ),
+    ]
+    service = await prepared_online_service(tmp_path, now, gateway)
+    first_events: list[SearchProgress] = []
+    more_events: list[SearchProgress] = []
+
+    session, first_page = await service.start_search(
+        ALL_DIALOGS_SCOPE_REF,
+        make_query(now, limit=101),
+        scope=SearchScope.ALL_DIALOGS,
+        on_progress=first_events.append,
+    )
+    session, all_results = await service.load_more(
+        session.id,
+        on_progress=more_events.append,
+    )
+
+    assert len(first_page) == 100
+    assert len(all_results) == 101
+    assert session.status is SearchStatus.COMPLETED
+    for events in (first_events, more_events):
+        assert all(
+            left.inspected <= right.inspected
+            for left, right in zip(events, events[1:], strict=False)
+        )
 
 
 @pytest.mark.asyncio

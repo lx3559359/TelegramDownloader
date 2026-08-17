@@ -28,6 +28,7 @@ from telegram_downloader.gateway import (
     MediaReferenceExpired,
     RemoteMedia,
     RemoteSearchHit,
+    RemoteSearchPage,
     TelegramGateway,
     TransientNetworkError,
 )
@@ -245,151 +246,217 @@ class ContentBrowserService:
     ) -> tuple[SearchSession, list[SearchResult]]:
         account = self._require_account()
         gateway, planner = self._require_online()
+        operation_accepted = 0
+        progress_inspected = 0
+        progress_matched = 0
+        request_cursor = session.cursor
+        seen_cursors = {request_cursor}
         try:
-            if session.scope is SearchScope.ALL_DIALOGS:
-                page = await gateway.search_all_media_page(
-                    session.query,
-                    session.cursor,
-                    on_progress=on_progress,
-                )
-            else:
-                page = await gateway.search_media_page(
-                    session.peer_ref,
-                    session.query,
-                    session.cursor,
-                    on_progress=on_progress,
-                )
-            expanded = list(page.items)
-            group_triggers: dict[tuple[str, int], int] = {}
-            for hit in page.items:
-                grouped_id = hit.remote.grouped_id
-                if grouped_id is None:
-                    continue
-                group_triggers.setdefault(
-                    (hit.remote.peer_ref, grouped_id),
-                    hit.remote.message_id,
-                )
+            while True:
+                page_inspected = 0
+                page_matched = 0
 
-            async def expand(
-                trigger: tuple[tuple[str, int], int],
-            ) -> tuple[RemoteSearchHit, ...]:
-                (peer_ref, grouped_id), message_id = trigger
-                async with self._album_semaphore:
-                    return await gateway.expand_album(
-                        peer_ref,
-                        message_id,
-                        grouped_id,
-                    )
-
-            album_values = await asyncio.gather(
-                *(expand(item) for item in group_triggers.items())
-            )
-            for values in album_values:
-                expanded.extend(values)
-
-            unique = self._deduplicate_hits(expanded)
-            existing_results = self.catalog.list_results(
-                account.account_id,
-                session.id,
-            )
-            existing_keys = {
-                (item.peer_ref, item.message_id, item.media_id)
-                for item in existing_results
-            }
-            units = self._album_units(unique)
-            remaining_total = max(
-                0,
-                session.query.filters.item_limit - len(existing_results),
-            )
-            remaining_page = min(100, remaining_total)
-            accepted: list[RemoteSearchHit] = []
-            deferred_cursor: SearchCursor | None = None
-            skipped_album = False
-            for unit in units:
-                new_items = [
-                    hit
-                    for hit in unit
-                    if self._media_key(hit.remote) not in existing_keys
-                ]
-                if not new_items:
-                    continue
-                is_album = new_items[0].remote.grouped_id is not None
-                if len(new_items) > remaining_total:
-                    skipped_album = skipped_album or is_album
-                    continue
-                if len(new_items) > remaining_page:
-                    grouped_id = new_items[0].remote.grouped_id
-                    trigger = (
-                        group_triggers.get(
-                            (new_items[0].remote.peer_ref, grouped_id),
-                            new_items[0].remote.message_id,
+                def report_progress(
+                    progress: SearchProgress,
+                    inspected_offset: int = progress_inspected,
+                    matched_offset: int = progress_matched,
+                ) -> None:
+                    nonlocal page_inspected, page_matched
+                    page_inspected = max(page_inspected, progress.inspected)
+                    page_matched = max(page_matched, progress.matched)
+                    if on_progress is not None:
+                        on_progress(
+                            SearchProgress(
+                                inspected_offset + page_inspected,
+                                matched_offset + page_matched,
+                                progress.phase,
+                            )
                         )
-                        if grouped_id is not None
-                        else new_items[0].remote.message_id
-                    )
-                    deferred_cursor = SearchCursor(trigger + 1)
-                    break
-                accepted.extend(new_items)
-                remaining_total -= len(new_items)
-                remaining_page -= len(new_items)
-                existing_keys.update(self._media_key(hit.remote) for hit in new_items)
 
-            queued_keys = planner.existing_media_keys(
-                {self._media_key(hit.remote) for hit in accepted}
-            )
-            saved = [
-                self._result_from_hit(
-                    account.account_id,
+                page = await self._search_remote_page(
                     session,
-                    hit,
-                    queued=self._media_key(hit.remote) in queued_keys,
+                    request_cursor,
+                    on_progress=report_progress if on_progress is not None else None,
                 )
-                for hit in accepted
-            ]
-            self.catalog.save_search_page(
-                account.account_id,
-                session.id,
-                session.generation,
-                saved,
-            )
-            result_count = len(
-                self.catalog.list_results(account.account_id, session.id)
-            )
-            reached_limit = result_count >= session.query.filters.item_limit
-            complete = (
-                page.exhausted
-                or reached_limit
-                or skipped_album
-                or (deferred_cursor is None and page.next_cursor is None)
-            )
-            cursor = (
-                None
-                if complete
-                else deferred_cursor
-                if deferred_cursor is not None
-                else page.next_cursor
-            )
-            self.catalog.finish_search(
-                account.account_id,
-                session.id,
-                session.generation,
-                cursor,
-                complete,
-                self.clock(),
-                status=(
-                    SearchStatus.COMPLETED if complete else SearchStatus.RUNNING
-                ),
-                error="达到数量上限" if skipped_album else None,
-            )
+                progress_inspected += page_inspected
+                progress_matched += page_matched
+                if session.scope is SearchScope.ALL_DIALOGS and not page.exhausted:
+                    if page.next_cursor is None or page.next_cursor in seen_cursors:
+                        raise GatewayError("Telegram 全局搜索分页未前进")
+                    seen_cursors.add(page.next_cursor)
+
+                expanded = list(page.items)
+                group_triggers: dict[tuple[str, int], int] = {}
+                for hit in page.items:
+                    grouped_id = hit.remote.grouped_id
+                    if grouped_id is None:
+                        continue
+                    group_triggers.setdefault(
+                        (hit.remote.peer_ref, grouped_id),
+                        hit.remote.message_id,
+                    )
+
+                async def expand(
+                    trigger: tuple[tuple[str, int], int],
+                ) -> tuple[RemoteSearchHit, ...]:
+                    (peer_ref, grouped_id), message_id = trigger
+                    async with self._album_semaphore:
+                        return await gateway.expand_album(
+                            peer_ref,
+                            message_id,
+                            grouped_id,
+                        )
+
+                album_values = await asyncio.gather(
+                    *(expand(item) for item in group_triggers.items())
+                )
+                for values in album_values:
+                    expanded.extend(values)
+
+                unique = self._deduplicate_hits(expanded)
+                existing_results = self.catalog.list_results(
+                    account.account_id,
+                    session.id,
+                )
+                existing_keys = {
+                    (item.peer_ref, item.message_id, item.media_id)
+                    for item in existing_results
+                }
+                units = self._album_units(unique)
+                remaining_total = max(
+                    0,
+                    session.query.filters.item_limit - len(existing_results),
+                )
+                remaining_page = min(
+                    100 - operation_accepted,
+                    remaining_total,
+                )
+                accepted: list[RemoteSearchHit] = []
+                deferred = False
+                deferred_cursor: SearchCursor | None = None
+                skipped_album = False
+                for unit in units:
+                    new_items = [
+                        hit
+                        for hit in unit
+                        if self._media_key(hit.remote) not in existing_keys
+                    ]
+                    if not new_items:
+                        continue
+                    is_album = new_items[0].remote.grouped_id is not None
+                    if len(new_items) > remaining_total:
+                        skipped_album = skipped_album or is_album
+                        continue
+                    if len(new_items) > remaining_page:
+                        grouped_id = new_items[0].remote.grouped_id
+                        trigger = (
+                            group_triggers.get(
+                                (new_items[0].remote.peer_ref, grouped_id),
+                                new_items[0].remote.message_id,
+                            )
+                            if grouped_id is not None
+                            else new_items[0].remote.message_id
+                        )
+                        deferred = True
+                        deferred_cursor = (
+                            request_cursor
+                            if session.scope is SearchScope.ALL_DIALOGS
+                            else SearchCursor(trigger + 1)
+                        )
+                        break
+                    accepted.extend(new_items)
+                    remaining_total -= len(new_items)
+                    remaining_page -= len(new_items)
+                    existing_keys.update(
+                        self._media_key(hit.remote) for hit in new_items
+                    )
+
+                queued_keys = planner.existing_media_keys(
+                    {self._media_key(hit.remote) for hit in accepted}
+                )
+                saved = [
+                    self._result_from_hit(
+                        account.account_id,
+                        session,
+                        hit,
+                        queued=self._media_key(hit.remote) in queued_keys,
+                    )
+                    for hit in accepted
+                ]
+                self.catalog.save_search_page(
+                    account.account_id,
+                    session.id,
+                    session.generation,
+                    saved,
+                )
+                operation_accepted += len(accepted)
+                result_count = len(
+                    self.catalog.list_results(account.account_id, session.id)
+                )
+                reached_limit = result_count >= session.query.filters.item_limit
+                complete = reached_limit or skipped_album or (
+                    not deferred and (page.exhausted or page.next_cursor is None)
+                )
+                cursor = (
+                    None
+                    if complete
+                    else deferred_cursor
+                    if deferred
+                    else page.next_cursor
+                )
+                self.catalog.finish_search(
+                    account.account_id,
+                    session.id,
+                    session.generation,
+                    cursor,
+                    complete,
+                    self.clock(),
+                    status=(
+                        SearchStatus.COMPLETED if complete else SearchStatus.RUNNING
+                    ),
+                    error="达到数量上限" if skipped_album else None,
+                )
+                session = self.catalog.get_session(account.account_id, session.id)
+                if (
+                    session.scope is SearchScope.SINGLE_DIALOG
+                    or complete
+                    or operation_accepted >= 100
+                    or deferred
+                ):
+                    break
+                request_cursor = cursor
         except asyncio.CancelledError:
-            self._finish_incomplete(session, "搜索已取消")
+            current = self.catalog.get_session(account.account_id, session.id)
+            self._finish_incomplete(current, "搜索已取消")
             raise
         except GatewayError as error:
-            self._finish_incomplete(session, self._safe_gateway_error(error))
+            current = self.catalog.get_session(account.account_id, session.id)
+            self._finish_incomplete(current, self._safe_gateway_error(error))
             raise
         current = self.catalog.get_session(account.account_id, session.id)
         results = self.catalog.list_results(account.account_id, session.id)
         return current, results
+
+    async def _search_remote_page(
+        self,
+        session: SearchSession,
+        cursor: SearchCursor | None,
+        *,
+        on_progress: Callable[[SearchProgress], None] | None,
+    ) -> RemoteSearchPage:
+        gateway, _planner = self._require_online()
+        if session.scope is SearchScope.ALL_DIALOGS:
+            return await gateway.search_all_media_page(
+                session.query,
+                cursor,
+                on_progress=on_progress,
+            )
+        return await gateway.search_media_page(
+            session.peer_ref,
+            session.query,
+            cursor,
+            on_progress=on_progress,
+        )
 
     def set_selected(
         self,
