@@ -342,6 +342,78 @@ async def test_five_page_search_reaches_500_across_short_flood_waits(
 
 
 @pytest.mark.asyncio
+async def test_long_flood_wait_returns_incomplete_session_that_can_continue(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 20, tzinfo=UTC)
+    gateway = FakeGateway(AccountProfile("a1", "账号一"))
+    gateway.pages = [
+        RemoteSearchPage((make_hit(10, now),), SearchCursor(10), False),
+        FloodWaitError(121),
+    ]
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    service = await prepared_online_service(
+        tmp_path,
+        now,
+        gateway,
+        sleep=fake_sleep,
+    )
+
+    session, results = await service.start_search("-1001", make_query(now))
+    session, results = await service.load_more(session.id)
+
+    assert session.status is SearchStatus.INCOMPLETE
+    assert session.cursor == SearchCursor(10)
+    assert session.last_error == "Telegram 请求需等待 121 秒"
+    assert [item.message_id for item in results] == [10]
+    assert sleeps == []
+
+    gateway.pages = [RemoteSearchPage((make_hit(5, now),), None, True)]
+    resumed, results = await service.load_more(session.id)
+
+    assert resumed.status is SearchStatus.COMPLETED
+    assert resumed.last_error is None
+    assert [item.message_id for item in results] == [10, 5]
+    assert gateway.search_cursors == [
+        None,
+        SearchCursor(10),
+        SearchCursor(10),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_third_short_flood_wait_returns_incomplete_without_more_sleep(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 20, tzinfo=UTC)
+    gateway = FakeGateway(AccountProfile("a1", "账号一"))
+    gateway.pages = [FloodWaitError(1), FloodWaitError(1), FloodWaitError(1)]
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    service = await prepared_online_service(
+        tmp_path,
+        now,
+        gateway,
+        sleep=fake_sleep,
+    )
+
+    session, results = await service.start_search("-1001", make_query(now))
+
+    assert session.status is SearchStatus.INCOMPLETE
+    assert session.last_error == "Telegram 请求需等待 1 秒"
+    assert results == []
+    assert sleeps == [1, 1]
+    assert gateway.search_cursors == [None, None, None]
+
+
+@pytest.mark.asyncio
 async def test_sync_and_search_forward_incremental_progress(tmp_path: Path) -> None:
     now = datetime(2026, 8, 15, tzinfo=UTC)
     gateway = FakeGateway(AccountProfile("a1", "账号一"))

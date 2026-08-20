@@ -295,6 +295,19 @@ class ContentBrowserService:
         except asyncio.CancelledError:
             self._finish_incomplete(session, "搜索已取消")
             raise
+        except FloodWaitError as error:
+            message = self._safe_gateway_error(error)
+            _LOGGER.warning(
+                "search flood wait terminal seconds=%d retries=%d cursor=%d",
+                error.seconds,
+                retries,
+                session.cursor.offset_id if session.cursor is not None else 0,
+            )
+            self._finish_incomplete(session, message)
+            account = self._require_account()
+            current = self.catalog.get_session(account.account_id, session.id)
+            results = self.catalog.list_results(account.account_id, session.id)
+            return current, results
         except GatewayError as error:
             self._finish_incomplete(session, self._safe_gateway_error(error))
             raise
