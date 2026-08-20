@@ -2096,6 +2096,60 @@ async def test_controller_forwards_global_scope_to_content_service() -> None:
 
 
 @pytest.mark.asyncio
+async def test_terminal_search_wait_activates_session_and_displays_error() -> None:
+    now = datetime(2026, 8, 20, tzinfo=UTC)
+    query = ContentSearchQuery(
+        "安装",
+        ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 500),
+    )
+    incomplete = SearchSession(
+        "search-1",
+        "a1",
+        "-1001",
+        "资料群",
+        query,
+        SearchStatus.INCOMPLETE,
+        1,
+        None,
+        False,
+        0,
+        now,
+        now,
+        "Telegram 请求需等待 121 秒",
+    )
+
+    class Browser:
+        async def start_search(
+            self,
+            _peer_ref,
+            _query,
+            *,
+            scope=SearchScope.SINGLE_DIALOG,
+            on_progress=None,
+        ):
+            return incomplete, []
+
+        def list_sessions(self):
+            return [incomplete]
+
+        def list_results(self, _search_id):
+            return []
+
+    window = ContentWindowFake()
+    controller = AppController.for_test(
+        gateway=ConnectedGateway(),
+        content_browser=Browser(),
+        window=window,
+    )
+
+    await controller.search_content("-1001", query)
+
+    assert window.content_page.active_search_id == "search-1"
+    assert window.content_page.sessions == [incomplete]
+    assert window.content_page.errors[-1] == "Telegram 请求需等待 121 秒"
+
+
+@pytest.mark.asyncio
 async def test_new_search_cancels_the_running_search_before_replacement() -> None:
     now = datetime(2026, 8, 15, tzinfo=UTC)
     first_started = asyncio.Event()

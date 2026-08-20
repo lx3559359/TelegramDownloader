@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -34,6 +35,20 @@ from telegram_downloader.gateway import (
 )
 from telegram_downloader.planner import EmptyScanError, ScanPreview, TaskPlanner
 from telegram_downloader.thumbnail_cache import ThumbnailCache
+
+_LOGGER = logging.getLogger("telegram_downloader.content_browser")
+
+
+@dataclass(frozen=True, slots=True)
+class SearchRetryPolicy:
+    maximum_wait_seconds: int = 120
+    maximum_retries: int = 2
+
+    def __post_init__(self) -> None:
+        if self.maximum_wait_seconds <= 0:
+            raise ValueError("搜索限流等待上限必须大于零")
+        if self.maximum_retries < 0:
+            raise ValueError("搜索限流重试次数不能为负数")
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +94,8 @@ class ContentBrowserService:
         clock: Callable[[], datetime] | None = None,
         album_concurrency: int = 4,
         thumbnail_concurrency: int = 4,
+        retry_policy: SearchRetryPolicy | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         if album_concurrency <= 0 or thumbnail_concurrency <= 0:
             raise ValueError("内容查询并发数必须大于零")
@@ -88,6 +105,8 @@ class ContentBrowserService:
         self.thumbnails = thumbnails
         self.uuid_factory = uuid_factory or (lambda: str(uuid4()))
         self.clock = clock or (lambda: datetime.now(UTC))
+        self.retry_policy = retry_policy or SearchRetryPolicy()
+        self.sleep = sleep
         self.account: AccountProfile | None = None
         self._last_dialog_sync_at: datetime | None = None
         self._sync_lock = asyncio.Lock()
@@ -246,6 +265,8 @@ class ContentBrowserService:
     ) -> tuple[SearchSession, list[SearchResult]]:
         account = self._require_account()
         gateway, planner = self._require_online()
+        latest_progress = SearchProgress(0, 0, "正在连接 Telegram")
+        retries = 0
         operation_accepted = 0
         progress_inspected = 0
         progress_matched = 0
@@ -261,23 +282,54 @@ class ContentBrowserService:
                     inspected_offset: int = progress_inspected,
                     matched_offset: int = progress_matched,
                 ) -> None:
-                    nonlocal page_inspected, page_matched
+                    nonlocal page_inspected, page_matched, latest_progress
                     page_inspected = max(page_inspected, progress.inspected)
                     page_matched = max(page_matched, progress.matched)
+                    latest_progress = SearchProgress(
+                        inspected_offset + page_inspected,
+                        matched_offset + page_matched,
+                        progress.phase,
+                    )
                     if on_progress is not None:
-                        on_progress(
-                            SearchProgress(
-                                inspected_offset + page_inspected,
-                                matched_offset + page_matched,
-                                progress.phase,
-                            )
-                        )
+                        on_progress(latest_progress)
 
-                page = await self._search_remote_page(
-                    session,
-                    request_cursor,
-                    on_progress=report_progress if on_progress is not None else None,
-                )
+                while True:
+                    try:
+                        page = await self._search_remote_page(
+                            session,
+                            request_cursor,
+                            on_progress=(
+                                report_progress if on_progress is not None else None
+                            ),
+                        )
+                        break
+                    except FloodWaitError as error:
+                        if (
+                            error.seconds > self.retry_policy.maximum_wait_seconds
+                            or retries >= self.retry_policy.maximum_retries
+                        ):
+                            raise
+                        retries += 1
+                        _LOGGER.warning(
+                            "search flood wait seconds=%d attempt=%d cursor=%d",
+                            error.seconds,
+                            retries,
+                            request_cursor.offset_id
+                            if request_cursor is not None
+                            else 0,
+                        )
+                        for remaining in range(error.seconds, 0, -1):
+                            if on_progress is not None:
+                                on_progress(
+                                    SearchProgress(
+                                        latest_progress.inspected,
+                                        latest_progress.matched,
+                                        "Telegram 限流，"
+                                        f"{remaining} 秒后自动重试（{retries}/"
+                                        f"{self.retry_policy.maximum_retries}）",
+                                    )
+                                )
+                            await self.sleep(1)
                 progress_inspected += page_inspected
                 progress_matched += page_matched
                 if session.scope is SearchScope.ALL_DIALOGS and not page.exhausted:
@@ -429,6 +481,19 @@ class ContentBrowserService:
             current = self.catalog.get_session(account.account_id, session.id)
             self._finish_incomplete(current, "搜索已取消")
             raise
+        except FloodWaitError as error:
+            message = self._safe_gateway_error(error)
+            _LOGGER.warning(
+                "search flood wait terminal seconds=%d retries=%d cursor=%d",
+                error.seconds,
+                retries,
+                request_cursor.offset_id if request_cursor is not None else 0,
+            )
+            current = self.catalog.get_session(account.account_id, session.id)
+            self._finish_incomplete(current, message)
+            current = self.catalog.get_session(account.account_id, session.id)
+            results = self.catalog.list_results(account.account_id, session.id)
+            return current, results
         except GatewayError as error:
             current = self.catalog.get_session(account.account_id, session.id)
             self._finish_incomplete(current, self._safe_gateway_error(error))

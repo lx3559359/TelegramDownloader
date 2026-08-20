@@ -1068,6 +1068,7 @@ class AppController:
             page.set_active_search(session)
             page.set_results(results)
             page.set_sessions(self.content_browser.list_sessions())
+            page.show_error(session.last_error or "")
         except asyncio.CancelledError:
             raise
         except SessionExpiredError as error:
@@ -1101,6 +1102,7 @@ class AppController:
             page.set_active_search(session)
             page.set_results(results)
             page.set_sessions(self.content_browser.list_sessions())
+            page.show_error(session.last_error or "")
         except asyncio.CancelledError:
             raise
         except SessionExpiredError as error:
