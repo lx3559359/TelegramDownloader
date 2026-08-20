@@ -726,9 +726,14 @@ class ContentBrowserPage(QWidget):
             and selectable
             and not self._queue_busy
         )
+        active_status = (
+            self.active_session.status if self.active_session is not None else None
+        )
+        incomplete = active_status is SearchStatus.INCOMPLETE
+        self.load_more_button.setText("继续搜索" if incomplete else "加载更多")
         can_load = (
             self.active_session is not None
-            and self.active_session.status is SearchStatus.RUNNING
+            and active_status in (SearchStatus.RUNNING, SearchStatus.INCOMPLETE)
             and not self.active_session.exhausted
             and not self._search_busy
             and self._logged_in

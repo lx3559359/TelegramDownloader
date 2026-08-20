@@ -193,6 +193,27 @@ def test_progress_and_retry_widgets_show_honest_operation_state(qtbot) -> None:
     assert page.connection_retry_button.isVisible()
 
 
+def test_incomplete_search_exposes_continue_action(qtbot) -> None:
+    now = datetime(2026, 8, 20, tzinfo=UTC)
+    page = ContentBrowserPage()
+    qtbot.addWidget(page)
+    page.show()
+    page.set_logged_in(True)
+    incomplete = replace(
+        session(now),
+        status=SearchStatus.INCOMPLETE,
+        last_error="Telegram 请求需等待 121 秒",
+    )
+
+    page.set_active_search(incomplete)
+
+    assert page.load_more_button.isVisible()
+    assert page.load_more_button.text() == "继续搜索"
+
+    page.set_active_search(replace(incomplete, status=SearchStatus.RUNNING))
+    assert page.load_more_button.text() == "加载更多"
+
+
 def test_connection_retry_button_emits_retry_signal(qtbot) -> None:
     page = ContentBrowserPage()
     qtbot.addWidget(page)
