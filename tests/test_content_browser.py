@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,6 +19,7 @@ from telegram_downloader.content import (
 from telegram_downloader.content_browser import (
     ContentBrowserService,
     NothingToQueueError,
+    SearchRetryPolicy,
 )
 from telegram_downloader.content_progress import DialogSyncProgress, SearchProgress
 from telegram_downloader.domain import (
@@ -29,6 +31,7 @@ from telegram_downloader.domain import (
     TaskStatus,
 )
 from telegram_downloader.gateway import (
+    FloodWaitError,
     RemoteMedia,
     RemoteSearchHit,
     RemoteSearchPage,
@@ -87,6 +90,7 @@ class FakeGateway:
         self.profile = profile
         self.dialogs: list[ContentDialog] = []
         self.pages: list[RemoteSearchPage | BaseException] = []
+        self.page_progress: list[SearchProgress | None] = []
         self.albums: dict[int, tuple[RemoteSearchHit, ...]] = {}
         self.thumbnail_values: dict[int, bytes | BaseException | None] = {}
         self.profile_calls = 0
@@ -107,10 +111,13 @@ class FakeGateway:
 
     async def search_media_page(self, peer_ref, query, cursor, *, on_progress=None):
         self.search_cursors.append(cursor)
+        progress = self.page_progress.pop(0) if self.page_progress else None
+        if progress is not None and on_progress is not None:
+            on_progress(progress)
         value = self.pages.pop(0)
         if isinstance(value, BaseException):
             raise value
-        if on_progress is not None:
+        if progress is None and on_progress is not None:
             on_progress(SearchProgress(len(value.items), len(value.items), "正在整理结果"))
         return value
 
@@ -164,6 +171,8 @@ async def prepared_online_service(
     *,
     album_concurrency: int = 4,
     thumbnail_concurrency: int = 4,
+    sleep=asyncio.sleep,
+    retry_policy: SearchRetryPolicy | None = None,
 ) -> ContentBrowserService:
     catalog = initialized_catalog(tmp_path)
     service = ContentBrowserService(
@@ -174,6 +183,8 @@ async def prepared_online_service(
         clock=lambda: now,
         album_concurrency=album_concurrency,
         thumbnail_concurrency=thumbnail_concurrency,
+        sleep=sleep,
+        retry_policy=retry_policy,
     )
     await service.activate_account()
     catalog.replace_dialogs(
@@ -182,6 +193,152 @@ async def prepared_online_service(
         now,
     )
     return service
+
+
+def test_search_retry_policy_rejects_invalid_limits() -> None:
+    with pytest.raises(ValueError, match="等待上限"):
+        SearchRetryPolicy(maximum_wait_seconds=0)
+    with pytest.raises(ValueError, match="重试次数"):
+        SearchRetryPolicy(maximum_retries=-1)
+
+
+@pytest.mark.asyncio
+async def test_short_flood_wait_counts_down_and_retries_same_cursor(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    now = datetime(2026, 8, 20, tzinfo=UTC)
+    gateway = FakeGateway(AccountProfile("a1", "账号一"))
+    gateway.pages = [
+        FloodWaitError(3),
+        RemoteSearchPage((make_hit(9, now),), None, True),
+    ]
+    gateway.page_progress = [SearchProgress(7, 2, "正在扫描"), None]
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    service = await prepared_online_service(
+        tmp_path,
+        now,
+        gateway,
+        sleep=fake_sleep,
+    )
+    progress: list[SearchProgress] = []
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger="telegram_downloader.content_browser",
+    ):
+        session, results = await service.start_search(
+            "-1001",
+            make_query(now, "隐私关键词"),
+            on_progress=progress.append,
+        )
+
+    countdown = [item for item in progress if "自动重试" in item.phase]
+    assert [item.phase for item in countdown] == [
+        "Telegram 限流，3 秒后自动重试（1/2）",
+        "Telegram 限流，2 秒后自动重试（1/2）",
+        "Telegram 限流，1 秒后自动重试（1/2）",
+    ]
+    assert all((item.inspected, item.matched) == (7, 2) for item in countdown)
+    assert sleeps == [1, 1, 1]
+    assert gateway.search_cursors == [None, None]
+    assert session.status is SearchStatus.COMPLETED
+    assert [item.message_id for item in results] == [9]
+    assert "seconds=3" in caplog.text
+    assert "attempt=1" in caplog.text
+    assert "cursor=0" in caplog.text
+    assert "隐私关键词" not in caplog.text
+    assert "资料群" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cancelling_flood_wait_stops_before_retry(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 20, tzinfo=UTC)
+    gateway = FakeGateway(AccountProfile("a1", "账号一"))
+    gateway.pages = [FloodWaitError(20)]
+
+    async def cancel_sleep(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    service = await prepared_online_service(
+        tmp_path,
+        now,
+        gateway,
+        sleep=cancel_sleep,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.start_search("-1001", make_query(now))
+
+    interrupted = service.latest_session("-1001")
+    assert interrupted is not None
+    assert interrupted.status is SearchStatus.INCOMPLETE
+    assert interrupted.last_error == "搜索已取消"
+    assert gateway.search_cursors == [None]
+
+
+@pytest.mark.asyncio
+async def test_five_page_search_reaches_500_across_short_flood_waits(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 20, tzinfo=UTC)
+    gateway = FakeGateway(AccountProfile("a1", "账号一"))
+    pages = [
+        RemoteSearchPage(
+            tuple(
+                make_hit(message_id, now)
+                for message_id in range(upper, upper - 100, -1)
+            ),
+            SearchCursor(upper - 100),
+            False,
+        )
+        for upper in (500, 400, 300, 200, 100)
+    ]
+    gateway.pages = [
+        pages[0],
+        FloodWaitError(1),
+        pages[1],
+        pages[2],
+        FloodWaitError(1),
+        pages[3],
+        pages[4],
+    ]
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    service = await prepared_online_service(
+        tmp_path,
+        now,
+        gateway,
+        sleep=fake_sleep,
+    )
+
+    session, results = await service.start_search(
+        "-1001",
+        make_query(now, limit=500),
+    )
+    while not session.exhausted:
+        session, results = await service.load_more(session.id)
+
+    assert session.status is SearchStatus.COMPLETED
+    assert len(results) == 500
+    assert len({item.id for item in results}) == 500
+    assert sleeps == [1, 1]
+    assert gateway.search_cursors == [
+        None,
+        SearchCursor(400),
+        SearchCursor(400),
+        SearchCursor(300),
+        SearchCursor(200),
+        SearchCursor(200),
+        SearchCursor(100),
+    ]
 
 
 @pytest.mark.asyncio

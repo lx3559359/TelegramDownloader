@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -30,6 +31,20 @@ from telegram_downloader.gateway import (
 )
 from telegram_downloader.planner import EmptyScanError, ScanPreview, TaskPlanner
 from telegram_downloader.thumbnail_cache import ThumbnailCache
+
+_LOGGER = logging.getLogger("telegram_downloader.content_browser")
+
+
+@dataclass(frozen=True, slots=True)
+class SearchRetryPolicy:
+    maximum_wait_seconds: int = 120
+    maximum_retries: int = 2
+
+    def __post_init__(self) -> None:
+        if self.maximum_wait_seconds <= 0:
+            raise ValueError("搜索限流等待上限必须大于零")
+        if self.maximum_retries < 0:
+            raise ValueError("搜索限流重试次数不能为负数")
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +90,8 @@ class ContentBrowserService:
         clock: Callable[[], datetime] | None = None,
         album_concurrency: int = 4,
         thumbnail_concurrency: int = 4,
+        retry_policy: SearchRetryPolicy | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         if album_concurrency <= 0 or thumbnail_concurrency <= 0:
             raise ValueError("内容查询并发数必须大于零")
@@ -84,6 +101,8 @@ class ContentBrowserService:
         self.thumbnails = thumbnails
         self.uuid_factory = uuid_factory or (lambda: str(uuid4()))
         self.clock = clock or (lambda: datetime.now(UTC))
+        self.retry_policy = retry_policy or SearchRetryPolicy()
+        self.sleep = sleep
         self.account: AccountProfile | None = None
         self._last_dialog_sync_at: datetime | None = None
         self._sync_lock = asyncio.Lock()
@@ -232,137 +251,182 @@ class ContentBrowserService:
         *,
         on_progress: Callable[[SearchProgress], None] | None = None,
     ) -> tuple[SearchSession, list[SearchResult]]:
-        account = self._require_account()
-        gateway, planner = self._require_online()
+        latest_progress = SearchProgress(0, 0, "正在连接 Telegram")
+        retries = 0
+
+        def report(progress: SearchProgress) -> None:
+            nonlocal latest_progress
+            latest_progress = progress
+            if on_progress is not None:
+                on_progress(progress)
+
         try:
-            page = await gateway.search_media_page(
-                session.peer_ref,
-                session.query,
-                session.cursor,
-                on_progress=on_progress,
-            )
-            expanded = list(page.items)
-            group_triggers: dict[int, int] = {}
-            for hit in page.items:
-                grouped_id = hit.remote.grouped_id
-                if grouped_id is None:
-                    continue
-                group_triggers.setdefault(grouped_id, hit.remote.message_id)
-
-            async def expand(
-                trigger: tuple[int, int],
-            ) -> tuple[RemoteSearchHit, ...]:
-                grouped_id, message_id = trigger
-                async with self._album_semaphore:
-                    return await gateway.expand_album(
-                        session.peer_ref,
-                        message_id,
-                        grouped_id,
+            while True:
+                try:
+                    return await self._fetch_page_once(
+                        session,
+                        on_progress=report if on_progress is not None else None,
                     )
-
-            album_values = await asyncio.gather(
-                *(expand(item) for item in group_triggers.items())
-            )
-            for values in album_values:
-                expanded.extend(values)
-
-            unique = self._deduplicate_hits(expanded)
-            existing_results = self.catalog.list_results(
-                account.account_id,
-                session.id,
-            )
-            existing_keys = {
-                (item.peer_ref, item.message_id, item.media_id)
-                for item in existing_results
-            }
-            units = self._album_units(unique)
-            remaining_total = max(
-                0,
-                session.query.filters.item_limit - len(existing_results),
-            )
-            remaining_page = min(100, remaining_total)
-            accepted: list[RemoteSearchHit] = []
-            deferred_cursor: SearchCursor | None = None
-            skipped_album = False
-            for unit in units:
-                new_items = [
-                    hit
-                    for hit in unit
-                    if self._media_key(hit.remote) not in existing_keys
-                ]
-                if not new_items:
-                    continue
-                is_album = new_items[0].remote.grouped_id is not None
-                if len(new_items) > remaining_total:
-                    skipped_album = skipped_album or is_album
-                    continue
-                if len(new_items) > remaining_page:
-                    grouped_id = new_items[0].remote.grouped_id
-                    trigger = (
-                        group_triggers.get(grouped_id, new_items[0].remote.message_id)
-                        if grouped_id is not None
-                        else new_items[0].remote.message_id
+                except FloodWaitError as error:
+                    if (
+                        error.seconds > self.retry_policy.maximum_wait_seconds
+                        or retries >= self.retry_policy.maximum_retries
+                    ):
+                        raise
+                    retries += 1
+                    _LOGGER.warning(
+                        "search flood wait seconds=%d attempt=%d cursor=%d",
+                        error.seconds,
+                        retries,
+                        session.cursor.offset_id if session.cursor is not None else 0,
                     )
-                    deferred_cursor = SearchCursor(trigger + 1)
-                    break
-                accepted.extend(new_items)
-                remaining_total -= len(new_items)
-                remaining_page -= len(new_items)
-                existing_keys.update(self._media_key(hit.remote) for hit in new_items)
-
-            queued_keys = planner.existing_media_keys(
-                {self._media_key(hit.remote) for hit in accepted}
-            )
-            saved = [
-                self._result_from_hit(
-                    account.account_id,
-                    session,
-                    hit,
-                    queued=self._media_key(hit.remote) in queued_keys,
-                )
-                for hit in accepted
-            ]
-            self.catalog.save_search_page(
-                account.account_id,
-                session.id,
-                session.generation,
-                saved,
-            )
-            result_count = len(
-                self.catalog.list_results(account.account_id, session.id)
-            )
-            reached_limit = result_count >= session.query.filters.item_limit
-            complete = (
-                page.exhausted
-                or reached_limit
-                or skipped_album
-                or (deferred_cursor is None and page.next_cursor is None)
-            )
-            cursor = (
-                None
-                if complete
-                else deferred_cursor
-                if deferred_cursor is not None
-                else page.next_cursor
-            )
-            self.catalog.finish_search(
-                account.account_id,
-                session.id,
-                session.generation,
-                cursor,
-                complete,
-                self.clock(),
-                status=(
-                    SearchStatus.COMPLETED if complete else SearchStatus.RUNNING
-                ),
-                error="达到数量上限" if skipped_album else None,
-            )
+                    for remaining in range(error.seconds, 0, -1):
+                        if on_progress is not None:
+                            on_progress(
+                                SearchProgress(
+                                    latest_progress.inspected,
+                                    latest_progress.matched,
+                                    "Telegram 限流，"
+                                    f"{remaining} 秒后自动重试（{retries}/"
+                                    f"{self.retry_policy.maximum_retries}）",
+                                )
+                            )
+                        await self.sleep(1)
         except asyncio.CancelledError:
             self._finish_incomplete(session, "搜索已取消")
             raise
         except GatewayError as error:
             self._finish_incomplete(session, self._safe_gateway_error(error))
             raise
+
+    async def _fetch_page_once(
+        self,
+        session: SearchSession,
+        *,
+        on_progress: Callable[[SearchProgress], None] | None = None,
+    ) -> tuple[SearchSession, list[SearchResult]]:
+        account = self._require_account()
+        gateway, planner = self._require_online()
+        page = await gateway.search_media_page(
+            session.peer_ref,
+            session.query,
+            session.cursor,
+            on_progress=on_progress,
+        )
+        expanded = list(page.items)
+        group_triggers: dict[int, int] = {}
+        for hit in page.items:
+            grouped_id = hit.remote.grouped_id
+            if grouped_id is None:
+                continue
+            group_triggers.setdefault(grouped_id, hit.remote.message_id)
+
+        async def expand(
+            trigger: tuple[int, int],
+        ) -> tuple[RemoteSearchHit, ...]:
+            grouped_id, message_id = trigger
+            async with self._album_semaphore:
+                return await gateway.expand_album(
+                    session.peer_ref,
+                    message_id,
+                    grouped_id,
+                )
+
+        album_values = await asyncio.gather(
+            *(expand(item) for item in group_triggers.items())
+        )
+        for values in album_values:
+            expanded.extend(values)
+
+        unique = self._deduplicate_hits(expanded)
+        existing_results = self.catalog.list_results(
+            account.account_id,
+            session.id,
+        )
+        existing_keys = {
+            (item.peer_ref, item.message_id, item.media_id)
+            for item in existing_results
+        }
+        units = self._album_units(unique)
+        remaining_total = max(
+            0,
+            session.query.filters.item_limit - len(existing_results),
+        )
+        remaining_page = min(100, remaining_total)
+        accepted: list[RemoteSearchHit] = []
+        deferred_cursor: SearchCursor | None = None
+        skipped_album = False
+        for unit in units:
+            new_items = [
+                hit
+                for hit in unit
+                if self._media_key(hit.remote) not in existing_keys
+            ]
+            if not new_items:
+                continue
+            is_album = new_items[0].remote.grouped_id is not None
+            if len(new_items) > remaining_total:
+                skipped_album = skipped_album or is_album
+                continue
+            if len(new_items) > remaining_page:
+                grouped_id = new_items[0].remote.grouped_id
+                trigger = (
+                    group_triggers.get(grouped_id, new_items[0].remote.message_id)
+                    if grouped_id is not None
+                    else new_items[0].remote.message_id
+                )
+                deferred_cursor = SearchCursor(trigger + 1)
+                break
+            accepted.extend(new_items)
+            remaining_total -= len(new_items)
+            remaining_page -= len(new_items)
+            existing_keys.update(self._media_key(hit.remote) for hit in new_items)
+
+        queued_keys = planner.existing_media_keys(
+            {self._media_key(hit.remote) for hit in accepted}
+        )
+        saved = [
+            self._result_from_hit(
+                account.account_id,
+                session,
+                hit,
+                queued=self._media_key(hit.remote) in queued_keys,
+            )
+            for hit in accepted
+        ]
+        self.catalog.save_search_page(
+            account.account_id,
+            session.id,
+            session.generation,
+            saved,
+        )
+        result_count = len(
+            self.catalog.list_results(account.account_id, session.id)
+        )
+        reached_limit = result_count >= session.query.filters.item_limit
+        complete = (
+            page.exhausted
+            or reached_limit
+            or skipped_album
+            or (deferred_cursor is None and page.next_cursor is None)
+        )
+        cursor = (
+            None
+            if complete
+            else deferred_cursor
+            if deferred_cursor is not None
+            else page.next_cursor
+        )
+        self.catalog.finish_search(
+            account.account_id,
+            session.id,
+            session.generation,
+            cursor,
+            complete,
+            self.clock(),
+            status=(SearchStatus.COMPLETED if complete else SearchStatus.RUNNING),
+            error="达到数量上限" if skipped_album else None,
+        )
         current = self.catalog.get_session(account.account_id, session.id)
         results = self.catalog.list_results(account.account_id, session.id)
         return current, results
