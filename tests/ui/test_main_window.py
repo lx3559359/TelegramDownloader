@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 
 import pytest
 from PySide6.QtCore import QItemSelectionModel, Qt
+from PySide6.QtTest import QSignalSpy
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QGraphicsDropShadowEffect,
@@ -488,6 +489,33 @@ def test_live_refresh_preserves_selected_task(qtbot) -> None:
 
     assert window.selected_task_id() == "task-1"
     assert window.pause_button.isEnabled() is True
+
+
+def test_progress_only_task_update_does_not_reset_model(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    first = TaskSummary(
+        "task-1",
+        "示例频道",
+        TaskStatus.DOWNLOADING,
+        "1 / 10",
+        "10 B",
+        "1 B/s",
+        "9 秒",
+        "—",
+        downloaded_bytes=1,
+        total_bytes=10,
+    )
+    window.set_task_summaries([first])
+    resets = QSignalSpy(window.task_model.modelReset)
+    changes = QSignalSpy(window.task_model.dataChanged)
+
+    window.set_task_summaries(
+        [replace(first, downloaded_bytes=2, progress_text="2 / 10")]
+    )
+
+    assert resets.count() == 0
+    assert changes.count() >= 1
 
 
 def test_task_workspace_filters_and_emits_stable_multiselect_batches(qtbot) -> None:

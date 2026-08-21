@@ -467,6 +467,8 @@ class AppController:
         self._integrity_cancel_event: Event | None = None
         self._integrity_repair_task_ids: set[str] = set()
         self._detail_task_id: str | None = None
+        self._task_refresh_task: asyncio.Task[None] | None = None
+        self._task_refresh_pending = False
         self._progress_refresh_interval = progress_refresh_interval
         self._next_progress_refresh = 0.0
         self._progress_samples: dict[str, tuple[float, int]] = {}
@@ -1670,7 +1672,7 @@ class AppController:
                 accepted.append(task_id)
         if accepted:
             await asyncio.gather(*(self.scheduler.resume_task(task_id) for task_id in accepted))
-        self.refresh_tasks()
+        await self.refresh_tasks_async()
         self._show_status(f"已继续 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个")
 
     async def retry_failed_tasks(self, task_ids: list[str]) -> None:
@@ -1685,7 +1687,7 @@ class AppController:
                 accepted.append(task_id)
         if accepted:
             await asyncio.gather(*(self.scheduler.resume_task(task_id) for task_id in accepted))
-        self.refresh_tasks()
+        await self.refresh_tasks_async()
         self._show_status(f"已重试 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个")
 
     def archive_tasks(self, task_ids: list[str]) -> None:
@@ -1963,8 +1965,54 @@ class AppController:
 
     def refresh_tasks(self, *, now: float | None = None) -> None:
         sampled_at = monotonic_clock() if now is None else now
-        summaries: list[TaskSummary] = []
-        active_ids: set[str] = set()
+        scheduler_state, queue_positions = self._task_scheduler_state()
+        snapshots = self.repository.list_task_snapshots(include_archived=True)
+        summaries = self._summaries_from_snapshots(
+            snapshots,
+            scheduler_state,
+            queue_positions,
+            sampled_at,
+        )
+        self._apply_task_summaries(summaries, scheduler_state)
+
+    async def refresh_tasks_async(self, *, now: float | None = None) -> None:
+        active = self._task_refresh_task
+        if active is not None and not active.done():
+            self._task_refresh_pending = True
+            await asyncio.shield(active)
+            return
+
+        refresh = asyncio.create_task(self._refresh_task_views(now=now))
+        self._task_refresh_task = refresh
+        refresh.add_done_callback(self._task_refresh_finished)
+        await asyncio.shield(refresh)
+
+    async def _refresh_task_views(self, *, now: float | None) -> None:
+        while True:
+            self._task_refresh_pending = False
+            sampled_at = monotonic_clock() if now is None else now
+            snapshots = await asyncio.to_thread(
+                self.repository.list_task_snapshots,
+                include_archived=True,
+            )
+            scheduler_state, queue_positions = self._task_scheduler_state()
+            summaries = self._summaries_from_snapshots(
+                snapshots,
+                scheduler_state,
+                queue_positions,
+                sampled_at,
+            )
+            self._apply_task_summaries(summaries, scheduler_state)
+            if not self._task_refresh_pending:
+                return
+
+    def _task_refresh_finished(self, task: asyncio.Task[None]) -> None:
+        if self._task_refresh_task is task:
+            self._task_refresh_task = None
+        if not task.cancelled():
+            task.exception()
+
+    def _task_scheduler_state(self) -> tuple[SchedulerSnapshot, dict[str, int]]:
         snapshot_method = getattr(self.scheduler, "snapshot", None)
         scheduler_state = (
             snapshot_method()
@@ -1980,7 +2028,17 @@ class AppController:
         queue_positions = (
             queue_positions_method() if callable(queue_positions_method) else {}
         )
-        snapshots = self.repository.list_task_snapshots(include_archived=True)
+        return scheduler_state, queue_positions
+
+    def _summaries_from_snapshots(
+        self,
+        snapshots: list[Any],
+        scheduler_state: SchedulerSnapshot,
+        queue_positions: dict[str, int],
+        sampled_at: float,
+    ) -> list[TaskSummary]:
+        summaries: list[TaskSummary] = []
+        active_ids: set[str] = set()
         for snapshot in snapshots:
             task = snapshot.task
             archived = task.archived_at is not None
@@ -2025,6 +2083,13 @@ class AppController:
                 active_ids.add(task.id)
         for task_id in set(self._progress_samples) - active_ids:
             self._progress_samples.pop(task_id, None)
+        return summaries
+
+    def _apply_task_summaries(
+        self,
+        summaries: list[TaskSummary],
+        scheduler_state: SchedulerSnapshot,
+    ) -> None:
         self.window.set_task_summaries(summaries)
         set_scheduler_summary = getattr(self.window, "set_scheduler_summary", None)
         if callable(set_scheduler_summary):
@@ -2053,12 +2118,12 @@ class AppController:
         delta = downloaded - previous[1]
         return delta / elapsed if elapsed > 0 and delta > 0 else 0.0
 
-    def _refresh_tasks_if_due(self, now: float | None = None) -> None:
+    async def _refresh_tasks_if_due(self, now: float | None = None) -> None:
         sampled_at = monotonic_clock() if now is None else now
         if sampled_at < self._next_progress_refresh:
             return
         self._next_progress_refresh = sampled_at + self._progress_refresh_interval
-        self.refresh_tasks(now=sampled_at)
+        await self.refresh_tasks_async(now=sampled_at)
 
     def show_login(self) -> None:
         self._prefill_login()
@@ -2305,7 +2370,7 @@ class AppController:
             while not operation.done():
                 is_active = getattr(self.scheduler, "is_active", None)
                 if not callable(is_active) or is_active(task_id):
-                    self._refresh_tasks_if_due()
+                    await self._refresh_tasks_if_due()
                 try:
                     await asyncio.wait_for(
                         asyncio.shield(operation),
@@ -2315,7 +2380,7 @@ class AppController:
                     continue
             await operation
         finally:
-            self.refresh_tasks()
+            await self.refresh_tasks_async()
 
     def _show_status(self, message: str) -> None:
         self.window.statusBar().showMessage(message, 8000)

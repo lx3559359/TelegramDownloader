@@ -1814,22 +1814,21 @@ def test_open_media_file_requires_completed_local_existing_file(
     assert "安全" in controller.window.message.last_message
 
 
-def test_progress_refresh_is_throttled_across_concurrent_callers() -> None:
-    class Window:
-        def __init__(self):
-            self.refreshes = 0
+@pytest.mark.asyncio
+async def test_progress_refresh_is_throttled_across_concurrent_callers() -> None:
+    controller = AppController.for_test(progress_refresh_interval=0.5)
+    refreshes: list[float | None] = []
 
-        def set_task_summaries(self, _summaries):
-            self.refreshes += 1
+    async def refresh(*, now=None) -> None:
+        refreshes.append(now)
 
-    window = Window()
-    controller = AppController.for_test(window=window, progress_refresh_interval=0.5)
+    controller.refresh_tasks_async = refresh
 
-    controller._refresh_tasks_if_due(20.0)
-    controller._refresh_tasks_if_due(20.1)
-    controller._refresh_tasks_if_due(20.5)
+    await controller._refresh_tasks_if_due(20.0)
+    await controller._refresh_tasks_if_due(20.1)
+    await controller._refresh_tasks_if_due(20.5)
 
-    assert window.refreshes == 2
+    assert refreshes == [20.0, 20.5]
 
 
 def test_progress_refresh_interval_must_be_positive() -> None:
@@ -3153,6 +3152,63 @@ async def test_scan_failure_is_persistent_and_releases_busy_state() -> None:
     assert window.busy_states == [True, False]
 
 
+@pytest.mark.asyncio
+async def test_async_task_refresh_does_not_block_event_loop() -> None:
+    import time
+
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    heartbeat = asyncio.Event()
+
+    class Repository:
+        def list_task_snapshots(self, *, include_archived=False):
+            assert include_archived is True
+            loop.call_soon_threadsafe(entered.set)
+            time.sleep(0.05)
+            return []
+
+    controller = AppController.for_test(repository=Repository())
+    refresh = asyncio.create_task(controller.refresh_tasks_async())
+    await entered.wait()
+    loop.call_soon(heartbeat.set)
+
+    await asyncio.wait_for(heartbeat.wait(), timeout=0.02)
+    await refresh
+
+
+@pytest.mark.asyncio
+async def test_concurrent_task_refreshes_are_coalesced() -> None:
+    from threading import Event
+
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = Event()
+    calls = 0
+
+    class Repository:
+        def list_task_snapshots(self, *, include_archived=False):
+            nonlocal calls
+            assert include_archived is True
+            calls += 1
+            if calls == 1:
+                loop.call_soon_threadsafe(entered.set)
+                assert release.wait(timeout=1)
+            return []
+
+    controller = AppController.for_test(repository=Repository())
+    first = asyncio.create_task(controller.refresh_tasks_async())
+    await entered.wait()
+    followers = [
+        asyncio.create_task(controller.refresh_tasks_async()) for _ in range(2)
+    ]
+    await asyncio.sleep(0)
+    release.set()
+
+    await asyncio.gather(first, *followers)
+
+    assert calls == 2
+
+
 def test_refresh_tasks_exposes_queue_positions_and_scheduler_summary() -> None:
     queued_task = SimpleNamespace(
         id="queued",
@@ -3392,11 +3448,11 @@ async def test_waiting_run_does_not_poll_database_until_completion() -> None:
     )
     refreshes = 0
 
-    def refresh() -> None:
+    async def refresh() -> None:
         nonlocal refreshes
         refreshes += 1
 
-    controller.refresh_tasks = refresh
+    controller.refresh_tasks_async = refresh
     operation = asyncio.create_task(controller._run_and_refresh("waiting"))
     await asyncio.sleep(0.03)
     assert refreshes == 0
