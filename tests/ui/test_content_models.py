@@ -4,6 +4,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QIcon, QPixmap
+from PySide6.QtTest import QSignalSpy
 
 from telegram_downloader.content import (
     ALL_DIALOGS_SCOPE_REF,
@@ -349,3 +350,29 @@ def test_thumbnail_path_returns_the_cached_project_file(tmp_path: Path) -> None:
     model.set_thumbnail("r1", path)
 
     assert model.thumbnail_path("r1") == path
+
+
+def test_apply_results_inserts_and_updates_without_model_reset(qtbot) -> None:
+    model = SearchResultTableModel()
+    first = search_results(datetime(2026, 8, 15, tzinfo=UTC))[0]
+    second = replace(first, id="r2", message_id=2, media_id="m2")
+    resets = QSignalSpy(model.modelReset)
+    inserted = QSignalSpy(model.rowsInserted)
+
+    model.apply_results([first])
+    model.apply_results([replace(first, selected=True), second])
+
+    assert resets.count() == 0
+    assert inserted.count() >= 1
+    assert model.rowCount() == 2
+    assert model.result_at(0).selected is True
+
+
+def test_apply_results_removes_missing_rows_without_reset(qtbot) -> None:
+    model = SearchResultTableModel()
+    values = search_results(datetime(2026, 8, 15, tzinfo=UTC))
+    model.apply_results(values)
+    removed = QSignalSpy(model.rowsRemoved)
+    model.apply_results(values[:1])
+    assert removed.count() == 1
+    assert model.rowCount() == 1

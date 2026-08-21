@@ -366,6 +366,62 @@ class SearchResultTableModel(QAbstractTableModel):
         }
         self.endResetModel()
 
+    def apply_results(self, results: list[SearchResult]) -> None:
+        target = list(results)
+        target_ids = {item.id for item in target}
+        current = list(self._results)
+        row = len(current) - 1
+        while row >= 0:
+            if current[row].id in target_ids:
+                row -= 1
+                continue
+            last = row
+            while row >= 0 and current[row].id not in target_ids:
+                row -= 1
+            first = row + 1
+            self.beginRemoveRows(_INVALID_INDEX, first, last)
+            del current[first : last + 1]
+            self._results = tuple(current)
+            self.endRemoveRows()
+
+        for row, wanted in enumerate(target):
+            existing = next(
+                (
+                    index
+                    for index, item in enumerate(current)
+                    if item.id == wanted.id
+                ),
+                None,
+            )
+            if existing is None:
+                self.beginInsertRows(_INVALID_INDEX, row, row)
+                current.insert(row, wanted)
+                self._results = tuple(current)
+                self.endInsertRows()
+            elif existing != row:
+                self.beginRemoveRows(_INVALID_INDEX, existing, existing)
+                moved = current.pop(existing)
+                self._results = tuple(current)
+                self.endRemoveRows()
+                self.beginInsertRows(_INVALID_INDEX, row, row)
+                current.insert(row, moved)
+                self._results = tuple(current)
+                self.endInsertRows()
+            if current[row] != wanted:
+                current[row] = wanted
+                self._results = tuple(current)
+                self.dataChanged.emit(
+                    self.index(row, 0),
+                    self.index(row, self.columnCount() - 1),
+                )
+
+        self._results = tuple(current)
+        self._thumbnails = {
+            result_id: path
+            for result_id, path in self._thumbnails.items()
+            if result_id in target_ids
+        }
+
     def set_thumbnail(self, result_id: str, path: Path) -> None:
         for row, result in enumerate(self._results):
             if result.id != result_id:

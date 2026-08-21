@@ -32,7 +32,7 @@ from telegram_downloader.content import (
     SearchSession,
     SearchStatus,
 )
-from telegram_downloader.content_progress import SearchProgress
+from telegram_downloader.content_progress import SearchProgress, SearchResultBatch
 from telegram_downloader.domain import MediaKind
 from telegram_downloader.links import is_telegram_link_candidate
 from telegram_downloader.ui.check_delegate import FullCellCheckDelegate
@@ -86,6 +86,9 @@ class ContentBrowserPage(QWidget):
         self._connection_action_busy = False
         self._connection_retryable = False
         self._queue_busy = False
+        self._batch_search_id: str | None = None
+        self._batch_generation: int | None = None
+        self._results_stable = True
         self._thumbnail_requested_ids: set[str] = set()
         self._preview_dialogs: set[MediaPreviewDialog] = set()
         self._build_ui()
@@ -462,14 +465,31 @@ class ContentBrowserPage(QWidget):
     def set_active_search(self, session: SearchSession | None) -> None:
         self.active_session = session
         self.active_search_id = session.id if session is not None else None
+        self._batch_search_id = self.active_search_id
+        self._batch_generation = session.generation if session is not None else None
+        self._results_stable = True
         self._set_form_from_session(session)
         self._refresh_actions()
 
     def set_results(self, results: list[SearchResult]) -> None:
         self.results = list(results)
         self.result_model.set_results(results)
+        self._results_stable = True
         self._thumbnail_requested_ids.intersection_update(
             item.id for item in results
+        )
+        self._update_selection_summary()
+        self._refresh_actions()
+        QTimer.singleShot(0, self.request_visible_thumbnails)
+
+    def apply_search_batch(self, batch: SearchResultBatch) -> None:
+        self._batch_search_id = batch.search_id
+        self._batch_generation = batch.generation
+        self._results_stable = batch.stable
+        self.results = list(batch.results)
+        self.result_model.apply_results(self.results)
+        self._thumbnail_requested_ids.intersection_update(
+            item.id for item in self.results
         )
         self._update_selection_summary()
         self._refresh_actions()
@@ -739,6 +759,7 @@ class ContentBrowserPage(QWidget):
             and choice_available
             and self.active_search_id is not None
             and selectable
+            and self._results_stable
             and not self._queue_busy
         )
         can_load = (
