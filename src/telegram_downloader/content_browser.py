@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -83,9 +84,13 @@ class ContentBrowserService:
         clock: Callable[[], datetime] | None = None,
         album_concurrency: int = 4,
         thumbnail_concurrency: int = 4,
+        thumbnail_failure_cooldown: float = 30.0,
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if album_concurrency <= 0 or thumbnail_concurrency <= 0:
             raise ValueError("内容查询并发数必须大于零")
+        if thumbnail_failure_cooldown < 0:
+            raise ValueError("缩略图失败冷却时间不能为负数")
         self.gateway = gateway
         self.catalog = catalog
         self.planner = planner
@@ -98,6 +103,10 @@ class ContentBrowserService:
         self._search_lock = asyncio.Lock()
         self._album_semaphore = asyncio.Semaphore(album_concurrency)
         self._thumbnail_semaphore = asyncio.Semaphore(thumbnail_concurrency)
+        self._thumbnail_failure_cooldown = thumbnail_failure_cooldown
+        self._monotonic_clock = monotonic_clock
+        self._thumbnail_inflight: dict[str, asyncio.Task[Path | None]] = {}
+        self._thumbnail_failures: dict[str, float] = {}
 
     @property
     def online(self) -> bool:
@@ -650,25 +659,72 @@ class ContentBrowserService:
     async def load_thumbnail(self, result_id: str) -> Path | None:
         account = self._require_account()
         result = self.catalog.get_result(account.account_id, result_id)
-        cached = self.thumbnails.get(result.thumbnail_key)
+        key = result.thumbnail_key
+        cached = self.thumbnails.get(key)
         if cached is not None:
+            self._thumbnail_failures.pop(key, None)
             return cached
-        if self.gateway is None:
+        now = self._monotonic_clock()
+        failure_deadline = self._thumbnail_failures.get(key)
+        if failure_deadline is not None:
+            if now < failure_deadline:
+                return None
+            self._thumbnail_failures.pop(key, None)
+        gateway = self.gateway
+        if gateway is None:
             return None
+
+        task = self._thumbnail_inflight.get(key)
+        if task is None:
+            async def load_once() -> Path | None:
+                current = asyncio.current_task()
+                try:
+                    return await self._load_thumbnail_remote(
+                        key,
+                        result.peer_ref,
+                        result.message_id,
+                        result.media_id,
+                        gateway,
+                    )
+                finally:
+                    if self._thumbnail_inflight.get(key) is current:
+                        self._thumbnail_inflight.pop(key, None)
+
+            task = asyncio.create_task(load_once())
+            self._thumbnail_inflight[key] = task
+        return await asyncio.shield(task)
+
+    async def _load_thumbnail_remote(
+        self,
+        key: str,
+        peer_ref: str,
+        message_id: int,
+        media_id: str,
+        gateway: TelegramGateway,
+    ) -> Path | None:
         try:
             async with self._thumbnail_semaphore:
-                content = await self.gateway.load_thumbnail(
-                    result.peer_ref,
-                    result.message_id,
-                    result.media_id,
+                content = await gateway.load_thumbnail(
+                    peer_ref,
+                    message_id,
+                    media_id,
                 )
+            if not content:
+                self._record_thumbnail_failure(key)
+                return None
+            cached = await asyncio.to_thread(self.thumbnails.put, key, content)
         except asyncio.CancelledError:
             raise
         except Exception:
+            self._record_thumbnail_failure(key)
             return None
-        if content is None:
-            return None
-        return self.thumbnails.put(result.thumbnail_key, content)
+        self._thumbnail_failures.pop(key, None)
+        return cached
+
+    def _record_thumbnail_failure(self, key: str) -> None:
+        self._thumbnail_failures[key] = (
+            self._monotonic_clock() + self._thumbnail_failure_cooldown
+        )
 
     def delete_history(self, search_id: str) -> str | None:
         account = self._require_account()

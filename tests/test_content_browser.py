@@ -1381,3 +1381,51 @@ async def test_direct_hits_emit_before_blocked_album_expansion(tmp_path: Path) -
     ]
     assert batches[-1].stable is True
     assert batches[-1].search_id == session.id
+
+
+async def thumbnail_service(tmp_path: Path):
+    now = datetime(2026, 8, 21, tzinfo=UTC)
+    gateway = FakeGateway(AccountProfile("a1", "账号一"))
+    gateway.pages = [RemoteSearchPage((make_hit(10, now),), None, True)]
+    service = await prepared_online_service(tmp_path, now, gateway)
+    _session, results = await service.start_search("-1001", make_query(now))
+    return service, gateway, results[0].id
+
+
+@pytest.mark.asyncio
+async def test_thumbnail_requests_share_one_gateway_call(tmp_path: Path) -> None:
+    service, gateway, result_id = await thumbnail_service(tmp_path)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def load_thumbnail(*_args):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return b"image"
+
+    gateway.load_thumbnail = load_thumbnail
+    first = asyncio.create_task(service.load_thumbnail(result_id))
+    await started.wait()
+    second = asyncio.create_task(service.load_thumbnail(result_id))
+    release.set()
+    assert await first == await second
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_thumbnail_failure_cooldown_skips_immediate_retry(tmp_path: Path) -> None:
+    service, gateway, result_id = await thumbnail_service(tmp_path)
+    calls = 0
+
+    async def missing(*_args):
+        nonlocal calls
+        calls += 1
+        return None
+
+    gateway.load_thumbnail = missing
+    assert await service.load_thumbnail(result_id) is None
+    assert await service.load_thumbnail(result_id) is None
+    assert calls == 1
