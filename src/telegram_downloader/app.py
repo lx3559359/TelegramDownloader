@@ -234,7 +234,6 @@ def create_application(root: Path):
 
     from telegram_downloader.ui.async_actions import (
         ActionHooks,
-        ActionPolicy,
         AsyncActionBridge,
     )
     from telegram_downloader.ui.login import LoginDialog
@@ -693,7 +692,7 @@ def create_application(root: Path):
         dialog.test_proxy_requested.connect(proxy_test_requested)
         async_actions.connect(
             dialog.thumbnail_cache_clear_requested,
-            "settings.cache.clear",
+            "settings.thumbnail_cache.clear",
             clear_thumbnail_cache,
             hooks=ActionHooks(
                 started=lambda: dialog.set_thumbnail_cache_busy(True),
@@ -769,7 +768,6 @@ def create_application(root: Path):
         "content.search",
         content_search_requested,
         hooks=ActionHooks(failed=content_failure),
-        policy=ActionPolicy.REPLACE_LATEST,
     )
     async_actions.connect_payload(
         window.content_page.load_more_requested,
@@ -794,7 +792,6 @@ def create_application(root: Path):
         "content.activate",
         lambda: controller.activate_content_page(),
         hooks=ActionHooks(failed=content_failure),
-        policy=ActionPolicy.REPLACE_LATEST,
     )
     async_actions.connect(
         window.subscriptions_activated,

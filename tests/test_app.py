@@ -29,6 +29,29 @@ from telegram_downloader.settings import AppSettings
 from telegram_downloader.subscription_scheduler import SubscriptionScheduler
 from telegram_downloader.subscription_service import SubscriptionService
 from telegram_downloader.subscriptions import SubscriptionRule, SubscriptionState
+from telegram_downloader.ui.async_actions import ActionPolicy
+
+EXPECTED_POLICIES = {
+    "content.activate": ActionPolicy.REPLACE_LATEST,
+    "content.search": ActionPolicy.REPLACE_LATEST,
+    "content.load_more": ActionPolicy.REPLACE_LATEST,
+    "dialogs.refresh": ActionPolicy.DEDUPLICATE,
+    "telegram.retry": ActionPolicy.DEDUPLICATE,
+    "diagnostics.run": ActionPolicy.DEDUPLICATE,
+    "diagnostics.export": ActionPolicy.DEDUPLICATE,
+    "login.qr.refresh": ActionPolicy.DEDUPLICATE,
+    "login.phone": ActionPolicy.DEDUPLICATE,
+    "settings.save": ActionPolicy.DEDUPLICATE,
+    "settings.thumbnail_cache.clear": ActionPolicy.DEDUPLICATE,
+}
+
+
+def test_responsive_action_policy_map_is_complete() -> None:
+    from telegram_downloader.ui import async_actions
+
+    assert {
+        key: async_actions.ACTION_POLICIES[key] for key in EXPECTED_POLICIES
+    } == EXPECTED_POLICIES
 
 
 def test_standard_button_selection_accepts_pyside_integer_result() -> None:

@@ -4,7 +4,6 @@ import pytest
 
 from telegram_downloader.ui.async_actions import (
     ActionHooks,
-    ActionPolicy,
     AsyncActionBridge,
 )
 
@@ -159,7 +158,13 @@ async def test_started_hook_runs_before_action_coroutine_starts() -> None:
 
 
 @pytest.mark.asyncio
-async def test_replace_latest_cancels_old_without_clearing_new_busy_state() -> None:
+@pytest.mark.parametrize(
+    "key",
+    ["content.activate", "content.search", "content.load_more"],
+)
+async def test_replace_latest_policy_cancels_old_without_clearing_new_busy_state(
+    key: str,
+) -> None:
     first_entered = asyncio.Event()
     second_release = asyncio.Event()
     events: list[str] = []
@@ -178,14 +183,9 @@ async def test_replace_latest_cancels_old_without_clearing_new_busy_state() -> N
         cancelled=lambda: events.append("cancelled"),
         finished=lambda: events.append("busy:off"),
     )
-    bridge.start("content.search", first, hooks=hooks)
+    bridge.start(key, first, hooks=hooks)
     await first_entered.wait()
-    bridge.start(
-        "content.search",
-        second,
-        hooks=hooks,
-        policy=ActionPolicy.REPLACE_LATEST,
-    )
+    bridge.start(key, second, hooks=hooks)
     await asyncio.sleep(0)
     assert events.count("busy:off") == 0
     second_release.set()
