@@ -401,3 +401,46 @@ async def test_progress_never_leads_confirmed_part_size(tmp_path: Path) -> None:
     await media.download(item(target, size=4))
     assert all(value <= 4 for _item, value, _status in repo.updates)
     assert repo.updates[-1][1] == 4
+
+
+@pytest.mark.asyncio
+async def test_slow_batch_write_allows_event_loop_heartbeat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+
+    from telegram_downloader import download_io
+
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    target = paths.downloads / "heartbeat.bin"
+    real_append = download_io.append_batch
+    ticks = 0
+    running = True
+
+    def slow_append(path, digest, data, durable):
+        time.sleep(0.05)
+        return real_append(path, digest, data, durable)
+
+    async def heartbeat():
+        nonlocal ticks
+        while running:
+            ticks += 1
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(download_io, "append_batch", slow_append)
+    pulse = asyncio.create_task(heartbeat())
+    try:
+        await MediaDownloader(
+            FakeGateway([b"x" * 1024] * 4),
+            FakeRepository(),
+            paths,
+            free_bytes=lambda _: 10**9,
+            reserve_bytes=0,
+            write_batch_bytes=1024,
+        ).download(item(target, size=4096))
+    finally:
+        running = False
+        await pulse
+    assert ticks > 10
