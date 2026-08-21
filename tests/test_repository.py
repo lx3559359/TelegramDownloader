@@ -674,3 +674,34 @@ def test_complete_item_atomically_records_verified_hash(tmp_path: Path) -> None:
     assert saved.content_sha256 == "d" * 64
     assert saved.verified_at == verified_at
     assert repo.get_task(task.id).status is TaskStatus.COMPLETED
+
+
+def test_get_tasks_and_update_statuses_use_bulk_contract(tmp_path: Path) -> None:
+    repository = TaskRepository(tmp_path / "tasks.sqlite3")
+    repository.initialize()
+    first_task, first_item = records(tmp_path)
+    second_task = replace(first_task, id="task-2", source_ref="peer-2")
+    second_item = replace(
+        first_item,
+        id="item-2",
+        task_id=second_task.id,
+        peer_ref="peer-2",
+        message_id=8,
+        media_id="media-8",
+        target_path=tmp_path / "y.mp4",
+    )
+    repository.create_task(first_task, [first_item])
+    repository.create_task(second_task, [second_item])
+    selected = [first_task.id, second_task.id, "missing"]
+    found = repository.get_tasks(selected)
+    assert [task.id for task in found] == selected[:2]
+    updated = repository.update_task_statuses(
+        selected,
+        TaskStatus.PAUSED,
+        allowed={TaskStatus.QUEUED, TaskStatus.DOWNLOADING},
+    )
+    assert updated == set(selected[:2])
+    assert all(
+        repository.get_task(task_id).status is TaskStatus.PAUSED
+        for task_id in updated
+    )

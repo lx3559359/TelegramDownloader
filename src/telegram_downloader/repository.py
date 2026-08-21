@@ -248,6 +248,19 @@ class TaskRepository:
             raise KeyError(task_id)
         return self._task_from_row(row)
 
+    def get_tasks(self, task_ids: list[str]) -> list[TaskRecord]:
+        ids = tuple(dict.fromkeys(task_ids))
+        if not ids:
+            return []
+        marks = ",".join("?" for _ in ids)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT {_TASK_COLUMNS} FROM tasks WHERE id IN ({marks})",
+                ids,
+            ).fetchall()
+        by_id = {str(row["id"]): self._task_from_row(row) for row in rows}
+        return [by_id[task_id] for task_id in ids if task_id in by_id]
+
     def get_item(self, item_id: str) -> MediaItem:
         with self._connection() as connection:
             row = connection.execute(
@@ -437,6 +450,38 @@ class TaskRepository:
             )
             if cursor.rowcount != 1:
                 raise KeyError(task_id)
+
+    def update_task_statuses(
+        self,
+        task_ids: list[str],
+        status: TaskStatus,
+        *,
+        allowed: set[TaskStatus],
+        error: str | None = None,
+    ) -> set[str]:
+        ids = tuple(dict.fromkeys(task_ids))
+        if not ids or not allowed:
+            return set()
+        id_marks = ",".join("?" for _ in ids)
+        states = tuple(sorted(value.value for value in allowed))
+        state_marks = ",".join("?" for _ in states)
+        now = datetime.now(UTC).isoformat()
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT id FROM tasks WHERE id IN ({id_marks}) "
+                f"AND status IN ({state_marks}) AND archived_at IS NULL",
+                (*ids, *states),
+            ).fetchall()
+            accepted = {str(row[0]) for row in rows}
+            if accepted:
+                ordered = tuple(sorted(accepted))
+                marks = ",".join("?" for _ in ordered)
+                connection.execute(
+                    f"UPDATE tasks SET status=?, updated_at=?, last_error=? "
+                    f"WHERE id IN ({marks})",
+                    (status.value, now, error, *ordered),
+                )
+        return accepted
 
     def update_item_progress(
         self,
