@@ -205,6 +205,16 @@ class SettingsDialog(QDialog):
     def set_thumbnail_cache_bytes(self, value: int) -> None:
         self.thumbnail_cache_size.setText(self._format_bytes(value))
 
+    def set_thumbnail_cache_busy(self, busy: bool) -> None:
+        self.thumbnail_cache_clear_button.setEnabled(not busy)
+        self.thumbnail_cache_clear_button.setText(
+            "正在清理…" if busy else "清理缩略图缓存"
+        )
+
+    def set_save_busy(self, busy: bool) -> None:
+        self.save_button.setEnabled(not busy)
+        self.save_button.setText("正在保存…" if busy else "保存")
+
     @staticmethod
     def _format_bytes(value: int) -> str:
         amount = float(max(0, value))

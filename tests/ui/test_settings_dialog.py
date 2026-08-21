@@ -82,3 +82,21 @@ def test_thumbnail_cache_clear_emits_without_closing_dialog(qtbot) -> None:
     assert dialog.result() == 0
     dialog.set_thumbnail_cache_bytes(0)
     assert dialog.thumbnail_cache_size.text() == "0 B"
+
+
+def test_cache_and_save_busy_states_are_immediate(qtbot) -> None:
+    dialog = SettingsDialog(AppSettings())
+    qtbot.addWidget(dialog)
+
+    dialog.set_thumbnail_cache_busy(True)
+    dialog.set_save_busy(True)
+
+    assert dialog.thumbnail_cache_clear_button.isEnabled() is False
+    assert "清理" in dialog.thumbnail_cache_clear_button.text()
+    assert dialog.save_button.isEnabled() is False
+    assert "保存" in dialog.save_button.text()
+
+    dialog.set_thumbnail_cache_busy(False)
+    dialog.set_save_busy(False)
+    assert dialog.thumbnail_cache_clear_button.isEnabled() is True
+    assert dialog.save_button.isEnabled() is True

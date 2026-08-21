@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import threading
+import time
 from datetime import UTC, date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -71,6 +73,142 @@ class ConnectedGateway:
 
     async def disconnect(self):
         pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action_name",
+    [
+        "delete_content_history",
+        "clear_content_history",
+        "clear_thumbnail_cache",
+        "activate_diagnostics",
+        "export_diagnostics",
+        "apply_settings",
+        "set_subscription_enabled",
+        "delete_subscription",
+    ],
+)
+async def test_blocking_ui_actions_leave_event_loop_responsive(action_name) -> None:
+    loop = asyncio.get_running_loop()
+    main_thread_id = threading.get_ident()
+    entered = asyncio.Event()
+    heartbeat = asyncio.Event()
+    worker_ids: list[int] = []
+    ui_ids: list[int] = []
+
+    def blocking(result=None):
+        def call(*_args, **_kwargs):
+            worker_ids.append(threading.get_ident())
+            loop.call_soon_threadsafe(entered.set)
+            time.sleep(0.05)
+            return result
+
+        return call
+
+    def ui(*_args, **_kwargs) -> None:
+        ui_ids.append(threading.get_ident())
+
+    page = SimpleNamespace(
+        active_search_id=None,
+        report=None,
+        set_sessions=ui,
+        set_active_search=ui,
+        set_results=ui,
+        set_thumbnail_cache_bytes=ui,
+        set_report=ui,
+        set_rules=ui,
+        set_rule_busy=ui,
+        show_error=ui,
+    )
+    status = SimpleNamespace(showMessage=ui)
+    window = SimpleNamespace(
+        content_page=page,
+        subscriptions_page=page,
+        diagnostics_page=page,
+        statusBar=lambda: status,
+    )
+
+    dependencies: dict[str, object] = {"window": window}
+    if action_name == "delete_content_history":
+        dependencies["content_browser"] = SimpleNamespace(
+            delete_history=blocking(None),
+            list_sessions=lambda: [],
+        )
+        def action(controller):
+            return controller.delete_content_history("search")
+    elif action_name == "clear_content_history":
+        dependencies["content_browser"] = SimpleNamespace(
+            clear_history=blocking(None),
+            list_sessions=lambda: [],
+        )
+        def action(controller):
+            return controller.clear_content_history()
+    elif action_name == "clear_thumbnail_cache":
+        dependencies["content_browser"] = SimpleNamespace(
+            thumbnails=SimpleNamespace(
+                clear=blocking((1, 1024)),
+                total_bytes=lambda: 0,
+            )
+        )
+        def action(controller):
+            return controller.clear_thumbnail_cache()
+    elif action_name == "activate_diagnostics":
+        dependencies["diagnostic_store"] = SimpleNamespace(
+            load_latest=blocking(object())
+        )
+        def action(controller):
+            return controller.activate_diagnostics()
+    elif action_name == "export_diagnostics":
+        dependencies["diagnostic_store"] = SimpleNamespace(
+            export=blocking(SimpleNamespace(name="diagnostics.zip"))
+        )
+
+        def action(controller):
+            controller._diagnostic_report = object()
+            return controller.export_diagnostics()
+
+    elif action_name == "apply_settings":
+        current = AppSettings(api_id=1)
+        dependencies.update(
+            settings=current,
+            secrets={},
+            settings_store=SimpleNamespace(save=blocking(None)),
+            vault=SimpleNamespace(save=lambda _value: None),
+            scheduler=SimpleNamespace(configure_resources=ui),
+        )
+        def action(controller):
+            return controller.apply_settings(current, "")
+    elif action_name == "set_subscription_enabled":
+        dependencies.update(
+            subscriptions=SimpleNamespace(
+                set_enabled=blocking(None),
+                snapshot=lambda: ((), ()),
+            ),
+            subscription_scheduler=SimpleNamespace(wake=ui),
+        )
+        def action(controller):
+            return controller.set_subscription_enabled("rule", True)
+    else:
+        dependencies["subscriptions"] = SimpleNamespace(
+            delete_rule=blocking(None),
+            snapshot=lambda: ((), ()),
+        )
+        def action(controller):
+            return controller.delete_subscription("rule")
+
+    controller = AppController.for_test(**dependencies)
+    if action_name == "clear_thumbnail_cache":
+        controller._settings_dialog = page
+    operation = asyncio.create_task(action(controller))
+    await entered.wait()
+    loop.call_soon(heartbeat.set)
+
+    await asyncio.wait_for(heartbeat.wait(), timeout=0.02)
+    await operation
+
+    assert worker_ids and worker_ids[0] != main_thread_id
+    assert ui_ids and all(value == main_thread_id for value in ui_ids)
 
 
 @pytest.mark.asyncio
@@ -3038,7 +3176,8 @@ async def test_dialog_sync_expired_session_stops_spinner_and_logs_out() -> None:
     assert calls == ["offline", "disconnect", "show-login"]
 
 
-def test_clear_thumbnail_cache_updates_settings_without_touching_history() -> None:
+@pytest.mark.asyncio
+async def test_clear_thumbnail_cache_updates_settings_without_touching_history() -> None:
     class Thumbnails:
         def clear(self):
             return 2, 5
@@ -3069,7 +3208,7 @@ def test_clear_thumbnail_cache_updates_settings_without_touching_history() -> No
     dialog = Dialog()
     controller._settings_dialog = dialog
 
-    controller.clear_thumbnail_cache()
+    await controller.clear_thumbnail_cache()
 
     assert dialog.cache_bytes == 0
     assert window.message == "已清理 2 个缩略图，共 5 B"
@@ -3376,7 +3515,8 @@ async def test_prioritize_task_handles_state_race_without_duplicate_start() -> N
     assert "已经开始下载" in controller.window.message.last_message
 
 
-def test_apply_settings_reconfigures_active_scheduler_after_persistence() -> None:
+@pytest.mark.asyncio
+async def test_apply_settings_reconfigures_active_scheduler_after_persistence() -> None:
     events: list[object] = []
 
     class Store:
@@ -3404,7 +3544,7 @@ def test_apply_settings_reconfigures_active_scheduler_after_persistence() -> Non
         scheduler=Scheduler(),
     )
 
-    controller.apply_settings(updated, "")
+    await controller.apply_settings(updated, "")
 
     assert events == [
         ("settings", updated),
@@ -3682,13 +3822,13 @@ async def test_controller_loads_history_runs_persists_exports_and_opens_director
         diagnostic_store=store,
     )
 
-    controller.activate_diagnostics()
+    await controller.activate_diagnostics()
     assert diagnostics.runs == 0
     assert page.report is completed
     assert page.historical is True
 
     await controller.run_diagnostics()
-    controller.export_diagnostics()
+    await controller.export_diagnostics()
     controller.open_diagnostics_directory()
 
     assert diagnostics.runs == 1

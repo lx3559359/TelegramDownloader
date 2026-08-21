@@ -101,6 +101,11 @@ def test_page_button_state_tracks_run_report_and_history(qtbot) -> None:
     assert page.export_button.isEnabled()
     assert "检查完成" in page.status_banner.text()
     assert page.status_banner.property("status") == "passed"
+    page.set_export_busy(True)
+    assert page.export_button.isEnabled() is False
+    assert "导出" in page.export_button.text()
+    page.set_export_busy(False)
+    assert page.export_button.isEnabled() is True
 
 
 def test_page_progress_is_bounded_and_shows_current_check(qtbot) -> None:

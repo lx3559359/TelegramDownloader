@@ -243,9 +243,9 @@ async def test_subscription_actions_restore_busy_state_and_refresh_rules() -> No
 
     await controller.create_subscription(draft)
     await controller.update_subscription("rule-1", draft)
-    controller.set_subscription_enabled("rule-1", False)
-    controller.run_subscription_now("rule-1")
-    controller.delete_subscription("rule-1")
+    await controller.set_subscription_enabled("rule-1", False)
+    await controller.run_subscription_now("rule-1")
+    await controller.delete_subscription("rule-1")
 
     assert [item[0] for item in subscriptions.calls if item[0] != "account"] == [
         "create",

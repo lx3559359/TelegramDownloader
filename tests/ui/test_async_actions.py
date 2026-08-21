@@ -16,9 +16,9 @@ class FakeSignal:
     def connect(self, slot) -> None:
         self.slot = slot
 
-    def emit(self, value) -> None:
+    def emit(self, *values) -> None:
         assert self.slot is not None
-        self.slot(value)
+        self.slot(*values)
 
 
 @pytest.mark.asyncio
@@ -119,6 +119,23 @@ async def test_payload_signal_forwards_value_and_deduplicates_running_key() -> N
 
     assert values == [["first"]]
     assert bridge.active_keys == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_args_signal_forwards_all_values() -> None:
+    signal = FakeSignal()
+    values: list[tuple[str, bool]] = []
+
+    async def action(rule_id: str, enabled: bool) -> None:
+        values.append((rule_id, enabled))
+
+    bridge = AsyncActionBridge()
+    bridge.connect_args(signal, "subscriptions.enabled", action)
+
+    signal.emit("rule-1", False)
+    await bridge.wait_idle()
+
+    assert values == [("rule-1", False)]
 
 
 @pytest.mark.asyncio

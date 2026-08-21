@@ -11,6 +11,7 @@ _LOGGER = logging.getLogger("telegram_downloader.ui.async_actions")
 
 ActionFactory = Callable[[], Awaitable[Any]]
 PayloadAction = Callable[[Any], Awaitable[Any]]
+ArgsAction = Callable[..., Awaitable[Any]]
 Callback = Callable[[], None]
 FailureCallback = Callable[[Exception], None]
 
@@ -35,7 +36,7 @@ class ActionPolicy(StrEnum):
 class AsyncActionBridge:
     def __init__(self) -> None:
         self._tasks: dict[str, asyncio.Task[Any]] = {}
-        self._slots: list[Callable[[], None]] = []
+        self._slots: list[Callable[..., None]] = []
 
     @property
     def active_keys(self) -> frozenset[str]:
@@ -70,6 +71,27 @@ class AsyncActionBridge:
             self.start(
                 key,
                 lambda: action(value),
+                hooks=hooks,
+                policy=policy,
+            )
+
+        signal.connect(trigger)
+        self._slots.append(trigger)
+        return trigger
+
+    def connect_args(
+        self,
+        signal: Any,
+        key: str,
+        action: ArgsAction,
+        *,
+        hooks: ActionHooks = _NO_HOOKS,
+        policy: ActionPolicy = ActionPolicy.DEDUPLICATE,
+    ) -> Callable[..., None]:
+        def trigger(*values: Any) -> None:
+            self.start(
+                key,
+                lambda: action(*values),
                 hooks=hooks,
                 policy=policy,
             )

@@ -83,9 +83,8 @@ class SubscriptionTableModel(QAbstractTableModel):
         rules: list[SubscriptionRule],
         latest_runs: dict[str, SubscriptionRun] | None = None,
     ) -> None:
-        self.beginResetModel()
-        self._latest_runs = dict(latest_runs or {})
-        self._rules = tuple(
+        target_runs = dict(latest_runs or {})
+        target_rules = tuple(
             sorted(
                 rules,
                 key=lambda item: (
@@ -98,6 +97,27 @@ class SubscriptionTableModel(QAbstractTableModel):
                 ),
             )
         )
+        if [item.id for item in self._rules] == [item.id for item in target_rules]:
+            previous_rules = self._rules
+            previous_runs = self._latest_runs
+            self._rules = target_rules
+            self._latest_runs = target_runs
+            for row, (before, after) in enumerate(
+                zip(previous_rules, target_rules, strict=True)
+            ):
+                if (
+                    before == after
+                    and previous_runs.get(after.id) == target_runs.get(after.id)
+                ):
+                    continue
+                self.dataChanged.emit(
+                    self.index(row, 0),
+                    self.index(row, self.columnCount() - 1),
+                )
+            return
+        self.beginResetModel()
+        self._latest_runs = target_runs
+        self._rules = target_rules
         self.endResetModel()
 
     def rule_at(self, row: int) -> SubscriptionRule:

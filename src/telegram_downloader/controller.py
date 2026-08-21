@@ -363,6 +363,9 @@ class _NullSubscriptionService:
     def latest_runs(self) -> dict[str, object]:
         return {}
 
+    def snapshot(self) -> tuple[tuple[object, ...], tuple[tuple[str, object], ...]]:
+        return (), ()
+
     def get_rule(self, rule_id: str) -> object:
         raise KeyError(rule_id)
 
@@ -578,7 +581,7 @@ class AppController:
             retryable=False,
         )
         if recovered:
-            self._resume_subscriptions_after_connection()
+            await self._resume_subscriptions_after_connection()
         return True
 
     @staticmethod
@@ -595,16 +598,16 @@ class AppController:
         )
         self._show_status("Telegram 重连失败，请检查网络或代理")
 
-    def _resume_subscriptions_after_connection(self) -> None:
+    async def _resume_subscriptions_after_connection(self) -> None:
         account = getattr(self.subscriptions, "account", None)
         if account is None:
             return
         if getattr(self.subscription_scheduler, "account_id", None) != account.account_id:
             return
         try:
-            self.subscriptions.resume_after_connection()
+            await asyncio.to_thread(self.subscriptions.resume_after_connection)
             self.subscription_scheduler.wake()
-            self._reload_subscriptions()
+            await self._reload_subscriptions()
         except Exception as error:
             self._subscription_page().show_error(self._safe_error(error))
 
@@ -936,7 +939,7 @@ class AppController:
             subscription_page = self._subscription_page()
             subscription_page.set_logged_in(False)
             subscription_page.set_dialogs(dialogs)
-            self._reload_subscriptions()
+            await self._reload_subscriptions()
             self._reload_content_history()
         except Exception as error:
             page.show_error(self._safe_error(error))
@@ -955,8 +958,8 @@ class AppController:
             subscription_page = self._subscription_page()
             subscription_page.set_logged_in(True)
             subscription_page.set_dialogs(dialogs)
-            self.subscriptions.resume_after_connection()
-            self._reload_subscriptions()
+            await asyncio.to_thread(self.subscriptions.resume_after_connection)
+            await self._reload_subscriptions()
             self.subscription_scheduler.set_account(profile.account_id)
             self.subscription_scheduler.start()
             self.subscription_scheduler.wake()
@@ -1307,35 +1310,44 @@ class AppController:
         except Exception as error:
             page.show_error(self._safe_error(error))
 
-    def delete_content_history(self, search_id: str) -> None:
+    async def delete_content_history(self, search_id: str) -> None:
         if self.content_browser is None:
             return
         try:
-            warning = self.content_browser.delete_history(search_id)
+            warning = await asyncio.to_thread(
+                self.content_browser.delete_history,
+                search_id,
+            )
             self._reload_content_history()
             if warning:
                 self._show_status(warning)
         except Exception as error:
             self._content_page().show_error(self._safe_error(error))
 
-    def clear_content_history(self) -> None:
+    async def clear_content_history(self) -> None:
         if self.content_browser is None:
             return
         try:
-            warning = self.content_browser.clear_history()
+            warning = await asyncio.to_thread(self.content_browser.clear_history)
             self._reload_content_history()
             if warning:
                 self._show_status(warning)
         except Exception as error:
             self._content_page().show_error(self._safe_error(error))
 
-    def clear_thumbnail_cache(self) -> None:
+    async def clear_thumbnail_cache(self) -> None:
         if self.content_browser is None:
             return
-        count, removed_bytes = self.content_browser.thumbnails.clear()
+
+        def clear_cache() -> tuple[int, int, int]:
+            count, removed_bytes = self.content_browser.thumbnails.clear()
+            remaining_bytes = self.content_browser.thumbnails.total_bytes()
+            return count, removed_bytes, remaining_bytes
+
+        count, removed_bytes, remaining_bytes = await asyncio.to_thread(clear_cache)
         dialog = self._settings_dialog
         if dialog is not None:
-            dialog.set_thumbnail_cache_bytes(self.content_browser.thumbnails.total_bytes())
+            dialog.set_thumbnail_cache_bytes(remaining_bytes)
         self._show_status(f"已清理 {count} 个缩略图，共 {self._format_bytes(removed_bytes)}")
 
     async def activate_subscriptions_page(self) -> None:
@@ -1348,7 +1360,7 @@ class AppController:
                 account = cached
         if self.content_browser is not None:
             page.set_dialogs(self.content_browser.list_dialogs())
-        self._reload_subscriptions()
+        await self._reload_subscriptions()
         online = await self.ensure_telegram_online()
         page.set_logged_in(online)
         if online and account is None:
@@ -1416,7 +1428,7 @@ class AppController:
         self._subscription_actions_active += 1
         try:
             saved = await self.subscriptions.create_rule(draft)
-            self._reload_subscriptions()
+            await self._reload_subscriptions()
             self.subscription_scheduler.wake()
             title = getattr(saved, "dialog_title", "")
             keyword = getattr(saved, "keyword", "")
@@ -1437,7 +1449,7 @@ class AppController:
         self._subscription_actions_active += 1
         try:
             await self.subscriptions.update_rule(rule_id, draft)
-            self._reload_subscriptions()
+            await self._reload_subscriptions()
             self.subscription_scheduler.wake()
             self._show_status("自动订阅已更新")
         except Exception as error:
@@ -1446,39 +1458,45 @@ class AppController:
             self._subscription_actions_active -= 1
             page.set_rule_busy(None, False)
 
-    def set_subscription_enabled(self, rule_id: str, enabled: bool) -> None:
+    async def set_subscription_enabled(self, rule_id: str, enabled: bool) -> None:
         page = self._subscription_page()
+        self._subscription_actions_active += 1
         try:
-            self.subscriptions.set_enabled(rule_id, enabled)
-            self._reload_subscriptions()
+            await asyncio.to_thread(self.subscriptions.set_enabled, rule_id, enabled)
+            await self._reload_subscriptions()
             if enabled:
                 self.subscription_scheduler.wake(rule_id)
             self._show_status("自动订阅已继续" if enabled else "自动订阅已暂停")
         except Exception as error:
             page.show_error(self._safe_error(error))
         finally:
+            self._subscription_actions_active -= 1
             page.set_rule_busy(None, False)
 
-    def run_subscription_now(self, rule_id: str) -> None:
+    async def run_subscription_now(self, rule_id: str) -> None:
         page = self._subscription_page()
+        self._subscription_actions_active += 1
         try:
-            self.subscriptions.get_rule(rule_id)
+            await asyncio.to_thread(self.subscriptions.get_rule, rule_id)
             self.subscription_scheduler.wake(rule_id)
             self._show_status("已安排立即检查")
         except Exception as error:
             page.show_error(self._safe_error(error))
         finally:
+            self._subscription_actions_active -= 1
             page.set_rule_busy(None, False)
 
-    def delete_subscription(self, rule_id: str) -> None:
+    async def delete_subscription(self, rule_id: str) -> None:
         page = self._subscription_page()
+        self._subscription_actions_active += 1
         try:
-            self.subscriptions.delete_rule(rule_id)
-            self._reload_subscriptions()
+            await asyncio.to_thread(self.subscriptions.delete_rule, rule_id)
+            await self._reload_subscriptions()
             self._show_status("自动订阅已删除；已有任务和文件已保留")
         except Exception as error:
             page.show_error(self._safe_error(error))
         finally:
+            self._subscription_actions_active -= 1
             page.set_rule_busy(None, False)
 
     def subscription_task_created(self, task_id: str) -> None:
@@ -1503,13 +1521,13 @@ class AppController:
             )
         )
 
-    def activate_diagnostics(self) -> None:
+    async def activate_diagnostics(self) -> None:
         page = self._diagnostics_page()
         if self.diagnostic_store is None:
             page.set_report(None, historical=True)
             return
         try:
-            report = self.diagnostic_store.load_latest()
+            report = await asyncio.to_thread(self.diagnostic_store.load_latest)
         except Exception:
             page.show_error("无法读取上次诊断报告")
             return
@@ -1525,10 +1543,14 @@ class AppController:
         page.set_progress(None)
         try:
             report = await self.diagnostics.run(page.set_progress)
-            register = getattr(self.diagnostic_store, "register_secrets", None)
-            if callable(register):
-                register(self.secrets.values())
-            self.diagnostic_store.save(report)
+
+            def persist_report() -> None:
+                register = getattr(self.diagnostic_store, "register_secrets", None)
+                if callable(register):
+                    register(self.secrets.values())
+                self.diagnostic_store.save(report)
+
+            await asyncio.to_thread(persist_report)
             self._diagnostic_report = report
             page.set_report(report, historical=False)
             self._show_status("健康诊断已完成")
@@ -1543,7 +1565,7 @@ class AppController:
         if self.diagnostics is not None:
             await self.diagnostics.cancel()
 
-    def export_diagnostics(self) -> None:
+    async def export_diagnostics(self) -> None:
         page = self._diagnostics_page()
         if self.diagnostic_store is None:
             page.show_error("诊断导出服务不可用")
@@ -1553,10 +1575,13 @@ class AppController:
             page.show_error("请先完成一次健康诊断")
             return
         try:
-            register = getattr(self.diagnostic_store, "register_secrets", None)
-            if callable(register):
-                register(self.secrets.values())
-            package = self.diagnostic_store.export(report)
+            def export_report():
+                register = getattr(self.diagnostic_store, "register_secrets", None)
+                if callable(register):
+                    register(self.secrets.values())
+                return self.diagnostic_store.export(report)
+
+            package = await asyncio.to_thread(export_report)
         except Exception as error:
             page.show_error(f"诊断包导出失败（{type(error).__name__}）")
             return
@@ -1592,7 +1617,7 @@ class AppController:
             with suppress(Exception):
                 await probe.disconnect()
 
-    def apply_settings(self, settings: AppSettings, proxy_password: str) -> None:
+    async def apply_settings(self, settings: AppSettings, proxy_password: str) -> None:
         connection_changed = (
             settings.api_id != self.settings.api_id
             or settings.proxy != self.settings.proxy
@@ -1602,8 +1627,11 @@ class AppController:
             updated_secrets["proxy_password"] = proxy_password
         else:
             updated_secrets.pop("proxy_password", None)
-        self.settings_store.save(settings)
-        self.vault.save(updated_secrets)
+        def persist_settings() -> None:
+            self.settings_store.save(settings)
+            self.vault.save(updated_secrets)
+
+        await asyncio.to_thread(persist_settings)
         self.settings = settings
         self.secrets = updated_secrets
         configure = getattr(self.scheduler, "configure_resources", None)
@@ -2289,13 +2317,25 @@ class AppController:
             _NullDiagnosticsPage(),
         )
 
-    def _reload_subscriptions(self) -> None:
+    async def _reload_subscriptions(self) -> None:
         page = self._subscription_page()
         try:
-            page.set_rules(
-                self.subscriptions.list_rules(),
-                self.subscriptions.latest_runs(),
-            )
+            def load_snapshot():
+                snapshot = getattr(self.subscriptions, "snapshot", None)
+                if callable(snapshot):
+                    rules, latest_runs = snapshot()
+                else:
+                    rules = self.subscriptions.list_rules()
+                    latest_runs = self.subscriptions.latest_runs()
+                latest_items = (
+                    tuple(latest_runs.items())
+                    if isinstance(latest_runs, dict)
+                    else tuple(latest_runs)
+                )
+                return tuple(rules), latest_items
+
+            rules, latest_items = await asyncio.to_thread(load_snapshot)
+            page.set_rules(list(rules), dict(latest_items))
         except Exception as error:
             page.show_error(self._safe_error(error))
 

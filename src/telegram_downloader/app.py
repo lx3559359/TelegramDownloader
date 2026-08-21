@@ -232,7 +232,11 @@ def create_application(root: Path):
     import qasync
     from PySide6.QtWidgets import QApplication, QMessageBox
 
-    from telegram_downloader.ui.async_actions import ActionHooks, AsyncActionBridge
+    from telegram_downloader.ui.async_actions import (
+        ActionHooks,
+        ActionPolicy,
+        AsyncActionBridge,
+    )
     from telegram_downloader.ui.login import LoginDialog
     from telegram_downloader.ui.main import MainWindow
     from telegram_downloader.ui.settings import SettingsDialog
@@ -461,6 +465,11 @@ def create_application(root: Path):
         if controller is not None:
             await controller._handle_session_expired(error)
 
+    def subscription_rules_changed() -> None:
+        controller = controller_ref.get("controller")
+        if controller is not None:
+            controller._spawn_background(controller._reload_subscriptions())
+
     subscription_scheduler = SubscriptionScheduler(
         subscriptions,
         foreground_busy=lambda: (
@@ -468,11 +477,7 @@ def create_application(root: Path):
             if "controller" in controller_ref
             else True
         ),
-        on_rules_changed=lambda: (
-            controller_ref["controller"]._reload_subscriptions()
-            if "controller" in controller_ref
-            else None
-        ),
+        on_rules_changed=subscription_rules_changed,
         on_task_created=lambda task_id: (
             controller_ref["controller"].subscription_task_created(task_id)
             if "controller" in controller_ref
@@ -569,11 +574,26 @@ def create_application(root: Path):
     async def retry_tasks_requested(value: object) -> None:
         await controller.retry_failed_tasks(_task_ids(value))
 
+    async def delete_content_history_requested(search_id: str) -> None:
+        await controller.delete_content_history(search_id)
+
+    async def clear_content_history_requested() -> None:
+        await controller.clear_content_history()
+
     async def archive_tasks_requested(value: object) -> None:
         await controller.archive_tasks(_task_ids(value))
 
     async def restore_tasks_requested(value: object) -> None:
         await controller.restore_tasks(_task_ids(value))
+
+    async def subscription_run_requested(rule_id: str) -> None:
+        await controller.run_subscription_now(rule_id)
+
+    async def subscription_enabled_requested(rule_id: str, enabled: bool) -> None:
+        await controller.set_subscription_enabled(rule_id, enabled)
+
+    async def subscription_delete_requested(rule_id: str) -> None:
+        await controller.delete_subscription(rule_id)
 
     def open_media_requested(item_id: str) -> None:
         controller.open_media_file(item_id)
@@ -594,7 +614,6 @@ def create_application(root: Path):
     async def content_dialog_selected(peer_ref: str) -> None:
         await controller.select_content_dialog(peer_ref)
 
-    @qasync.asyncSlot(str, str, str, object, object, object, int)
     async def content_search_requested(
         scope_value: str,
         peer_ref: str,
@@ -618,7 +637,6 @@ def create_application(root: Path):
             scope=scope,
         )
 
-    @qasync.asyncSlot(str)
     async def content_load_more_requested(search_id: str) -> None:
         await controller.load_more_content(search_id)
 
@@ -649,12 +667,13 @@ def create_application(root: Path):
             ),
         )
 
-    def open_settings() -> None:
+    async def open_settings() -> None:
+        thumbnail_cache_bytes = await asyncio.to_thread(thumbnails.total_bytes)
         dialog = SettingsDialog(
             controller.settings,
             controller.secrets.get("proxy_password", ""),
             window,
-            thumbnail_cache_bytes=thumbnails.total_bytes(),
+            thumbnail_cache_bytes=thumbnail_cache_bytes,
         )
         controller._settings_dialog = dialog
 
@@ -662,13 +681,39 @@ def create_application(root: Path):
         async def proxy_test_requested(proxy: object, password: str) -> None:
             await controller.test_proxy(proxy, password)
 
-        def save_settings() -> None:
-            controller.apply_settings(dialog.values(), dialog.proxy_password.text())
+        async def clear_thumbnail_cache() -> None:
+            await controller.clear_thumbnail_cache()
+
+        async def save_settings() -> None:
+            await controller.apply_settings(
+                dialog.values(),
+                dialog.proxy_password.text(),
+            )
 
         dialog.test_proxy_requested.connect(proxy_test_requested)
-        dialog.thumbnail_cache_clear_requested.connect(controller.clear_thumbnail_cache)
-        dialog.accepted.connect(save_settings)
-        controller._ui_slots.extend((proxy_test_requested, save_settings))
+        async_actions.connect(
+            dialog.thumbnail_cache_clear_requested,
+            "settings.cache.clear",
+            clear_thumbnail_cache,
+            hooks=ActionHooks(
+                started=lambda: dialog.set_thumbnail_cache_busy(True),
+                failed=lambda error: dialog._show_error(controller._safe_error(error)),
+                finished=lambda: dialog.set_thumbnail_cache_busy(False),
+            ),
+        )
+        async_actions.connect(
+            dialog.accepted,
+            "settings.save",
+            save_settings,
+            hooks=ActionHooks(
+                started=lambda: dialog.set_save_busy(True),
+                failed=lambda error: dialog._show_error(controller._safe_error(error)),
+                finished=lambda: dialog.set_save_busy(False),
+            ),
+        )
+        controller._ui_slots.extend(
+            (proxy_test_requested, clear_thumbnail_cache, save_settings)
+        )
         dialog.open()
 
     window.scan_requested.connect(scan_requested)
@@ -676,30 +721,20 @@ def create_application(root: Path):
     window.open_media_requested.connect(open_media_requested)
     window.integrity_cancel_requested.connect(integrity_cancel_requested)
     window.open_directory_requested.connect(controller.open_task_directory)
-    window.settings_requested.connect(open_settings)
     window.login_requested.connect(controller.show_login)
     window.content_page.dialog_selected.connect(content_dialog_selected)
     window.content_page.link_requested.connect(controller.route_content_link)
-    window.content_page.search_requested.connect(content_search_requested)
     window.content_page.cancel_search_requested.connect(controller.cancel_content_search)
-    window.content_page.load_more_requested.connect(content_load_more_requested)
     window.content_page.selection_changed.connect(controller.set_content_selected)
     window.content_page.queue_requested.connect(content_queue_requested)
     window.content_page.thumbnail_requested.connect(controller.request_thumbnail)
     window.content_page.preview_requested.connect(content_preview_requested)
     window.content_page.history_open_requested.connect(controller._reload_content_search)
-    window.content_page.history_delete_requested.connect(controller.delete_content_history)
-    window.content_page.history_clear_requested.connect(controller.clear_content_history)
     window.subscriptions_page.create_requested.connect(subscription_create_requested)
     window.subscriptions_page.update_requested.connect(subscription_update_requested)
-    window.subscriptions_page.run_requested.connect(controller.run_subscription_now)
-    window.subscriptions_page.enabled_requested.connect(controller.set_subscription_enabled)
-    window.subscriptions_page.delete_requested.connect(controller.delete_subscription)
     window.subscriptions_page.rule_selected.connect(controller.show_subscription_details)
     window.subscriptions_page.probe_requested.connect(subscription_probe_requested)
     window.subscriptions_page.probe_cancel_requested.connect(controller.cancel_subscription_probe)
-    window.diagnostics_activated.connect(controller.activate_diagnostics)
-    window.diagnostics_page.export_requested.connect(controller.export_diagnostics)
     window.diagnostics_page.open_directory_requested.connect(
         controller.open_diagnostics_directory
     )
@@ -719,10 +754,47 @@ def create_application(root: Path):
         )
 
     async_actions.connect(
+        window.settings_requested,
+        "settings.open",
+        open_settings,
+        hooks=ActionHooks(
+            failed=lambda error: window.statusBar().showMessage(
+                controller._safe_error(error),
+                0,
+            )
+        ),
+    )
+    async_actions.connect_args(
+        window.content_page.search_requested,
+        "content.search",
+        content_search_requested,
+        hooks=ActionHooks(failed=content_failure),
+        policy=ActionPolicy.REPLACE_LATEST,
+    )
+    async_actions.connect_payload(
+        window.content_page.load_more_requested,
+        "content.load_more",
+        content_load_more_requested,
+        hooks=ActionHooks(failed=content_failure),
+    )
+    async_actions.connect_payload(
+        window.content_page.history_delete_requested,
+        "content.history.delete",
+        delete_content_history_requested,
+        hooks=ActionHooks(failed=content_failure),
+    )
+    async_actions.connect(
+        window.content_page.history_clear_requested,
+        "content.history.clear",
+        clear_content_history_requested,
+        hooks=ActionHooks(failed=content_failure),
+    )
+    async_actions.connect(
         window.content_activated,
         "content.activate",
         lambda: controller.activate_content_page(),
         hooks=ActionHooks(failed=content_failure),
+        policy=ActionPolicy.REPLACE_LATEST,
     )
     async_actions.connect(
         window.subscriptions_activated,
@@ -730,6 +802,28 @@ def create_application(root: Path):
         lambda: controller.activate_subscriptions_page(),
         hooks=ActionHooks(
             failed=lambda error: window.subscriptions_page.show_error(controller._safe_error(error))
+        ),
+    )
+    async_actions.connect(
+        window.diagnostics_activated,
+        "diagnostics.activate",
+        lambda: controller.activate_diagnostics(),
+        hooks=ActionHooks(
+            failed=lambda error: window.diagnostics_page.show_error(
+                controller._safe_error(error)
+            )
+        ),
+    )
+    async_actions.connect(
+        window.diagnostics_page.export_requested,
+        "diagnostics.export",
+        lambda: controller.export_diagnostics(),
+        hooks=ActionHooks(
+            started=lambda: window.diagnostics_page.set_export_busy(True),
+            failed=lambda error: window.diagnostics_page.show_error(
+                controller._safe_error(error)
+            ),
+            finished=lambda: window.diagnostics_page.set_export_busy(False),
         ),
     )
     async_actions.connect(
@@ -758,6 +852,24 @@ def create_application(root: Path):
     def task_failure(error: Exception) -> None:
         window.statusBar().showMessage(controller._safe_error(error), 0)
 
+    async_actions.connect_payload(
+        window.subscriptions_page.run_requested,
+        "subscriptions.run",
+        subscription_run_requested,
+        hooks=ActionHooks(failed=task_failure),
+    )
+    async_actions.connect_args(
+        window.subscriptions_page.enabled_requested,
+        "subscriptions.enabled",
+        subscription_enabled_requested,
+        hooks=ActionHooks(failed=task_failure),
+    )
+    async_actions.connect_payload(
+        window.subscriptions_page.delete_requested,
+        "subscriptions.delete",
+        subscription_delete_requested,
+        hooks=ActionHooks(failed=task_failure),
+    )
     async_actions.connect_payload(
         window.pause_tasks_requested,
         "tasks.pause",
@@ -866,6 +978,8 @@ def create_application(root: Path):
             prioritize_task_requested,
             resume_tasks_requested,
             retry_tasks_requested,
+            delete_content_history_requested,
+            clear_content_history_requested,
             archive_tasks_requested,
             restore_tasks_requested,
             open_media_requested,
@@ -880,6 +994,9 @@ def create_application(root: Path):
             content_preview_requested,
             subscription_create_requested,
             subscription_update_requested,
+            subscription_run_requested,
+            subscription_enabled_requested,
+            subscription_delete_requested,
             subscription_probe_requested,
             open_settings,
         )

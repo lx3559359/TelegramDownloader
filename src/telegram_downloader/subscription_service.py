@@ -95,6 +95,19 @@ class SubscriptionService:
         account = self._require_account()
         return self.catalog.latest_subscription_runs(account.account_id)
 
+    def snapshot(
+        self,
+    ) -> tuple[
+        tuple[SubscriptionRule, ...],
+        tuple[tuple[str, SubscriptionRun], ...],
+    ]:
+        account = self._require_account()
+        rules = tuple(self.catalog.list_subscriptions(account.account_id))
+        latest_runs = tuple(
+            self.catalog.latest_subscription_runs(account.account_id).items()
+        )
+        return rules, latest_runs
+
     def list_runs(
         self,
         rule_id: str,

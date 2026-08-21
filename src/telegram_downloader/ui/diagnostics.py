@@ -117,6 +117,7 @@ class DiagnosticsPage(QWidget):
         super().__init__()
         self.report: DiagnosticReport | None = None
         self._running = False
+        self._exporting = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 18)
         layout.setSpacing(13)
@@ -280,6 +281,11 @@ class DiagnosticsPage(QWidget):
             self.show_error("")
         self._update_buttons()
 
+    def set_export_busy(self, busy: bool) -> None:
+        self._exporting = busy
+        self.export_button.setText("正在导出…" if busy else "导出诊断包")
+        self._update_buttons()
+
     def show_error(self, message: str) -> None:
         self.error_label.setText(message)
         self.error_label.setVisible(bool(message))
@@ -287,7 +293,9 @@ class DiagnosticsPage(QWidget):
     def _update_buttons(self) -> None:
         self.start_button.setEnabled(not self._running)
         self.cancel_button.setEnabled(self._running)
-        self.export_button.setEnabled(not self._running and self.report is not None)
+        self.export_button.setEnabled(
+            not self._running and not self._exporting and self.report is not None
+        )
         self.open_button.setEnabled(not self._running)
 
     def _set_status_banner(self, text: str, status: DiagnosticStatus) -> None:
