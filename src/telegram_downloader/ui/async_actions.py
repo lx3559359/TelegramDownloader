@@ -4,6 +4,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 _LOGGER = logging.getLogger("telegram_downloader.ui.async_actions")
@@ -26,6 +27,11 @@ class ActionHooks:
 _NO_HOOKS = ActionHooks()
 
 
+class ActionPolicy(StrEnum):
+    DEDUPLICATE = "deduplicate"
+    REPLACE_LATEST = "replace_latest"
+
+
 class AsyncActionBridge:
     def __init__(self) -> None:
         self._tasks: dict[str, asyncio.Task[Any]] = {}
@@ -42,9 +48,10 @@ class AsyncActionBridge:
         action: ActionFactory,
         *,
         hooks: ActionHooks = _NO_HOOKS,
+        policy: ActionPolicy = ActionPolicy.DEDUPLICATE,
     ) -> Callable[[], None]:
         def trigger() -> None:
-            self.start(key, action, hooks=hooks)
+            self.start(key, action, hooks=hooks, policy=policy)
 
         signal.connect(trigger)
         self._slots.append(trigger)
@@ -57,9 +64,15 @@ class AsyncActionBridge:
         action: PayloadAction,
         *,
         hooks: ActionHooks = _NO_HOOKS,
+        policy: ActionPolicy = ActionPolicy.DEDUPLICATE,
     ) -> Callable[[Any], None]:
         def trigger(value: Any) -> None:
-            self.start(key, lambda: action(value), hooks=hooks)
+            self.start(
+                key,
+                lambda: action(value),
+                hooks=hooks,
+                policy=policy,
+            )
 
         signal.connect(trigger)
         self._slots.append(trigger)
@@ -71,10 +84,13 @@ class AsyncActionBridge:
         action: ActionFactory,
         *,
         hooks: ActionHooks = _NO_HOOKS,
+        policy: ActionPolicy = ActionPolicy.DEDUPLICATE,
     ) -> bool:
         existing = self._tasks.get(key)
         if existing is not None and not existing.done():
-            return False
+            if policy is ActionPolicy.DEDUPLICATE:
+                return False
+            existing.cancel()
         self._invoke(hooks.started, key)
         task = asyncio.create_task(self._run(key, action, hooks), name=f"ui:{key}")
         self._tasks[key] = task
@@ -97,8 +113,8 @@ class AsyncActionBridge:
         else:
             self._invoke(hooks.succeeded, key)
         finally:
-            self._invoke(hooks.finished, key)
             if self._tasks.get(key) is asyncio.current_task():
+                self._invoke(hooks.finished, key)
                 self._tasks.pop(key, None)
 
     async def wait_idle(self) -> None:
