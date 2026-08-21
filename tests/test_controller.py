@@ -1255,6 +1255,37 @@ async def test_confirmed_scan_starts_persisted_task() -> None:
 
 
 @pytest.mark.asyncio
+async def test_confirmed_scan_awaits_async_task_refresh_before_start() -> None:
+    class Planner:
+        async def scan(self, _source, _filters):
+            return "preview"
+
+        def commit(self, _preview):
+            return SimpleNamespace(
+                task=SimpleNamespace(id="task-1"),
+                accepted_keys=frozenset(),
+                skipped_count=0,
+            )
+
+    controller = AppController.for_test(
+        gateway=ConnectedGateway(),
+        planner=Planner(),
+        confirm_preview=lambda _preview: True,
+    )
+    controller.refresh_tasks = Mock(side_effect=AssertionError("同步刷新不应被调用"))
+    controller.refresh_tasks_async = AsyncMock()
+    controller._start_task = Mock()
+
+    await controller.scan_link(
+        "https://t.me/example/42",
+        controller.default_filters(datetime(2026, 8, 13, tzinfo=UTC)),
+    )
+
+    controller.refresh_tasks_async.assert_awaited_once()
+    controller._start_task.assert_called_once_with("task-1")
+
+
+@pytest.mark.asyncio
 async def test_running_task_refreshes_window_before_download_finishes() -> None:
     release = asyncio.Event()
     started = asyncio.Event()
@@ -1618,6 +1649,7 @@ async def test_verify_media_forwards_progress_suppresses_duplicate_and_refreshes
         window=window,
         integrity_service=integrity,
     )
+    controller.refresh_tasks = Mock(side_effect=AssertionError("同步刷新不应被调用"))
     controller.select_task_details([item.task_id])
 
     active = asyncio.create_task(controller.verify_media([item.id, item.id]))
@@ -2955,6 +2987,43 @@ async def test_content_search_selection_and_queue_flow() -> None:
     assert ("finalize", "search-1", 2) in calls
     assert window.message == "选择 4 项，加入 2 项，跳过重复 1 项，不可用 1 项"
     assert window.content_page.queue_busy == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_queue_selection_awaits_async_task_refresh_before_start() -> None:
+    class ContentService:
+        def prepare_download(self, _search_id):
+            return SimpleNamespace(preview="preview")
+
+        def finalize_queue(self, _search_id, joined_count):
+            return SimpleNamespace(
+                selected_count=joined_count,
+                joined_count=joined_count,
+                duplicate_count=0,
+                unavailable_count=0,
+            )
+
+    class Planner:
+        def commit_selected(self, _preview):
+            return SimpleNamespace(
+                task=SimpleNamespace(id="task-1"),
+                accepted_keys=frozenset({("peer", 1, "media")}),
+            )
+
+    controller = AppController.for_test(
+        content_browser=ContentService(),
+        planner=Planner(),
+        confirm_preview=lambda _preview: True,
+    )
+    controller._reload_content_search = Mock()
+    controller.refresh_tasks = Mock(side_effect=AssertionError("同步刷新不应被调用"))
+    controller.refresh_tasks_async = AsyncMock()
+    controller._start_task = Mock()
+
+    await controller.queue_content_selection("search-1")
+
+    controller.refresh_tasks_async.assert_awaited_once()
+    controller._start_task.assert_called_once_with("task-1")
 
 
 @pytest.mark.asyncio

@@ -897,7 +897,7 @@ class AppController:
                 self._show_status("已取消创建任务")
                 return
             committed = self.planner.commit(preview)
-            self.refresh_tasks()
+            await self.refresh_tasks_async()
             self._start_task(committed.task.id)
             self._show_status(
                 f"加入 {len(committed.accepted_keys)} 项，"
@@ -1243,7 +1243,7 @@ class AppController:
                 joined_count,
             )
             self._reload_content_search(search_id)
-            self.refresh_tasks()
+            await self.refresh_tasks_async()
             self._start_task(committed.task.id)
             self._show_status(
                 f"选择 {report.selected_count} 项，加入 {report.joined_count} 项，"
@@ -1500,8 +1500,8 @@ class AppController:
             page.set_rule_busy(None, False)
 
     def subscription_task_created(self, task_id: str) -> None:
-        self.refresh_tasks()
         self._start_task(task_id)
+        self._schedule_task_refresh()
 
     def foreground_telegram_busy(self) -> bool:
         if (
@@ -1812,7 +1812,7 @@ class AppController:
             self._show_status(self._integrity_summary_text(summary))
         finally:
             self._finish_integrity_operation(current)
-            self._refresh_integrity_views()
+            await self._refresh_integrity_views()
 
     async def repair_media(self, item_ids: list[str]) -> None:
         unique = self._unique_task_ids(item_ids)
@@ -1852,7 +1852,7 @@ class AppController:
             )
         finally:
             self._finish_integrity_operation(current)
-            self._refresh_integrity_views()
+            await self._refresh_integrity_views()
 
     def cancel_integrity(self) -> None:
         event = self._integrity_cancel_event
@@ -1889,8 +1889,8 @@ class AppController:
         self.window.set_integrity_progress(None)
         self.window.set_integrity_busy(False)
 
-    def _refresh_integrity_views(self) -> None:
-        self.refresh_tasks()
+    async def _refresh_integrity_views(self) -> None:
+        await self.refresh_tasks_async()
         if self._detail_task_id is not None:
             self.select_task_details([self._detail_task_id])
 
@@ -1935,7 +1935,7 @@ class AppController:
             self._show_status("安全限制：文件路径不在应用目录内")
         except KeyError:
             self._show_status("媒体记录不存在，任务列表已刷新")
-            self.refresh_tasks()
+            self._schedule_task_refresh()
         except OSError:
             self._show_status("Windows 无法打开该文件")
 
@@ -2390,6 +2390,14 @@ class AppController:
 
     def _start_task(self, task_id: str) -> None:
         self._spawn_background(self._run_and_refresh(task_id))
+
+    def _schedule_task_refresh(self) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self.refresh_tasks()
+            return
+        self._spawn_background(self.refresh_tasks_async())
 
     def _spawn_background(self, operation) -> asyncio.Task[Any]:
         task = asyncio.create_task(operation)
