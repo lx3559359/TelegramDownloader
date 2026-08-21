@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from telegram_downloader.domain import ItemStatus, MediaItem, TaskStatus
+from telegram_downloader.domain import ItemStatus, MediaItem, TaskRecord, TaskStatus
 from telegram_downloader.downloader import (
     DownloadPaused,
     InsufficientSpaceError,
@@ -55,6 +55,8 @@ class _QueuedOperation:
 
 
 class SchedulerRepository(Protocol):
+    def get_tasks(self, task_ids: list[str]) -> list[TaskRecord]: ...
+
     def get_item(self, item_id: str) -> MediaItem: ...
 
     def list_items(
@@ -78,6 +80,15 @@ class SchedulerRepository(Protocol):
         status: TaskStatus,
         error: str | None = None,
     ) -> None: ...
+
+    def update_task_statuses(
+        self,
+        task_ids: list[str],
+        status: TaskStatus,
+        *,
+        allowed: set[TaskStatus],
+        error: str | None = None,
+    ) -> set[str]: ...
 
     def recover_interrupted(self) -> None: ...
 
@@ -133,22 +144,52 @@ class DownloadScheduler:
         self.repository.recover_interrupted()
 
     def pause_task(self, task_id: str) -> None:
-        self._pause_flag(task_id).set()
-        operation = self._operations.get(task_id)
-        if operation is not None and operation is not self._active_operation:
+        self.pause_tasks([task_id])
+
+    def pause_tasks(self, task_ids: list[str]) -> set[str]:
+        ordered = tuple(dict.fromkeys(task_ids))
+        for task_id in ordered:
+            self._pause_flag(task_id).set()
+            operation = self._operations.get(task_id)
+            if operation is None or operation is self._active_operation:
+                continue
             if operation in self._pending:
                 self._pending.remove(operation)
             self._operations.pop(task_id, None)
             if not operation.completion.done():
                 operation.completion.set_result(None)
-        self.repository.update_task_status(task_id, TaskStatus.PAUSED)
+        return self.repository.update_task_statuses(
+            list(ordered),
+            TaskStatus.PAUSED,
+            allowed={
+                TaskStatus.QUEUED,
+                TaskStatus.DOWNLOADING,
+                TaskStatus.WAITING_RETRY,
+            },
+        )
 
     async def resume_task(self, task_id: str) -> None:
+        await self.resume_tasks([task_id])
+
+    async def resume_tasks(self, task_ids: list[str]) -> set[str]:
         if self._shutting_down:
-            return
-        self._pause_flag(task_id).clear()
-        self.repository.update_task_status(task_id, TaskStatus.QUEUED)
-        await self.run_task(task_id)
+            return set()
+        ordered = tuple(dict.fromkeys(task_ids))
+        accepted = self.repository.update_task_statuses(
+            list(ordered),
+            TaskStatus.QUEUED,
+            allowed={
+                TaskStatus.PAUSED,
+                TaskStatus.PARTIAL_FAILURE,
+                TaskStatus.WAITING_RETRY,
+            },
+        )
+        scheduled = [task_id for task_id in ordered if task_id in accepted]
+        for task_id in scheduled:
+            self._pause_flag(task_id).clear()
+        if scheduled:
+            await asyncio.gather(*(self.run_task(task_id) for task_id in scheduled))
+        return accepted
 
     async def run_task(self, task_id: str) -> None:
         if self._shutting_down:

@@ -1571,3 +1571,90 @@ async def test_thumbnail_cache_hit_remote_fallback_and_history_cleanup(
     await service.activate_account()
     assert service.clear_history() is None
     assert other_path.exists() is False
+
+
+@pytest.mark.asyncio
+async def test_direct_hits_emit_before_blocked_album_expansion(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 21, tzinfo=UTC)
+    gateway = FakeGateway(AccountProfile("a1", "账号一"))
+    service = await prepared_online_service(tmp_path, now, gateway)
+    album_started = asyncio.Event()
+    release_album = asyncio.Event()
+    batches = []
+
+    direct = make_hit(20, now)
+    grouped = make_hit(19, now, grouped_id=900)
+    gateway.pages = [RemoteSearchPage((direct, grouped), None, True)]
+
+    async def expand_album(*_args):
+        album_started.set()
+        await release_album.wait()
+        return (grouped, make_hit(18, now, grouped_id=900))
+
+    gateway.expand_album = expand_album
+    operation = asyncio.create_task(
+        service.start_search("-1001", make_query(now), on_results=batches.append)
+    )
+    await album_started.wait()
+
+    assert batches
+    assert batches[0].stable is False
+    assert {item.media_id for item in batches[0].results} == {"m20", "m19"}
+    provisional_ids = {item.media_id: item.id for item in batches[0].results}
+
+    release_album.set()
+    session, results = await operation
+    assert {item.media_id for item in results} == {"m20", "m19", "m18"}
+    assert next(item.id for item in results if item.media_id == "m20") == provisional_ids[
+        "m20"
+    ]
+    assert batches[-1].stable is True
+    assert batches[-1].search_id == session.id
+
+
+async def thumbnail_service(tmp_path: Path):
+    now = datetime(2026, 8, 21, tzinfo=UTC)
+    gateway = FakeGateway(AccountProfile("a1", "账号一"))
+    gateway.pages = [RemoteSearchPage((make_hit(10, now),), None, True)]
+    service = await prepared_online_service(tmp_path, now, gateway)
+    _session, results = await service.start_search("-1001", make_query(now))
+    return service, gateway, results[0].id
+
+
+@pytest.mark.asyncio
+async def test_thumbnail_requests_share_one_gateway_call(tmp_path: Path) -> None:
+    service, gateway, result_id = await thumbnail_service(tmp_path)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def load_thumbnail(*_args):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return b"image"
+
+    gateway.load_thumbnail = load_thumbnail
+    first = asyncio.create_task(service.load_thumbnail(result_id))
+    await started.wait()
+    second = asyncio.create_task(service.load_thumbnail(result_id))
+    release.set()
+    assert await first == await second
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_thumbnail_failure_cooldown_skips_immediate_retry(tmp_path: Path) -> None:
+    service, gateway, result_id = await thumbnail_service(tmp_path)
+    calls = 0
+
+    async def missing(*_args):
+        nonlocal calls
+        calls += 1
+        return None
+
+    gateway.load_thumbnail = missing
+    assert await service.load_thumbnail(result_id) is None
+    assert await service.load_thumbnail(result_id) is None
+    assert calls == 1

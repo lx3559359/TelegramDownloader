@@ -16,7 +16,7 @@ from telegram_downloader.content import (
     SearchSession,
     SearchStatus,
 )
-from telegram_downloader.content_progress import SearchProgress
+from telegram_downloader.content_progress import SearchProgress, SearchResultBatch
 from telegram_downloader.domain import MediaKind, ScanFilters
 from telegram_downloader.ui.content_browser import ContentBrowserPage
 from telegram_downloader.ui.effects import ElevationLevel
@@ -551,6 +551,30 @@ def test_selection_cell_click_and_space_toggle_once(qtbot) -> None:
         == Qt.CheckState.Unchecked
     )
     assert changed == [("r1", True), ("r1", False)]
+
+
+def test_progressive_batch_disables_queue_until_results_are_stable(qtbot) -> None:
+    now = datetime(2026, 8, 21, tzinfo=UTC)
+    page = ContentBrowserPage()
+    qtbot.addWidget(page)
+    page.set_logged_in(True)
+    page.set_dialogs([dialog(now)])
+    page.set_active_search(session(now))
+    selected = replace(result(now, "r1", 1), selected=True)
+
+    page.apply_search_batch(
+        SearchResultBatch("search-1", 1, (selected,), stable=False)
+    )
+
+    assert page.result_model.rowCount() == 1
+    assert page.queue_button.isEnabled() is False
+    assert page._batch_search_id == "search-1"
+    assert page._batch_generation == 1
+
+    page.apply_search_batch(
+        SearchResultBatch("search-1", 1, (selected,), stable=True)
+    )
+    assert page.queue_button.isEnabled() is True
 
 
 def test_disabled_selection_cells_ignore_mouse_and_keyboard(qtbot) -> None:

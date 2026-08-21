@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from PySide6.QtCore import Qt
+from PySide6.QtTest import QSignalSpy
 from PySide6.QtWidgets import (
     QDialogButtonBox,
     QGraphicsDropShadowEffect,
@@ -137,6 +139,29 @@ def test_subscription_model_exposes_status_schedule_and_rule_id(qtbot) -> None:
         model.index(0, 4),
         Qt.ItemDataRole.DisplayRole,
     )
+
+
+def test_subscription_state_update_does_not_reset_model(qtbot) -> None:
+    model = SubscriptionTableModel()
+    first = rule()
+    model.set_rules([first])
+    resets = QSignalSpy(model.modelReset)
+    changes = QSignalSpy(model.dataChanged)
+
+    model.set_rules(
+        [
+            replace(
+                first,
+                enabled=False,
+                state=SubscriptionState.PAUSED,
+                next_run_at=None,
+            )
+        ]
+    )
+
+    assert resets.count() == 0
+    assert changes.count() >= 1
+    assert model.data(model.index(0, 2), Qt.ItemDataRole.DisplayRole) == "已暂停"
 
 
 def test_rule_editor_validates_then_returns_trimmed_draft(qtbot) -> None:

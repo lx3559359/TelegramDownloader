@@ -29,6 +29,29 @@ from telegram_downloader.settings import AppSettings
 from telegram_downloader.subscription_scheduler import SubscriptionScheduler
 from telegram_downloader.subscription_service import SubscriptionService
 from telegram_downloader.subscriptions import SubscriptionRule, SubscriptionState
+from telegram_downloader.ui.async_actions import ActionPolicy
+
+EXPECTED_POLICIES = {
+    "content.activate": ActionPolicy.REPLACE_LATEST,
+    "content.search": ActionPolicy.REPLACE_LATEST,
+    "content.load_more": ActionPolicy.REPLACE_LATEST,
+    "dialogs.refresh": ActionPolicy.DEDUPLICATE,
+    "telegram.retry": ActionPolicy.DEDUPLICATE,
+    "diagnostics.run": ActionPolicy.DEDUPLICATE,
+    "diagnostics.export": ActionPolicy.DEDUPLICATE,
+    "login.qr.refresh": ActionPolicy.DEDUPLICATE,
+    "login.phone": ActionPolicy.DEDUPLICATE,
+    "settings.save": ActionPolicy.DEDUPLICATE,
+    "settings.thumbnail_cache.clear": ActionPolicy.DEDUPLICATE,
+}
+
+
+def test_responsive_action_policy_map_is_complete() -> None:
+    from telegram_downloader.ui import async_actions
+
+    assert {
+        key: async_actions.ACTION_POLICIES[key] for key in EXPECTED_POLICIES
+    } == EXPECTED_POLICIES
 
 
 def test_standard_button_selection_accepts_pyside_integer_result() -> None:
@@ -169,7 +192,7 @@ def test_create_application_initializes_project_local_content_services(
         assert "content_preview_requested" in slot_names
         assert "subscription_probe_requested" in slot_names
         assert controller._async_actions.active_keys == frozenset()
-        assert len(controller._async_actions._slots) == 15
+        assert len(controller._async_actions._slots) == 29
         assert controller.diagnostics is not None
         assert controller.diagnostic_store.paths.root == tmp_path.resolve()
         controller.window.content_page.link_requested.emit("https://t.me/example/1#fragment")
@@ -444,10 +467,26 @@ def test_task_management_signals_route_sync_and_async_actions(
         calls.append((name, value))
 
     monkeypatch.setattr(controller, "select_task_details", record_sync("select"))
-    monkeypatch.setattr(controller, "pause_tasks", record_sync("pause"))
-    monkeypatch.setattr(controller, "prioritize_task", record_sync("priority"))
-    monkeypatch.setattr(controller, "archive_tasks", record_sync("archive"))
-    monkeypatch.setattr(controller, "restore_tasks", record_sync("restore"))
+    monkeypatch.setattr(
+        controller,
+        "pause_tasks",
+        lambda value: record_async("pause", value),
+    )
+    monkeypatch.setattr(
+        controller,
+        "prioritize_task",
+        lambda value: record_async("priority", value),
+    )
+    monkeypatch.setattr(
+        controller,
+        "archive_tasks",
+        lambda value: record_async("archive", value),
+    )
+    monkeypatch.setattr(
+        controller,
+        "restore_tasks",
+        lambda value: record_async("restore", value),
+    )
     monkeypatch.setattr(controller, "open_media_file", record_sync("open"))
     monkeypatch.setattr(controller, "cancel_integrity", lambda: calls.append(("cancel", None)))
     monkeypatch.setattr(
@@ -499,11 +538,11 @@ def test_task_management_signals_route_sync_and_async_actions(
 
         assert calls == [
             ("select", ["one"]),
+            ("open", "media"),
             ("pause", ["one", "two"]),
             ("priority", "queued"),
             ("archive", ["done"]),
             ("restore", ["old"]),
-            ("open", "media"),
             ("resume", ["paused"]),
             ("retry", ["failed"]),
             ("verify_media", ["media"]),
@@ -513,8 +552,12 @@ def test_task_management_signals_route_sync_and_async_actions(
         ]
         slot_names = {getattr(slot, "__name__", "") for slot in controller._ui_slots}
         assert "task_selection_changed" in slot_names
+        assert "pause_tasks_requested" in slot_names
+        assert "prioritize_task_requested" in slot_names
         assert "resume_tasks_requested" in slot_names
         assert "retry_tasks_requested" in slot_names
+        assert "archive_tasks_requested" in slot_names
+        assert "restore_tasks_requested" in slot_names
         assert "verify_media_requested" in slot_names
         assert "verify_tasks_requested" in slot_names
         assert "repair_media_requested" in slot_names
@@ -525,33 +568,49 @@ def test_task_management_signals_route_sync_and_async_actions(
         application.processEvents()
 
 
-def test_repeated_task_resume_clicks_share_one_async_action(
+@pytest.mark.parametrize(
+    ("signal_name", "method_name", "payload", "action_key"),
+    [
+        ("pause_tasks_requested", "pause_tasks", ["running"], "tasks.pause"),
+        ("prioritize_task_requested", "prioritize_task", "queued", "tasks.prioritize"),
+        ("resume_tasks_requested", "resume_tasks", ["paused"], "tasks.resume"),
+        ("retry_tasks_requested", "retry_failed_tasks", ["failed"], "tasks.retry"),
+        ("archive_tasks_requested", "archive_tasks", ["done"], "tasks.archive"),
+        ("restore_tasks_requested", "restore_tasks", ["old"], "tasks.restore"),
+    ],
+)
+def test_repeated_task_command_clicks_share_one_async_action(
     tmp_path,
     monkeypatch,
+    signal_name,
+    method_name,
+    payload,
+    action_key,
 ) -> None:
     application, loop, controller = app.create_application(tmp_path)
     started = asyncio.Event()
     release = asyncio.Event()
-    calls: list[list[str]] = []
+    calls: list[object] = []
 
-    async def resume(task_ids):
-        calls.append(task_ids)
+    async def command(value):
+        calls.append(value)
         started.set()
         await release.wait()
 
-    monkeypatch.setattr(controller, "resume_tasks", resume)
+    monkeypatch.setattr(controller, method_name, command)
 
     async def emit_actions() -> None:
-        controller.window.resume_tasks_requested.emit(["paused"])
+        signal = getattr(controller.window, signal_name)
+        signal.emit(payload)
         await started.wait()
-        controller.window.resume_tasks_requested.emit(["paused"])
-        assert controller._async_actions.active_keys == frozenset({"tasks.resume"})
+        signal.emit(payload)
+        assert controller._async_actions.active_keys == frozenset({action_key})
         release.set()
         await controller._async_actions.wait_idle()
 
     try:
         loop.run_until_complete(emit_actions())
-        assert calls == [["paused"]]
+        assert calls == [payload]
         assert controller._async_actions.active_keys == frozenset()
     finally:
         loop.run_until_complete(controller._async_actions.shutdown())

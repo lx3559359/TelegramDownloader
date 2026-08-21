@@ -54,7 +54,8 @@ def completed_fixture(paths: PortablePaths) -> tuple[TaskRecord, MediaItem]:
     return task, item
 
 
-def test_task_management_persists_archive_restart_restore_and_dedup(
+@pytest.mark.asyncio
+async def test_task_management_persists_archive_restart_restore_and_dedup(
     qtbot,
     tmp_path,
 ) -> None:
@@ -82,7 +83,7 @@ def test_task_management_persists_archive_restart_restore_and_dedup(
     assert window.task_item_model.rowCount() == 1
     assert window.task_item_model.item_at(0).id == item.id
 
-    controller.archive_tasks([completed.id])
+    await controller.archive_tasks([completed.id])
 
     assert repository.get_task(completed.id).archived_at is not None
     assert window.task_model.rowCount() == 0
@@ -108,7 +109,7 @@ def test_task_management_persists_archive_restart_restore_and_dedup(
 
     assert restarted_window.task_model.rowCount() == 1
     assert restarted_window.task_model.task_at(0).archived is True
-    restarted_controller.restore_tasks([completed.id])
+    await restarted_controller.restore_tasks([completed.id])
 
     assert restarted.get_task(completed.id).archived_at is None
     assert restarted_window.task_model.rowCount() == 0

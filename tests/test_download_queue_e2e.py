@@ -21,11 +21,12 @@ from telegram_downloader.resource_control import AsyncBandwidthLimiter
 from telegram_downloader.scheduler import DownloadScheduler
 
 
-async def wait_until(predicate, attempts: int = 200) -> None:
-    for _ in range(attempts):
+async def wait_until(predicate, timeout: float = 1.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
         if predicate():
             return
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.005)
     raise AssertionError("condition was not reached")
 
 
@@ -38,13 +39,14 @@ class ControlledGateway:
         }
         self.started: list[int] = []
         self.offsets: list[tuple[int, int]] = []
+        self.consumed: list[tuple[int, int]] = []
 
     async def stream_media(self, _peer_ref, message_id, offset):
         self.started.append(message_id)
         self.offsets.append((message_id, offset))
         position = 0
-        for gate, chunk in zip(
-            self.gates[message_id], self.payloads[message_id], strict=True
+        for chunk_index, (gate, chunk) in enumerate(
+            zip(self.gates[message_id], self.payloads[message_id], strict=True)
         ):
             next_position = position + len(chunk)
             if next_position <= offset:
@@ -52,6 +54,7 @@ class ControlledGateway:
                 continue
             await gate.wait()
             yield chunk[offset - position :] if offset > position else chunk
+            self.consumed.append((message_id, chunk_index))
             position = next_position
 
     def release(self, message_id: int, chunk_index: int) -> None:
@@ -172,7 +175,7 @@ async def test_real_queue_prioritizes_pauses_restarts_and_stays_portable(tmp_pat
     await wait_until(lambda: scheduler.active_task_id == subscription_task.id)
     gateway.release(103, 0)
     part = subscription_item.target_path.with_suffix(".bin.part")
-    await wait_until(lambda: part.exists() and part.stat().st_size == len(b"sub-"))
+    await wait_until(lambda: (103, 0) in gateway.consumed)
     scheduler.pause_task(subscription_task.id)
     gateway.release(103, 1)
     await wait_until(lambda: scheduler.active_task_id == search_task.id)
@@ -218,8 +221,11 @@ async def test_real_queue_prioritizes_pauses_restarts_and_stays_portable(tmp_pat
     ):
         assert item.status is ItemStatus.COMPLETED
         assert item.integrity_status is IntegrityStatus.VERIFIED
+        assert item.downloaded_bytes == len(expected)
+        assert item.expected_size == len(expected)
         assert item.content_sha256 == hashlib.sha256(expected).hexdigest()
         assert item.target_path.read_bytes() == expected
+        assert not item.target_path.with_suffix(item.target_path.suffix + ".part").exists()
         assert item.target_path.is_relative_to(paths.root)
     assert paths.database.is_relative_to(paths.root)
     assert paths.settings.is_relative_to(paths.root)

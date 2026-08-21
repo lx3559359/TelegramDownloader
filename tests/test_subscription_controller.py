@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -243,9 +244,9 @@ async def test_subscription_actions_restore_busy_state_and_refresh_rules() -> No
 
     await controller.create_subscription(draft)
     await controller.update_subscription("rule-1", draft)
-    controller.set_subscription_enabled("rule-1", False)
-    controller.run_subscription_now("rule-1")
-    controller.delete_subscription("rule-1")
+    await controller.set_subscription_enabled("rule-1", False)
+    await controller.run_subscription_now("rule-1")
+    await controller.delete_subscription("rule-1")
 
     assert [item[0] for item in subscriptions.calls if item[0] != "account"] == [
         "create",
@@ -315,15 +316,26 @@ async def test_network_recovery_wakes_connection_blocked_subscriptions() -> None
     assert scheduler.wakes == [None]
 
 
-def test_subscription_created_task_enters_existing_download_scheduler() -> None:
+@pytest.mark.asyncio
+async def test_subscription_created_task_enters_existing_download_scheduler() -> None:
     controller = AppController.for_test(window=Window())
     started = []
-    controller.refresh_tasks = lambda: started.append("refresh")
+    refreshed = asyncio.Event()
+
+    async def refresh() -> None:
+        started.append("refresh")
+        refreshed.set()
+
+    controller.refresh_tasks = Mock(
+        side_effect=AssertionError("同步刷新不应被调用")
+    )
+    controller.refresh_tasks_async = refresh
     controller._start_task = lambda task_id: started.append(task_id)
 
     controller.subscription_task_created("task-1")
+    await asyncio.wait_for(refreshed.wait(), timeout=1)
 
-    assert started == ["refresh", "task-1"]
+    assert started == ["task-1", "refresh"]
 
 
 @pytest.mark.asyncio

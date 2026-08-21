@@ -16,7 +16,11 @@ from typing import Any
 from telegram_downloader.connectivity import ConnectionRecovery
 from telegram_downloader.content import ContentSearchQuery, SearchResult, SearchScope
 from telegram_downloader.content_browser import NothingToQueueError
-from telegram_downloader.content_progress import DialogSyncProgress, SearchProgress
+from telegram_downloader.content_progress import (
+    DialogSyncProgress,
+    SearchProgress,
+    SearchResultBatch,
+)
 from telegram_downloader.domain import (
     IntegrityStatus,
     ItemStatus,
@@ -132,6 +136,9 @@ class _NullContentPage:
         pass
 
     def set_results(self, _value: list[object]) -> None:
+        pass
+
+    def apply_search_batch(self, _batch: SearchResultBatch) -> None:
         pass
 
     def set_search_busy(self, _busy: bool) -> None:
@@ -279,6 +286,9 @@ class _NullRepository:
     def get_task(self, task_id: str):
         raise KeyError(task_id)
 
+    def get_tasks(self, _task_ids: list[str]) -> list[object]:
+        return []
+
     def get_item(self, item_id: str):
         raise KeyError(item_id)
 
@@ -296,11 +306,17 @@ class _NullScheduler:
     async def resume_task(self, _task_id: str) -> None:
         pass
 
+    async def resume_tasks(self, _task_ids: list[str]) -> set[str]:
+        return set()
+
     async def run_items(self, _task_id: str, _item_ids: list[str]) -> None:
         pass
 
     def pause_task(self, _task_id: str) -> None:
         pass
+
+    def pause_tasks(self, _task_ids: list[str]) -> set[str]:
+        return set()
 
     def snapshot(self) -> SchedulerSnapshot:
         return SchedulerSnapshot(None, (), 3, 0)
@@ -346,6 +362,9 @@ class _NullSubscriptionService:
 
     def latest_runs(self) -> dict[str, object]:
         return {}
+
+    def snapshot(self) -> tuple[tuple[object, ...], tuple[tuple[str, object], ...]]:
+        return (), ()
 
     def get_rule(self, rule_id: str) -> object:
         raise KeyError(rule_id)
@@ -460,6 +479,8 @@ class AppController:
         self._integrity_cancel_event: Event | None = None
         self._integrity_repair_task_ids: set[str] = set()
         self._detail_task_id: str | None = None
+        self._task_refresh_task: asyncio.Task[None] | None = None
+        self._task_refresh_pending = False
         self._progress_refresh_interval = progress_refresh_interval
         self._next_progress_refresh = 0.0
         self._progress_samples: dict[str, tuple[float, int]] = {}
@@ -560,7 +581,7 @@ class AppController:
             retryable=False,
         )
         if recovered:
-            self._resume_subscriptions_after_connection()
+            await self._resume_subscriptions_after_connection()
         return True
 
     @staticmethod
@@ -577,16 +598,16 @@ class AppController:
         )
         self._show_status("Telegram 重连失败，请检查网络或代理")
 
-    def _resume_subscriptions_after_connection(self) -> None:
+    async def _resume_subscriptions_after_connection(self) -> None:
         account = getattr(self.subscriptions, "account", None)
         if account is None:
             return
         if getattr(self.subscription_scheduler, "account_id", None) != account.account_id:
             return
         try:
-            self.subscriptions.resume_after_connection()
+            await asyncio.to_thread(self.subscriptions.resume_after_connection)
             self.subscription_scheduler.wake()
-            self._reload_subscriptions()
+            await self._reload_subscriptions()
         except Exception as error:
             self._subscription_page().show_error(self._safe_error(error))
 
@@ -876,7 +897,7 @@ class AppController:
                 self._show_status("已取消创建任务")
                 return
             committed = self.planner.commit(preview)
-            self.refresh_tasks()
+            await self.refresh_tasks_async()
             self._start_task(committed.task.id)
             self._show_status(
                 f"加入 {len(committed.accepted_keys)} 项，"
@@ -918,7 +939,7 @@ class AppController:
             subscription_page = self._subscription_page()
             subscription_page.set_logged_in(False)
             subscription_page.set_dialogs(dialogs)
-            self._reload_subscriptions()
+            await self._reload_subscriptions()
             self._reload_content_history()
         except Exception as error:
             page.show_error(self._safe_error(error))
@@ -937,8 +958,8 @@ class AppController:
             subscription_page = self._subscription_page()
             subscription_page.set_logged_in(True)
             subscription_page.set_dialogs(dialogs)
-            self.subscriptions.resume_after_connection()
-            self._reload_subscriptions()
+            await asyncio.to_thread(self.subscriptions.resume_after_connection)
+            await self._reload_subscriptions()
             self.subscription_scheduler.set_account(profile.account_id)
             self.subscription_scheduler.start()
             self.subscription_scheduler.wake()
@@ -1055,6 +1076,20 @@ class AppController:
         page.set_search_busy(True)
         page.set_search_progress(SearchProgress(0, 0, "正在连接 Telegram"))
         search_id: str | None = None
+        search_generation: int | None = None
+        succeeded = False
+
+        def show_batch(batch: SearchResultBatch) -> None:
+            nonlocal search_id, search_generation
+            if (
+                current is not None
+                and self._content_search_task is current
+                and not current.cancelled()
+            ):
+                search_id = batch.search_id
+                search_generation = batch.generation
+                page.apply_search_batch(batch)
+
         try:
             if not await self.ensure_telegram_online():
                 return
@@ -1063,12 +1098,25 @@ class AppController:
                 query,
                 scope=scope,
                 on_progress=page.set_search_progress,
+                on_results=show_batch,
             )
             search_id = session.id
             page.set_active_search(session)
-            page.set_results(results)
+            generation = getattr(session, "generation", search_generation)
+            if isinstance(generation, int) and generation > 0:
+                show_batch(
+                    SearchResultBatch(
+                        session.id,
+                        generation,
+                        tuple(results),
+                        stable=True,
+                    )
+                )
+            else:
+                page.set_results(results)
             page.set_sessions(self.content_browser.list_sessions())
             page.show_error(session.last_error or "")
+            succeeded = True
         except asyncio.CancelledError:
             raise
         except SessionExpiredError as error:
@@ -1076,7 +1124,7 @@ class AppController:
         except Exception as error:
             page.show_error(self._safe_error(error))
         finally:
-            if search_id is not None:
+            if not succeeded and search_id is not None:
                 self._reload_content_search(search_id)
             page.set_search_busy(False)
             page.set_search_progress(None)
@@ -1092,17 +1140,43 @@ class AppController:
         self._content_search_task = current
         page.set_search_busy(True)
         page.set_search_progress(SearchProgress(0, 0, "正在连接 Telegram"))
+        search_generation: int | None = None
+        succeeded = False
+
+        def show_batch(batch: SearchResultBatch) -> None:
+            nonlocal search_generation
+            if (
+                current is not None
+                and self._content_search_task is current
+                and not current.cancelled()
+            ):
+                search_generation = batch.generation
+                page.apply_search_batch(batch)
+
         try:
             if not await self.ensure_telegram_online():
                 return
             session, results = await self.content_browser.load_more(
                 search_id,
                 on_progress=page.set_search_progress,
+                on_results=show_batch,
             )
             page.set_active_search(session)
-            page.set_results(results)
+            generation = getattr(session, "generation", search_generation)
+            if isinstance(generation, int) and generation > 0:
+                show_batch(
+                    SearchResultBatch(
+                        session.id,
+                        generation,
+                        tuple(results),
+                        stable=True,
+                    )
+                )
+            else:
+                page.set_results(results)
             page.set_sessions(self.content_browser.list_sessions())
             page.show_error(session.last_error or "")
+            succeeded = True
         except asyncio.CancelledError:
             raise
         except SessionExpiredError as error:
@@ -1110,7 +1184,8 @@ class AppController:
         except Exception as error:
             page.show_error(self._safe_error(error))
         finally:
-            self._reload_content_search(search_id)
+            if not succeeded:
+                self._reload_content_search(search_id)
             page.set_search_busy(False)
             page.set_search_progress(None)
             if self._content_search_task is current:
@@ -1170,7 +1245,7 @@ class AppController:
                 joined_count,
             )
             self._reload_content_search(search_id)
-            self.refresh_tasks()
+            await self.refresh_tasks_async()
             self._start_task(committed.task.id)
             self._show_status(
                 f"选择 {report.selected_count} 项，加入 {report.joined_count} 项，"
@@ -1237,35 +1312,44 @@ class AppController:
         except Exception as error:
             page.show_error(self._safe_error(error))
 
-    def delete_content_history(self, search_id: str) -> None:
+    async def delete_content_history(self, search_id: str) -> None:
         if self.content_browser is None:
             return
         try:
-            warning = self.content_browser.delete_history(search_id)
+            warning = await asyncio.to_thread(
+                self.content_browser.delete_history,
+                search_id,
+            )
             self._reload_content_history()
             if warning:
                 self._show_status(warning)
         except Exception as error:
             self._content_page().show_error(self._safe_error(error))
 
-    def clear_content_history(self) -> None:
+    async def clear_content_history(self) -> None:
         if self.content_browser is None:
             return
         try:
-            warning = self.content_browser.clear_history()
+            warning = await asyncio.to_thread(self.content_browser.clear_history)
             self._reload_content_history()
             if warning:
                 self._show_status(warning)
         except Exception as error:
             self._content_page().show_error(self._safe_error(error))
 
-    def clear_thumbnail_cache(self) -> None:
+    async def clear_thumbnail_cache(self) -> None:
         if self.content_browser is None:
             return
-        count, removed_bytes = self.content_browser.thumbnails.clear()
+
+        def clear_cache() -> tuple[int, int, int]:
+            count, removed_bytes = self.content_browser.thumbnails.clear()
+            remaining_bytes = self.content_browser.thumbnails.total_bytes()
+            return count, removed_bytes, remaining_bytes
+
+        count, removed_bytes, remaining_bytes = await asyncio.to_thread(clear_cache)
         dialog = self._settings_dialog
         if dialog is not None:
-            dialog.set_thumbnail_cache_bytes(self.content_browser.thumbnails.total_bytes())
+            dialog.set_thumbnail_cache_bytes(remaining_bytes)
         self._show_status(f"已清理 {count} 个缩略图，共 {self._format_bytes(removed_bytes)}")
 
     async def activate_subscriptions_page(self) -> None:
@@ -1278,7 +1362,7 @@ class AppController:
                 account = cached
         if self.content_browser is not None:
             page.set_dialogs(self.content_browser.list_dialogs())
-        self._reload_subscriptions()
+        await self._reload_subscriptions()
         online = await self.ensure_telegram_online()
         page.set_logged_in(online)
         if online and account is None:
@@ -1346,7 +1430,7 @@ class AppController:
         self._subscription_actions_active += 1
         try:
             saved = await self.subscriptions.create_rule(draft)
-            self._reload_subscriptions()
+            await self._reload_subscriptions()
             self.subscription_scheduler.wake()
             title = getattr(saved, "dialog_title", "")
             keyword = getattr(saved, "keyword", "")
@@ -1367,7 +1451,7 @@ class AppController:
         self._subscription_actions_active += 1
         try:
             await self.subscriptions.update_rule(rule_id, draft)
-            self._reload_subscriptions()
+            await self._reload_subscriptions()
             self.subscription_scheduler.wake()
             self._show_status("自动订阅已更新")
         except Exception as error:
@@ -1376,44 +1460,50 @@ class AppController:
             self._subscription_actions_active -= 1
             page.set_rule_busy(None, False)
 
-    def set_subscription_enabled(self, rule_id: str, enabled: bool) -> None:
+    async def set_subscription_enabled(self, rule_id: str, enabled: bool) -> None:
         page = self._subscription_page()
+        self._subscription_actions_active += 1
         try:
-            self.subscriptions.set_enabled(rule_id, enabled)
-            self._reload_subscriptions()
+            await asyncio.to_thread(self.subscriptions.set_enabled, rule_id, enabled)
+            await self._reload_subscriptions()
             if enabled:
                 self.subscription_scheduler.wake(rule_id)
             self._show_status("自动订阅已继续" if enabled else "自动订阅已暂停")
         except Exception as error:
             page.show_error(self._safe_error(error))
         finally:
+            self._subscription_actions_active -= 1
             page.set_rule_busy(None, False)
 
-    def run_subscription_now(self, rule_id: str) -> None:
+    async def run_subscription_now(self, rule_id: str) -> None:
         page = self._subscription_page()
+        self._subscription_actions_active += 1
         try:
-            self.subscriptions.get_rule(rule_id)
+            await asyncio.to_thread(self.subscriptions.get_rule, rule_id)
             self.subscription_scheduler.wake(rule_id)
             self._show_status("已安排立即检查")
         except Exception as error:
             page.show_error(self._safe_error(error))
         finally:
+            self._subscription_actions_active -= 1
             page.set_rule_busy(None, False)
 
-    def delete_subscription(self, rule_id: str) -> None:
+    async def delete_subscription(self, rule_id: str) -> None:
         page = self._subscription_page()
+        self._subscription_actions_active += 1
         try:
-            self.subscriptions.delete_rule(rule_id)
-            self._reload_subscriptions()
+            await asyncio.to_thread(self.subscriptions.delete_rule, rule_id)
+            await self._reload_subscriptions()
             self._show_status("自动订阅已删除；已有任务和文件已保留")
         except Exception as error:
             page.show_error(self._safe_error(error))
         finally:
+            self._subscription_actions_active -= 1
             page.set_rule_busy(None, False)
 
     def subscription_task_created(self, task_id: str) -> None:
-        self.refresh_tasks()
         self._start_task(task_id)
+        self._schedule_task_refresh()
 
     def foreground_telegram_busy(self) -> bool:
         if (
@@ -1433,13 +1523,13 @@ class AppController:
             )
         )
 
-    def activate_diagnostics(self) -> None:
+    async def activate_diagnostics(self) -> None:
         page = self._diagnostics_page()
         if self.diagnostic_store is None:
             page.set_report(None, historical=True)
             return
         try:
-            report = self.diagnostic_store.load_latest()
+            report = await asyncio.to_thread(self.diagnostic_store.load_latest)
         except Exception:
             page.show_error("无法读取上次诊断报告")
             return
@@ -1455,10 +1545,14 @@ class AppController:
         page.set_progress(None)
         try:
             report = await self.diagnostics.run(page.set_progress)
-            register = getattr(self.diagnostic_store, "register_secrets", None)
-            if callable(register):
-                register(self.secrets.values())
-            self.diagnostic_store.save(report)
+
+            def persist_report() -> None:
+                register = getattr(self.diagnostic_store, "register_secrets", None)
+                if callable(register):
+                    register(self.secrets.values())
+                self.diagnostic_store.save(report)
+
+            await asyncio.to_thread(persist_report)
             self._diagnostic_report = report
             page.set_report(report, historical=False)
             self._show_status("健康诊断已完成")
@@ -1473,7 +1567,7 @@ class AppController:
         if self.diagnostics is not None:
             await self.diagnostics.cancel()
 
-    def export_diagnostics(self) -> None:
+    async def export_diagnostics(self) -> None:
         page = self._diagnostics_page()
         if self.diagnostic_store is None:
             page.show_error("诊断导出服务不可用")
@@ -1483,10 +1577,13 @@ class AppController:
             page.show_error("请先完成一次健康诊断")
             return
         try:
-            register = getattr(self.diagnostic_store, "register_secrets", None)
-            if callable(register):
-                register(self.secrets.values())
-            package = self.diagnostic_store.export(report)
+            def export_report():
+                register = getattr(self.diagnostic_store, "register_secrets", None)
+                if callable(register):
+                    register(self.secrets.values())
+                return self.diagnostic_store.export(report)
+
+            package = await asyncio.to_thread(export_report)
         except Exception as error:
             page.show_error(f"诊断包导出失败（{type(error).__name__}）")
             return
@@ -1522,7 +1619,7 @@ class AppController:
             with suppress(Exception):
                 await probe.disconnect()
 
-    def apply_settings(self, settings: AppSettings, proxy_password: str) -> None:
+    async def apply_settings(self, settings: AppSettings, proxy_password: str) -> None:
         connection_changed = (
             settings.api_id != self.settings.api_id
             or settings.proxy != self.settings.proxy
@@ -1532,8 +1629,11 @@ class AppController:
             updated_secrets["proxy_password"] = proxy_password
         else:
             updated_secrets.pop("proxy_password", None)
-        self.settings_store.save(settings)
-        self.vault.save(updated_secrets)
+        def persist_settings() -> None:
+            self.settings_store.save(settings)
+            self.vault.save(updated_secrets)
+
+        await asyncio.to_thread(persist_settings)
         self.settings = settings
         self.secrets = updated_secrets
         configure = getattr(self.scheduler, "configure_resources", None)
@@ -1544,8 +1644,8 @@ class AppController:
             message += "，API/代理变更将在下次连接时生效"
         self._show_status(message)
 
-    def pause_task(self, task_id: str) -> None:
-        self.pause_tasks([task_id])
+    async def pause_task(self, task_id: str) -> None:
+        await self.pause_tasks([task_id])
 
     async def resume_task(self, task_id: str) -> None:
         await self.resume_tasks([task_id])
@@ -1553,43 +1653,50 @@ class AppController:
     async def retry_failed(self, task_id: str) -> None:
         await self.retry_failed_tasks([task_id])
 
-    def pause_tasks(self, task_ids: list[str]) -> None:
+    async def pause_tasks(self, task_ids: list[str]) -> None:
         unique = self._unique_task_ids(task_ids)
-        accepted = 0
-        for task_id in unique:
-            try:
-                task = self.repository.get_task(task_id)
-            except KeyError:
-                continue
-            if task.archived_at is not None or task.status not in {
+        tasks = await asyncio.to_thread(self.repository.get_tasks, unique)
+        eligible = [
+            task.id
+            for task in tasks
+            if task.archived_at is None
+            and task.status
+            in {
                 TaskStatus.QUEUED,
                 TaskStatus.DOWNLOADING,
                 TaskStatus.WAITING_RETRY,
-            }:
-                continue
-            self.scheduler.pause_task(task_id)
-            accepted += 1
-        self.refresh_tasks()
-        self._show_status(f"已暂停 {accepted} 个任务，跳过 {len(unique) - accepted} 个")
+            }
+        ]
+        accepted = self.scheduler.pause_tasks(eligible)
+        await self.refresh_tasks_async()
+        self._show_status(
+            f"已暂停 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个"
+        )
 
-    def prioritize_task(self, task_id: str) -> None:
-        try:
-            task = self.repository.get_task(task_id)
-        except KeyError:
+    async def prioritize_task(self, task_id: str) -> None:
+        tasks = await asyncio.to_thread(self.repository.get_tasks, [task_id])
+        if not tasks:
+            await self.refresh_tasks_async()
             self._show_status("任务不存在或已被移除")
             return
+        task = tasks[0]
         if task.archived_at is not None or task.status is not TaskStatus.QUEUED:
+            await self.refresh_tasks_async()
             self._show_status("任务已经开始下载或状态已变化")
             return
 
         prioritize = getattr(self.repository, "prioritize_task", None)
-        persisted = bool(prioritize(task_id)) if callable(prioritize) else False
+        persisted = (
+            bool(await asyncio.to_thread(prioritize, task_id))
+            if callable(prioritize)
+            else False
+        )
         reordered = self.scheduler.prioritize_task(task_id) if persisted else False
         if not reordered:
             clear_priority = getattr(self.repository, "clear_task_priority", None)
             if callable(clear_priority):
-                clear_priority(task_id)
-        self.refresh_tasks()
+                await asyncio.to_thread(clear_priority, task_id)
+        await self.refresh_tasks_async()
         if reordered:
             position = self.scheduler.queue_positions().get(task_id)
             if position is not None:
@@ -1601,47 +1708,45 @@ class AppController:
 
     async def resume_tasks(self, task_ids: list[str]) -> None:
         unique = self._unique_task_ids(task_ids)
-        accepted: list[str] = []
-        for task_id in unique:
-            try:
-                task = self.repository.get_task(task_id)
-            except KeyError:
-                continue
-            if task.archived_at is None and task.status is TaskStatus.PAUSED:
-                accepted.append(task_id)
-        if accepted:
-            await asyncio.gather(*(self.scheduler.resume_task(task_id) for task_id in accepted))
-        self.refresh_tasks()
-        self._show_status(f"已继续 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个")
+        tasks = await asyncio.to_thread(self.repository.get_tasks, unique)
+        eligible = [
+            task.id
+            for task in tasks
+            if task.archived_at is None and task.status is TaskStatus.PAUSED
+        ]
+        accepted = await self.scheduler.resume_tasks(eligible) if eligible else set()
+        await self.refresh_tasks_async()
+        self._show_status(
+            f"已继续 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个"
+        )
 
     async def retry_failed_tasks(self, task_ids: list[str]) -> None:
         unique = self._unique_task_ids(task_ids)
-        accepted: list[str] = []
-        for task_id in unique:
-            try:
-                task = self.repository.get_task(task_id)
-            except KeyError:
-                continue
-            if task.archived_at is None and task.status is TaskStatus.PARTIAL_FAILURE:
-                accepted.append(task_id)
-        if accepted:
-            await asyncio.gather(*(self.scheduler.resume_task(task_id) for task_id in accepted))
-        self.refresh_tasks()
-        self._show_status(f"已重试 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个")
+        tasks = await asyncio.to_thread(self.repository.get_tasks, unique)
+        eligible = [
+            task.id
+            for task in tasks
+            if task.archived_at is None and task.status is TaskStatus.PARTIAL_FAILURE
+        ]
+        accepted = await self.scheduler.resume_tasks(eligible) if eligible else set()
+        await self.refresh_tasks_async()
+        self._show_status(
+            f"已重试 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个"
+        )
 
-    def archive_tasks(self, task_ids: list[str]) -> None:
+    async def archive_tasks(self, task_ids: list[str]) -> None:
         unique = self._unique_task_ids(task_ids)
-        accepted = self.repository.archive_tasks(unique)
-        self.refresh_tasks()
+        accepted = await asyncio.to_thread(self.repository.archive_tasks, unique)
+        await self.refresh_tasks_async()
         self._show_status(
             f"已归档 {len(accepted)} 个完成任务；下载文件已保留，"
             f"跳过 {len(unique) - len(accepted)} 个"
         )
 
-    def restore_tasks(self, task_ids: list[str]) -> None:
+    async def restore_tasks(self, task_ids: list[str]) -> None:
         unique = self._unique_task_ids(task_ids)
-        accepted = self.repository.restore_tasks(unique)
-        self.refresh_tasks()
+        accepted = await asyncio.to_thread(self.repository.restore_tasks, unique)
+        await self.refresh_tasks_async()
         self._show_status(
             f"已恢复 {len(accepted)} 个归档任务，跳过 {len(unique) - len(accepted)} 个"
         )
@@ -1709,7 +1814,7 @@ class AppController:
             self._show_status(self._integrity_summary_text(summary))
         finally:
             self._finish_integrity_operation(current)
-            self._refresh_integrity_views()
+            await self._refresh_integrity_views()
 
     async def repair_media(self, item_ids: list[str]) -> None:
         unique = self._unique_task_ids(item_ids)
@@ -1749,7 +1854,7 @@ class AppController:
             )
         finally:
             self._finish_integrity_operation(current)
-            self._refresh_integrity_views()
+            await self._refresh_integrity_views()
 
     def cancel_integrity(self) -> None:
         event = self._integrity_cancel_event
@@ -1786,8 +1891,8 @@ class AppController:
         self.window.set_integrity_progress(None)
         self.window.set_integrity_busy(False)
 
-    def _refresh_integrity_views(self) -> None:
-        self.refresh_tasks()
+    async def _refresh_integrity_views(self) -> None:
+        await self.refresh_tasks_async()
         if self._detail_task_id is not None:
             self.select_task_details([self._detail_task_id])
 
@@ -1832,7 +1937,7 @@ class AppController:
             self._show_status("安全限制：文件路径不在应用目录内")
         except KeyError:
             self._show_status("媒体记录不存在，任务列表已刷新")
-            self.refresh_tasks()
+            self._schedule_task_refresh()
         except OSError:
             self._show_status("Windows 无法打开该文件")
 
@@ -1904,8 +2009,54 @@ class AppController:
 
     def refresh_tasks(self, *, now: float | None = None) -> None:
         sampled_at = monotonic_clock() if now is None else now
-        summaries: list[TaskSummary] = []
-        active_ids: set[str] = set()
+        scheduler_state, queue_positions = self._task_scheduler_state()
+        snapshots = self.repository.list_task_snapshots(include_archived=True)
+        summaries = self._summaries_from_snapshots(
+            snapshots,
+            scheduler_state,
+            queue_positions,
+            sampled_at,
+        )
+        self._apply_task_summaries(summaries, scheduler_state)
+
+    async def refresh_tasks_async(self, *, now: float | None = None) -> None:
+        active = self._task_refresh_task
+        if active is not None and not active.done():
+            self._task_refresh_pending = True
+            await asyncio.shield(active)
+            return
+
+        refresh = asyncio.create_task(self._refresh_task_views(now=now))
+        self._task_refresh_task = refresh
+        refresh.add_done_callback(self._task_refresh_finished)
+        await asyncio.shield(refresh)
+
+    async def _refresh_task_views(self, *, now: float | None) -> None:
+        while True:
+            self._task_refresh_pending = False
+            sampled_at = monotonic_clock() if now is None else now
+            snapshots = await asyncio.to_thread(
+                self.repository.list_task_snapshots,
+                include_archived=True,
+            )
+            scheduler_state, queue_positions = self._task_scheduler_state()
+            summaries = self._summaries_from_snapshots(
+                snapshots,
+                scheduler_state,
+                queue_positions,
+                sampled_at,
+            )
+            self._apply_task_summaries(summaries, scheduler_state)
+            if not self._task_refresh_pending:
+                return
+
+    def _task_refresh_finished(self, task: asyncio.Task[None]) -> None:
+        if self._task_refresh_task is task:
+            self._task_refresh_task = None
+        if not task.cancelled():
+            task.exception()
+
+    def _task_scheduler_state(self) -> tuple[SchedulerSnapshot, dict[str, int]]:
         snapshot_method = getattr(self.scheduler, "snapshot", None)
         scheduler_state = (
             snapshot_method()
@@ -1921,7 +2072,17 @@ class AppController:
         queue_positions = (
             queue_positions_method() if callable(queue_positions_method) else {}
         )
-        snapshots = self.repository.list_task_snapshots(include_archived=True)
+        return scheduler_state, queue_positions
+
+    def _summaries_from_snapshots(
+        self,
+        snapshots: list[Any],
+        scheduler_state: SchedulerSnapshot,
+        queue_positions: dict[str, int],
+        sampled_at: float,
+    ) -> list[TaskSummary]:
+        summaries: list[TaskSummary] = []
+        active_ids: set[str] = set()
         for snapshot in snapshots:
             task = snapshot.task
             archived = task.archived_at is not None
@@ -1966,6 +2127,13 @@ class AppController:
                 active_ids.add(task.id)
         for task_id in set(self._progress_samples) - active_ids:
             self._progress_samples.pop(task_id, None)
+        return summaries
+
+    def _apply_task_summaries(
+        self,
+        summaries: list[TaskSummary],
+        scheduler_state: SchedulerSnapshot,
+    ) -> None:
         self.window.set_task_summaries(summaries)
         set_scheduler_summary = getattr(self.window, "set_scheduler_summary", None)
         if callable(set_scheduler_summary):
@@ -1994,12 +2162,12 @@ class AppController:
         delta = downloaded - previous[1]
         return delta / elapsed if elapsed > 0 and delta > 0 else 0.0
 
-    def _refresh_tasks_if_due(self, now: float | None = None) -> None:
+    async def _refresh_tasks_if_due(self, now: float | None = None) -> None:
         sampled_at = monotonic_clock() if now is None else now
         if sampled_at < self._next_progress_refresh:
             return
         self._next_progress_refresh = sampled_at + self._progress_refresh_interval
-        self.refresh_tasks(now=sampled_at)
+        await self.refresh_tasks_async(now=sampled_at)
 
     def show_login(self) -> None:
         self._prefill_login()
@@ -2151,13 +2319,25 @@ class AppController:
             _NullDiagnosticsPage(),
         )
 
-    def _reload_subscriptions(self) -> None:
+    async def _reload_subscriptions(self) -> None:
         page = self._subscription_page()
         try:
-            page.set_rules(
-                self.subscriptions.list_rules(),
-                self.subscriptions.latest_runs(),
-            )
+            def load_snapshot():
+                snapshot = getattr(self.subscriptions, "snapshot", None)
+                if callable(snapshot):
+                    rules, latest_runs = snapshot()
+                else:
+                    rules = self.subscriptions.list_rules()
+                    latest_runs = self.subscriptions.latest_runs()
+                latest_items = (
+                    tuple(latest_runs.items())
+                    if isinstance(latest_runs, dict)
+                    else tuple(latest_runs)
+                )
+                return tuple(rules), latest_items
+
+            rules, latest_items = await asyncio.to_thread(load_snapshot)
+            page.set_rules(list(rules), dict(latest_items))
         except Exception as error:
             page.show_error(self._safe_error(error))
 
@@ -2173,8 +2353,9 @@ class AppController:
             sessions[0] if sessions else None,
         )
         page.set_active_search(active)
-        if active is not None:
-            page.set_results(self.content_browser.list_results(active.id))
+        list_results = getattr(self.content_browser, "list_results", None)
+        if active is not None and callable(list_results):
+            page.set_results(list_results(active.id))
         elif hasattr(page, "set_results"):
             page.set_results([])
 
@@ -2212,6 +2393,14 @@ class AppController:
     def _start_task(self, task_id: str) -> None:
         self._spawn_background(self._run_and_refresh(task_id))
 
+    def _schedule_task_refresh(self) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self.refresh_tasks()
+            return
+        self._spawn_background(self.refresh_tasks_async())
+
     def _spawn_background(self, operation) -> asyncio.Task[Any]:
         task = asyncio.create_task(operation)
         self._background.add(task)
@@ -2245,7 +2434,7 @@ class AppController:
             while not operation.done():
                 is_active = getattr(self.scheduler, "is_active", None)
                 if not callable(is_active) or is_active(task_id):
-                    self._refresh_tasks_if_due()
+                    await self._refresh_tasks_if_due()
                 try:
                     await asyncio.wait_for(
                         asyncio.shield(operation),
@@ -2255,7 +2444,7 @@ class AppController:
                     continue
             await operation
         finally:
-            self.refresh_tasks()
+            await self.refresh_tasks_async()
 
     def _show_status(self, message: str) -> None:
         self.window.statusBar().showMessage(message, 8000)

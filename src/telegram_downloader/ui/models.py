@@ -179,9 +179,28 @@ class TaskTableModel(QAbstractTableModel):
         return super().headerData(section, orientation, role)
 
     def set_tasks(self, tasks: list[TaskSummary]) -> None:
+        target_all = list(tasks)
+        target = [
+            task
+            for task in target_all
+            if self._matches_search(task)
+            and self._matches_filter(task, self._filter)
+        ]
+        if [task.id for task in self._tasks] == [task.id for task in target]:
+            previous = self._tasks
+            self._all_tasks = target_all
+            self._tasks = target
+            for row, (before, after) in enumerate(zip(previous, target, strict=True)):
+                if before == after:
+                    continue
+                self.dataChanged.emit(
+                    self.index(row, 0),
+                    self.index(row, self.columnCount() - 1),
+                )
+            return
         self.beginResetModel()
-        self._all_tasks = list(tasks)
-        self._tasks = self._filtered_tasks()
+        self._all_tasks = target_all
+        self._tasks = target
         self.endResetModel()
 
     def set_filter(self, selected: TaskFilter, search: str = "") -> None:

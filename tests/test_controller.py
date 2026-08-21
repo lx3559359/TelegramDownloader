@@ -1,7 +1,10 @@
 import asyncio
 import logging
+import threading
+import time
 from datetime import UTC, date, datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -30,6 +33,7 @@ from telegram_downloader.domain import (
     MediaKind,
     ScanFilters,
     SourceKind,
+    TaskRecord,
     TaskStatus,
 )
 from telegram_downloader.file_integrity import (
@@ -69,6 +73,142 @@ class ConnectedGateway:
 
     async def disconnect(self):
         pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action_name",
+    [
+        "delete_content_history",
+        "clear_content_history",
+        "clear_thumbnail_cache",
+        "activate_diagnostics",
+        "export_diagnostics",
+        "apply_settings",
+        "set_subscription_enabled",
+        "delete_subscription",
+    ],
+)
+async def test_blocking_ui_actions_leave_event_loop_responsive(action_name) -> None:
+    loop = asyncio.get_running_loop()
+    main_thread_id = threading.get_ident()
+    entered = asyncio.Event()
+    heartbeat = asyncio.Event()
+    worker_ids: list[int] = []
+    ui_ids: list[int] = []
+
+    def blocking(result=None):
+        def call(*_args, **_kwargs):
+            worker_ids.append(threading.get_ident())
+            loop.call_soon_threadsafe(entered.set)
+            time.sleep(0.05)
+            return result
+
+        return call
+
+    def ui(*_args, **_kwargs) -> None:
+        ui_ids.append(threading.get_ident())
+
+    page = SimpleNamespace(
+        active_search_id=None,
+        report=None,
+        set_sessions=ui,
+        set_active_search=ui,
+        set_results=ui,
+        set_thumbnail_cache_bytes=ui,
+        set_report=ui,
+        set_rules=ui,
+        set_rule_busy=ui,
+        show_error=ui,
+    )
+    status = SimpleNamespace(showMessage=ui)
+    window = SimpleNamespace(
+        content_page=page,
+        subscriptions_page=page,
+        diagnostics_page=page,
+        statusBar=lambda: status,
+    )
+
+    dependencies: dict[str, object] = {"window": window}
+    if action_name == "delete_content_history":
+        dependencies["content_browser"] = SimpleNamespace(
+            delete_history=blocking(None),
+            list_sessions=lambda: [],
+        )
+        def action(controller):
+            return controller.delete_content_history("search")
+    elif action_name == "clear_content_history":
+        dependencies["content_browser"] = SimpleNamespace(
+            clear_history=blocking(None),
+            list_sessions=lambda: [],
+        )
+        def action(controller):
+            return controller.clear_content_history()
+    elif action_name == "clear_thumbnail_cache":
+        dependencies["content_browser"] = SimpleNamespace(
+            thumbnails=SimpleNamespace(
+                clear=blocking((1, 1024)),
+                total_bytes=lambda: 0,
+            )
+        )
+        def action(controller):
+            return controller.clear_thumbnail_cache()
+    elif action_name == "activate_diagnostics":
+        dependencies["diagnostic_store"] = SimpleNamespace(
+            load_latest=blocking(object())
+        )
+        def action(controller):
+            return controller.activate_diagnostics()
+    elif action_name == "export_diagnostics":
+        dependencies["diagnostic_store"] = SimpleNamespace(
+            export=blocking(SimpleNamespace(name="diagnostics.zip"))
+        )
+
+        def action(controller):
+            controller._diagnostic_report = object()
+            return controller.export_diagnostics()
+
+    elif action_name == "apply_settings":
+        current = AppSettings(api_id=1)
+        dependencies.update(
+            settings=current,
+            secrets={},
+            settings_store=SimpleNamespace(save=blocking(None)),
+            vault=SimpleNamespace(save=lambda _value: None),
+            scheduler=SimpleNamespace(configure_resources=ui),
+        )
+        def action(controller):
+            return controller.apply_settings(current, "")
+    elif action_name == "set_subscription_enabled":
+        dependencies.update(
+            subscriptions=SimpleNamespace(
+                set_enabled=blocking(None),
+                snapshot=lambda: ((), ()),
+            ),
+            subscription_scheduler=SimpleNamespace(wake=ui),
+        )
+        def action(controller):
+            return controller.set_subscription_enabled("rule", True)
+    else:
+        dependencies["subscriptions"] = SimpleNamespace(
+            delete_rule=blocking(None),
+            snapshot=lambda: ((), ()),
+        )
+        def action(controller):
+            return controller.delete_subscription("rule")
+
+    controller = AppController.for_test(**dependencies)
+    if action_name == "clear_thumbnail_cache":
+        controller._settings_dialog = page
+    operation = asyncio.create_task(action(controller))
+    await entered.wait()
+    loop.call_soon(heartbeat.set)
+
+    await asyncio.wait_for(heartbeat.wait(), timeout=0.02)
+    await operation
+
+    assert worker_ids and worker_ids[0] != main_thread_id
+    assert ui_ids and all(value == main_thread_id for value in ui_ids)
 
 
 @pytest.mark.asyncio
@@ -1115,6 +1255,37 @@ async def test_confirmed_scan_starts_persisted_task() -> None:
 
 
 @pytest.mark.asyncio
+async def test_confirmed_scan_awaits_async_task_refresh_before_start() -> None:
+    class Planner:
+        async def scan(self, _source, _filters):
+            return "preview"
+
+        def commit(self, _preview):
+            return SimpleNamespace(
+                task=SimpleNamespace(id="task-1"),
+                accepted_keys=frozenset(),
+                skipped_count=0,
+            )
+
+    controller = AppController.for_test(
+        gateway=ConnectedGateway(),
+        planner=Planner(),
+        confirm_preview=lambda _preview: True,
+    )
+    controller.refresh_tasks = Mock(side_effect=AssertionError("同步刷新不应被调用"))
+    controller.refresh_tasks_async = AsyncMock()
+    controller._start_task = Mock()
+
+    await controller.scan_link(
+        "https://t.me/example/42",
+        controller.default_filters(datetime(2026, 8, 13, tzinfo=UTC)),
+    )
+
+    controller.refresh_tasks_async.assert_awaited_once()
+    controller._start_task.assert_called_once_with("task-1")
+
+
+@pytest.mark.asyncio
 async def test_running_task_refreshes_window_before_download_finishes() -> None:
     release = asyncio.Event()
     started = asyncio.Event()
@@ -1478,6 +1649,7 @@ async def test_verify_media_forwards_progress_suppresses_duplicate_and_refreshes
         window=window,
         integrity_service=integrity,
     )
+    controller.refresh_tasks = Mock(side_effect=AssertionError("同步刷新不应被调用"))
     controller.select_task_details([item.task_id])
 
     active = asyncio.create_task(controller.verify_media([item.id, item.id]))
@@ -1683,85 +1855,114 @@ async def test_cancel_integrity_pauses_active_repair_download() -> None:
         await operation
 
 
+def task_record(task_id: str, status: TaskStatus) -> TaskRecord:
+    now = datetime(2026, 8, 21, tzinfo=UTC)
+    return TaskRecord(
+        task_id,
+        SourceKind.CHANNEL_OR_GROUP,
+        f"peer-{task_id}",
+        f"任务 {task_id}",
+        f"https://t.me/{task_id}",
+        ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 10),
+        status,
+        now,
+        now,
+    )
+
+
 @pytest.mark.asyncio
-async def test_task_batch_actions_deduplicate_and_skip_ineligible_tasks() -> None:
-    tasks = {
-        "run": SimpleNamespace(
-            id="run",
-            status=TaskStatus.DOWNLOADING,
-            archived_at=None,
-        ),
-        "pause": SimpleNamespace(
-            id="pause",
-            status=TaskStatus.PAUSED,
-            archived_at=None,
-        ),
-        "fail": SimpleNamespace(
-            id="fail",
-            status=TaskStatus.PARTIAL_FAILURE,
-            archived_at=None,
-        ),
-    }
+async def test_pause_tasks_uses_bulk_lookup_command_and_one_refresh() -> None:
+    events: list[str] = []
 
     class Repository:
-        def get_task(self, task_id):
-            return tasks[task_id]
-
-        def list_task_snapshots(self, *, include_archived=False):
-            assert include_archived is True
-            return []
+        def get_tasks(self, task_ids):
+            events.append("lookup")
+            return [task_record(task_id, TaskStatus.QUEUED) for task_id in task_ids]
 
     class Scheduler:
-        def __init__(self):
-            self.paused = []
-            self.resumed = []
+        def pause_tasks(self, task_ids):
+            events.append("pause:" + ",".join(task_ids))
+            return set(task_ids)
 
-        def pause_task(self, task_id):
-            self.paused.append(task_id)
+    controller = AppController.for_test(
+        repository=Repository(),
+        scheduler=Scheduler(),
+    )
+    controller.refresh_tasks_async = AsyncMock(
+        side_effect=lambda: events.append("refresh")
+    )
 
-        async def resume_task(self, task_id):
-            self.resumed.append(task_id)
+    await controller.pause_tasks(["a", "b", "a"])
 
-    scheduler = Scheduler()
-    controller = AppController.for_test(repository=Repository(), scheduler=scheduler)
-
-    controller.pause_tasks(["run", "pause", "run"])
-    await controller.resume_tasks(["pause", "run", "pause"])
-    assert scheduler.paused == ["run"]
-    assert scheduler.resumed == ["pause"]
-
-    await controller.retry_failed_tasks(["fail", "run", "fail"])
-
-    assert scheduler.resumed == ["pause", "fail"]
+    assert events == ["lookup", "pause:a,b", "refresh"]
 
 
-def test_archive_and_restore_tasks_report_repository_results() -> None:
-    class Repository:
-        def __init__(self):
-            self.archived = []
-            self.restored = []
+@pytest.mark.asyncio
+async def test_task_batch_commands_skip_ineligible_states() -> None:
+    tasks = [
+        task_record("run", TaskStatus.DOWNLOADING),
+        task_record("pause", TaskStatus.PAUSED),
+        task_record("fail", TaskStatus.PARTIAL_FAILURE),
+    ]
+    repository = SimpleNamespace(get_tasks=Mock(return_value=tasks))
+    scheduler = SimpleNamespace(
+        pause_tasks=Mock(return_value={"run"}),
+        resume_tasks=AsyncMock(side_effect=({"pause"}, {"fail"})),
+    )
+    controller = AppController.for_test(repository=repository, scheduler=scheduler)
+    controller.refresh_tasks_async = AsyncMock()
 
-        def archive_tasks(self, task_ids):
-            self.archived.append(task_ids)
-            return {"done"}
+    await controller.pause_tasks(["run", "pause", "fail"])
+    await controller.resume_tasks(["run", "pause", "fail"])
+    await controller.retry_failed_tasks(["run", "pause", "fail"])
 
-        def restore_tasks(self, task_ids):
-            self.restored.append(task_ids)
-            return {"done"}
+    scheduler.pause_tasks.assert_called_once_with(["run"])
+    assert scheduler.resume_tasks.await_args_list[0].args == (["pause"],)
+    assert scheduler.resume_tasks.await_args_list[1].args == (["fail"],)
 
-        def list_task_snapshots(self, *, include_archived=False):
-            assert include_archived is True
-            return []
 
-    repository = Repository()
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "initial"),
+    [
+        ("resume_tasks", TaskStatus.PAUSED),
+        ("retry_failed_tasks", TaskStatus.PARTIAL_FAILURE),
+    ],
+)
+async def test_resume_commands_use_one_bulk_lookup_and_refresh(
+    method: str,
+    initial: TaskStatus,
+) -> None:
+    repository = SimpleNamespace(
+        get_tasks=Mock(
+            return_value=[task_record("a", initial), task_record("b", initial)]
+        )
+    )
+    scheduler = SimpleNamespace(
+        resume_tasks=AsyncMock(return_value={"a", "b"}),
+    )
+    controller = AppController.for_test(repository=repository, scheduler=scheduler)
+    controller.refresh_tasks_async = AsyncMock()
+
+    await getattr(controller, method)(["a", "b", "a"])
+
+    repository.get_tasks.assert_called_once_with(["a", "b"])
+    scheduler.resume_tasks.assert_awaited_once_with(["a", "b"])
+    controller.refresh_tasks_async.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["archive_tasks", "restore_tasks"])
+async def test_archive_commands_write_and_refresh_once(method: str) -> None:
+    repository = SimpleNamespace()
+    setattr(repository, method, Mock(return_value={"a", "b"}))
     controller = AppController.for_test(repository=repository)
+    controller.refresh_tasks_async = AsyncMock()
 
-    controller.archive_tasks(["done", "done", "active"])
-    controller.restore_tasks(["done", "done"])
+    await getattr(controller, method)(["a", "b", "a"])
 
-    assert repository.archived == [["done", "active"]]
-    assert repository.restored == [["done"]]
-    assert "已恢复 1 个" in controller.window.message.last_message
+    getattr(repository, method).assert_called_once_with(["a", "b"])
+    controller.refresh_tasks_async.assert_awaited_once()
 
 
 def test_open_media_file_requires_completed_local_existing_file(
@@ -1814,22 +2015,21 @@ def test_open_media_file_requires_completed_local_existing_file(
     assert "安全" in controller.window.message.last_message
 
 
-def test_progress_refresh_is_throttled_across_concurrent_callers() -> None:
-    class Window:
-        def __init__(self):
-            self.refreshes = 0
+@pytest.mark.asyncio
+async def test_progress_refresh_is_throttled_across_concurrent_callers() -> None:
+    controller = AppController.for_test(progress_refresh_interval=0.5)
+    refreshes: list[float | None] = []
 
-        def set_task_summaries(self, _summaries):
-            self.refreshes += 1
+    async def refresh(*, now=None) -> None:
+        refreshes.append(now)
 
-    window = Window()
-    controller = AppController.for_test(window=window, progress_refresh_interval=0.5)
+    controller.refresh_tasks_async = refresh
 
-    controller._refresh_tasks_if_due(20.0)
-    controller._refresh_tasks_if_due(20.1)
-    controller._refresh_tasks_if_due(20.5)
+    await controller._refresh_tasks_if_due(20.0)
+    await controller._refresh_tasks_if_due(20.1)
+    await controller._refresh_tasks_if_due(20.5)
 
-    assert window.refreshes == 2
+    assert refreshes == [20.0, 20.5]
 
 
 def test_progress_refresh_interval_must_be_positive() -> None:
@@ -1843,6 +2043,7 @@ class ContentPageFake:
         self.dialogs = []
         self.sessions = []
         self.results = []
+        self.batches = []
         self.active_search_id = None
         self.busy = []
         self.search_progress = []
@@ -1869,6 +2070,10 @@ class ContentPageFake:
 
     def set_results(self, value):
         self.results = value
+
+    def apply_search_batch(self, value):
+        self.batches.append(value)
+        self.results = list(value.results)
 
     def set_search_busy(self, value):
         self.busy.append(value)
@@ -2020,6 +2225,7 @@ async def test_search_progress_is_forwarded_and_always_stops() -> None:
             *,
             scope=SearchScope.SINGLE_DIALOG,
             on_progress=None,
+            on_results=None,
         ):
             on_progress(SearchProgress(20, 3, "正在整理结果"))
             return session, []
@@ -2070,7 +2276,15 @@ async def test_controller_forwards_global_scope_to_content_service() -> None:
     calls = []
 
     class Browser:
-        async def start_search(self, peer_ref, query, *, scope, on_progress=None):
+        async def start_search(
+            self,
+            peer_ref,
+            query,
+            *,
+            scope,
+            on_progress=None,
+            on_results=None,
+        ):
             calls.append((scope, peer_ref, query.keyword))
             return session, []
 
@@ -2126,6 +2340,7 @@ async def test_terminal_search_wait_activates_session_and_displays_error() -> No
             *,
             scope=SearchScope.SINGLE_DIALOG,
             on_progress=None,
+            on_results=None,
         ):
             return incomplete, []
 
@@ -2189,6 +2404,7 @@ async def test_new_search_cancels_the_running_search_before_replacement() -> Non
             *,
             scope=SearchScope.SINGLE_DIALOG,
             on_progress=None,
+            on_results=None,
         ):
             calls.append(query.keyword)
             if query.keyword == "first":
@@ -2216,6 +2432,52 @@ async def test_new_search_cancels_the_running_search_before_replacement() -> Non
     with pytest.raises(asyncio.CancelledError):
         await first
     assert calls == ["first", "first-cancelled", "second"]
+
+
+@pytest.mark.asyncio
+async def test_search_displays_current_batch_and_rejects_replaced_task() -> None:
+    window = ContentWindowFake()
+    page = window.content_page
+    page.batches = []
+    page.apply_search_batch = page.batches.append
+
+    class Service:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def start_search(self, _peer, _query, **kwargs):
+            self.calls += 1
+            search_id = "old" if self.calls == 1 else "new"
+            kwargs["on_results"](
+                SimpleNamespace(
+                    search_id=search_id,
+                    generation=self.calls,
+                    results=(),
+                    stable=False,
+                )
+            )
+            if self.calls == 1:
+                await asyncio.Event().wait()
+            return SimpleNamespace(id=search_id), []
+
+        def list_sessions(self):
+            return [SimpleNamespace(id="new")]
+
+    class Gateway:
+        def is_connected(self) -> bool:
+            return True
+
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        content_browser=Service(),
+        window=window,
+    )
+    first = asyncio.create_task(controller.search_content("peer", object()))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(controller.search_content("peer", object()))
+    await asyncio.sleep(0)
+    await asyncio.gather(first, second, return_exceptions=True)
+    assert page.batches[-1].search_id == "new"
 
 
 @pytest.mark.asyncio
@@ -2346,6 +2608,7 @@ async def test_offline_search_reconnects_then_continues() -> None:
             *,
             scope=SearchScope.SINGLE_DIALOG,
             on_progress=None,
+            on_results=None,
         ):
             calls.append(("search", peer_ref, query))
             return active, []
@@ -2392,6 +2655,7 @@ async def test_failed_reconnect_keeps_cached_content_and_skips_search() -> None:
             *,
             scope=SearchScope.SINGLE_DIALOG,
             on_progress=None,
+            on_results=None,
         ):
             self.search_calls += 1
 
@@ -2673,7 +2937,7 @@ async def test_content_search_selection_and_queue_flow() -> None:
         status=SearchStatus.RUNNING,
         exhausted=False,
     )
-    first_page = [SimpleNamespace(id="result-1")]
+    first_page = [SimpleNamespace(id="result-1", search_id="search-1")]
     calls = []
 
     class ContentService:
@@ -2684,11 +2948,18 @@ async def test_content_search_selection_and_queue_flow() -> None:
             *,
             scope=SearchScope.SINGLE_DIALOG,
             on_progress=None,
+            on_results=None,
         ):
             calls.append(("search", peer_ref, received_query))
             return active, first_page
 
-        async def load_more(self, search_id, *, on_progress=None):
+        async def load_more(
+            self,
+            search_id,
+            *,
+            on_progress=None,
+            on_results=None,
+        ):
             calls.append(("more", search_id))
             return (
                 SimpleNamespace(
@@ -2774,6 +3045,43 @@ async def test_content_search_selection_and_queue_flow() -> None:
 
 
 @pytest.mark.asyncio
+async def test_queue_selection_awaits_async_task_refresh_before_start() -> None:
+    class ContentService:
+        def prepare_download(self, _search_id):
+            return SimpleNamespace(preview="preview")
+
+        def finalize_queue(self, _search_id, joined_count):
+            return SimpleNamespace(
+                selected_count=joined_count,
+                joined_count=joined_count,
+                duplicate_count=0,
+                unavailable_count=0,
+            )
+
+    class Planner:
+        def commit_selected(self, _preview):
+            return SimpleNamespace(
+                task=SimpleNamespace(id="task-1"),
+                accepted_keys=frozenset({("peer", 1, "media")}),
+            )
+
+    controller = AppController.for_test(
+        content_browser=ContentService(),
+        planner=Planner(),
+        confirm_preview=lambda _preview: True,
+    )
+    controller._reload_content_search = Mock()
+    controller.refresh_tasks = Mock(side_effect=AssertionError("同步刷新不应被调用"))
+    controller.refresh_tasks_async = AsyncMock()
+    controller._start_task = Mock()
+
+    await controller.queue_content_selection("search-1")
+
+    controller.refresh_tasks_async.assert_awaited_once()
+    controller._start_task.assert_called_once_with("task-1")
+
+
+@pytest.mark.asyncio
 async def test_cancelled_queue_confirmation_restores_action_state() -> None:
     class ContentService:
         def prepare_download(self, search_id):
@@ -2842,6 +3150,7 @@ async def test_cancel_content_search_restores_page_busy_state() -> None:
             *,
             scope=SearchScope.SINGLE_DIALOG,
             on_progress=None,
+            on_results=None,
         ):
             started.set()
             await asyncio.Event().wait()
@@ -2877,6 +3186,7 @@ async def test_content_search_expired_session_rebuilds_gateway_for_qr_login() ->
             *,
             scope=SearchScope.SINGLE_DIALOG,
             on_progress=None,
+            on_results=None,
         ):
             raise SessionExpiredError("Telegram 登录已失效，请重新扫码登录")
 
@@ -2990,7 +3300,8 @@ async def test_dialog_sync_expired_session_stops_spinner_and_logs_out() -> None:
     assert calls == ["offline", "disconnect", "show-login"]
 
 
-def test_clear_thumbnail_cache_updates_settings_without_touching_history() -> None:
+@pytest.mark.asyncio
+async def test_clear_thumbnail_cache_updates_settings_without_touching_history() -> None:
     class Thumbnails:
         def clear(self):
             return 2, 5
@@ -3021,7 +3332,7 @@ def test_clear_thumbnail_cache_updates_settings_without_touching_history() -> No
     dialog = Dialog()
     controller._settings_dialog = dialog
 
-    controller.clear_thumbnail_cache()
+    await controller.clear_thumbnail_cache()
 
     assert dialog.cache_bytes == 0
     assert window.message == "已清理 2 个缩略图，共 5 B"
@@ -3048,6 +3359,7 @@ async def test_shutdown_cancels_content_operations_before_services() -> None:
             *,
             scope=SearchScope.SINGLE_DIALOG,
             on_progress=None,
+            on_results=None,
         ):
             started["search"].set()
             await asyncio.Event().wait()
@@ -3134,6 +3446,63 @@ async def test_scan_failure_is_persistent_and_releases_busy_state() -> None:
     assert window.busy_states == [True, False]
 
 
+@pytest.mark.asyncio
+async def test_async_task_refresh_does_not_block_event_loop() -> None:
+    import time
+
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    heartbeat = asyncio.Event()
+
+    class Repository:
+        def list_task_snapshots(self, *, include_archived=False):
+            assert include_archived is True
+            loop.call_soon_threadsafe(entered.set)
+            time.sleep(0.05)
+            return []
+
+    controller = AppController.for_test(repository=Repository())
+    refresh = asyncio.create_task(controller.refresh_tasks_async())
+    await entered.wait()
+    loop.call_soon(heartbeat.set)
+
+    await asyncio.wait_for(heartbeat.wait(), timeout=0.02)
+    await refresh
+
+
+@pytest.mark.asyncio
+async def test_concurrent_task_refreshes_are_coalesced() -> None:
+    from threading import Event
+
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = Event()
+    calls = 0
+
+    class Repository:
+        def list_task_snapshots(self, *, include_archived=False):
+            nonlocal calls
+            assert include_archived is True
+            calls += 1
+            if calls == 1:
+                loop.call_soon_threadsafe(entered.set)
+                assert release.wait(timeout=1)
+            return []
+
+    controller = AppController.for_test(repository=Repository())
+    first = asyncio.create_task(controller.refresh_tasks_async())
+    await entered.wait()
+    followers = [
+        asyncio.create_task(controller.refresh_tasks_async()) for _ in range(2)
+    ]
+    await asyncio.sleep(0)
+    release.set()
+
+    await asyncio.gather(first, *followers)
+
+    assert calls == 2
+
+
 def test_refresh_tasks_exposes_queue_positions_and_scheduler_summary() -> None:
     queued_task = SimpleNamespace(
         id="queued",
@@ -3205,25 +3574,19 @@ def test_refresh_tasks_exposes_queue_positions_and_scheduler_summary() -> None:
     }
 
 
-def test_prioritize_task_persists_before_reordering_and_reports_position() -> None:
+@pytest.mark.asyncio
+async def test_prioritize_task_persists_before_reordering_and_reports_position() -> None:
     events: list[str] = []
-    task = SimpleNamespace(
-        id="queued",
-        status=TaskStatus.QUEUED,
-        archived_at=None,
-    )
+    task = task_record("queued", TaskStatus.QUEUED)
 
     class Repository:
-        def get_task(self, task_id):
-            assert task_id == task.id
-            return task
+        def get_tasks(self, task_ids):
+            assert task_ids == [task.id]
+            return [task]
 
         def prioritize_task(self, task_id):
             events.append(f"repository:{task_id}")
             return True
-
-        def list_task_snapshots(self, *, include_archived=False):
-            return []
 
     class Scheduler:
         def prioritize_task(self, task_id):
@@ -3233,36 +3596,29 @@ def test_prioritize_task_persists_before_reordering_and_reports_position() -> No
         def queue_positions(self):
             return {task.id: 1}
 
-        def snapshot(self):
-            return SchedulerSnapshot(None, (task.id,), 3, 0)
-
     controller = AppController.for_test(
         repository=Repository(),
         scheduler=Scheduler(),
     )
+    controller.refresh_tasks_async = AsyncMock()
 
-    controller.prioritize_task(task.id)
+    await controller.prioritize_task(task.id)
 
     assert events == ["repository:queued", "scheduler:queued"]
+    controller.refresh_tasks_async.assert_awaited_once()
     assert "第 1 位" in controller.window.message.last_message
 
 
-def test_prioritize_task_handles_state_race_without_duplicate_start() -> None:
-    task = SimpleNamespace(
-        id="queued",
-        status=TaskStatus.QUEUED,
-        archived_at=None,
-    )
+@pytest.mark.asyncio
+async def test_prioritize_task_handles_state_race_without_duplicate_start() -> None:
+    task = task_record("queued", TaskStatus.QUEUED)
 
     class Repository:
-        def get_task(self, _task_id):
-            return task
+        def get_tasks(self, _task_ids):
+            return [task]
 
         def prioritize_task(self, _task_id):
             return True
-
-        def list_task_snapshots(self, *, include_archived=False):
-            return []
 
     class Scheduler:
         def prioritize_task(self, _task_id):
@@ -3271,20 +3627,20 @@ def test_prioritize_task_handles_state_race_without_duplicate_start() -> None:
         def queue_positions(self):
             return {}
 
-        def snapshot(self):
-            return SchedulerSnapshot(task.id, (), 3, 0)
-
     controller = AppController.for_test(
         repository=Repository(),
         scheduler=Scheduler(),
     )
+    controller.refresh_tasks_async = AsyncMock()
 
-    controller.prioritize_task(task.id)
+    await controller.prioritize_task(task.id)
 
+    controller.refresh_tasks_async.assert_awaited_once()
     assert "已经开始下载" in controller.window.message.last_message
 
 
-def test_apply_settings_reconfigures_active_scheduler_after_persistence() -> None:
+@pytest.mark.asyncio
+async def test_apply_settings_reconfigures_active_scheduler_after_persistence() -> None:
     events: list[object] = []
 
     class Store:
@@ -3312,7 +3668,7 @@ def test_apply_settings_reconfigures_active_scheduler_after_persistence() -> Non
         scheduler=Scheduler(),
     )
 
-    controller.apply_settings(updated, "")
+    await controller.apply_settings(updated, "")
 
     assert events == [
         ("settings", updated),
@@ -3373,11 +3729,11 @@ async def test_waiting_run_does_not_poll_database_until_completion() -> None:
     )
     refreshes = 0
 
-    def refresh() -> None:
+    async def refresh() -> None:
         nonlocal refreshes
         refreshes += 1
 
-    controller.refresh_tasks = refresh
+    controller.refresh_tasks_async = refresh
     operation = asyncio.create_task(controller._run_and_refresh("waiting"))
     await asyncio.sleep(0.03)
     assert refreshes == 0
@@ -3590,13 +3946,13 @@ async def test_controller_loads_history_runs_persists_exports_and_opens_director
         diagnostic_store=store,
     )
 
-    controller.activate_diagnostics()
+    await controller.activate_diagnostics()
     assert diagnostics.runs == 0
     assert page.report is completed
     assert page.historical is True
 
     await controller.run_diagnostics()
-    controller.export_diagnostics()
+    await controller.export_diagnostics()
     controller.open_diagnostics_directory()
 
     assert diagnostics.runs == 1

@@ -2,7 +2,10 @@ import asyncio
 
 import pytest
 
-from telegram_downloader.ui.async_actions import ActionHooks, AsyncActionBridge
+from telegram_downloader.ui.async_actions import (
+    ActionHooks,
+    AsyncActionBridge,
+)
 
 
 class FakeSignal:
@@ -12,9 +15,9 @@ class FakeSignal:
     def connect(self, slot) -> None:
         self.slot = slot
 
-    def emit(self, value) -> None:
+    def emit(self, *values) -> None:
         assert self.slot is not None
-        self.slot(value)
+        self.slot(*values)
 
 
 @pytest.mark.asyncio
@@ -115,3 +118,77 @@ async def test_payload_signal_forwards_value_and_deduplicates_running_key() -> N
 
     assert values == [["first"]]
     assert bridge.active_keys == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_args_signal_forwards_all_values() -> None:
+    signal = FakeSignal()
+    values: list[tuple[str, bool]] = []
+
+    async def action(rule_id: str, enabled: bool) -> None:
+        values.append((rule_id, enabled))
+
+    bridge = AsyncActionBridge()
+    bridge.connect_args(signal, "subscriptions.enabled", action)
+
+    signal.emit("rule-1", False)
+    await bridge.wait_idle()
+
+    assert values == [("rule-1", False)]
+
+
+@pytest.mark.asyncio
+async def test_started_hook_runs_before_action_coroutine_starts() -> None:
+    events: list[str] = []
+    entered = asyncio.Event()
+
+    async def action() -> None:
+        events.append("action")
+        entered.set()
+
+    bridge = AsyncActionBridge()
+    assert bridge.start(
+        "content.search",
+        action,
+        hooks=ActionHooks(started=lambda: events.append("started")),
+    ) is True
+    assert events == ["started"]
+    await entered.wait()
+    await bridge.wait_idle()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "key",
+    ["content.activate", "content.search", "content.load_more"],
+)
+async def test_replace_latest_policy_cancels_old_without_clearing_new_busy_state(
+    key: str,
+) -> None:
+    first_entered = asyncio.Event()
+    second_release = asyncio.Event()
+    events: list[str] = []
+
+    async def first() -> None:
+        first_entered.set()
+        await asyncio.Event().wait()
+
+    async def second() -> None:
+        events.append("second")
+        await second_release.wait()
+
+    bridge = AsyncActionBridge()
+    hooks = ActionHooks(
+        started=lambda: events.append("busy:on"),
+        cancelled=lambda: events.append("cancelled"),
+        finished=lambda: events.append("busy:off"),
+    )
+    bridge.start(key, first, hooks=hooks)
+    await first_entered.wait()
+    bridge.start(key, second, hooks=hooks)
+    await asyncio.sleep(0)
+    assert events.count("busy:off") == 0
+    second_release.set()
+    await bridge.wait_idle()
+    assert events[-1] == "busy:off"
+    assert events.count("busy:off") == 1

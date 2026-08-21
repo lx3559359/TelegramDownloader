@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -21,7 +22,11 @@ from telegram_downloader.content import (
     SearchSession,
     SearchStatus,
 )
-from telegram_downloader.content_progress import DialogSyncProgress, SearchProgress
+from telegram_downloader.content_progress import (
+    DialogSyncProgress,
+    SearchProgress,
+    SearchResultBatch,
+)
 from telegram_downloader.gateway import (
     AccessDeniedError,
     FloodWaitError,
@@ -96,9 +101,13 @@ class ContentBrowserService:
         thumbnail_concurrency: int = 4,
         retry_policy: SearchRetryPolicy | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        thumbnail_failure_cooldown: float = 30.0,
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if album_concurrency <= 0 or thumbnail_concurrency <= 0:
             raise ValueError("内容查询并发数必须大于零")
+        if thumbnail_failure_cooldown < 0:
+            raise ValueError("缩略图失败冷却时间不能为负数")
         self.gateway = gateway
         self.catalog = catalog
         self.planner = planner
@@ -113,6 +122,10 @@ class ContentBrowserService:
         self._search_lock = asyncio.Lock()
         self._album_semaphore = asyncio.Semaphore(album_concurrency)
         self._thumbnail_semaphore = asyncio.Semaphore(thumbnail_concurrency)
+        self._thumbnail_failure_cooldown = thumbnail_failure_cooldown
+        self._monotonic_clock = monotonic_clock
+        self._thumbnail_inflight: dict[str, asyncio.Task[Path | None]] = {}
+        self._thumbnail_failures: dict[str, float] = {}
 
     @property
     def online(self) -> bool:
@@ -219,6 +232,7 @@ class ContentBrowserService:
         *,
         scope: SearchScope = SearchScope.SINGLE_DIALOG,
         on_progress: Callable[[SearchProgress], None] | None = None,
+        on_results: Callable[[SearchResultBatch], None] | None = None,
     ) -> tuple[SearchSession, list[SearchResult]]:
         async with self._search_lock:
             account = self._require_account()
@@ -241,27 +255,47 @@ class ContentBrowserService:
                 self.clock(),
                 scope=scope,
             )
-            return await self._fetch_page(session, on_progress=on_progress)
+            return await self._fetch_page(
+                session,
+                on_progress=on_progress,
+                on_results=on_results,
+            )
 
     async def load_more(
         self,
         search_id: str,
         *,
         on_progress: Callable[[SearchProgress], None] | None = None,
+        on_results: Callable[[SearchResultBatch], None] | None = None,
     ) -> tuple[SearchSession, list[SearchResult]]:
         async with self._search_lock:
             account = self._require_account()
             self._require_online()
             session = self.catalog.get_session(account.account_id, search_id)
             if session.exhausted:
-                return session, self.catalog.list_results(account.account_id, search_id)
-            return await self._fetch_page(session, on_progress=on_progress)
+                results = self.catalog.list_results(account.account_id, search_id)
+                if on_results is not None:
+                    on_results(
+                        SearchResultBatch(
+                            session.id,
+                            session.generation,
+                            tuple(results),
+                            stable=True,
+                        )
+                    )
+                return session, results
+            return await self._fetch_page(
+                session,
+                on_progress=on_progress,
+                on_results=on_results,
+            )
 
     async def _fetch_page(
         self,
         session: SearchSession,
         *,
         on_progress: Callable[[SearchProgress], None] | None = None,
+        on_results: Callable[[SearchResultBatch], None] | None = None,
     ) -> tuple[SearchSession, list[SearchResult]]:
         account = self._require_account()
         gateway, planner = self._require_online()
@@ -272,6 +306,28 @@ class ContentBrowserService:
         progress_matched = 0
         request_cursor = session.cursor
         seen_cursors = {request_cursor}
+        stable_results = self.catalog.list_results(account.account_id, session.id)
+        result_ids = {
+            (item.peer_ref, item.message_id, item.media_id): item.id
+            for item in stable_results
+        }
+
+        def result_for(
+            hit: RemoteSearchHit,
+            *,
+            queued: bool = False,
+        ) -> SearchResult:
+            key = self._media_key(hit.remote)
+            result = self._result_from_hit(
+                account.account_id,
+                session,
+                hit,
+                queued=queued,
+                result_id=result_ids.get(key),
+            )
+            result_ids.setdefault(key, result.id)
+            return result
+
         try:
             while True:
                 page_inspected = 0
@@ -337,6 +393,19 @@ class ContentBrowserService:
                         raise GatewayError("Telegram 全局搜索分页未前进")
                     seen_cursors.add(page.next_cursor)
 
+                if on_results is not None and page.items:
+                    on_results(
+                        SearchResultBatch(
+                            session.id,
+                            session.generation,
+                            tuple(
+                                result_for(hit)
+                                for hit in self._deduplicate_hits(list(page.items))
+                            ),
+                            stable=False,
+                        )
+                    )
+
                 expanded = list(page.items)
                 group_triggers: dict[tuple[str, int], int] = {}
                 for hit in page.items:
@@ -359,25 +428,23 @@ class ContentBrowserService:
                             grouped_id,
                         )
 
-                album_values = await asyncio.gather(
-                    *(expand(item) for item in group_triggers.items())
-                )
+                album_tasks = [
+                    asyncio.create_task(expand(item))
+                    for item in group_triggers.items()
+                ]
+                album_values = await asyncio.gather(*album_tasks)
                 for values in album_values:
                     expanded.extend(values)
 
                 unique = self._deduplicate_hits(expanded)
-                existing_results = self.catalog.list_results(
-                    account.account_id,
-                    session.id,
-                )
                 existing_keys = {
                     (item.peer_ref, item.message_id, item.media_id)
-                    for item in existing_results
+                    for item in stable_results
                 }
                 units = self._album_units(unique)
                 remaining_total = max(
                     0,
-                    session.query.filters.item_limit - len(existing_results),
+                    session.query.filters.item_limit - len(stable_results),
                 )
                 remaining_page = min(
                     100 - operation_accepted,
@@ -427,25 +494,17 @@ class ContentBrowserService:
                     {self._media_key(hit.remote) for hit in accepted}
                 )
                 saved = [
-                    self._result_from_hit(
-                        account.account_id,
-                        session,
+                    result_for(
                         hit,
                         queued=self._media_key(hit.remote) in queued_keys,
                     )
                     for hit in accepted
                 ]
-                self.catalog.save_search_page(
-                    account.account_id,
-                    session.id,
-                    session.generation,
-                    saved,
-                )
                 operation_accepted += len(accepted)
-                result_count = len(
-                    self.catalog.list_results(account.account_id, session.id)
+                projected_count = len(stable_results) + len(accepted)
+                reached_limit = (
+                    projected_count >= session.query.filters.item_limit
                 )
-                reached_limit = result_count >= session.query.filters.item_limit
                 complete = reached_limit or skipped_album or (
                     not deferred and (page.exhausted or page.next_cursor is None)
                 )
@@ -456,27 +515,33 @@ class ContentBrowserService:
                     if deferred
                     else page.next_cursor
                 )
-                self.catalog.finish_search(
+                commit = self.catalog.commit_search_page(
                     account.account_id,
                     session.id,
                     session.generation,
-                    cursor,
-                    complete,
-                    self.clock(),
+                    saved,
+                    cursor=cursor,
+                    complete=complete,
+                    finished_at=self.clock(),
                     status=(
                         SearchStatus.COMPLETED if complete else SearchStatus.RUNNING
                     ),
                     error="达到数量上限" if skipped_album else None,
                 )
-                session = self.catalog.get_session(account.account_id, session.id)
+                session = commit.session
+                stable_results = list(commit.results)
+                reached_limit = (
+                    commit.result_count >= session.query.filters.item_limit
+                )
                 if (
                     session.scope is SearchScope.SINGLE_DIALOG
-                    or complete
+                    or session.exhausted
+                    or reached_limit
                     or operation_accepted >= 100
                     or deferred
                 ):
                     break
-                request_cursor = cursor
+                request_cursor = session.cursor
         except asyncio.CancelledError:
             current = self.catalog.get_session(account.account_id, session.id)
             self._finish_incomplete(current, "搜索已取消")
@@ -498,8 +563,17 @@ class ContentBrowserService:
             current = self.catalog.get_session(account.account_id, session.id)
             self._finish_incomplete(current, self._safe_gateway_error(error))
             raise
-        current = self.catalog.get_session(account.account_id, session.id)
-        results = self.catalog.list_results(account.account_id, session.id)
+        current = session
+        results = stable_results
+        if on_results is not None:
+            on_results(
+                SearchResultBatch(
+                    current.id,
+                    current.generation,
+                    tuple(results),
+                    stable=True,
+                )
+            )
         return current, results
 
     async def _search_remote_page(
@@ -650,25 +724,72 @@ class ContentBrowserService:
     async def load_thumbnail(self, result_id: str) -> Path | None:
         account = self._require_account()
         result = self.catalog.get_result(account.account_id, result_id)
-        cached = self.thumbnails.get(result.thumbnail_key)
+        key = result.thumbnail_key
+        cached = self.thumbnails.get(key)
         if cached is not None:
+            self._thumbnail_failures.pop(key, None)
             return cached
-        if self.gateway is None:
+        now = self._monotonic_clock()
+        failure_deadline = self._thumbnail_failures.get(key)
+        if failure_deadline is not None:
+            if now < failure_deadline:
+                return None
+            self._thumbnail_failures.pop(key, None)
+        gateway = self.gateway
+        if gateway is None:
             return None
+
+        task = self._thumbnail_inflight.get(key)
+        if task is None:
+            async def load_once() -> Path | None:
+                current = asyncio.current_task()
+                try:
+                    return await self._load_thumbnail_remote(
+                        key,
+                        result.peer_ref,
+                        result.message_id,
+                        result.media_id,
+                        gateway,
+                    )
+                finally:
+                    if self._thumbnail_inflight.get(key) is current:
+                        self._thumbnail_inflight.pop(key, None)
+
+            task = asyncio.create_task(load_once())
+            self._thumbnail_inflight[key] = task
+        return await asyncio.shield(task)
+
+    async def _load_thumbnail_remote(
+        self,
+        key: str,
+        peer_ref: str,
+        message_id: int,
+        media_id: str,
+        gateway: TelegramGateway,
+    ) -> Path | None:
         try:
             async with self._thumbnail_semaphore:
-                content = await self.gateway.load_thumbnail(
-                    result.peer_ref,
-                    result.message_id,
-                    result.media_id,
+                content = await gateway.load_thumbnail(
+                    peer_ref,
+                    message_id,
+                    media_id,
                 )
+            if not content:
+                self._record_thumbnail_failure(key)
+                return None
+            cached = await asyncio.to_thread(self.thumbnails.put, key, content)
         except asyncio.CancelledError:
             raise
         except Exception:
+            self._record_thumbnail_failure(key)
             return None
-        if content is None:
-            return None
-        return self.thumbnails.put(result.thumbnail_key, content)
+        self._thumbnail_failures.pop(key, None)
+        return cached
+
+    def _record_thumbnail_failure(self, key: str) -> None:
+        self._thumbnail_failures[key] = (
+            self._monotonic_clock() + self._thumbnail_failure_cooldown
+        )
 
     def delete_history(self, search_id: str) -> str | None:
         account = self._require_account()
@@ -787,11 +908,12 @@ class ContentBrowserService:
         hit: RemoteSearchHit,
         *,
         queued: bool,
+        result_id: str | None = None,
     ) -> SearchResult:
         remote = hit.remote
         key = f"{session.id}:{remote.peer_ref}:{remote.message_id}:{remote.media_id}"
         return SearchResult(
-            id=str(uuid5(NAMESPACE_URL, key)),
+            id=result_id or str(uuid5(NAMESPACE_URL, key)),
             search_id=session.id,
             account_id=account_id,
             peer_ref=remote.peer_ref,

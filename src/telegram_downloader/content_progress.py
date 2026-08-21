@@ -4,6 +4,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from time import monotonic
 
+from telegram_downloader.content import SearchResult
+
 
 @dataclass(frozen=True, slots=True)
 class DialogSyncProgress:
@@ -15,6 +17,20 @@ class SearchProgress:
     inspected: int
     matched: int
     phase: str
+
+
+@dataclass(frozen=True, slots=True)
+class SearchResultBatch:
+    search_id: str
+    generation: int
+    results: tuple[SearchResult, ...]
+    stable: bool
+
+    def __post_init__(self) -> None:
+        if not self.search_id or self.generation <= 0:
+            raise ValueError("搜索结果批次缺少有效搜索代次")
+        if any(result.search_id != self.search_id for result in self.results):
+            raise ValueError("搜索结果批次包含其他搜索的数据")
 
 
 class SearchProgressReporter:

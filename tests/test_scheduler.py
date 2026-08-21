@@ -29,6 +29,7 @@ class Repo:
         ]
         self.item_updates = []
         self.task_updates = []
+        self.bulk_task_updates = []
         self.task_errors = []
         self.recovered = False
         self.list_item_calls = 0
@@ -65,6 +66,11 @@ class Repo:
         self.task_updates.append(status)
         self.task_errors.append(error)
 
+    def update_task_statuses(self, task_ids, status, *, allowed, error=None):
+        ordered = tuple(dict.fromkeys(task_ids))
+        self.bulk_task_updates.append((ordered, status, allowed, error))
+        return set(ordered)
+
     def recover_interrupted(self):
         self.recovered = True
 
@@ -97,6 +103,7 @@ class QueueRepo:
         self.priorities = dict.fromkeys(task_ids, 0)
         self.task_statuses = dict.fromkeys(task_ids, TaskStatus.QUEUED)
         self.task_updates: list[tuple[str, TaskStatus]] = []
+        self.bulk_task_updates = []
         self.cleared: list[str] = []
 
     def list_items(self, task_id, statuses=None):
@@ -126,6 +133,18 @@ class QueueRepo:
     def update_task_status(self, task_id, status, error=None):
         self.task_statuses[task_id] = status
         self.task_updates.append((task_id, status))
+
+    def update_task_statuses(self, task_ids, status, *, allowed, error=None):
+        ordered = tuple(dict.fromkeys(task_ids))
+        accepted = {
+            task_id
+            for task_id in ordered
+            if self.task_statuses.get(task_id) in allowed
+        }
+        for task_id in accepted:
+            self.task_statuses[task_id] = status
+        self.bulk_task_updates.append((ordered, status, allowed, error))
+        return accepted
 
     def recover_interrupted(self):
         return None
@@ -608,3 +627,55 @@ def test_runtime_resource_configuration_is_visible_in_snapshot() -> None:
 
     assert scheduler.snapshot() == SchedulerSnapshot(None, (), 5, 2048)
     assert bandwidth.speed_limit_kib == 2048
+
+
+@pytest.mark.asyncio
+async def test_pause_tasks_deduplicates_flags_queue_and_persistence() -> None:
+    repo = QueueRepo(("active", "waiting"))
+    entered = asyncio.Event()
+
+    class Downloader:
+        async def download(self, _item, should_pause):
+            entered.set()
+            while not should_pause():
+                await asyncio.sleep(0)
+            raise DownloadPaused("paused")
+
+    scheduler = DownloadScheduler(repo, Downloader())
+    active = asyncio.create_task(scheduler.run_task("active"))
+    await entered.wait()
+    waiting = asyncio.create_task(scheduler.run_task("waiting"))
+    await wait_until(lambda: scheduler.queue_positions() == {"waiting": 1})
+
+    accepted = scheduler.pause_tasks(["active", "waiting", "active"])
+    await asyncio.gather(active, waiting)
+
+    assert accepted == {"active", "waiting"}
+    assert scheduler._pause_flags["active"].is_set()
+    assert scheduler._pause_flags["waiting"].is_set()
+    assert scheduler.queue_positions() == {}
+    assert len(repo.bulk_task_updates) == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_tasks_bulk_updates_and_schedules_each_once() -> None:
+    repo = QueueRepo(("a", "b"))
+    repo.task_statuses.update({"a": TaskStatus.PAUSED, "b": TaskStatus.PAUSED})
+    entered: list[str] = []
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            entered.append(item.task_id)
+
+    scheduler = DownloadScheduler(repo, Downloader())
+    scheduler._pause_flag("a").set()
+    scheduler._pause_flag("b").set()
+
+    accepted = await scheduler.resume_tasks(["a", "b", "a"])
+
+    assert accepted == {"a", "b"}
+    assert entered == ["a", "b"]
+    assert scheduler._pause_flags["a"].is_set() is False
+    assert scheduler._pause_flags["b"].is_set() is False
+    assert len(repo.bulk_task_updates) == 1
+    assert repo.bulk_task_updates[0][1] is TaskStatus.QUEUED
