@@ -1,7 +1,9 @@
 # 缓冲下载 I/O 验证记录
 
-验证日期：2026-08-21（Asia/Shanghai）  
-验证分支：`codex/performance-optimization`  
+验证日期：2026-08-21（Asia/Shanghai）
+
+验证分支：`codex/performance-optimization`
+
 验证源码提交：`6da711c610f31dcd155385688863ba43a893bd98`
 
 ## 自动化质量门禁

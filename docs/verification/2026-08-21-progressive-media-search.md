@@ -1,7 +1,9 @@
 # 渐进式媒体搜索验证记录
 
-验证日期：2026-08-21（Asia/Shanghai）  
-验证分支：`codex/performance-optimization`  
+验证日期：2026-08-21（Asia/Shanghai）
+
+验证分支：`codex/performance-optimization`
+
 验证源码提交：`efa59221405c4230d7003c7f2f6a3f05967d6e6c`
 
 ## 自动化质量门禁

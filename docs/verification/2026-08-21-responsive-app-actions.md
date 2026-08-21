@@ -1,7 +1,9 @@
 # 响应式应用操作验证记录
 
-验证日期：2026-08-22（Asia/Shanghai）  
-验证分支：`codex/performance-optimization`  
+验证日期：2026-08-22（Asia/Shanghai）
+
+验证分支：`codex/performance-optimization`
+
 验证源码提交：`e678913`
 
 ## 自动化质量门禁
