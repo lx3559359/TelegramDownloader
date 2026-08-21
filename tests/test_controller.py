@@ -1843,6 +1843,7 @@ class ContentPageFake:
         self.dialogs = []
         self.sessions = []
         self.results = []
+        self.batches = []
         self.active_search_id = None
         self.busy = []
         self.search_progress = []
@@ -1869,6 +1870,10 @@ class ContentPageFake:
 
     def set_results(self, value):
         self.results = value
+
+    def apply_search_batch(self, value):
+        self.batches.append(value)
+        self.results = list(value.results)
 
     def set_search_busy(self, value):
         self.busy.append(value)
@@ -2020,6 +2025,7 @@ async def test_search_progress_is_forwarded_and_always_stops() -> None:
             *,
             scope=SearchScope.SINGLE_DIALOG,
             on_progress=None,
+            on_results=None,
         ):
             on_progress(SearchProgress(20, 3, "正在整理结果"))
             return session, []
@@ -2070,7 +2076,15 @@ async def test_controller_forwards_global_scope_to_content_service() -> None:
     calls = []
 
     class Browser:
-        async def start_search(self, peer_ref, query, *, scope, on_progress=None):
+        async def start_search(
+            self,
+            peer_ref,
+            query,
+            *,
+            scope,
+            on_progress=None,
+            on_results=None,
+        ):
             calls.append((scope, peer_ref, query.keyword))
             return session, []
 
@@ -2135,6 +2149,7 @@ async def test_new_search_cancels_the_running_search_before_replacement() -> Non
             *,
             scope=SearchScope.SINGLE_DIALOG,
             on_progress=None,
+            on_results=None,
         ):
             calls.append(query.keyword)
             if query.keyword == "first":
@@ -2162,6 +2177,52 @@ async def test_new_search_cancels_the_running_search_before_replacement() -> Non
     with pytest.raises(asyncio.CancelledError):
         await first
     assert calls == ["first", "first-cancelled", "second"]
+
+
+@pytest.mark.asyncio
+async def test_search_displays_current_batch_and_rejects_replaced_task() -> None:
+    window = ContentWindowFake()
+    page = window.content_page
+    page.batches = []
+    page.apply_search_batch = page.batches.append
+
+    class Service:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def start_search(self, _peer, _query, **kwargs):
+            self.calls += 1
+            search_id = "old" if self.calls == 1 else "new"
+            kwargs["on_results"](
+                SimpleNamespace(
+                    search_id=search_id,
+                    generation=self.calls,
+                    results=(),
+                    stable=False,
+                )
+            )
+            if self.calls == 1:
+                await asyncio.Event().wait()
+            return SimpleNamespace(id=search_id), []
+
+        def list_sessions(self):
+            return [SimpleNamespace(id="new")]
+
+    class Gateway:
+        def is_connected(self) -> bool:
+            return True
+
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        content_browser=Service(),
+        window=window,
+    )
+    first = asyncio.create_task(controller.search_content("peer", object()))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(controller.search_content("peer", object()))
+    await asyncio.sleep(0)
+    await asyncio.gather(first, second, return_exceptions=True)
+    assert page.batches[-1].search_id == "new"
 
 
 @pytest.mark.asyncio
@@ -2292,6 +2353,7 @@ async def test_offline_search_reconnects_then_continues() -> None:
             *,
             scope=SearchScope.SINGLE_DIALOG,
             on_progress=None,
+            on_results=None,
         ):
             calls.append(("search", peer_ref, query))
             return active, []
@@ -2338,6 +2400,7 @@ async def test_failed_reconnect_keeps_cached_content_and_skips_search() -> None:
             *,
             scope=SearchScope.SINGLE_DIALOG,
             on_progress=None,
+            on_results=None,
         ):
             self.search_calls += 1
 
@@ -2619,7 +2682,7 @@ async def test_content_search_selection_and_queue_flow() -> None:
         status=SearchStatus.RUNNING,
         exhausted=False,
     )
-    first_page = [SimpleNamespace(id="result-1")]
+    first_page = [SimpleNamespace(id="result-1", search_id="search-1")]
     calls = []
 
     class ContentService:
@@ -2630,11 +2693,18 @@ async def test_content_search_selection_and_queue_flow() -> None:
             *,
             scope=SearchScope.SINGLE_DIALOG,
             on_progress=None,
+            on_results=None,
         ):
             calls.append(("search", peer_ref, received_query))
             return active, first_page
 
-        async def load_more(self, search_id, *, on_progress=None):
+        async def load_more(
+            self,
+            search_id,
+            *,
+            on_progress=None,
+            on_results=None,
+        ):
             calls.append(("more", search_id))
             return (
                 SimpleNamespace(
@@ -2788,6 +2858,7 @@ async def test_cancel_content_search_restores_page_busy_state() -> None:
             *,
             scope=SearchScope.SINGLE_DIALOG,
             on_progress=None,
+            on_results=None,
         ):
             started.set()
             await asyncio.Event().wait()
@@ -2823,6 +2894,7 @@ async def test_content_search_expired_session_rebuilds_gateway_for_qr_login() ->
             *,
             scope=SearchScope.SINGLE_DIALOG,
             on_progress=None,
+            on_results=None,
         ):
             raise SessionExpiredError("Telegram 登录已失效，请重新扫码登录")
 
@@ -2994,6 +3066,7 @@ async def test_shutdown_cancels_content_operations_before_services() -> None:
             *,
             scope=SearchScope.SINGLE_DIALOG,
             on_progress=None,
+            on_results=None,
         ):
             started["search"].set()
             await asyncio.Event().wait()

@@ -16,7 +16,11 @@ from typing import Any
 from telegram_downloader.connectivity import ConnectionRecovery
 from telegram_downloader.content import ContentSearchQuery, SearchResult, SearchScope
 from telegram_downloader.content_browser import NothingToQueueError
-from telegram_downloader.content_progress import DialogSyncProgress, SearchProgress
+from telegram_downloader.content_progress import (
+    DialogSyncProgress,
+    SearchProgress,
+    SearchResultBatch,
+)
 from telegram_downloader.domain import (
     IntegrityStatus,
     ItemStatus,
@@ -132,6 +136,9 @@ class _NullContentPage:
         pass
 
     def set_results(self, _value: list[object]) -> None:
+        pass
+
+    def apply_search_batch(self, _batch: SearchResultBatch) -> None:
         pass
 
     def set_search_busy(self, _busy: bool) -> None:
@@ -1055,6 +1062,20 @@ class AppController:
         page.set_search_busy(True)
         page.set_search_progress(SearchProgress(0, 0, "正在连接 Telegram"))
         search_id: str | None = None
+        search_generation: int | None = None
+        succeeded = False
+
+        def show_batch(batch: SearchResultBatch) -> None:
+            nonlocal search_id, search_generation
+            if (
+                current is not None
+                and self._content_search_task is current
+                and not current.cancelled()
+            ):
+                search_id = batch.search_id
+                search_generation = batch.generation
+                page.apply_search_batch(batch)
+
         try:
             if not await self.ensure_telegram_online():
                 return
@@ -1063,11 +1084,24 @@ class AppController:
                 query,
                 scope=scope,
                 on_progress=page.set_search_progress,
+                on_results=show_batch,
             )
             search_id = session.id
             page.set_active_search(session)
-            page.set_results(results)
+            generation = getattr(session, "generation", search_generation)
+            if isinstance(generation, int) and generation > 0:
+                show_batch(
+                    SearchResultBatch(
+                        session.id,
+                        generation,
+                        tuple(results),
+                        stable=True,
+                    )
+                )
+            else:
+                page.set_results(results)
             page.set_sessions(self.content_browser.list_sessions())
+            succeeded = True
         except asyncio.CancelledError:
             raise
         except SessionExpiredError as error:
@@ -1075,7 +1109,7 @@ class AppController:
         except Exception as error:
             page.show_error(self._safe_error(error))
         finally:
-            if search_id is not None:
+            if not succeeded and search_id is not None:
                 self._reload_content_search(search_id)
             page.set_search_busy(False)
             page.set_search_progress(None)
@@ -1091,16 +1125,42 @@ class AppController:
         self._content_search_task = current
         page.set_search_busy(True)
         page.set_search_progress(SearchProgress(0, 0, "正在连接 Telegram"))
+        search_generation: int | None = None
+        succeeded = False
+
+        def show_batch(batch: SearchResultBatch) -> None:
+            nonlocal search_generation
+            if (
+                current is not None
+                and self._content_search_task is current
+                and not current.cancelled()
+            ):
+                search_generation = batch.generation
+                page.apply_search_batch(batch)
+
         try:
             if not await self.ensure_telegram_online():
                 return
             session, results = await self.content_browser.load_more(
                 search_id,
                 on_progress=page.set_search_progress,
+                on_results=show_batch,
             )
             page.set_active_search(session)
-            page.set_results(results)
+            generation = getattr(session, "generation", search_generation)
+            if isinstance(generation, int) and generation > 0:
+                show_batch(
+                    SearchResultBatch(
+                        session.id,
+                        generation,
+                        tuple(results),
+                        stable=True,
+                    )
+                )
+            else:
+                page.set_results(results)
             page.set_sessions(self.content_browser.list_sessions())
+            succeeded = True
         except asyncio.CancelledError:
             raise
         except SessionExpiredError as error:
@@ -1108,7 +1168,8 @@ class AppController:
         except Exception as error:
             page.show_error(self._safe_error(error))
         finally:
-            self._reload_content_search(search_id)
+            if not succeeded:
+                self._reload_content_search(search_id)
             page.set_search_busy(False)
             page.set_search_progress(None)
             if self._content_search_task is current:
@@ -2171,8 +2232,9 @@ class AppController:
             sessions[0] if sessions else None,
         )
         page.set_active_search(active)
-        if active is not None:
-            page.set_results(self.content_browser.list_results(active.id))
+        list_results = getattr(self.content_browser, "list_results", None)
+        if active is not None and callable(list_results):
+            page.set_results(list_results(active.id))
         elif hasattr(page, "set_results"):
             page.set_results([])
 
