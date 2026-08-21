@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -779,3 +780,47 @@ def test_thumbnail_reference_queries_follow_history_deletion(tmp_path: Path) -> 
     assert repo.referenced_thumbnail_keys("a1", {"a1:shared"}) == {"a1:shared"}
     repo.delete_session("a1", second.id)
     assert repo.referenced_thumbnail_keys("a1", {"a1:shared"}) == set()
+
+
+def test_commit_search_page_uses_one_connection_and_returns_stable_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 8, 21, tzinfo=UTC)
+    catalog = CatalogRepository(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+    account = AccountProfile("a1", "账号一")
+    catalog.upsert_account(account, now)
+    catalog.replace_dialogs("a1", [dialog("a1", "-1001", "群", now)], now)
+    query = ContentSearchQuery(
+        "安装",
+        ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 20),
+    )
+    session = catalog.begin_search("s1", "a1", "-1001", "群", query, now)
+    saved = result(session.id, account.account_id, now)
+    opened = 0
+    real_connection = catalog._connection
+
+    @contextmanager
+    def counted_connection():
+        nonlocal opened
+        opened += 1
+        with real_connection() as connection:
+            yield connection
+
+    monkeypatch.setattr(catalog, "_connection", counted_connection)
+    commit = catalog.commit_search_page(
+        account.account_id,
+        session.id,
+        session.generation,
+        [saved],
+        cursor=None,
+        complete=True,
+        finished_at=session.updated_at,
+        status=SearchStatus.COMPLETED,
+        error=None,
+    )
+    assert opened == 1
+    assert commit.session.status is SearchStatus.COMPLETED
+    assert commit.results == (saved,)
+    assert commit.result_count == 1

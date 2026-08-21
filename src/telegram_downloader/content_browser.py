@@ -276,7 +276,11 @@ class ContentBrowserService:
         progress_matched = 0
         request_cursor = session.cursor
         seen_cursors = {request_cursor}
-        result_ids: dict[tuple[str, int, str], str] = {}
+        stable_results = self.catalog.list_results(account.account_id, session.id)
+        result_ids = {
+            (item.peer_ref, item.message_id, item.media_id): item.id
+            for item in stable_results
+        }
 
         def result_for(
             hit: RemoteSearchHit,
@@ -372,18 +376,14 @@ class ContentBrowserService:
                     expanded.extend(values)
 
                 unique = self._deduplicate_hits(expanded)
-                existing_results = self.catalog.list_results(
-                    account.account_id,
-                    session.id,
-                )
                 existing_keys = {
                     (item.peer_ref, item.message_id, item.media_id)
-                    for item in existing_results
+                    for item in stable_results
                 }
                 units = self._album_units(unique)
                 remaining_total = max(
                     0,
-                    session.query.filters.item_limit - len(existing_results),
+                    session.query.filters.item_limit - len(stable_results),
                 )
                 remaining_page = min(
                     100 - operation_accepted,
@@ -439,17 +439,11 @@ class ContentBrowserService:
                     )
                     for hit in accepted
                 ]
-                self.catalog.save_search_page(
-                    account.account_id,
-                    session.id,
-                    session.generation,
-                    saved,
-                )
                 operation_accepted += len(accepted)
-                result_count = len(
-                    self.catalog.list_results(account.account_id, session.id)
+                projected_count = len(stable_results) + len(accepted)
+                reached_limit = (
+                    projected_count >= session.query.filters.item_limit
                 )
-                reached_limit = result_count >= session.query.filters.item_limit
                 complete = reached_limit or skipped_album or (
                     not deferred and (page.exhausted or page.next_cursor is None)
                 )
@@ -460,27 +454,33 @@ class ContentBrowserService:
                     if deferred
                     else page.next_cursor
                 )
-                self.catalog.finish_search(
+                commit = self.catalog.commit_search_page(
                     account.account_id,
                     session.id,
                     session.generation,
-                    cursor,
-                    complete,
-                    self.clock(),
+                    saved,
+                    cursor=cursor,
+                    complete=complete,
+                    finished_at=self.clock(),
                     status=(
                         SearchStatus.COMPLETED if complete else SearchStatus.RUNNING
                     ),
                     error="达到数量上限" if skipped_album else None,
                 )
-                session = self.catalog.get_session(account.account_id, session.id)
+                session = commit.session
+                stable_results = list(commit.results)
+                reached_limit = (
+                    commit.result_count >= session.query.filters.item_limit
+                )
                 if (
                     session.scope is SearchScope.SINGLE_DIALOG
-                    or complete
+                    or session.exhausted
+                    or reached_limit
                     or operation_accepted >= 100
                     or deferred
                 ):
                     break
-                request_cursor = cursor
+                request_cursor = session.cursor
         except asyncio.CancelledError:
             current = self.catalog.get_session(account.account_id, session.id)
             self._finish_incomplete(current, "搜索已取消")
@@ -489,8 +489,8 @@ class ContentBrowserService:
             current = self.catalog.get_session(account.account_id, session.id)
             self._finish_incomplete(current, self._safe_gateway_error(error))
             raise
-        current = self.catalog.get_session(account.account_id, session.id)
-        results = self.catalog.list_results(account.account_id, session.id)
+        current = session
+        results = stable_results
         if on_results is not None:
             on_results(
                 SearchResultBatch(

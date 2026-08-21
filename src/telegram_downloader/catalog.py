@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -35,6 +36,13 @@ class CatalogError(RuntimeError):
 
 class StaleSearchError(CatalogError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class SearchPageCommit:
+    session: SearchSession
+    results: tuple[SearchResult, ...]
+    result_count: int
 
 
 _SCHEMA_V1 = """
@@ -384,67 +392,156 @@ class CatalogRepository:
         generation: int,
         results: list[SearchResult],
     ) -> None:
+        with self._connection() as connection:
+            session = connection.execute(
+                "SELECT * FROM search_sessions WHERE account_id=? AND id=?",
+                (account_id, search_id),
+            ).fetchone()
+            self._insert_search_results(
+                connection,
+                account_id,
+                search_id,
+                generation,
+                results,
+                session=session,
+            )
+
+    def commit_search_page(
+        self,
+        account_id: str,
+        search_id: str,
+        generation: int,
+        results: list[SearchResult],
+        *,
+        cursor: SearchCursor | None,
+        complete: bool,
+        finished_at: datetime,
+        status: SearchStatus,
+        error: str | None,
+    ) -> SearchPageCommit:
+        with self._connection() as connection:
+            session = connection.execute(
+                "SELECT * FROM search_sessions "
+                "WHERE account_id=? AND id=? AND generation=?",
+                (account_id, search_id, generation),
+            ).fetchone()
+            if session is None:
+                raise StaleSearchError("搜索结果已被更新的搜索代次取代")
+            self._insert_search_results(
+                connection,
+                account_id,
+                search_id,
+                generation,
+                results,
+                session=session,
+            )
+            count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM search_results "
+                    "WHERE account_id=? AND search_id=? AND generation=?",
+                    (account_id, search_id, generation),
+                ).fetchone()[0]
+            )
+            self._update_search_state(
+                connection,
+                account_id,
+                search_id,
+                generation,
+                cursor,
+                complete,
+                finished_at,
+                status,
+                error,
+                count,
+            )
+            session_row = connection.execute(
+                "SELECT * FROM search_sessions WHERE account_id=? AND id=?",
+                (account_id, search_id),
+            ).fetchone()
+            result_rows = self._select_result_rows(
+                connection,
+                account_id,
+                search_id,
+            )
+        if session_row is None:
+            raise CatalogError("无法读取搜索提交状态")
+        return SearchPageCommit(
+            self._session_from_row(session_row),
+            tuple(self._result_from_row(row) for row in result_rows),
+            count,
+        )
+
+    def _insert_search_results(
+        self,
+        connection: sqlite3.Connection,
+        account_id: str,
+        search_id: str,
+        generation: int,
+        results: list[SearchResult],
+        *,
+        session: sqlite3.Row | None = None,
+    ) -> None:
         if any(
             item.search_id != search_id or item.account_id != account_id
             for item in results
         ):
             raise ValueError("搜索结果不属于当前搜索")
-        with self._connection() as connection:
+        if session is None:
             session = connection.execute(
-                "SELECT peer_ref, generation, scope FROM search_sessions "
+                "SELECT * FROM search_sessions "
                 "WHERE account_id=? AND id=?",
                 (account_id, search_id),
             ).fetchone()
-            if session is None or int(session["generation"]) != generation:
-                raise StaleSearchError("搜索结果已被更新的搜索代次取代")
-            if SearchScope(str(session["scope"])) is SearchScope.SINGLE_DIALOG and any(
-                item.peer_ref != str(session["peer_ref"]) for item in results
-            ):
-                raise ValueError("搜索结果不属于当前会话")
-            for item in results:
-                connection.execute(
-                    "INSERT INTO search_results(id, search_id, account_id, peer_ref, "
-                    "message_id, grouped_id, media_id, media_kind, original_name, "
-                    "expected_size, message_date_utc, excerpt, thumbnail_key, "
-                    "selected, available, queued, source_title, source_kind, "
-                    "generation) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                    "?, ?, ?, ?, ?) "
-                    "ON CONFLICT(search_id, peer_ref, message_id, media_id) "
-                    "DO UPDATE SET grouped_id=excluded.grouped_id, "
-                    "media_kind=excluded.media_kind, "
-                    "original_name=excluded.original_name, "
-                    "expected_size=excluded.expected_size, "
-                    "message_date_utc=excluded.message_date_utc, "
-                    "excerpt=excluded.excerpt, thumbnail_key=excluded.thumbnail_key, "
-                    "source_title=excluded.source_title, "
-                    "source_kind=excluded.source_kind, "
-                    "available=excluded.available, "
-                    "queued=MAX(search_results.queued, excluded.queued), "
-                    "selected=CASE WHEN excluded.queued=1 THEN 0 "
-                    "ELSE search_results.selected END, "
-                    "generation=excluded.generation",
-                    (
-                        item.id,
-                        item.search_id,
-                        item.account_id,
-                        item.peer_ref,
-                        item.message_id,
-                        item.grouped_id,
-                        item.media_id,
-                        item.media_kind.value,
-                        item.original_name,
-                        item.expected_size,
-                        item.message_date_utc.isoformat(),
-                        item.excerpt,
-                        item.thumbnail_key,
-                        int(item.selected),
-                        int(item.available),
-                        int(item.queued),
-                        item.source_title,
-                        item.source_kind.value,
-                        generation,
-                    ),
-                )
+        if session is None or int(session["generation"]) != generation:
+            raise StaleSearchError("搜索结果已被更新的搜索代次取代")
+        if SearchScope(str(session["scope"])) is SearchScope.SINGLE_DIALOG and any(
+            item.peer_ref != str(session["peer_ref"]) for item in results
+        ):
+            raise ValueError("搜索结果不属于当前会话")
+        for item in results:
+            connection.execute(
+                "INSERT INTO search_results(id, search_id, account_id, peer_ref, "
+                "message_id, grouped_id, media_id, media_kind, original_name, "
+                "expected_size, message_date_utc, excerpt, thumbnail_key, "
+                "selected, available, queued, source_title, source_kind, "
+                "generation) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, ?, ?, ?) "
+                "ON CONFLICT(search_id, peer_ref, message_id, media_id) "
+                "DO UPDATE SET grouped_id=excluded.grouped_id, "
+                "media_kind=excluded.media_kind, "
+                "original_name=excluded.original_name, "
+                "expected_size=excluded.expected_size, "
+                "message_date_utc=excluded.message_date_utc, "
+                "excerpt=excluded.excerpt, thumbnail_key=excluded.thumbnail_key, "
+                "source_title=excluded.source_title, "
+                "source_kind=excluded.source_kind, "
+                "available=excluded.available, "
+                "queued=MAX(search_results.queued, excluded.queued), "
+                "selected=CASE WHEN excluded.queued=1 THEN 0 "
+                "ELSE search_results.selected END, "
+                "generation=excluded.generation",
+                (
+                    item.id,
+                    item.search_id,
+                    item.account_id,
+                    item.peer_ref,
+                    item.message_id,
+                    item.grouped_id,
+                    item.media_id,
+                    item.media_kind.value,
+                    item.original_name,
+                    item.expected_size,
+                    item.message_date_utc.isoformat(),
+                    item.excerpt,
+                    item.thumbnail_key,
+                    int(item.selected),
+                    int(item.available),
+                    int(item.queued),
+                    item.source_title,
+                    item.source_kind.value,
+                    generation,
+                ),
+            )
 
     def finish_search(
         self,
@@ -473,29 +570,55 @@ class CatalogRepository:
                     (account_id, search_id, generation),
                 ).fetchone()[0]
             )
-            connection.execute(
-                "UPDATE search_sessions SET status=?, next_offset_id=?, cursor_json=?, "
-                "exhausted=?, result_count=?, updated_at=?, last_error=? "
-                "WHERE account_id=? AND id=? AND generation=?",
-                (
-                    status.value,
-                    cursor.offset_id if cursor else None,
-                    cursor.to_json() if cursor else None,
-                    int(exhausted),
-                    count,
-                    now.isoformat(),
-                    error,
-                    account_id,
-                    search_id,
-                    generation,
-                ),
+            self._update_search_state(
+                connection,
+                account_id,
+                search_id,
+                generation,
+                cursor,
+                exhausted,
+                now,
+                status,
+                error,
+                count,
             )
-            if status is SearchStatus.COMPLETED:
-                connection.execute(
-                    "DELETE FROM search_results WHERE account_id=? AND search_id=? "
-                    "AND generation<>?",
-                    (account_id, search_id, generation),
-                )
+
+    @staticmethod
+    def _update_search_state(
+        connection: sqlite3.Connection,
+        account_id: str,
+        search_id: str,
+        generation: int,
+        cursor: SearchCursor | None,
+        exhausted: bool,
+        now: datetime,
+        status: SearchStatus,
+        error: str | None,
+        result_count: int,
+    ) -> None:
+        connection.execute(
+            "UPDATE search_sessions SET status=?, next_offset_id=?, cursor_json=?, "
+            "exhausted=?, result_count=?, updated_at=?, last_error=? "
+            "WHERE account_id=? AND id=? AND generation=?",
+            (
+                status.value,
+                cursor.offset_id if cursor else None,
+                cursor.to_json() if cursor else None,
+                int(exhausted),
+                result_count,
+                now.isoformat(),
+                error,
+                account_id,
+                search_id,
+                generation,
+            ),
+        )
+        if status is SearchStatus.COMPLETED:
+            connection.execute(
+                "DELETE FROM search_results WHERE account_id=? AND search_id=? "
+                "AND generation<>?",
+                (account_id, search_id, generation),
+            )
 
     def list_results(
         self,
@@ -504,18 +627,33 @@ class CatalogRepository:
         *,
         selected_only: bool = False,
     ) -> list[SearchResult]:
-        selected = " AND result.selected=1" if selected_only else ""
         with self._connection() as connection:
-            rows = connection.execute(
-                "SELECT result.* FROM search_results AS result "
-                "JOIN search_sessions AS session ON session.id=result.search_id "
-                "WHERE session.account_id=? AND session.id=? "
-                "AND result.generation=session.generation"
-                f"{selected} ORDER BY result.message_date_utc DESC, "
-                "result.message_id DESC, result.id",
-                (account_id, search_id),
-            ).fetchall()
+            rows = self._select_result_rows(
+                connection,
+                account_id,
+                search_id,
+                selected_only=selected_only,
+            )
         return [self._result_from_row(row) for row in rows]
+
+    @staticmethod
+    def _select_result_rows(
+        connection: sqlite3.Connection,
+        account_id: str,
+        search_id: str,
+        *,
+        selected_only: bool = False,
+    ) -> list[sqlite3.Row]:
+        selected = " AND result.selected=1" if selected_only else ""
+        return connection.execute(
+            "SELECT result.* FROM search_results AS result "
+            "JOIN search_sessions AS session ON session.id=result.search_id "
+            "WHERE session.account_id=? AND session.id=? "
+            "AND result.generation=session.generation"
+            f"{selected} ORDER BY result.message_date_utc DESC, "
+            "result.message_id DESC, result.id",
+            (account_id, search_id),
+        ).fetchall()
 
     def get_result(self, account_id: str, result_id: str) -> SearchResult:
         with self._connection() as connection:
