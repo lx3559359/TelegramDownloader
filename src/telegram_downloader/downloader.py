@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Protocol
 
 from telegram_downloader.domain import ItemStatus, MediaItem
+from telegram_downloader.download_io import (
+    BatchSubmit,
+    BufferedPartWriter,
+    submit_batch,
+)
 from telegram_downloader.gateway import TelegramGateway
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.resource_control import AsyncBandwidthLimiter
@@ -61,6 +66,15 @@ def _hash_file(path: Path) -> _Digest:
     return digest
 
 
+async def persist_writer(writer: BufferedPartWriter) -> int:
+    operation = asyncio.create_task(writer.flush(durable=True))
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        await operation
+        raise
+
+
 class MediaDownloader:
     _DISK_RECHECK_BYTES = 16 * 1024 * 1024
     _PAUSE_POLL_SECONDS = 0.05
@@ -74,9 +88,14 @@ class MediaDownloader:
         reserve_bytes: int = 512 * 1024 * 1024,
         progress_interval: float = 0.5,
         bandwidth: AsyncBandwidthLimiter | None = None,
+        write_batch_bytes: int = 1024 * 1024,
+        write_batch_interval: float = 0.5,
+        batch_submit: BatchSubmit | None = None,
     ) -> None:
         if reserve_bytes < 0 or progress_interval < 0:
             raise ValueError("磁盘预留和进度间隔不能为负数")
+        if write_batch_bytes <= 0 or write_batch_interval <= 0:
+            raise ValueError("写入批次大小和间隔必须大于零")
         self.gateway = gateway
         self.repository = repository
         self.paths = paths
@@ -84,6 +103,9 @@ class MediaDownloader:
         self.reserve_bytes = reserve_bytes
         self.progress_interval = progress_interval
         self.bandwidth = bandwidth or AsyncBandwidthLimiter()
+        self.write_batch_bytes = write_batch_bytes
+        self.write_batch_interval = write_batch_interval
+        self.batch_submit = batch_submit or submit_batch
 
     async def download(
         self,
@@ -130,9 +152,9 @@ class MediaDownloader:
             raise DownloadPaused("下载已暂停")
 
         self.repository.update_item_progress(item.id, offset, ItemStatus.DOWNLOADING)
-        downloaded = offset
         bytes_since_disk_check = 0
         last_progress = time.monotonic()
+        writer: BufferedPartWriter | None = None
 
         try:
             digest = (
@@ -140,83 +162,107 @@ class MediaDownloader:
                 if offset
                 else hashlib.sha256()
             )
-            with part.open("ab") as stream:
-                async for chunk in self.gateway.stream_media(
-                    item.peer_ref,
-                    item.message_id,
-                    offset,
-                ):
-                    bandwidth_ready = await self._acquire_bandwidth(
-                        len(chunk),
-                        pause_requested,
+            writer = BufferedPartWriter(
+                part,
+                digest,
+                offset=offset,
+                batch_bytes=self.write_batch_bytes,
+                batch_interval=self.write_batch_interval,
+                submit=self.batch_submit,
+            )
+            async for chunk in self.gateway.stream_media(
+                item.peer_ref,
+                item.message_id,
+                offset,
+            ):
+                bandwidth_ready = await self._acquire_bandwidth(
+                    len(chunk),
+                    pause_requested,
+                )
+                if not bandwidth_ready or pause_requested():
+                    durable_offset = await persist_writer(writer)
+                    self.repository.update_item_progress(
+                        item.id,
+                        durable_offset,
+                        ItemStatus.PAUSED,
                     )
-                    if not bandwidth_ready or pause_requested():
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                        self.repository.update_item_progress(
-                            item.id,
-                            downloaded,
-                            ItemStatus.PAUSED,
-                        )
-                        raise DownloadPaused("下载已暂停")
-                    stream.write(chunk)
-                    digest.update(chunk)
-                    stream.flush()
-                    downloaded += len(chunk)
-                    bytes_since_disk_check += len(chunk)
-                    if item.expected_size is not None and downloaded > item.expected_size:
-                        raise SizeMismatchError(
-                            "下载数据超过预期大小: "
-                            f"期望 {item.expected_size}，实际至少 {downloaded}"
-                        )
+                    raise DownloadPaused("下载已暂停")
+                await writer.append(bytes(chunk))
+                bytes_since_disk_check += len(chunk)
+                if (
+                    item.expected_size is not None
+                    and writer.received_bytes > item.expected_size
+                ):
+                    raise SizeMismatchError(
+                        "下载数据超过预期大小: "
+                        f"期望 {item.expected_size}，实际至少 {writer.received_bytes}"
+                    )
 
-                    now = time.monotonic()
-                    if self.progress_interval == 0 or now - last_progress >= self.progress_interval:
-                        self.repository.update_item_progress(
-                            item.id,
-                            downloaded,
-                            ItemStatus.DOWNLOADING,
-                        )
-                        last_progress = now
+                now = time.monotonic()
+                if (
+                    self.progress_interval == 0
+                    or now - last_progress >= self.progress_interval
+                ):
+                    self.repository.update_item_progress(
+                        item.id,
+                        writer.persisted_bytes,
+                        ItemStatus.DOWNLOADING,
+                    )
+                    last_progress = now
 
-                    if bytes_since_disk_check >= self._DISK_RECHECK_BYTES:
-                        self._ensure_space(target.parent, item.expected_size, downloaded)
-                        bytes_since_disk_check %= self._DISK_RECHECK_BYTES
+                if bytes_since_disk_check >= self._DISK_RECHECK_BYTES:
+                    self._ensure_space(
+                        target.parent,
+                        item.expected_size,
+                        writer.received_bytes,
+                    )
+                    bytes_since_disk_check %= self._DISK_RECHECK_BYTES
 
-                    if pause_requested():
-                        os.fsync(stream.fileno())
-                        self.repository.update_item_progress(
-                            item.id,
-                            downloaded,
-                            ItemStatus.PAUSED,
-                        )
-                        raise DownloadPaused("下载已暂停")
-                stream.flush()
-                os.fsync(stream.fileno())
+                if pause_requested():
+                    durable_offset = await persist_writer(writer)
+                    self.repository.update_item_progress(
+                        item.id,
+                        durable_offset,
+                        ItemStatus.PAUSED,
+                    )
+                    raise DownloadPaused("下载已暂停")
+            await writer.flush(durable=True)
         except asyncio.CancelledError:
+            durable_offset = (
+                await persist_writer(writer) if writer is not None else offset
+            )
             self.repository.update_item_progress(
                 item.id,
-                downloaded,
+                durable_offset,
                 ItemStatus.PAUSED,
             )
             raise
         except InsufficientSpaceError:
+            durable_offset = (
+                await persist_writer(writer) if writer is not None else offset
+            )
             self.repository.update_item_progress(
                 item.id,
-                downloaded,
+                durable_offset,
                 ItemStatus.PAUSED,
             )
             raise
 
-        if item.expected_size is not None and downloaded != item.expected_size:
+        if writer is None:
+            raise RuntimeError("下载写入器未初始化")
+        if (
+            item.expected_size is not None
+            and writer.persisted_bytes != item.expected_size
+        ):
             raise SizeMismatchError(
-                f"下载大小不符: 期望 {item.expected_size}，实际 {downloaded}"
+                "下载大小不符: "
+                f"期望 {item.expected_size}，实际 {writer.persisted_bytes}"
             )
         os.replace(part, target)
         self.repository.complete_item(
             item.id,
-            downloaded,
-            digest.hexdigest(),
+            writer.persisted_bytes,
+            writer.hexdigest(),
             datetime.now(UTC),
         )
         return target

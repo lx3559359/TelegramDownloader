@@ -1,8 +1,11 @@
+import asyncio
 import hashlib
+import threading
 from pathlib import Path
 
 import pytest
 
+from telegram_downloader import download_io
 from telegram_downloader.download_io import BufferedPartWriter
 
 
@@ -93,3 +96,43 @@ async def test_empty_durable_flush_reaches_submitter(tmp_path: Path) -> None:
     assert durable_values == [True]
     assert writer.persisted_bytes == 7
     assert writer.durable_bytes == 7
+
+
+@pytest.mark.asyncio
+async def test_cancelled_batch_is_not_submitted_twice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    real_append = download_io.append_batch
+
+    def blocked_append(path, digest, data, durable):
+        started.set()
+        release.wait(timeout=1)
+        try:
+            return real_append(path, digest, data, durable)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(download_io, "append_batch", blocked_append)
+    path = tmp_path / "video.part"
+    writer = BufferedPartWriter(
+        path,
+        hashlib.sha256(),
+        offset=0,
+        batch_bytes=1,
+    )
+    operation = asyncio.create_task(writer.append(b"x"))
+    assert await asyncio.to_thread(started.wait, 1)
+
+    operation.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+    assert await asyncio.to_thread(finished.wait, 1)
+
+    await writer.flush(durable=True)
+    assert path.read_bytes() == b"x"
+    assert writer.persisted_bytes == writer.durable_bytes == 1

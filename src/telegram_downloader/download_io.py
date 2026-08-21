@@ -76,7 +76,15 @@ class BufferedPartWriter:
         if not self._buffer and not durable:
             return self.persisted_bytes
         data = bytes(self._buffer)
-        written = await self._submit(self.path, self._digest, data, durable)
+        operation = asyncio.ensure_future(
+            self._submit(self.path, self._digest, data, durable)
+        )
+        cancellation: asyncio.CancelledError | None = None
+        try:
+            written = await asyncio.shield(operation)
+        except asyncio.CancelledError as error:
+            cancellation = error
+            written = await operation
         if written != len(data):
             raise OSError(f"short batch submission: {written}/{len(data)}")
         self._buffer.clear()
@@ -84,6 +92,8 @@ class BufferedPartWriter:
         if durable:
             self.durable_bytes = self.persisted_bytes
         self._last_flush = self._clock()
+        if cancellation is not None:
+            raise cancellation
         return self.persisted_bytes
 
     def hexdigest(self) -> str:
