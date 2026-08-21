@@ -557,11 +557,11 @@ def create_application(root: Path):
     def task_selection_changed(value: object) -> None:
         controller.select_task_details(_task_ids(value))
 
-    def pause_tasks_requested(value: object) -> None:
-        controller.pause_tasks(_task_ids(value))
+    async def pause_tasks_requested(value: object) -> None:
+        await controller.pause_tasks(_task_ids(value))
 
-    def prioritize_task_requested(task_id: str) -> None:
-        controller.prioritize_task(task_id)
+    async def prioritize_task_requested(task_id: str) -> None:
+        await controller.prioritize_task(task_id)
 
     async def resume_tasks_requested(value: object) -> None:
         await controller.resume_tasks(_task_ids(value))
@@ -569,11 +569,11 @@ def create_application(root: Path):
     async def retry_tasks_requested(value: object) -> None:
         await controller.retry_failed_tasks(_task_ids(value))
 
-    def archive_tasks_requested(value: object) -> None:
-        controller.archive_tasks(_task_ids(value))
+    async def archive_tasks_requested(value: object) -> None:
+        await controller.archive_tasks(_task_ids(value))
 
-    def restore_tasks_requested(value: object) -> None:
-        controller.restore_tasks(_task_ids(value))
+    async def restore_tasks_requested(value: object) -> None:
+        await controller.restore_tasks(_task_ids(value))
 
     def open_media_requested(item_id: str) -> None:
         controller.open_media_file(item_id)
@@ -673,10 +673,6 @@ def create_application(root: Path):
 
     window.scan_requested.connect(scan_requested)
     window.task_selection_changed.connect(task_selection_changed)
-    window.pause_tasks_requested.connect(pause_tasks_requested)
-    window.prioritize_task_requested.connect(prioritize_task_requested)
-    window.archive_tasks_requested.connect(archive_tasks_requested)
-    window.restore_tasks_requested.connect(restore_tasks_requested)
     window.open_media_requested.connect(open_media_requested)
     window.integrity_cancel_requested.connect(integrity_cancel_requested)
     window.open_directory_requested.connect(controller.open_task_directory)
@@ -763,6 +759,30 @@ def create_application(root: Path):
         window.statusBar().showMessage(controller._safe_error(error), 0)
 
     async_actions.connect_payload(
+        window.pause_tasks_requested,
+        "tasks.pause",
+        pause_tasks_requested,
+        hooks=ActionHooks(failed=task_failure),
+    )
+    async_actions.connect_payload(
+        window.prioritize_task_requested,
+        "tasks.prioritize",
+        prioritize_task_requested,
+        hooks=ActionHooks(failed=task_failure),
+    )
+    async_actions.connect_payload(
+        window.archive_tasks_requested,
+        "tasks.archive",
+        archive_tasks_requested,
+        hooks=ActionHooks(failed=task_failure),
+    )
+    async_actions.connect_payload(
+        window.restore_tasks_requested,
+        "tasks.restore",
+        restore_tasks_requested,
+        hooks=ActionHooks(failed=task_failure),
+    )
+    async_actions.connect_payload(
         window.resume_tasks_requested,
         "tasks.resume",
         resume_tasks_requested,
@@ -843,6 +863,7 @@ def create_application(root: Path):
             password_submitted,
             task_selection_changed,
             pause_tasks_requested,
+            prioritize_task_requested,
             resume_tasks_requested,
             retry_tasks_requested,
             archive_tasks_requested,

@@ -2,6 +2,7 @@ import asyncio
 import logging
 from datetime import UTC, date, datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -30,6 +31,7 @@ from telegram_downloader.domain import (
     MediaKind,
     ScanFilters,
     SourceKind,
+    TaskRecord,
     TaskStatus,
 )
 from telegram_downloader.file_integrity import (
@@ -1683,85 +1685,114 @@ async def test_cancel_integrity_pauses_active_repair_download() -> None:
         await operation
 
 
+def task_record(task_id: str, status: TaskStatus) -> TaskRecord:
+    now = datetime(2026, 8, 21, tzinfo=UTC)
+    return TaskRecord(
+        task_id,
+        SourceKind.CHANNEL_OR_GROUP,
+        f"peer-{task_id}",
+        f"任务 {task_id}",
+        f"https://t.me/{task_id}",
+        ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 10),
+        status,
+        now,
+        now,
+    )
+
+
 @pytest.mark.asyncio
-async def test_task_batch_actions_deduplicate_and_skip_ineligible_tasks() -> None:
-    tasks = {
-        "run": SimpleNamespace(
-            id="run",
-            status=TaskStatus.DOWNLOADING,
-            archived_at=None,
-        ),
-        "pause": SimpleNamespace(
-            id="pause",
-            status=TaskStatus.PAUSED,
-            archived_at=None,
-        ),
-        "fail": SimpleNamespace(
-            id="fail",
-            status=TaskStatus.PARTIAL_FAILURE,
-            archived_at=None,
-        ),
-    }
+async def test_pause_tasks_uses_bulk_lookup_command_and_one_refresh() -> None:
+    events: list[str] = []
 
     class Repository:
-        def get_task(self, task_id):
-            return tasks[task_id]
-
-        def list_task_snapshots(self, *, include_archived=False):
-            assert include_archived is True
-            return []
+        def get_tasks(self, task_ids):
+            events.append("lookup")
+            return [task_record(task_id, TaskStatus.QUEUED) for task_id in task_ids]
 
     class Scheduler:
-        def __init__(self):
-            self.paused = []
-            self.resumed = []
+        def pause_tasks(self, task_ids):
+            events.append("pause:" + ",".join(task_ids))
+            return set(task_ids)
 
-        def pause_task(self, task_id):
-            self.paused.append(task_id)
+    controller = AppController.for_test(
+        repository=Repository(),
+        scheduler=Scheduler(),
+    )
+    controller.refresh_tasks_async = AsyncMock(
+        side_effect=lambda: events.append("refresh")
+    )
 
-        async def resume_task(self, task_id):
-            self.resumed.append(task_id)
+    await controller.pause_tasks(["a", "b", "a"])
 
-    scheduler = Scheduler()
-    controller = AppController.for_test(repository=Repository(), scheduler=scheduler)
-
-    controller.pause_tasks(["run", "pause", "run"])
-    await controller.resume_tasks(["pause", "run", "pause"])
-    assert scheduler.paused == ["run"]
-    assert scheduler.resumed == ["pause"]
-
-    await controller.retry_failed_tasks(["fail", "run", "fail"])
-
-    assert scheduler.resumed == ["pause", "fail"]
+    assert events == ["lookup", "pause:a,b", "refresh"]
 
 
-def test_archive_and_restore_tasks_report_repository_results() -> None:
-    class Repository:
-        def __init__(self):
-            self.archived = []
-            self.restored = []
+@pytest.mark.asyncio
+async def test_task_batch_commands_skip_ineligible_states() -> None:
+    tasks = [
+        task_record("run", TaskStatus.DOWNLOADING),
+        task_record("pause", TaskStatus.PAUSED),
+        task_record("fail", TaskStatus.PARTIAL_FAILURE),
+    ]
+    repository = SimpleNamespace(get_tasks=Mock(return_value=tasks))
+    scheduler = SimpleNamespace(
+        pause_tasks=Mock(return_value={"run"}),
+        resume_tasks=AsyncMock(side_effect=({"pause"}, {"fail"})),
+    )
+    controller = AppController.for_test(repository=repository, scheduler=scheduler)
+    controller.refresh_tasks_async = AsyncMock()
 
-        def archive_tasks(self, task_ids):
-            self.archived.append(task_ids)
-            return {"done"}
+    await controller.pause_tasks(["run", "pause", "fail"])
+    await controller.resume_tasks(["run", "pause", "fail"])
+    await controller.retry_failed_tasks(["run", "pause", "fail"])
 
-        def restore_tasks(self, task_ids):
-            self.restored.append(task_ids)
-            return {"done"}
+    scheduler.pause_tasks.assert_called_once_with(["run"])
+    assert scheduler.resume_tasks.await_args_list[0].args == (["pause"],)
+    assert scheduler.resume_tasks.await_args_list[1].args == (["fail"],)
 
-        def list_task_snapshots(self, *, include_archived=False):
-            assert include_archived is True
-            return []
 
-    repository = Repository()
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "initial"),
+    [
+        ("resume_tasks", TaskStatus.PAUSED),
+        ("retry_failed_tasks", TaskStatus.PARTIAL_FAILURE),
+    ],
+)
+async def test_resume_commands_use_one_bulk_lookup_and_refresh(
+    method: str,
+    initial: TaskStatus,
+) -> None:
+    repository = SimpleNamespace(
+        get_tasks=Mock(
+            return_value=[task_record("a", initial), task_record("b", initial)]
+        )
+    )
+    scheduler = SimpleNamespace(
+        resume_tasks=AsyncMock(return_value={"a", "b"}),
+    )
+    controller = AppController.for_test(repository=repository, scheduler=scheduler)
+    controller.refresh_tasks_async = AsyncMock()
+
+    await getattr(controller, method)(["a", "b", "a"])
+
+    repository.get_tasks.assert_called_once_with(["a", "b"])
+    scheduler.resume_tasks.assert_awaited_once_with(["a", "b"])
+    controller.refresh_tasks_async.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["archive_tasks", "restore_tasks"])
+async def test_archive_commands_write_and_refresh_once(method: str) -> None:
+    repository = SimpleNamespace()
+    setattr(repository, method, Mock(return_value={"a", "b"}))
     controller = AppController.for_test(repository=repository)
+    controller.refresh_tasks_async = AsyncMock()
 
-    controller.archive_tasks(["done", "done", "active"])
-    controller.restore_tasks(["done", "done"])
+    await getattr(controller, method)(["a", "b", "a"])
 
-    assert repository.archived == [["done", "active"]]
-    assert repository.restored == [["done"]]
-    assert "已恢复 1 个" in controller.window.message.last_message
+    getattr(repository, method).assert_called_once_with(["a", "b"])
+    controller.refresh_tasks_async.assert_awaited_once()
 
 
 def test_open_media_file_requires_completed_local_existing_file(
@@ -3280,25 +3311,19 @@ def test_refresh_tasks_exposes_queue_positions_and_scheduler_summary() -> None:
     }
 
 
-def test_prioritize_task_persists_before_reordering_and_reports_position() -> None:
+@pytest.mark.asyncio
+async def test_prioritize_task_persists_before_reordering_and_reports_position() -> None:
     events: list[str] = []
-    task = SimpleNamespace(
-        id="queued",
-        status=TaskStatus.QUEUED,
-        archived_at=None,
-    )
+    task = task_record("queued", TaskStatus.QUEUED)
 
     class Repository:
-        def get_task(self, task_id):
-            assert task_id == task.id
-            return task
+        def get_tasks(self, task_ids):
+            assert task_ids == [task.id]
+            return [task]
 
         def prioritize_task(self, task_id):
             events.append(f"repository:{task_id}")
             return True
-
-        def list_task_snapshots(self, *, include_archived=False):
-            return []
 
     class Scheduler:
         def prioritize_task(self, task_id):
@@ -3308,36 +3333,29 @@ def test_prioritize_task_persists_before_reordering_and_reports_position() -> No
         def queue_positions(self):
             return {task.id: 1}
 
-        def snapshot(self):
-            return SchedulerSnapshot(None, (task.id,), 3, 0)
-
     controller = AppController.for_test(
         repository=Repository(),
         scheduler=Scheduler(),
     )
+    controller.refresh_tasks_async = AsyncMock()
 
-    controller.prioritize_task(task.id)
+    await controller.prioritize_task(task.id)
 
     assert events == ["repository:queued", "scheduler:queued"]
+    controller.refresh_tasks_async.assert_awaited_once()
     assert "第 1 位" in controller.window.message.last_message
 
 
-def test_prioritize_task_handles_state_race_without_duplicate_start() -> None:
-    task = SimpleNamespace(
-        id="queued",
-        status=TaskStatus.QUEUED,
-        archived_at=None,
-    )
+@pytest.mark.asyncio
+async def test_prioritize_task_handles_state_race_without_duplicate_start() -> None:
+    task = task_record("queued", TaskStatus.QUEUED)
 
     class Repository:
-        def get_task(self, _task_id):
-            return task
+        def get_tasks(self, _task_ids):
+            return [task]
 
         def prioritize_task(self, _task_id):
             return True
-
-        def list_task_snapshots(self, *, include_archived=False):
-            return []
 
     class Scheduler:
         def prioritize_task(self, _task_id):
@@ -3346,16 +3364,15 @@ def test_prioritize_task_handles_state_race_without_duplicate_start() -> None:
         def queue_positions(self):
             return {}
 
-        def snapshot(self):
-            return SchedulerSnapshot(task.id, (), 3, 0)
-
     controller = AppController.for_test(
         repository=Repository(),
         scheduler=Scheduler(),
     )
+    controller.refresh_tasks_async = AsyncMock()
 
-    controller.prioritize_task(task.id)
+    await controller.prioritize_task(task.id)
 
+    controller.refresh_tasks_async.assert_awaited_once()
     assert "已经开始下载" in controller.window.message.last_message
 
 

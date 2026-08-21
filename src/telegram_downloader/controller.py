@@ -286,6 +286,9 @@ class _NullRepository:
     def get_task(self, task_id: str):
         raise KeyError(task_id)
 
+    def get_tasks(self, _task_ids: list[str]) -> list[object]:
+        return []
+
     def get_item(self, item_id: str):
         raise KeyError(item_id)
 
@@ -303,11 +306,17 @@ class _NullScheduler:
     async def resume_task(self, _task_id: str) -> None:
         pass
 
+    async def resume_tasks(self, _task_ids: list[str]) -> set[str]:
+        return set()
+
     async def run_items(self, _task_id: str, _item_ids: list[str]) -> None:
         pass
 
     def pause_task(self, _task_id: str) -> None:
         pass
+
+    def pause_tasks(self, _task_ids: list[str]) -> set[str]:
+        return set()
 
     def snapshot(self) -> SchedulerSnapshot:
         return SchedulerSnapshot(None, (), 3, 0)
@@ -1605,8 +1614,8 @@ class AppController:
             message += "，API/代理变更将在下次连接时生效"
         self._show_status(message)
 
-    def pause_task(self, task_id: str) -> None:
-        self.pause_tasks([task_id])
+    async def pause_task(self, task_id: str) -> None:
+        await self.pause_tasks([task_id])
 
     async def resume_task(self, task_id: str) -> None:
         await self.resume_tasks([task_id])
@@ -1614,43 +1623,50 @@ class AppController:
     async def retry_failed(self, task_id: str) -> None:
         await self.retry_failed_tasks([task_id])
 
-    def pause_tasks(self, task_ids: list[str]) -> None:
+    async def pause_tasks(self, task_ids: list[str]) -> None:
         unique = self._unique_task_ids(task_ids)
-        accepted = 0
-        for task_id in unique:
-            try:
-                task = self.repository.get_task(task_id)
-            except KeyError:
-                continue
-            if task.archived_at is not None or task.status not in {
+        tasks = await asyncio.to_thread(self.repository.get_tasks, unique)
+        eligible = [
+            task.id
+            for task in tasks
+            if task.archived_at is None
+            and task.status
+            in {
                 TaskStatus.QUEUED,
                 TaskStatus.DOWNLOADING,
                 TaskStatus.WAITING_RETRY,
-            }:
-                continue
-            self.scheduler.pause_task(task_id)
-            accepted += 1
-        self.refresh_tasks()
-        self._show_status(f"已暂停 {accepted} 个任务，跳过 {len(unique) - accepted} 个")
+            }
+        ]
+        accepted = self.scheduler.pause_tasks(eligible)
+        await self.refresh_tasks_async()
+        self._show_status(
+            f"已暂停 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个"
+        )
 
-    def prioritize_task(self, task_id: str) -> None:
-        try:
-            task = self.repository.get_task(task_id)
-        except KeyError:
+    async def prioritize_task(self, task_id: str) -> None:
+        tasks = await asyncio.to_thread(self.repository.get_tasks, [task_id])
+        if not tasks:
+            await self.refresh_tasks_async()
             self._show_status("任务不存在或已被移除")
             return
+        task = tasks[0]
         if task.archived_at is not None or task.status is not TaskStatus.QUEUED:
+            await self.refresh_tasks_async()
             self._show_status("任务已经开始下载或状态已变化")
             return
 
         prioritize = getattr(self.repository, "prioritize_task", None)
-        persisted = bool(prioritize(task_id)) if callable(prioritize) else False
+        persisted = (
+            bool(await asyncio.to_thread(prioritize, task_id))
+            if callable(prioritize)
+            else False
+        )
         reordered = self.scheduler.prioritize_task(task_id) if persisted else False
         if not reordered:
             clear_priority = getattr(self.repository, "clear_task_priority", None)
             if callable(clear_priority):
-                clear_priority(task_id)
-        self.refresh_tasks()
+                await asyncio.to_thread(clear_priority, task_id)
+        await self.refresh_tasks_async()
         if reordered:
             position = self.scheduler.queue_positions().get(task_id)
             if position is not None:
@@ -1662,47 +1678,45 @@ class AppController:
 
     async def resume_tasks(self, task_ids: list[str]) -> None:
         unique = self._unique_task_ids(task_ids)
-        accepted: list[str] = []
-        for task_id in unique:
-            try:
-                task = self.repository.get_task(task_id)
-            except KeyError:
-                continue
-            if task.archived_at is None and task.status is TaskStatus.PAUSED:
-                accepted.append(task_id)
-        if accepted:
-            await asyncio.gather(*(self.scheduler.resume_task(task_id) for task_id in accepted))
+        tasks = await asyncio.to_thread(self.repository.get_tasks, unique)
+        eligible = [
+            task.id
+            for task in tasks
+            if task.archived_at is None and task.status is TaskStatus.PAUSED
+        ]
+        accepted = await self.scheduler.resume_tasks(eligible) if eligible else set()
         await self.refresh_tasks_async()
-        self._show_status(f"已继续 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个")
+        self._show_status(
+            f"已继续 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个"
+        )
 
     async def retry_failed_tasks(self, task_ids: list[str]) -> None:
         unique = self._unique_task_ids(task_ids)
-        accepted: list[str] = []
-        for task_id in unique:
-            try:
-                task = self.repository.get_task(task_id)
-            except KeyError:
-                continue
-            if task.archived_at is None and task.status is TaskStatus.PARTIAL_FAILURE:
-                accepted.append(task_id)
-        if accepted:
-            await asyncio.gather(*(self.scheduler.resume_task(task_id) for task_id in accepted))
+        tasks = await asyncio.to_thread(self.repository.get_tasks, unique)
+        eligible = [
+            task.id
+            for task in tasks
+            if task.archived_at is None and task.status is TaskStatus.PARTIAL_FAILURE
+        ]
+        accepted = await self.scheduler.resume_tasks(eligible) if eligible else set()
         await self.refresh_tasks_async()
-        self._show_status(f"已重试 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个")
+        self._show_status(
+            f"已重试 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个"
+        )
 
-    def archive_tasks(self, task_ids: list[str]) -> None:
+    async def archive_tasks(self, task_ids: list[str]) -> None:
         unique = self._unique_task_ids(task_ids)
-        accepted = self.repository.archive_tasks(unique)
-        self.refresh_tasks()
+        accepted = await asyncio.to_thread(self.repository.archive_tasks, unique)
+        await self.refresh_tasks_async()
         self._show_status(
             f"已归档 {len(accepted)} 个完成任务；下载文件已保留，"
             f"跳过 {len(unique) - len(accepted)} 个"
         )
 
-    def restore_tasks(self, task_ids: list[str]) -> None:
+    async def restore_tasks(self, task_ids: list[str]) -> None:
         unique = self._unique_task_ids(task_ids)
-        accepted = self.repository.restore_tasks(unique)
-        self.refresh_tasks()
+        accepted = await asyncio.to_thread(self.repository.restore_tasks, unique)
+        await self.refresh_tasks_async()
         self._show_status(
             f"已恢复 {len(accepted)} 个归档任务，跳过 {len(unique) - len(accepted)} 个"
         )
