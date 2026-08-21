@@ -20,7 +20,11 @@ from telegram_downloader.content import (
     SearchSession,
     SearchStatus,
 )
-from telegram_downloader.content_progress import DialogSyncProgress, SearchProgress
+from telegram_downloader.content_progress import (
+    DialogSyncProgress,
+    SearchProgress,
+    SearchResultBatch,
+)
 from telegram_downloader.gateway import (
     AccessDeniedError,
     FloodWaitError,
@@ -200,6 +204,7 @@ class ContentBrowserService:
         *,
         scope: SearchScope = SearchScope.SINGLE_DIALOG,
         on_progress: Callable[[SearchProgress], None] | None = None,
+        on_results: Callable[[SearchResultBatch], None] | None = None,
     ) -> tuple[SearchSession, list[SearchResult]]:
         async with self._search_lock:
             account = self._require_account()
@@ -222,27 +227,47 @@ class ContentBrowserService:
                 self.clock(),
                 scope=scope,
             )
-            return await self._fetch_page(session, on_progress=on_progress)
+            return await self._fetch_page(
+                session,
+                on_progress=on_progress,
+                on_results=on_results,
+            )
 
     async def load_more(
         self,
         search_id: str,
         *,
         on_progress: Callable[[SearchProgress], None] | None = None,
+        on_results: Callable[[SearchResultBatch], None] | None = None,
     ) -> tuple[SearchSession, list[SearchResult]]:
         async with self._search_lock:
             account = self._require_account()
             self._require_online()
             session = self.catalog.get_session(account.account_id, search_id)
             if session.exhausted:
-                return session, self.catalog.list_results(account.account_id, search_id)
-            return await self._fetch_page(session, on_progress=on_progress)
+                results = self.catalog.list_results(account.account_id, search_id)
+                if on_results is not None:
+                    on_results(
+                        SearchResultBatch(
+                            session.id,
+                            session.generation,
+                            tuple(results),
+                            stable=True,
+                        )
+                    )
+                return session, results
+            return await self._fetch_page(
+                session,
+                on_progress=on_progress,
+                on_results=on_results,
+            )
 
     async def _fetch_page(
         self,
         session: SearchSession,
         *,
         on_progress: Callable[[SearchProgress], None] | None = None,
+        on_results: Callable[[SearchResultBatch], None] | None = None,
     ) -> tuple[SearchSession, list[SearchResult]]:
         account = self._require_account()
         gateway, planner = self._require_online()
@@ -251,6 +276,24 @@ class ContentBrowserService:
         progress_matched = 0
         request_cursor = session.cursor
         seen_cursors = {request_cursor}
+        result_ids: dict[tuple[str, int, str], str] = {}
+
+        def result_for(
+            hit: RemoteSearchHit,
+            *,
+            queued: bool = False,
+        ) -> SearchResult:
+            key = self._media_key(hit.remote)
+            result = self._result_from_hit(
+                account.account_id,
+                session,
+                hit,
+                queued=queued,
+                result_id=result_ids.get(key),
+            )
+            result_ids.setdefault(key, result.id)
+            return result
+
         try:
             while True:
                 page_inspected = 0
@@ -285,6 +328,19 @@ class ContentBrowserService:
                         raise GatewayError("Telegram 全局搜索分页未前进")
                     seen_cursors.add(page.next_cursor)
 
+                if on_results is not None and page.items:
+                    on_results(
+                        SearchResultBatch(
+                            session.id,
+                            session.generation,
+                            tuple(
+                                result_for(hit)
+                                for hit in self._deduplicate_hits(list(page.items))
+                            ),
+                            stable=False,
+                        )
+                    )
+
                 expanded = list(page.items)
                 group_triggers: dict[tuple[str, int], int] = {}
                 for hit in page.items:
@@ -307,9 +363,11 @@ class ContentBrowserService:
                             grouped_id,
                         )
 
-                album_values = await asyncio.gather(
-                    *(expand(item) for item in group_triggers.items())
-                )
+                album_tasks = [
+                    asyncio.create_task(expand(item))
+                    for item in group_triggers.items()
+                ]
+                album_values = await asyncio.gather(*album_tasks)
                 for values in album_values:
                     expanded.extend(values)
 
@@ -375,9 +433,7 @@ class ContentBrowserService:
                     {self._media_key(hit.remote) for hit in accepted}
                 )
                 saved = [
-                    self._result_from_hit(
-                        account.account_id,
-                        session,
+                    result_for(
                         hit,
                         queued=self._media_key(hit.remote) in queued_keys,
                     )
@@ -435,6 +491,15 @@ class ContentBrowserService:
             raise
         current = self.catalog.get_session(account.account_id, session.id)
         results = self.catalog.list_results(account.account_id, session.id)
+        if on_results is not None:
+            on_results(
+                SearchResultBatch(
+                    current.id,
+                    current.generation,
+                    tuple(results),
+                    stable=True,
+                )
+            )
         return current, results
 
     async def _search_remote_page(
@@ -722,11 +787,12 @@ class ContentBrowserService:
         hit: RemoteSearchHit,
         *,
         queued: bool,
+        result_id: str | None = None,
     ) -> SearchResult:
         remote = hit.remote
         key = f"{session.id}:{remote.peer_ref}:{remote.message_id}:{remote.media_id}"
         return SearchResult(
-            id=str(uuid5(NAMESPACE_URL, key)),
+            id=result_id or str(uuid5(NAMESPACE_URL, key)),
             search_id=session.id,
             account_id=account_id,
             peer_ref=remote.peer_ref,

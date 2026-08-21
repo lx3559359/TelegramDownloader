@@ -1342,3 +1342,42 @@ async def test_thumbnail_cache_hit_remote_fallback_and_history_cleanup(
     await service.activate_account()
     assert service.clear_history() is None
     assert other_path.exists() is False
+
+
+@pytest.mark.asyncio
+async def test_direct_hits_emit_before_blocked_album_expansion(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 21, tzinfo=UTC)
+    gateway = FakeGateway(AccountProfile("a1", "账号一"))
+    service = await prepared_online_service(tmp_path, now, gateway)
+    album_started = asyncio.Event()
+    release_album = asyncio.Event()
+    batches = []
+
+    direct = make_hit(20, now)
+    grouped = make_hit(19, now, grouped_id=900)
+    gateway.pages = [RemoteSearchPage((direct, grouped), None, True)]
+
+    async def expand_album(*_args):
+        album_started.set()
+        await release_album.wait()
+        return (grouped, make_hit(18, now, grouped_id=900))
+
+    gateway.expand_album = expand_album
+    operation = asyncio.create_task(
+        service.start_search("-1001", make_query(now), on_results=batches.append)
+    )
+    await album_started.wait()
+
+    assert batches
+    assert batches[0].stable is False
+    assert {item.media_id for item in batches[0].results} == {"m20", "m19"}
+    provisional_ids = {item.media_id: item.id for item in batches[0].results}
+
+    release_album.set()
+    session, results = await operation
+    assert {item.media_id for item in results} == {"m20", "m19", "m18"}
+    assert next(item.id for item in results if item.media_id == "m20") == provisional_ids[
+        "m20"
+    ]
+    assert batches[-1].stable is True
+    assert batches[-1].search_id == session.id
