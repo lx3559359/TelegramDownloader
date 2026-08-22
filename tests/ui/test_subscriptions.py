@@ -13,6 +13,10 @@ from PySide6.QtWidgets import (
 
 from telegram_downloader.content import ContentDialog, DialogKind
 from telegram_downloader.domain import MediaKind
+from telegram_downloader.subscription_matching import (
+    SubscriptionCriteria,
+    SubscriptionMatchMode,
+)
 from telegram_downloader.subscriptions import (
     SubscriptionProbeProgress,
     SubscriptionProbeReport,
@@ -47,6 +51,7 @@ def test_subscription_page_uses_major_and_nested_silver_cards(qtbot) -> None:
     assert page.diagnostic_card.isAncestorOf(page.run_history_table)
     assert page.diagnostic_card.isAncestorOf(page.probe_sample_table)
 
+
 NOW = datetime(2026, 8, 15, 9, 0, tzinfo=UTC)
 
 
@@ -65,22 +70,25 @@ def dialog() -> ContentDialog:
 
 def rule(*, enabled: bool = True) -> SubscriptionRule:
     return SubscriptionRule(
-        "rule-1",
-        "a1",
-        "-1001",
-        "资料群",
-        "美女",
-        frozenset({MediaKind.PHOTO, MediaKind.VIDEO}),
-        30,
-        enabled,
-        SubscriptionState.WAITING if enabled else SubscriptionState.PAUSED,
-        42,
-        NOW + timedelta(minutes=30) if enabled else None,
-        NOW,
-        None,
-        0,
-        NOW,
-        NOW,
+        id="rule-1",
+        account_id="a1",
+        peer_ref="-1001",
+        dialog_title="资料群",
+        criteria=SubscriptionCriteria(("美女",)),
+        media_kinds=frozenset({MediaKind.PHOTO, MediaKind.VIDEO}),
+        interval_minutes=30,
+        history_days=0,
+        enabled=enabled,
+        state=(SubscriptionState.WAITING if enabled else SubscriptionState.PAUSED),
+        last_message_id=42,
+        backfill_from_utc=None,
+        backfill_through_id=None,
+        next_run_at=NOW + timedelta(minutes=30) if enabled else None,
+        last_run_at=NOW,
+        last_error=None,
+        failure_count=0,
+        created_at=NOW,
+        updated_at=NOW,
     )
 
 
@@ -164,7 +172,7 @@ def test_subscription_state_update_does_not_reset_model(qtbot) -> None:
     assert model.data(model.index(0, 2), Qt.ItemDataRole.DisplayRole) == "已暂停"
 
 
-def test_rule_editor_validates_then_returns_trimmed_draft(qtbot) -> None:
+def test_rule_editor_builds_advanced_draft_and_waits_for_save_result(qtbot) -> None:
     editor = SubscriptionEditorDialog([dialog()])
     qtbot.addWidget(editor)
     assert editor.styleSheet() == APP_STYLESHEET
@@ -176,17 +184,101 @@ def test_rule_editor_validates_then_returns_trimmed_draft(qtbot) -> None:
 
     qtbot.mouseClick(save, Qt.MouseButton.LeftButton)
     assert editor.isVisible()
-    assert "关键词" in editor.error_label.text()
+    assert "包含词" in editor.error_label.text()
 
-    editor.keyword_input.setText("  美女  ")
-    with qtbot.waitSignal(editor.accepted, timeout=500):
+    editor.include_input.setPlainText("  AI  \n模型")
+    editor.exclude_input.setPlainText("广告\n搬运")
+    editor.match_mode_combo.setCurrentIndex(
+        editor.match_mode_combo.findData(SubscriptionMatchMode.ALL.value)
+    )
+    editor.history_combo.setCurrentIndex(editor.history_combo.findData(7))
+    with qtbot.waitSignal(editor.save_requested, timeout=500) as requested:
         qtbot.mouseClick(save, Qt.MouseButton.LeftButton)
 
-    draft = editor.draft()
+    draft = requested.args[0]
     assert draft.peer_ref == "-1001"
-    assert draft.keyword == "美女"
+    assert draft.criteria == SubscriptionCriteria(
+        ("AI", "模型"),
+        ("广告", "搬运"),
+        SubscriptionMatchMode.ALL,
+    )
     assert draft.media_kinds == frozenset(MediaKind)
     assert draft.interval_minutes == 30
+    assert draft.history_days == 7
+    assert "最近 7 天" in editor.baseline_label.text()
+    assert editor.isVisible()
+    assert editor.buttons.isEnabled() is False
+
+    editor.finish_save(True)
+
+    assert editor.isVisible() is False
+
+
+def test_rule_editor_rejects_include_exclude_overlap(qtbot) -> None:
+    editor = SubscriptionEditorDialog([dialog()])
+    qtbot.addWidget(editor)
+    editor.show()
+    editor.include_input.setPlainText("AI")
+    editor.exclude_input.setPlainText(" ai ")
+
+    qtbot.mouseClick(
+        editor.buttons.button(QDialogButtonBox.StandardButton.Save),
+        Qt.MouseButton.LeftButton,
+    )
+
+    assert editor.isVisible()
+    assert "不能同时" in editor.error_label.text()
+    assert editor.buttons.isEnabled()
+
+
+def test_rule_editor_prefills_advanced_rule(qtbot) -> None:
+    advanced = replace(
+        rule(),
+        criteria=SubscriptionCriteria(
+            ("AI", "模型"),
+            ("广告",),
+            SubscriptionMatchMode.ALL,
+        ),
+        history_days=30,
+    )
+
+    editor = SubscriptionEditorDialog([dialog()], advanced)
+    qtbot.addWidget(editor)
+
+    assert editor.include_input.toPlainText() == "AI\n模型"
+    assert editor.exclude_input.toPlainText() == "广告"
+    assert editor.match_mode_combo.currentData() == SubscriptionMatchMode.ALL.value
+    assert editor.history_combo.currentData() == 30
+    assert "最近 30 天" in editor.baseline_label.text()
+
+
+def test_page_failed_save_keeps_editor_and_success_closes_it(qtbot) -> None:
+    page = SubscriptionPage()
+    qtbot.addWidget(page)
+    page.set_logged_in(True)
+    page.set_dialogs([dialog()])
+    page.show()
+
+    qtbot.mouseClick(page.new_button, Qt.MouseButton.LeftButton)
+    editor = next(iter(page._editors))
+    editor.include_input.setPlainText("AI")
+    save = editor.buttons.button(QDialogButtonBox.StandardButton.Save)
+
+    with qtbot.waitSignal(page.create_requested, timeout=500):
+        qtbot.mouseClick(save, Qt.MouseButton.LeftButton)
+    assert editor.isVisible()
+    assert editor.buttons.isEnabled() is False
+
+    page.finish_editor_save(False, "网络暂不可用")
+    assert editor.isVisible()
+    assert editor.include_input.toPlainText() == "AI"
+    assert editor.buttons.isEnabled()
+    assert "网络暂不可用" in editor.error_label.text()
+
+    with qtbot.waitSignal(page.create_requested, timeout=500):
+        qtbot.mouseClick(save, Qt.MouseButton.LeftButton)
+    page.finish_editor_save(True)
+    assert editor.isVisible() is False
 
 
 def test_page_emits_run_pause_resume_and_tracks_busy_progress(qtbot) -> None:
@@ -267,25 +359,32 @@ def test_page_create_edit_and_confirmed_delete_emit_complete_payloads(
 
     qtbot.mouseClick(page.new_button, Qt.MouseButton.LeftButton)
     create_editor = next(iter(page._editors))
-    create_editor.keyword_input.setText("写真")
+    create_editor.include_input.setPlainText("写真\n高清")
+    create_editor.exclude_input.setPlainText("广告")
+    create_editor.history_combo.setCurrentIndex(create_editor.history_combo.findData(3))
     with qtbot.waitSignal(page.create_requested, timeout=500) as created:
         qtbot.mouseClick(
             create_editor.buttons.button(QDialogButtonBox.StandardButton.Save),
             Qt.MouseButton.LeftButton,
         )
-    assert created.args[0].keyword == "写真"
+    assert created.args[0].criteria.include_keywords == ("写真", "高清")
+    assert created.args[0].criteria.exclude_keywords == ("广告",)
+    assert created.args[0].history_days == 3
+    page.finish_editor_save(True)
 
     page.set_rule_busy(None, False)
     qtbot.mouseClick(page.edit_button, Qt.MouseButton.LeftButton)
     edit_editor = next(iter(page._editors))
-    edit_editor.keyword_input.setText("视频")
+    assert edit_editor.include_input.toPlainText() == "美女"
+    edit_editor.include_input.setPlainText("视频")
     with qtbot.waitSignal(page.update_requested, timeout=500) as updated:
         qtbot.mouseClick(
             edit_editor.buttons.button(QDialogButtonBox.StandardButton.Save),
             Qt.MouseButton.LeftButton,
         )
     assert updated.args[0] == "rule-1"
-    assert updated.args[1].keyword == "视频"
+    assert updated.args[1].criteria.include_keywords == ("视频",)
+    page.finish_editor_save(True)
 
     page.set_rule_busy(None, False)
     monkeypatch.setattr(
@@ -328,12 +427,10 @@ def test_probe_progress_shows_counts_and_cancel(qtbot) -> None:
     page.show()
     qtbot.waitExposed(page)
     page.set_probe_busy("rule-1", True)
-    page.set_probe_progress(
-        SubscriptionProbeProgress("rule-1", 12, 3, 2, "正在筛选")
-    )
+    page.set_probe_progress(SubscriptionProbeProgress("rule-1", 12, 3, 2, "正在筛选"))
 
     assert "已扫描 12" in page.probe_progress_label.text()
-    assert "关键词 3" in page.probe_progress_label.text()
+    assert "规则命中 3" in page.probe_progress_label.text()
     assert page.probe_cancel_button.isVisible()
     with qtbot.waitSignal(page.probe_cancel_requested, timeout=500):
         qtbot.mouseClick(page.probe_cancel_button, Qt.MouseButton.LeftButton)

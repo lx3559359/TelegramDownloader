@@ -11,10 +11,7 @@ def test_self_test_reports_only_paths_under_root(tmp_path: Path) -> None:
     assert report["ok"] is True
     assert report["version"] == __version__
     root = tmp_path.resolve()
-    assert all(
-        Path(value).is_relative_to(root)
-        for value in report["writable_paths"].values()
-    )
+    assert all(Path(value).is_relative_to(root) for value in report["writable_paths"].values())
     report_path = tmp_path / "data" / "logs" / "self-test.json"
     disk_report = json.loads(report_path.read_text(encoding="utf-8"))
     assert disk_report == report
@@ -23,7 +20,7 @@ def test_self_test_reports_only_paths_under_root(tmp_path: Path) -> None:
 def test_self_test_includes_update_storage_and_database(tmp_path: Path) -> None:
     report = run_self_test(tmp_path)
 
-    assert report["catalog_schema_version"] == 4
+    assert report["catalog_schema_version"] == 5
     assert "update_staging" in report["writable_paths"]
     assert "catalog_database" in report["writable_paths"]
     assert "thumbnail_cache" in report["writable_paths"]

@@ -2,8 +2,10 @@ import json
 
 import pytest
 
+from telegram_downloader.files import DownloadNamingSettings
 from telegram_downloader.settings import (
     AppSettings,
+    DownloadScheduleSettings,
     ProxySettings,
     SettingsError,
     SettingsStore,
@@ -28,6 +30,79 @@ def test_settings_round_trip_is_atomic(tmp_path) -> None:
 
 def test_missing_settings_use_safe_defaults(tmp_path) -> None:
     assert SettingsStore(tmp_path / "missing.json").load() == AppSettings()
+
+
+def test_background_settings_have_safe_compatible_defaults(tmp_path) -> None:
+    loaded = SettingsStore(tmp_path / "missing.json").load()
+
+    assert loaded.close_to_tray is True
+    assert loaded.notifications_enabled is True
+    assert loaded.autostart_enabled is False
+    assert loaded.tray_hint_shown is False
+    assert loaded.download_schedule == DownloadScheduleSettings()
+    assert loaded.download_naming == DownloadNamingSettings()
+
+
+def test_download_naming_settings_round_trip_as_nested_json(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    store = SettingsStore(path)
+    naming = DownloadNamingSettings(
+        "{year}/{month}/{source}/{media_type}",
+        "{stem}_{message_id}{extension}",
+    )
+    settings = AppSettings(download_naming=naming)
+
+    store.save(settings)
+
+    assert store.load() == settings
+    assert json.loads(path.read_text(encoding="utf-8"))["download_naming"] == {
+        "directory_template": "{year}/{month}/{source}/{media_type}",
+        "filename_template": "{stem}_{message_id}{extension}",
+    }
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"weekdays": []},
+        {"weekdays": None},
+        {"weekdays": [0, 7]},
+        {"start_minute": -1},
+        {"end_minute": 1440},
+    ],
+)
+def test_download_schedule_rejects_invalid_values(value) -> None:
+    with pytest.raises(SettingsError):
+        DownloadScheduleSettings(**value)
+
+
+def test_old_settings_json_loads_with_new_defaults(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text('{"api_id":123,"concurrency":3}', encoding="utf-8")
+
+    loaded = SettingsStore(path).load()
+
+    assert loaded.api_id == 123
+    assert loaded.download_schedule.enabled is False
+    assert loaded.download_naming == DownloadNamingSettings()
+
+
+def test_invalid_download_naming_json_is_rejected(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "download_naming": {
+                    "directory_template": "../{source}",
+                    "filename_template": "{original_name}",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SettingsError, match="目录模板"):
+        SettingsStore(path).load()
 
 
 def test_old_settings_default_to_unlimited_speed(tmp_path) -> None:

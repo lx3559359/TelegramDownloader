@@ -14,6 +14,7 @@ from telegram_downloader.domain import (
     ItemStatus,
     MediaItem,
     MediaKind,
+    PauseReason,
     ScanFilters,
     SourceKind,
     TaskRecord,
@@ -37,7 +38,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     last_error TEXT,
     display_title TEXT,
     archived_at TEXT,
-    queue_priority INTEGER NOT NULL DEFAULT 0
+    queue_priority INTEGER NOT NULL DEFAULT 0,
+    pause_reason TEXT
 );
 CREATE TABLE IF NOT EXISTS media_items (
     id TEXT PRIMARY KEY,
@@ -66,7 +68,8 @@ CREATE INDEX IF NOT EXISTS idx_items_task_status ON media_items(task_id, status)
 _TASK_COLUMNS = """
 id, source_kind, source_ref, source_title, source_url,
 date_from_utc, date_to_utc, media_kinds, item_limit, status,
-created_at, updated_at, last_error, display_title, archived_at, queue_priority
+created_at, updated_at, last_error, display_title, archived_at, queue_priority,
+pause_reason
 """
 
 _QUALIFIED_TASK_COLUMNS = """
@@ -76,7 +79,8 @@ t.date_from_utc AS date_from_utc, t.date_to_utc AS date_to_utc,
 t.media_kinds AS media_kinds, t.item_limit AS item_limit,
 t.status AS status, t.created_at AS created_at, t.updated_at AS updated_at,
 t.last_error AS last_error, t.display_title AS display_title,
-t.archived_at AS archived_at, t.queue_priority AS queue_priority
+t.archived_at AS archived_at, t.queue_priority AS queue_priority,
+t.pause_reason AS pause_reason
 """
 
 _ITEM_COLUMNS = """
@@ -146,6 +150,12 @@ class TaskRepository:
                 connection.execute(
                     "ALTER TABLE tasks ADD COLUMN queue_priority "
                     "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "pause_reason" not in columns:
+                connection.execute("ALTER TABLE tasks ADD COLUMN pause_reason TEXT")
+                connection.execute(
+                    "UPDATE tasks SET pause_reason = ? WHERE status = ?",
+                    (PauseReason.USER.value, TaskStatus.PAUSED.value),
                 )
             item_columns = {
                 str(row[1])
@@ -287,6 +297,16 @@ class TaskRepository:
                 "WHERE status = ? AND archived_at IS NULL "
                 "ORDER BY queue_priority DESC, created_at ASC, id ASC",
                 (TaskStatus.QUEUED.value,),
+            ).fetchall()
+        return [self._task_from_row(row) for row in rows]
+
+    def list_paused_by_reason(self, reason: PauseReason) -> list[TaskRecord]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT {_TASK_COLUMNS} FROM tasks "
+                "WHERE status = ? AND pause_reason = ? AND archived_at IS NULL "
+                "ORDER BY created_at, id",
+                (TaskStatus.PAUSED.value, reason.value),
             ).fetchall()
         return [self._task_from_row(row) for row in rows]
 
@@ -441,12 +461,21 @@ class TaskRepository:
         task_id: str,
         status: TaskStatus,
         error: str | None = None,
+        *,
+        pause_reason: PauseReason | None = None,
     ) -> None:
         now = datetime.now(UTC).isoformat()
         with self._connection() as connection:
             cursor = connection.execute(
-                "UPDATE tasks SET status = ?, updated_at = ?, last_error = ? WHERE id = ?",
-                (status.value, now, error, task_id),
+                "UPDATE tasks SET status = ?, updated_at = ?, last_error = ?, "
+                "pause_reason = ? WHERE id = ?",
+                (
+                    status.value,
+                    now,
+                    error,
+                    self._pause_value(status, pause_reason),
+                    task_id,
+                ),
             )
             if cursor.rowcount != 1:
                 raise KeyError(task_id)
@@ -458,6 +487,7 @@ class TaskRepository:
         *,
         allowed: set[TaskStatus],
         error: str | None = None,
+        pause_reason: PauseReason | None = None,
     ) -> set[str]:
         ids = tuple(dict.fromkeys(task_ids))
         if not ids or not allowed:
@@ -477,9 +507,15 @@ class TaskRepository:
                 ordered = tuple(sorted(accepted))
                 marks = ",".join("?" for _ in ordered)
                 connection.execute(
-                    f"UPDATE tasks SET status=?, updated_at=?, last_error=? "
+                    f"UPDATE tasks SET status=?, updated_at=?, last_error=?, pause_reason=? "
                     f"WHERE id IN ({marks})",
-                    (status.value, now, error, *ordered),
+                    (
+                        status.value,
+                        now,
+                        error,
+                        self._pause_value(status, pause_reason),
+                        *ordered,
+                    ),
                 )
         return accepted
 
@@ -605,7 +641,8 @@ class TaskRepository:
                 ),
             )
             connection.execute(
-                "UPDATE tasks SET status = ?, updated_at = ?, last_error = ? "
+                "UPDATE tasks SET status = ?, updated_at = ?, last_error = ?, "
+                "pause_reason = NULL "
                 "WHERE id = ?",
                 (
                     TaskStatus.PARTIAL_FAILURE.value,
@@ -656,7 +693,7 @@ class TaskRepository:
         item_states = (ItemStatus.DOWNLOADING.value, ItemStatus.WAITING_RETRY.value)
         with self._connection() as connection:
             connection.execute(
-                "UPDATE tasks SET status = ?, updated_at = ? "
+                "UPDATE tasks SET status = ?, updated_at = ?, pause_reason = NULL "
                 "WHERE status IN (?, ?, ?)",
                 (TaskStatus.QUEUED.value, now, *task_states),
             )
@@ -669,7 +706,7 @@ class TaskRepository:
     def _insert_task(connection: sqlite3.Connection, task: TaskRecord) -> None:
         connection.execute(
             f"INSERT INTO tasks ({_TASK_COLUMNS}) "
-            f"VALUES ({','.join('?' for _ in range(16))})",
+            f"VALUES ({','.join('?' for _ in range(17))})",
             TaskRepository._task_values(task),
         )
 
@@ -725,6 +762,7 @@ class TaskRepository:
             task.display_title,
             task.archived_at.isoformat() if task.archived_at is not None else None,
             task.queue_priority,
+            TaskRepository._pause_value(task.status, task.pause_reason),
         )
 
     @staticmethod
@@ -756,7 +794,21 @@ class TaskRepository:
                 else None
             ),
             int(row["queue_priority"]),
+            (
+                PauseReason(row["pause_reason"])
+                if row["pause_reason"] is not None
+                else None
+            ),
         )
+
+    @staticmethod
+    def _pause_value(
+        status: TaskStatus,
+        pause_reason: PauseReason | None,
+    ) -> str | None:
+        if status is not TaskStatus.PAUSED:
+            return None
+        return (pause_reason or PauseReason.USER).value
 
     @staticmethod
     def _snapshot_from_row(row: sqlite3.Row) -> TaskSnapshot:
@@ -828,13 +880,15 @@ class TaskRepository:
         now = datetime.now(UTC).isoformat()
         if status is TaskStatus.PARTIAL_FAILURE:
             connection.execute(
-                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                "UPDATE tasks SET status = ?, updated_at = ?, pause_reason = NULL "
+                "WHERE id = ?",
                 (status.value, now, task_id),
             )
         else:
+            pause_reason = TaskRepository._pause_value(status, None)
             connection.execute(
-                "UPDATE tasks SET status = ?, updated_at = ?, last_error = NULL "
-                "WHERE id = ?",
-                (status.value, now, task_id),
+                "UPDATE tasks SET status = ?, updated_at = ?, last_error = NULL, "
+                "pause_reason = ? WHERE id = ?",
+                (status.value, now, pause_reason, task_id),
             )
         return status

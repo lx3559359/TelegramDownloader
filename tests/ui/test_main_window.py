@@ -208,7 +208,7 @@ def test_scheduler_summary_formats_active_and_idle_resources(qtbot) -> None:
     )
     assert (
         window.scheduler_summary.text()
-        == "调度：1 个下载中 · 3 个等待 · 文件并发 3 · 不限速"
+        == "调度：1 个活动任务 · 3 个等待 · 全局媒体槽 3 · 不限速"
     )
 
     window.set_scheduler_summary(
@@ -217,7 +217,7 @@ def test_scheduler_summary_formats_active_and_idle_resources(qtbot) -> None:
         concurrency=3,
         speed_limit_kib=2048,
     )
-    assert window.scheduler_summary.text() == "调度：空闲 · 文件并发 3 · 限速 2.0 MB/s"
+    assert window.scheduler_summary.text() == "调度：空闲 · 全局媒体槽 3 · 限速 2.0 MB/s"
 
 
 @pytest.mark.parametrize(

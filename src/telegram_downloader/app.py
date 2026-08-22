@@ -2,17 +2,33 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import json
+import logging
 import os
 import platform
 import sys
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from dataclasses import replace
 from datetime import UTC, datetime
+from math import ceil
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 from telegram_downloader import __version__
+from telegram_downloader.activation import (
+    ACTIVATION_CHANNEL,
+    LocalActivationServer,
+    request_activation,
+)
+from telegram_downloader.autostart import CurrentUserAutostart, WindowsCurrentUserRegistry
+from telegram_downloader.background import (
+    BackgroundModeController,
+    QtTrayAdapter,
+    QtWindowPort,
+)
 from telegram_downloader.catalog import CatalogRepository
 from telegram_downloader.content import ContentSearchQuery, SearchScope
 from telegram_downloader.content_browser import ContentBrowserService
@@ -32,15 +48,27 @@ from telegram_downloader.diagnostic_probes import (
 )
 from telegram_downloader.diagnostic_store import DiagnosticReportStore
 from telegram_downloader.diagnostics import DiagnosticResult, DiagnosticsService
+from telegram_downloader.domain import TaskStatus
+from telegram_downloader.download_schedule import (
+    DownloadScheduleController,
+    evaluate_download_schedule,
+)
 from telegram_downloader.downloader import MediaDownloader
 from telegram_downloader.file_integrity import FileIntegrityService
 from telegram_downloader.gateway import SessionExpiredError, TelethonGateway
 from telegram_downloader.instance_guard import WindowsInstanceGuard
 from telegram_downloader.logging import configure_logging
+from telegram_downloader.notifications import (
+    ApplicationEvent,
+    NotificationBatcher,
+    NotificationRoute,
+    update_available_event,
+)
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.planner import ScanPreview, TaskPlanner
 from telegram_downloader.repository import TaskRepository
 from telegram_downloader.resource_control import AsyncBandwidthLimiter
+from telegram_downloader.runtime_settings import RuntimeSettingsCoordinator
 from telegram_downloader.scheduler import DownloadScheduler
 from telegram_downloader.security import SecretsError, SecretsVault
 from telegram_downloader.settings import AppSettings, SettingsError, SettingsStore
@@ -50,6 +78,29 @@ from telegram_downloader.thumbnail_cache import ThumbnailCache
 from telegram_downloader.update import HttpBytesClient, UpdateCoordinator
 from telegram_downloader.update_contract import load_trusted_keys
 from telegram_downloader.update_download import ResumableUpdateDownloader
+
+_LOGGER = logging.getLogger("telegram_downloader.app")
+
+
+class BackgroundUpdatePrompt:
+    def __init__(
+        self,
+        *,
+        window_visible: Callable[[], bool],
+        show_dialog: Callable[[object], bool | Awaitable[bool]],
+        publish: Callable[[ApplicationEvent], None],
+    ) -> None:
+        self.window_visible = window_visible
+        self.show_dialog = show_dialog
+        self.publish = publish
+
+    async def __call__(self, manifest: object) -> bool:
+        if not self.window_visible():
+            version = str(getattr(manifest, "version", "unknown"))
+            self.publish(update_available_event(version))
+            return False
+        decision = self.show_dialog(manifest)
+        return bool(await decision if inspect.isawaitable(decision) else decision)
 
 
 class _FunctionDiagnosticProbe:
@@ -92,9 +143,16 @@ async def _telegram_health(controller: AppController) -> DiagnosticResult:
 
 
 class _GracefulShutdown:
-    def __init__(self, controller: Any, quit_application: Callable[[], None]) -> None:
+    def __init__(
+        self,
+        controller: Any,
+        quit_application: Callable[[], None],
+        *,
+        before_controller_shutdown: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         self.controller = controller
         self.quit_application = quit_application
+        self.before_controller_shutdown = before_controller_shutdown
         self.task: asyncio.Task[None] | None = None
         self.completed = False
 
@@ -112,31 +170,62 @@ class _GracefulShutdown:
             async_actions = getattr(self.controller, "_async_actions", None)
             if async_actions is not None:
                 await async_actions.shutdown()
+            if self.before_controller_shutdown is not None:
+                await self.before_controller_shutdown()
             await self.controller.shutdown()
         finally:
             self.completed = True
             self.quit_application()
 
 
-def _install_graceful_shutdown(application: Any, controller: Any):
+def _install_graceful_shutdown(
+    application: Any,
+    controller: Any,
+    background: BackgroundModeController,
+    *,
+    shutdown: _GracefulShutdown | None = None,
+):
     from PySide6.QtCore import QEvent, QObject
 
-    shutdown = _GracefulShutdown(controller, application.quit)
+    shutdown = shutdown or _GracefulShutdown(controller, application.quit)
 
     class WindowCloseFilter(QObject):
         def eventFilter(self, watched, event):
             if event.type() == QEvent.Type.Close and not shutdown.completed:
                 event.ignore()
-                watched.hide()
-                shutdown.request()
+                background.handle_window_close()
                 return True
             return super().eventFilter(watched, event)
 
     close_filter = WindowCloseFilter(controller.window)
     controller.window.installEventFilter(close_filter)
     application.setQuitOnLastWindowClosed(False)
-    controller.update_shutdown = shutdown.request
+    controller.update_shutdown = background.request_exit
     return shutdown, close_filter
+
+
+def _install_session_shutdown(
+    application: Any,
+    background: BackgroundModeController,
+) -> Callable[[object], None]:
+    def commit_data_requested(_manager: object) -> None:
+        background.request_exit()
+
+    application.commitDataRequest.connect(commit_data_requested)
+    return commit_data_requested
+
+
+def _show_initial_window(
+    controller: Any,
+    *,
+    background: bool,
+    tray_available: bool,
+) -> None:
+    if background and tray_available:
+        return
+    controller.window.show()
+    if background:
+        controller._show_status("系统托盘不可用，已显示主窗口")
 
 
 def run_self_test(root: Path) -> dict[str, object]:
@@ -204,6 +293,26 @@ def _standard_button_selected(answer: object, expected: object) -> bool:
     return answer == expected
 
 
+def _download_confirmation_text(preview: object) -> str:
+    known = AppController._format_bytes(int(getattr(preview, "known_bytes", 0)))
+    unknown_count = int(getattr(preview, "unknown_size_count", 0))
+    unknown = f"，另有 {unknown_count} 项大小未知" if unknown_count else ""
+    if hasattr(preview, "unique_link_count"):
+        return (
+            f"输入 {preview.input_count} 条 · 有效唯一 {preview.unique_link_count} 条 · "
+            f"无效 {preview.invalid_link_count} 条 · 输入重复 {preview.duplicate_link_count} 条\n"
+            f"扫描媒体 {preview.scanned_media_count} 项 · "
+            f"跨链接重复 {preview.internal_duplicate_count} 项 · "
+            f"队列既有 {preview.existing_media_count} 项\n"
+            f"最终新增 {len(preview.items)} 项，已知大小 {known}{unknown}。"
+            "\n\n创建一个批量下载任务？"
+        )
+    return (
+        f"扫描到 {len(preview.items)} 项媒体，已知大小 {known}{unknown}。"
+        "\n\n加入下载队列？"
+    )
+
+
 def _startup_status(indicator: object | None, text: str) -> None:
     method = getattr(indicator, "set_status", None)
     if not callable(method):
@@ -228,7 +337,11 @@ def _startup_close(indicator: object | None) -> None:
         method()
 
 
-def create_application(root: Path):
+def create_application(
+    root: Path,
+    *,
+    publish_event: Callable[[ApplicationEvent], None] | None = None,
+):
     import qasync
     from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -242,6 +355,7 @@ def create_application(root: Path):
     from telegram_downloader.ui.update_dialog import UpdateDialog
 
     paths = PortablePaths(root)
+    publish_event = publish_event or (lambda _event: None)
     paths.ensure_layout()
     application = QApplication.instance() or QApplication(sys.argv[:1])
     application.setApplicationName("TelegramDownloader")
@@ -292,7 +406,12 @@ def create_application(root: Path):
         return TelethonGateway(api_id, api_hash, session, proxy, proxy_password)
 
     def build_services(gateway: TelethonGateway, resource_settings: AppSettings):
-        planner = TaskPlanner(gateway, repository, paths.downloads)
+        planner = TaskPlanner(
+            gateway,
+            repository,
+            paths.downloads,
+            naming=resource_settings.download_naming,
+        )
         bandwidth = AsyncBandwidthLimiter(resource_settings.speed_limit_kib)
         downloader = MediaDownloader(gateway, repository, paths, bandwidth=bandwidth)
         scheduler = DownloadScheduler(
@@ -300,7 +419,13 @@ def create_application(root: Path):
             downloader,
             concurrency=resource_settings.concurrency,
             bandwidth=bandwidth,
+            publish=publish_event,
         )
+        schedule_state = evaluate_download_schedule(
+            resource_settings.download_schedule,
+            datetime.now().astimezone(),
+        )
+        scheduler.set_admission_open(schedule_state.allowed)
         content_browser.bind_online(gateway, planner)
         subscriptions.bind_online(gateway, planner)
         return planner, scheduler, content_browser
@@ -323,15 +448,9 @@ def create_application(root: Path):
         )
 
     async def confirm_preview(preview: ScanPreview) -> bool:
-        known = AppController._format_bytes(preview.known_bytes)
-        unknown = (
-            f"，另有 {preview.unknown_size_count} 项大小未知" if preview.unknown_size_count else ""
-        )
         dialog = QMessageBox(window)
         dialog.setWindowTitle("确认下载任务")
-        dialog.setText(
-            f"扫描到 {len(preview.items)} 项媒体，已知大小 {known}{unknown}。\n\n加入下载队列？"
-        )
+        dialog.setText(_download_confirmation_text(preview))
         dialog.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         dialog.setDefaultButton(QMessageBox.StandardButton.Yes)
         loop = asyncio.get_running_loop()
@@ -366,8 +485,32 @@ def create_application(root: Path):
     )
     diagnostic_store = DiagnosticReportStore(paths, secrets=set(secrets.values()))
 
-    def confirm_update(manifest) -> bool:
-        return UpdateDialog(manifest, window).exec() == UpdateDialog.DialogCode.Accepted
+    async def confirm_update(manifest) -> bool:
+        dialog = UpdateDialog(manifest, window)
+        loop = asyncio.get_running_loop()
+        finished: asyncio.Future[bool] = loop.create_future()
+
+        def resolve(answer: int) -> None:
+            if not finished.done():
+                finished.set_result(
+                    answer == UpdateDialog.DialogCode.Accepted.value
+                )
+
+        dialog.finished.connect(resolve)
+        dialog.open()
+        try:
+            return await finished
+        except asyncio.CancelledError:
+            dialog.reject()
+            raise
+        finally:
+            dialog.deleteLater()
+
+    update_prompt = BackgroundUpdatePrompt(
+        window_visible=window.isVisible,
+        show_dialog=confirm_update,
+        publish=publish_event,
+    )
 
     controller_ref: dict[str, AppController] = {}
 
@@ -484,6 +627,7 @@ def create_application(root: Path):
         ),
         on_progress=window.subscriptions_page.set_progress,
         on_session_expired=subscription_session_expired,
+        publish=publish_event,
     )
 
     controller = AppController(
@@ -506,8 +650,9 @@ def create_application(root: Path):
         service_builder=build_services,
         confirm_preview=confirm_preview,
         update_coordinator=update_coordinator,
-        update_prompt=confirm_update,
+        update_prompt=update_prompt,
         update_shutdown=application.quit,
+        publish=publish_event,
         settings=settings,
         secrets=secrets,
     )
@@ -526,6 +671,19 @@ def create_application(root: Path):
             local_timezone,
         )
         await controller.scan_link(link, filters)
+
+    @qasync.asyncSlot(object)
+    async def batch_scan_requested(value: object) -> None:
+        links = tuple(str(item) for item in value) if isinstance(value, (list, tuple)) else ()
+        local_timezone = datetime_now_timezone()
+        filters = AppController.filters_from_dates(
+            window.date_from.date().toPython(),
+            window.date_to.date().toPython(),
+            window.selected_media_kinds(),
+            window.limit_input.value(),
+            local_timezone,
+        )
+        await controller.scan_links(links, filters)
 
     @qasync.asyncSlot(int, str, object, str)
     async def credentials_submitted(
@@ -673,6 +831,10 @@ def create_application(root: Path):
             controller.secrets.get("proxy_password", ""),
             window,
             thumbnail_cache_bytes=thumbnail_cache_bytes,
+            autostart_available=bool(
+                getattr(controller.runtime_settings_effects, "autostart_available", False)
+            ),
+            tray_available=bool(getattr(controller, "tray_available", False)),
         )
         controller._settings_dialog = dialog
 
@@ -701,11 +863,12 @@ def create_application(root: Path):
             ),
         )
         async_actions.connect(
-            dialog.accepted,
+            dialog.save_requested,
             "settings.save",
             save_settings,
             hooks=ActionHooks(
                 started=lambda: dialog.set_save_busy(True),
+                succeeded=dialog.accept,
                 failed=lambda error: dialog._show_error(controller._safe_error(error)),
                 finished=lambda: dialog.set_save_busy(False),
             ),
@@ -716,6 +879,7 @@ def create_application(root: Path):
         dialog.open()
 
     window.scan_requested.connect(scan_requested)
+    window.batch_scan_requested.connect(batch_scan_requested)
     window.task_selection_changed.connect(task_selection_changed)
     window.open_media_requested.connect(open_media_requested)
     window.integrity_cancel_requested.connect(integrity_cancel_requested)
@@ -966,6 +1130,7 @@ def create_application(root: Path):
     controller._ui_slots.extend(
         (
             scan_requested,
+            batch_scan_requested,
             credentials_submitted,
             phone_submitted,
             code_submitted,
@@ -1012,28 +1177,189 @@ def run(
     instance_guard: WindowsInstanceGuard | None = None,
     *,
     startup_indicator: object | None = None,
+    background: bool = False,
 ) -> int:
+    launch_in_background = bool(background)
     guard = instance_guard or WindowsInstanceGuard()
     if not guard.acquire():
-        guard.notify_already_running()
+        if not request_activation(ACTIVATION_CHANNEL, timeout_ms=1000):
+            guard.notify_already_running()
         _startup_close(startup_indicator)
         return 2
 
+    activation_server: LocalActivationServer | None = None
+    tray_adapter: QtTrayAdapter | None = None
+    notification_batcher = NotificationBatcher(window_seconds=5.0)
+    notification_arm: Callable[[], None] | None = None
+
+    def publish_event(event: ApplicationEvent) -> None:
+        if notification_batcher.record(event, now=monotonic()) and notification_arm:
+            notification_arm()
+
     try:
         _startup_status(startup_indicator, "正在准备本地数据…")
-        application, loop, controller = create_application(root)
+        application, loop, controller = create_application(
+            root,
+            publish_event=publish_event,
+        )
+
+        download_schedule = DownloadScheduleController(
+            lambda: controller.scheduler,
+            controller.settings.download_schedule,
+            publish=publish_event,
+        )
+        controller.download_schedule = download_schedule
+        graceful_shutdown = _GracefulShutdown(
+            controller,
+            application.quit,
+            before_controller_shutdown=download_schedule.shutdown,
+        )
+        window_port = QtWindowPort(
+            controller.window,
+            {
+                NotificationRoute.TASKS: lambda: controller.window.show_page("tasks"),
+                NotificationRoute.SUBSCRIPTIONS: lambda: controller.window.show_page(
+                    "subscriptions"
+                ),
+                NotificationRoute.LOGIN: controller.show_login,
+                NotificationRoute.UPDATE: controller.check_for_updates,
+            },
+        )
+        tray_adapter = QtTrayAdapter(controller.window)
+
+        def persist_tray_hint() -> None:
+            updated = replace(controller.settings, tray_hint_shown=True)
+            controller.settings_store.save(updated)
+            controller.settings = updated
+
+        background = BackgroundModeController(
+            window_port,
+            tray_adapter,
+            graceful_shutdown.request,
+            tray_hint_shown=controller.settings.tray_hint_shown,
+            persist_tray_hint=persist_tray_hint,
+        )
+        background.configure(
+            close_to_tray=controller.settings.close_to_tray,
+            notifications_enabled=controller.settings.notifications_enabled,
+        )
+        autostart = CurrentUserAutostart(
+            WindowsCurrentUserRegistry(),
+            Path(sys.executable),
+            frozen=bool(getattr(sys, "frozen", False)),
+        )
+        runtime_settings = RuntimeSettingsCoordinator(
+            controller.settings_store,
+            autostart,
+            background,
+            download_schedule,
+        )
+        controller.runtime_settings_effects = runtime_settings
+        controller.tray_available = tray_adapter.available
+        if controller.settings.autostart_enabled and autostart.available:
+            try:
+                autostart.reconcile(True)
+            except Exception:
+                _LOGGER.warning("无法校正开机启动配置")
+
+        from PySide6.QtCore import QTimer
+
+        notification_timer = QTimer(controller.window)
+        notification_timer.setSingleShot(True)
+
+        def arm_notification_timer() -> None:
+            deadline = notification_batcher.next_deadline
+            if deadline is None or notification_timer.isActive():
+                return
+            delay_ms = max(1, ceil((deadline - monotonic()) * 1000))
+            notification_timer.start(delay_ms)
+
+        def flush_notifications() -> None:
+            for payload in notification_batcher.flush_due(now=monotonic()):
+                background.show_notification(payload)
+            arm_notification_timer()
+
+        notification_timer.timeout.connect(flush_notifications)
+        notification_arm = arm_notification_timer
+        arm_notification_timer()
+        tray_adapter.show_requested.connect(background.show_window)
+        tray_adapter.hide_requested.connect(controller.window.hide)
+        tray_adapter.exit_requested.connect(background.request_exit)
+        tray_adapter.notification_activated.connect(background.show_window)
+
+        async def pause_all_downloads() -> None:
+            tasks = await asyncio.to_thread(controller.repository.list_tasks)
+            await controller.pause_tasks(
+                [
+                    task.id
+                    for task in tasks
+                    if task.status
+                    in {
+                        TaskStatus.QUEUED,
+                        TaskStatus.DOWNLOADING,
+                        TaskStatus.WAITING_RETRY,
+                    }
+                ]
+            )
+
+        async def resume_all_downloads() -> None:
+            tasks = await asyncio.to_thread(controller.repository.list_tasks)
+            await controller.resume_tasks(
+                [task.id for task in tasks if task.status is TaskStatus.PAUSED]
+            )
+
+        def open_downloads() -> None:
+            try:
+                downloads = controller.paths.guard(controller.paths.downloads)
+                downloads.mkdir(parents=True, exist_ok=True)
+                startfile = getattr(os, "startfile", None)
+                if startfile is not None:
+                    startfile(downloads)
+            except (OSError, ValueError):
+                controller._show_status("Windows 无法打开下载目录")
+
+        tray_adapter.pause_all_requested.connect(
+            lambda: controller._spawn_background(pause_all_downloads())
+        )
+        tray_adapter.resume_all_requested.connect(
+            lambda: controller._spawn_background(resume_all_downloads())
+        )
+        tray_adapter.subscriptions_requested.connect(
+            controller.subscription_scheduler.wake
+        )
+        tray_adapter.downloads_requested.connect(open_downloads)
+        tray_adapter.show()
+
+        def activate_main_window() -> None:
+            background.show_window()
+
+        activation_server = LocalActivationServer(
+            ACTIVATION_CHANNEL,
+            activate_main_window,
+        )
+        activation_server.start()
         graceful_shutdown, close_filter = _install_graceful_shutdown(
             application,
             controller,
+            background,
+            shutdown=graceful_shutdown,
         )
+        session_shutdown = _install_session_shutdown(application, background)
         application.aboutToQuit.connect(loop.stop)
         with loop:
 
             async def start_application() -> None:
                 _startup_status(startup_indicator, "正在恢复任务与账号…")
-                controller.window.show()
+                _show_initial_window(
+                    controller,
+                    background=launch_in_background,
+                    tray_available=tray_adapter.available,
+                )
                 _startup_finish(startup_indicator, controller.window)
-                await controller.start()
+                await download_schedule.start()
+                await controller.start(
+                    background=launch_in_background and tray_adapter.available
+                )
 
             startup_task = loop.create_task(start_application())
 
@@ -1052,7 +1378,12 @@ def run(
             if not startup_task.cancelled():
                 startup_task.result()
         del close_filter
+        del session_shutdown
         return 0
     finally:
+        if activation_server is not None:
+            activation_server.close()
+        if tray_adapter is not None:
+            tray_adapter.hide()
         _startup_close(startup_indicator)
         guard.release()

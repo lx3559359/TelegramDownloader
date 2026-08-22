@@ -16,9 +16,9 @@ def explain_run(run: SubscriptionRun) -> str:
     if run.inspected == 0:
         return "没有新消息"
     if run.keyword_hits == 0:
-        return f"扫描 {run.inspected} 条，新消息未命中关键词"
+        return f"扫描 {run.inspected} 条，新消息未命中规则"
     if run.matched == 0:
-        return f"命中 {run.keyword_hits} 条消息，但没有所选媒体类型"
+        return f"规则命中 {run.keyword_hits} 条消息，但没有所选媒体类型"
     if run.queued == 0 and run.duplicate == run.matched:
         return f"匹配 {run.matched} 项，均已在队列"
     if run.duplicate:
@@ -31,9 +31,9 @@ def explain_probe(report: SubscriptionProbeReport) -> str:
     if report.inspected == 0:
         return "最近消息范围内没有最近消息"
     if report.keyword_hits == 0:
-        return f"最近 {report.inspected} 条中未出现关键词"
+        return f"最近 {report.inspected} 条中未命中规则"
     if report.matched == 0:
-        return f"命中 {report.keyword_hits} 条消息，但没有所选媒体类型"
+        return f"规则命中 {report.keyword_hits} 条消息，但没有所选媒体类型"
     if report.duplicate == report.matched:
         return f"匹配 {report.matched} 项，均已在队列"
     available = report.matched - report.duplicate

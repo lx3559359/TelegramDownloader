@@ -159,26 +159,24 @@ async def test_real_queue_prioritizes_pauses_restarts_and_stays_portable(tmp_pat
         asyncio.create_task(scheduler.run_task(task.id))
         for task in (link_task, search_task, subscription_task)
     ]
-    await wait_until(lambda: scheduler.active_task_id == link_task.id)
-    assert scheduler.queue_positions() == {
-        search_task.id: 1,
-        subscription_task.id: 2,
-    }
+    await wait_until(
+        lambda: scheduler.active_task_ids == (link_task.id, search_task.id)
+    )
+    assert scheduler.queue_positions() == {subscription_task.id: 1}
     assert repository.prioritize_task(subscription_task.id) is True
     assert scheduler.prioritize_task(subscription_task.id) is True
-    assert scheduler.queue_positions() == {
-        subscription_task.id: 1,
-        search_task.id: 2,
-    }
+    assert scheduler.queue_positions() == {subscription_task.id: 1}
 
     gateway.release_all(101)
-    await wait_until(lambda: scheduler.active_task_id == subscription_task.id)
+    await wait_until(
+        lambda: scheduler.active_task_ids == (search_task.id, subscription_task.id)
+    )
     gateway.release(103, 0)
     part = subscription_item.target_path.with_suffix(".bin.part")
     await wait_until(lambda: (103, 0) in gateway.consumed)
     scheduler.pause_task(subscription_task.id)
     gateway.release(103, 1)
-    await wait_until(lambda: scheduler.active_task_id == search_task.id)
+    await wait_until(lambda: subscription_task.id not in scheduler.active_task_ids)
     assert part.read_bytes() == b"sub-"
     gateway.release_all(102)
     await asyncio.gather(*operations)
@@ -207,7 +205,7 @@ async def test_real_queue_prioritizes_pauses_restarts_and_stays_portable(tmp_pat
     await resumed
     await restarted_scheduler.shutdown()
 
-    assert gateway.started == [101, 103, 102, 103]
+    assert gateway.started == [101, 102, 103, 103]
     assert gateway.offsets[-1] == (103, len(b"sub-"))
     all_items = [
         restarted_repository.get_item(item.id)

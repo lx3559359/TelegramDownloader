@@ -14,6 +14,10 @@ from telegram_downloader.paths import PortablePaths
 from telegram_downloader.planner import TaskPlanner
 from telegram_downloader.repository import TaskRepository
 from telegram_downloader.scheduler import DownloadScheduler
+from telegram_downloader.subscription_matching import (
+    SubscriptionCriteria,
+    SubscriptionMatchMode,
+)
 from telegram_downloader.subscription_scheduler import SubscriptionScheduler
 from telegram_downloader.subscription_service import SubscriptionService
 from telegram_downloader.subscriptions import SubscriptionDraft
@@ -35,10 +39,19 @@ def ids(prefix: str):
 class Gateway:
     def __init__(self) -> None:
         self.latest_id = 10
+        self.boundary_id = 0
         self.messages: tuple[RemoteMessage, ...] = ()
+        self.incremental_calls: list[tuple[int, int, int]] = []
 
     async def latest_message_id(self, _peer_ref: str) -> int:
         return self.latest_id
+
+    async def message_id_before(
+        self,
+        _peer_ref: str,
+        _before_utc: datetime,
+    ) -> int:
+        return self.boundary_id
 
     async def incremental_messages(
         self,
@@ -48,11 +61,10 @@ class Gateway:
         through_id: int,
         limit: int,
     ) -> tuple[RemoteMessage, ...]:
-        return tuple(
-            item
-            for item in self.messages
-            if after_id < item.message_id <= through_id
-        )[:limit]
+        self.incremental_calls.append((after_id, through_id, limit))
+        return tuple(item for item in self.messages if after_id < item.message_id <= through_id)[
+            :limit
+        ]
 
     async def expand_album(self, *_args) -> tuple[object, ...]:
         return ()
@@ -131,7 +143,11 @@ async def test_project_local_subscription_to_completed_download_and_restart(
     service.set_account(profile)
 
     rule = await service.create_rule(
-        SubscriptionDraft("-1001", "测试关键词", frozenset({MediaKind.PHOTO}))
+        SubscriptionDraft(
+            "-1001",
+            SubscriptionCriteria(("测试关键词",)),
+            frozenset({MediaKind.PHOTO}),
+        )
     )
     assert rule.last_message_id == 10
     assert tasks.list_tasks() == []
@@ -183,3 +199,130 @@ async def test_project_local_subscription_to_completed_download_and_restart(
         *(item.target_path for item in items),
     ):
         assert path.resolve().is_relative_to(paths.root)
+
+
+@pytest.mark.asyncio
+async def test_advanced_rule_resumes_fixed_snapshot_catchup_after_restart(
+    tmp_path: Path,
+) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    catalog = CatalogRepository(paths.catalog_database)
+    catalog.initialize()
+    profile = AccountProfile("a1", "测试账号")
+    catalog.upsert_account(profile, NOW)
+    catalog.replace_dialogs(
+        "a1",
+        [
+            ContentDialog(
+                "a1",
+                "-1001",
+                "测试群",
+                "",
+                DialogKind.GROUP,
+                False,
+                True,
+                NOW,
+            )
+        ],
+        NOW,
+    )
+    tasks = TaskRepository(paths.database)
+    tasks.initialize()
+    gateway = Gateway()
+    gateway.latest_id = 1200
+    gateway.boundary_id = 0
+    planner = TaskPlanner(
+        gateway,
+        tasks,
+        paths.downloads,
+        uuid_factory=ids("task"),
+        clock=lambda: NOW,
+    )
+    service = SubscriptionService(
+        catalog,
+        uuid_factory=ids("subscription"),
+        clock=lambda: NOW,
+    )
+    service.bind_online(gateway, planner)
+    service.set_account(profile)
+    criteria = SubscriptionCriteria(
+        ("AI", "模型"),
+        ("广告",),
+        SubscriptionMatchMode.ALL,
+    )
+    saved = await service.create_rule(
+        SubscriptionDraft(
+            "-1001",
+            criteria,
+            frozenset({MediaKind.PHOTO}),
+            history_days=7,
+        )
+    )
+    gateway.latest_id = 1300
+    matching = {101, 502, 1100, 1250}
+    gateway.messages = tuple(
+        RemoteMessage(
+            message_id,
+            None,
+            NOW + timedelta(minutes=message_id),
+            (
+                "AI 模型 广告"
+                if message_id == 700
+                else "AI 模型"
+                if message_id in matching
+                else "普通消息"
+            ),
+            remote(message_id),
+        )
+        for message_id in range(1, 1301)
+    )
+
+    first = await service.run_rule(saved.id)
+    assert first.has_more is True
+    assert catalog.get_subscription("a1", saved.id).last_message_id == 500
+
+    reopened_catalog = CatalogRepository(paths.catalog_database)
+    reopened_catalog.initialize()
+    reopened_planner = TaskPlanner(
+        gateway,
+        tasks,
+        paths.downloads,
+        uuid_factory=ids("restart-task"),
+        clock=lambda: NOW,
+    )
+    reopened = SubscriptionService(
+        reopened_catalog,
+        uuid_factory=ids("restart-subscription"),
+        clock=lambda: NOW,
+    )
+    reopened.bind_online(gateway, reopened_planner)
+    reopened.set_account(profile)
+
+    restored = reopened.get_rule(saved.id)
+    assert restored.criteria == criteria
+    assert restored.backfill_through_id == 1200
+    second = await reopened.run_rule(saved.id)
+    third = await reopened.run_rule(saved.id)
+    completed = reopened.get_rule(saved.id)
+
+    assert gateway.incremental_calls[:3] == [
+        (0, 1200, 500),
+        (500, 1200, 500),
+        (1000, 1200, 500),
+    ]
+    assert second.has_more is True
+    assert third.has_more is False
+    assert completed.last_message_id == 1200
+    assert completed.backfill_from_utc is None
+    assert completed.backfill_through_id is None
+    caught_up_ids = {
+        item.message_id for task in tasks.list_tasks() for item in tasks.list_items(task.id)
+    }
+    assert caught_up_ids == {101, 502, 1100}
+
+    incremental = await reopened.run_rule(saved.id)
+    assert gateway.incremental_calls[-1] == (1200, 1300, 500)
+    assert incremental.has_more is False
+    all_ids = {item.message_id for task in tasks.list_tasks() for item in tasks.list_items(task.id)}
+    assert all_ids == {101, 502, 1100, 1250}

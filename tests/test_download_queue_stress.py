@@ -158,7 +158,7 @@ async def test_fifty_task_queue_survives_priority_duplicates_pauses_and_live_lim
     await asyncio.gather(*operations, *duplicates)
 
     assert started_tasks[1] == prioritized[-1]
-    assert max_active_tasks == 1
+    assert 2 <= max_active_tasks <= 5
     assert max_active_files == 5
     assert repository.get_task(task_ids[0]).status is TaskStatus.PAUSED
     assert repository.get_task(queued_paused).status is TaskStatus.PAUSED

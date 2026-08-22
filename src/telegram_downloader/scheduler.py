@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from telegram_downloader.domain import ItemStatus, MediaItem, TaskRecord, TaskStatus
+from telegram_downloader.domain import (
+    ItemStatus,
+    MediaItem,
+    PauseReason,
+    TaskRecord,
+    TaskStatus,
+)
 from telegram_downloader.downloader import (
     DownloadPaused,
     InsufficientSpaceError,
@@ -16,10 +23,18 @@ from telegram_downloader.gateway import (
     MediaReferenceExpired,
     TransientNetworkError,
 )
+from telegram_downloader.notifications import (
+    ApplicationEvent,
+    EventKind,
+    disk_full_event,
+    download_event,
+)
 from telegram_downloader.resource_control import (
     AdjustableConcurrencyLimiter,
     AsyncBandwidthLimiter,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,10 +49,18 @@ class RetryPolicy:
 
 @dataclass(frozen=True, slots=True)
 class SchedulerSnapshot:
-    active_task_id: str | None
+    active_task_ids: tuple[str, ...]
     queued_task_ids: tuple[str, ...]
     concurrency: int
     speed_limit_kib: int
+
+    @property
+    def active_task_id(self) -> str | None:
+        return self.active_task_ids[0] if self.active_task_ids else None
+
+    @property
+    def active_count(self) -> int:
+        return len(self.active_task_ids)
 
     @property
     def queued_count(self) -> int:
@@ -79,6 +102,8 @@ class SchedulerRepository(Protocol):
         task_id: str,
         status: TaskStatus,
         error: str | None = None,
+        *,
+        pause_reason: PauseReason | None = None,
     ) -> None: ...
 
     def update_task_statuses(
@@ -88,7 +113,10 @@ class SchedulerRepository(Protocol):
         *,
         allowed: set[TaskStatus],
         error: str | None = None,
+        pause_reason: PauseReason | None = None,
     ) -> set[str]: ...
+
+    def list_paused_by_reason(self, reason: PauseReason) -> list[TaskRecord]: ...
 
     def recover_interrupted(self) -> None: ...
 
@@ -113,6 +141,7 @@ class DownloadScheduler:
         sleep: Callable[[float], Awaitable[None]] | None = None,
         shutdown_grace_seconds: float = 30.0,
         bandwidth: AsyncBandwidthLimiter | None = None,
+        publish: Callable[[ApplicationEvent], None] | None = None,
     ) -> None:
         if shutdown_grace_seconds <= 0:
             raise ValueError("关闭等待时间必须大于零")
@@ -124,12 +153,18 @@ class DownloadScheduler:
         self._permits = AdjustableConcurrencyLimiter(min(5, max(1, concurrency)))
         downloader_bandwidth = getattr(downloader, "bandwidth", None)
         self._bandwidth = bandwidth or downloader_bandwidth or AsyncBandwidthLimiter()
+        self.publish = publish or (lambda _event: None)
         self._pause_flags: dict[str, asyncio.Event] = {}
+        self._pause_reasons: dict[str, PauseReason] = {}
+        self._disk_full_tasks: set[str] = set()
+        self._disk_notified: set[str] = set()
+        self._terminal_notified: set[str] = set()
         self._pending: list[_QueuedOperation] = []
         self._operations: dict[str, _QueuedOperation] = {}
-        self._active_operation: _QueuedOperation | None = None
+        self._active_operations: dict[str, _QueuedOperation] = {}
         self._sequence = 0
         self._shutting_down = False
+        self._admission_open = True
 
     @property
     def concurrency(self) -> int:
@@ -137,8 +172,32 @@ class DownloadScheduler:
 
     @property
     def active_task_id(self) -> str | None:
-        operation = self._active_operation
-        return operation.task_id if operation is not None else None
+        return self.active_task_ids[0] if self.active_task_ids else None
+
+    @property
+    def active_task_ids(self) -> tuple[str, ...]:
+        return tuple(
+            operation.task_id
+            for operation in sorted(
+                self._active_operations.values(),
+                key=lambda item: item.sequence,
+            )
+        )
+
+    def set_admission_open(self, opened: bool) -> None:
+        self._admission_open = bool(opened)
+        if self._admission_open:
+            self._admit_available()
+
+    async def set_schedule_open(self, opened: bool) -> set[str]:
+        self.set_admission_open(opened)
+        if not opened:
+            for task_id in self.active_task_ids:
+                self._pause_reasons.setdefault(task_id, PauseReason.SCHEDULE)
+                self._pause_flag(task_id).set()
+            return set()
+        tasks = self.repository.list_paused_by_reason(PauseReason.SCHEDULE)
+        return await self.resume_tasks([task.id for task in tasks])
 
     def recover(self) -> None:
         self.repository.recover_interrupted()
@@ -151,7 +210,9 @@ class DownloadScheduler:
         for task_id in ordered:
             self._pause_flag(task_id).set()
             operation = self._operations.get(task_id)
-            if operation is None or operation is self._active_operation:
+            if task_id in self._active_operations:
+                self._pause_reasons[task_id] = PauseReason.USER
+            if operation is None or task_id in self._active_operations:
                 continue
             if operation in self._pending:
                 self._pending.remove(operation)
@@ -166,6 +227,7 @@ class DownloadScheduler:
                 TaskStatus.DOWNLOADING,
                 TaskStatus.WAITING_RETRY,
             },
+            pause_reason=PauseReason.USER,
         )
 
     async def resume_task(self, task_id: str) -> None:
@@ -186,6 +248,7 @@ class DownloadScheduler:
         )
         scheduled = [task_id for task_id in ordered if task_id in accepted]
         for task_id in scheduled:
+            self._pause_reasons.pop(task_id, None)
             self._pause_flag(task_id).clear()
         if scheduled:
             await asyncio.gather(*(self.run_task(task_id) for task_id in scheduled))
@@ -228,7 +291,7 @@ class DownloadScheduler:
 
     def snapshot(self) -> SchedulerSnapshot:
         return SchedulerSnapshot(
-            self.active_task_id,
+            self.active_task_ids,
             tuple(operation.task_id for operation in self._sorted_pending()),
             self._permits.limit,
             self._bandwidth.speed_limit_kib,
@@ -241,13 +304,13 @@ class DownloadScheduler:
         }
 
     def is_active(self, task_id: str) -> bool:
-        return self.active_task_id == task_id
+        return task_id in self._active_operations
 
     def prioritize_task(self, task_id: str) -> bool:
         operation = self._operations.get(task_id)
         if (
             operation is None
-            or operation is self._active_operation
+            or task_id in self._active_operations
             or operation not in self._pending
         ):
             return False
@@ -258,6 +321,7 @@ class DownloadScheduler:
     def configure_resources(self, concurrency: int, speed_limit_kib: int) -> None:
         self._permits.set_limit(concurrency)
         self._bandwidth.set_speed_limit_kib(speed_limit_kib)
+        self._admit_available()
 
     async def shutdown(self) -> None:
         self._shutting_down = True
@@ -268,18 +332,23 @@ class DownloadScheduler:
             if not operation.completion.done():
                 operation.completion.set_result(None)
 
-        active = self._active_operation
-        if active is None or active.runner is None:
+        active = tuple(self._active_operations.values())
+        runners = tuple(
+            operation.runner for operation in active if operation.runner is not None
+        )
+        if not runners:
             return
-        self._pause_flag(active.task_id).set()
+        for operation in active:
+            self._pause_flag(operation.task_id).set()
         try:
             await asyncio.wait_for(
-                asyncio.gather(active.runner, return_exceptions=True),
+                asyncio.gather(*runners, return_exceptions=True),
                 timeout=self.shutdown_grace_seconds,
             )
         except TimeoutError:
-            active.runner.cancel()
-            await asyncio.gather(active.runner, return_exceptions=True)
+            for runner in runners:
+                runner.cancel()
+            await asyncio.gather(*runners, return_exceptions=True)
         await asyncio.sleep(0)
 
     async def _queue_operation(
@@ -299,36 +368,46 @@ class DownloadScheduler:
         self._operations[task_id] = operation
         self._pending.append(operation)
         self._pending.sort(key=self._operation_sort_key)
-        self._admit_next()
+        self._admit_available()
         await asyncio.shield(operation.completion)
 
-    def _admit_next(self) -> None:
-        if self._shutting_down or self._active_operation is not None or not self._pending:
-            return
-        self._pending.sort(key=self._operation_sort_key)
-        operation = self._pending.pop(0)
-        self._active_operation = operation
-        operation.runner = asyncio.create_task(self._perform(operation))
-        operation.runner.add_done_callback(
-            lambda runner, selected=operation: self._finish_operation(selected, runner)
-        )
+    def _admit_available(self) -> None:
+        while (
+            not self._shutting_down
+            and self._admission_open
+            and len(self._active_operations) < self._permits.limit
+            and self._pending
+        ):
+            self._pending.sort(key=self._operation_sort_key)
+            operation = self._pending.pop(0)
+            self._active_operations[operation.task_id] = operation
+            operation.runner = asyncio.create_task(self._perform(operation))
+            operation.runner.add_done_callback(
+                lambda runner, selected=operation: self._finish_operation(
+                    selected,
+                    runner,
+                )
+            )
 
     async def _perform(self, operation: _QueuedOperation) -> None:
         clear_priority = getattr(self.repository, "clear_task_priority", None)
         if clear_priority is not None:
             clear_priority(operation.task_id)
-        if operation.item_ids is None:
-            await self._execute_task(operation.task_id)
-        else:
-            await self._execute_items(operation.task_id, operation.item_ids)
+        try:
+            if operation.item_ids is None:
+                await self._execute_task(operation.task_id)
+            else:
+                await self._execute_items(operation.task_id, operation.item_ids)
+        finally:
+            self._pause_reasons.pop(operation.task_id, None)
 
     def _finish_operation(
         self,
         operation: _QueuedOperation,
         runner: asyncio.Task[None],
     ) -> None:
-        if self._active_operation is operation:
-            self._active_operation = None
+        if self._active_operations.get(operation.task_id) is operation:
+            self._active_operations.pop(operation.task_id, None)
         if self._operations.get(operation.task_id) is operation:
             self._operations.pop(operation.task_id, None)
 
@@ -345,7 +424,7 @@ class DownloadScheduler:
                 operation.completion.set_result(None)
             else:
                 operation.completion.set_exception(error)
-        self._admit_next()
+        self._admit_available()
 
     def _sorted_pending(self) -> list[_QueuedOperation]:
         return sorted(self._pending, key=self._operation_sort_key)
@@ -374,7 +453,13 @@ class DownloadScheduler:
             *(self._guarded_item(task_id, item, pause_flag) for item in items)
         )
         if any(status is ItemStatus.PAUSED for status in results):
-            self.repository.update_task_status(task_id, TaskStatus.PAUSED)
+            reason = self._pause_reasons.pop(task_id, PauseReason.USER)
+            self.repository.update_task_status(
+                task_id,
+                TaskStatus.PAUSED,
+                pause_reason=reason,
+            )
+            self._publish_disk_full(task_id)
         elif any(status is ItemStatus.FAILED for status in results):
             failed = self.repository.list_items(task_id, {ItemStatus.FAILED})
             reason = next(
@@ -386,8 +471,10 @@ class DownloadScheduler:
                 TaskStatus.PARTIAL_FAILURE,
                 reason,
             )
+            self._publish_terminal(EventKind.DOWNLOAD_FAILED, task_id)
         else:
             self.repository.update_task_status(task_id, TaskStatus.COMPLETED)
+            self._publish_terminal(EventKind.DOWNLOAD_COMPLETED, task_id)
 
     async def _execute_items(
         self,
@@ -403,10 +490,23 @@ class DownloadScheduler:
         pause_flag = self._pause_flag(task_id)
         pause_flag.clear()
         self.repository.update_task_status(task_id, TaskStatus.DOWNLOADING)
-        await asyncio.gather(
+        results = await asyncio.gather(
             *(self._guarded_item(task_id, item, pause_flag) for item in items)
         )
-        self.repository.recompute_task_status(task_id)
+        if any(status is ItemStatus.PAUSED for status in results):
+            reason = self._pause_reasons.pop(task_id, PauseReason.USER)
+            self.repository.update_task_status(
+                task_id,
+                TaskStatus.PAUSED,
+                pause_reason=reason,
+            )
+            self._publish_disk_full(task_id)
+        else:
+            terminal = self.repository.recompute_task_status(task_id)
+            if terminal is TaskStatus.COMPLETED:
+                self._publish_terminal(EventKind.DOWNLOAD_COMPLETED, task_id)
+            elif terminal is TaskStatus.PARTIAL_FAILURE:
+                self._publish_terminal(EventKind.DOWNLOAD_FAILED, task_id)
 
     async def _guarded_item(
         self,
@@ -414,8 +514,11 @@ class DownloadScheduler:
         item: MediaItem,
         pause_flag: asyncio.Event,
     ) -> ItemStatus:
-        async with self._permits:
+        await self._permits.acquire(task_id)
+        try:
             return await self._run_item(task_id, item, pause_flag)
+        finally:
+            self._permits.release()
 
     async def _run_item(
         self,
@@ -479,7 +582,17 @@ class DownloadScheduler:
                 await self.sleep(delay)
                 if not pause_flag.is_set() and not self._shutting_down:
                     self.repository.update_task_status(task_id, TaskStatus.DOWNLOADING)
-            except (DownloadPaused, InsufficientSpaceError) as error:
+            except InsufficientSpaceError as error:
+                self._pause_reasons[task_id] = PauseReason.USER
+                self._disk_full_tasks.add(task_id)
+                self._set_item_state(
+                    task_id,
+                    item.id,
+                    ItemStatus.PAUSED,
+                    error=str(error),
+                )
+                return ItemStatus.PAUSED
+            except DownloadPaused as error:
                 self._set_item_state(
                     task_id,
                     item.id,
@@ -520,3 +633,22 @@ class DownloadScheduler:
 
     def _pause_flag(self, task_id: str) -> asyncio.Event:
         return self._pause_flags.setdefault(task_id, asyncio.Event())
+
+    def _publish_terminal(self, kind: EventKind, task_id: str) -> None:
+        if task_id in self._terminal_notified:
+            return
+        self._terminal_notified.add(task_id)
+        self._publish(download_event(kind, task_id))
+
+    def _publish_disk_full(self, task_id: str) -> None:
+        if task_id not in self._disk_full_tasks or task_id in self._disk_notified:
+            return
+        self._disk_notified.add(task_id)
+        self._disk_full_tasks.discard(task_id)
+        self._publish(disk_full_event(task_id))
+
+    def _publish(self, event: ApplicationEvent) -> None:
+        try:
+            self.publish(event)
+        except Exception:
+            _LOGGER.error("notification event callback failed")

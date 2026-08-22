@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtWidgets import QMessageBox, QWidget
 
 from telegram_downloader import app
 from telegram_downloader.catalog import CatalogRepository
@@ -19,13 +19,16 @@ from telegram_downloader.content import (
 )
 from telegram_downloader.content_browser import ContentBrowserService
 from telegram_downloader.domain import MediaKind
+from telegram_downloader.download_schedule import DownloadScheduleController
 from telegram_downloader.file_integrity import FileIntegrityService
+from telegram_downloader.files import DownloadNamingSettings
 from telegram_downloader.gateway import (
     AuthorizationFailureReason,
     SessionExpiredError,
 )
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.settings import AppSettings
+from telegram_downloader.subscription_matching import SubscriptionCriteria
 from telegram_downloader.subscription_scheduler import SubscriptionScheduler
 from telegram_downloader.subscription_service import SubscriptionService
 from telegram_downloader.subscriptions import SubscriptionRule, SubscriptionState
@@ -85,6 +88,31 @@ def test_download_confirmation_is_nonblocking_and_awaitable(tmp_path) -> None:
         application.processEvents()
 
 
+def test_batch_download_confirmation_summarizes_preflight_duplicates() -> None:
+    preview = SimpleNamespace(
+        items=(1, 2, 3),
+        known_bytes=1024,
+        unknown_size_count=1,
+        input_count=5,
+        unique_link_count=3,
+        invalid_link_count=1,
+        duplicate_link_count=1,
+        scanned_media_count=8,
+        internal_duplicate_count=2,
+        existing_media_count=3,
+    )
+
+    text = app._download_confirmation_text(preview)
+
+    assert "输入 5 条" in text
+    assert "有效唯一 3 条" in text
+    assert "无效 1 条" in text
+    assert "输入重复 1 条" in text
+    assert "跨链接重复 2 项" in text
+    assert "队列既有 3 项" in text
+    assert "最终新增 3 项" in text
+
+
 def test_graceful_shutdown_cleans_async_work_before_quitting() -> None:
     events: list[str] = []
 
@@ -116,17 +144,145 @@ def test_graceful_shutdown_cleans_async_work_before_quitting() -> None:
     assert events == ["actions", "controller", "quit"]
 
 
+def test_graceful_shutdown_stops_schedule_before_controller() -> None:
+    events: list[str] = []
+
+    class AsyncActions:
+        async def shutdown(self) -> None:
+            events.append("actions")
+
+    class Schedule:
+        async def shutdown(self) -> None:
+            events.append("schedule")
+
+    class Controller:
+        _async_actions = AsyncActions()
+
+        async def shutdown(self) -> None:
+            events.append("controller")
+
+    async def exercise() -> None:
+        shutdown = app._GracefulShutdown(
+            Controller(),
+            lambda: events.append("quit"),
+            before_controller_shutdown=Schedule().shutdown,
+        )
+        shutdown.request()
+        await shutdown.wait()
+
+    asyncio.run(exercise())
+
+    assert events == ["actions", "schedule", "controller", "quit"]
+
+
+def test_window_close_filter_delegates_to_background_without_shutdown(qapp) -> None:
+    class Controller:
+        window = QWidget()
+
+        async def shutdown(self) -> None:
+            raise AssertionError("close-to-tray must not shut down")
+
+    class Background:
+        closes = 0
+
+        def handle_window_close(self) -> bool:
+            self.closes += 1
+            Controller.window.hide()
+            return True
+
+        def request_exit(self) -> None:
+            raise AssertionError("close-to-tray must not request exit")
+
+    background = Background()
+    shutdown, close_filter = app._install_graceful_shutdown(
+        qapp,
+        Controller(),
+        background,
+    )
+    Controller.window.show()
+
+    Controller.window.close()
+    qapp.processEvents()
+
+    assert background.closes == 1
+    assert Controller.window.isVisible() is False
+    assert shutdown.task is None
+    Controller.window.removeEventFilter(close_filter)
+    qapp.setQuitOnLastWindowClosed(True)
+
+
+def test_session_shutdown_requests_true_background_exit() -> None:
+    callbacks = []
+
+    class Signal:
+        def connect(self, callback) -> None:
+            callbacks.append(callback)
+
+    class Application:
+        commitDataRequest = Signal()
+
+    class Background:
+        exit_requests = 0
+
+        def request_exit(self) -> None:
+            self.exit_requests += 1
+
+    background = Background()
+    retained = app._install_session_shutdown(Application(), background)
+
+    callbacks[0](object())
+
+    assert retained is callbacks[0]
+    assert background.exit_requests == 1
+
+
+def test_background_launch_falls_back_to_visible_window_without_tray() -> None:
+    class Window:
+        visible = False
+
+        def show(self) -> None:
+            self.visible = True
+
+    class Controller:
+        window = Window()
+        messages = []
+
+        def _show_status(self, text: str) -> None:
+            self.messages.append(text)
+
+    controller = Controller()
+
+    app._show_initial_window(controller, background=True, tray_available=False)
+
+    assert controller.window.visible is True
+    assert controller.messages == ["系统托盘不可用，已显示主窗口"]
+
+
 def test_run_keeps_startup_inside_the_continuous_event_loop() -> None:
     source = getsource(app.run)
 
     assert "run_until_complete(controller.start())" not in source
     assert "loop.create_task(start_application())" in source
-    assert source.index("controller.window.show()") < source.index(
-        "await controller.start()"
+    assert source.index("_show_initial_window(") < source.index("await controller.start(")
+    assert source.index("await download_schedule.start()") < source.index("await controller.start(")
+
+
+@pytest.mark.asyncio
+async def test_download_schedule_starts_without_configured_telegram_gateway() -> None:
+    controller = app.AppController.for_test(gateway=None)
+    schedule = DownloadScheduleController(
+        lambda: controller.scheduler,
+        AppSettings().download_schedule,
     )
 
+    await schedule.start()
+    await schedule.shutdown()
 
-def test_duplicate_instance_exits_before_application_construction(tmp_path, monkeypatch) -> None:
+
+def test_duplicate_instance_falls_back_before_application_construction(
+    tmp_path,
+    monkeypatch,
+) -> None:
     events: list[str] = []
 
     class Guard:
@@ -144,6 +300,7 @@ def test_duplicate_instance_exits_before_application_construction(tmp_path, monk
             events.append("close")
 
     guard = Guard()
+    monkeypatch.setattr(app, "request_activation", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(
         app,
         "create_application",
@@ -160,6 +317,31 @@ def test_duplicate_instance_exits_before_application_construction(tmp_path, monk
     )
     assert guard.notified is True
     assert events == ["close"]
+
+
+def test_duplicate_instance_requests_activation_without_fallback(tmp_path, monkeypatch) -> None:
+    class Guard:
+        notified = False
+
+        def acquire(self) -> bool:
+            return False
+
+        def notify_already_running(self) -> None:
+            self.notified = True
+
+        def release(self) -> None:
+            raise AssertionError("unowned guard must not be released")
+
+    guard = Guard()
+    monkeypatch.setattr(app, "request_activation", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        app,
+        "create_application",
+        lambda _root: (_ for _ in ()).throw(AssertionError()),
+    )
+
+    assert app.run(tmp_path, instance_guard=guard) == 2
+    assert guard.notified is False
 
 
 def test_create_application_initializes_project_local_content_services(
@@ -221,9 +403,7 @@ def test_create_application_initializes_project_local_content_services(
         controller._handle_session_expired = record_expiry
         loop.run_until_complete(
             controller.subscription_scheduler.on_session_expired(
-                SessionExpiredError(
-                    reason=AuthorizationFailureReason.SESSION_REVOKED
-                )
+                SessionExpiredError(reason=AuthorizationFailureReason.SESSION_REVOKED)
             )
         )
         assert auth_events == [AuthorizationFailureReason.SESSION_REVOKED]
@@ -263,9 +443,7 @@ def test_account_search_signal_reaches_controller_with_typed_scope(tmp_path) -> 
 
     try:
         loop.run_until_complete(emit_and_wait())
-        assert calls == [
-            (SearchScope.ALL_DIALOGS, ALL_DIALOGS_SCOPE_REF, "安装")
-        ]
+        assert calls == [(SearchScope.ALL_DIALOGS, ALL_DIALOGS_SCOPE_REF, "安装")]
     finally:
         loop.run_until_complete(controller._async_actions.shutdown())
         controller.window.close()
@@ -277,22 +455,26 @@ def test_account_search_signal_reaches_controller_with_typed_scope(tmp_path) -> 
 async def test_telegram_health_uses_retained_authorization_reason() -> None:
     controller = SimpleNamespace(
         gateway=None,
-        last_authorization_failure_reason=(
-            AuthorizationFailureReason.AUTH_KEY_DUPLICATED
-        ),
+        last_authorization_failure_reason=(AuthorizationFailureReason.AUTH_KEY_DUPLICATED),
     )
 
     result = await app._telegram_health(controller)
 
     assert result.code == "telegram-session-expired"
-    assert result.metrics == {
-        "authorizationReason": "auth-key-duplicated"
-    }
+    assert result.metrics == {"authorizationReason": "auth-key-duplicated"}
 
 
 def test_service_builder_shares_runtime_download_resource_settings(tmp_path) -> None:
     application, loop, controller = app.create_application(tmp_path)
-    settings = AppSettings(concurrency=4, speed_limit_kib=2048)
+    naming = DownloadNamingSettings(
+        "{year}/{source}/{media_type}",
+        "{message_id}_{original_name}",
+    )
+    settings = AppSettings(
+        concurrency=4,
+        speed_limit_kib=2048,
+        download_naming=naming,
+    )
 
     try:
         planner, scheduler, content = controller.service_builder(object(), settings)
@@ -302,6 +484,7 @@ def test_service_builder_shares_runtime_download_resource_settings(tmp_path) -> 
         assert scheduler.snapshot().concurrency == 4
         assert scheduler.snapshot().speed_limit_kib == 2048
         assert scheduler.downloader.bandwidth is scheduler._bandwidth
+        assert planner.naming == naming
     finally:
         loop.run_until_complete(controller._async_actions.shutdown())
         controller.window.close()
@@ -334,22 +517,25 @@ def test_create_application_recovers_interrupted_subscription(tmp_path) -> None:
     )
     catalog.save_subscription(
         SubscriptionRule(
-            "rule-1",
-            "a1",
-            "-1001",
-            "资料群",
-            "美女",
-            frozenset({MediaKind.PHOTO}),
-            30,
-            True,
-            SubscriptionState.RUNNING,
-            42,
-            None,
-            now,
-            None,
-            0,
-            now,
-            now,
+            id="rule-1",
+            account_id="a1",
+            peer_ref="-1001",
+            dialog_title="资料群",
+            criteria=SubscriptionCriteria(("美女",)),
+            media_kinds=frozenset({MediaKind.PHOTO}),
+            interval_minutes=30,
+            history_days=0,
+            enabled=True,
+            state=SubscriptionState.RUNNING,
+            last_message_id=42,
+            backfill_from_utc=None,
+            backfill_through_id=None,
+            next_run_at=None,
+            last_run_at=now,
+            last_error=None,
+            failure_count=0,
+            created_at=now,
+            updated_at=now,
         )
     )
 

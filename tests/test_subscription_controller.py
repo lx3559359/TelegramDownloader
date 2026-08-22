@@ -10,6 +10,7 @@ import pytest
 from telegram_downloader.content import AccountProfile
 from telegram_downloader.controller import AppController
 from telegram_downloader.domain import MediaKind
+from telegram_downloader.subscription_matching import SubscriptionCriteria
 from telegram_downloader.subscriptions import SubscriptionDraft
 
 NOW = datetime(2026, 8, 15, tzinfo=UTC)
@@ -57,6 +58,7 @@ class SubscriptionPage:
         self.probe_progress = []
         self.probe_reports = []
         self.cancelled_messages = 0
+        self.editor_results = []
 
     def set_logged_in(self, value):
         self.logged_in.append(value)
@@ -91,6 +93,9 @@ class SubscriptionPage:
 
     def show_error(self, message):
         self.errors.append(message)
+
+    def finish_editor_save(self, success, error=""):
+        self.editor_results.append((success, error))
 
 
 class Window:
@@ -238,7 +243,7 @@ async def test_subscription_actions_restore_busy_state_and_refresh_rules() -> No
     )
     draft = SubscriptionDraft(
         "-1001",
-        "美女",
+        SubscriptionCriteria(("美女",)),
         frozenset({MediaKind.PHOTO}),
     )
 
@@ -255,6 +260,35 @@ async def test_subscription_actions_restore_busy_state_and_refresh_rules() -> No
         "delete",
     ]
     assert scheduler.wakes == [None, None, "rule-1"]
+    assert window.subscriptions_page.rules == []
+    assert window.subscriptions_page.busy[-1][1] is False
+    assert window.subscriptions_page.editor_results == [(True, ""), (True, "")]
+
+
+@pytest.mark.asyncio
+async def test_subscription_save_failure_keeps_editor_open_with_safe_error() -> None:
+    class FailingSubscriptions(Subscriptions):
+        async def create_rule(self, draft):
+            raise ValueError("无法读取历史边界")
+
+    subscriptions = FailingSubscriptions()
+    subscriptions.set_account(AccountProfile("a1", "账号一"))
+    window = Window()
+    controller = AppController.for_test(
+        subscriptions=subscriptions,
+        subscription_scheduler=SubscriptionScheduler(),
+        window=window,
+    )
+    draft = SubscriptionDraft(
+        "-1001",
+        SubscriptionCriteria(("AI",)),
+        frozenset({MediaKind.PHOTO}),
+        history_days=7,
+    )
+
+    await controller.create_subscription(draft)
+
+    assert window.subscriptions_page.editor_results == [(False, "无法读取历史边界")]
     assert window.subscriptions_page.rules == []
     assert window.subscriptions_page.busy[-1][1] is False
 
@@ -277,7 +311,11 @@ async def test_subscription_baseline_action_has_foreground_priority() -> None:
         subscription_scheduler=SubscriptionScheduler(),
         window=Window(),
     )
-    draft = SubscriptionDraft("-1001", "美女", frozenset({MediaKind.PHOTO}))
+    draft = SubscriptionDraft(
+        "-1001",
+        SubscriptionCriteria(("美女",)),
+        frozenset({MediaKind.PHOTO}),
+    )
 
     task = asyncio.create_task(controller.create_subscription(draft))
     await entered.wait()
@@ -326,9 +364,7 @@ async def test_subscription_created_task_enters_existing_download_scheduler() ->
         started.append("refresh")
         refreshed.set()
 
-    controller.refresh_tasks = Mock(
-        side_effect=AssertionError("同步刷新不应被调用")
-    )
+    controller.refresh_tasks = Mock(side_effect=AssertionError("同步刷新不应被调用"))
     controller.refresh_tasks_async = refresh
     controller._start_task = lambda task_id: started.append(task_id)
 

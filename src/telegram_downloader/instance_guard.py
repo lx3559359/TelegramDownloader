@@ -5,9 +5,7 @@ from typing import Protocol
 
 
 class KernelApi(Protocol):
-    def create_mutex(self, name: str) -> int: ...
-
-    def get_last_error(self) -> int: ...
+    def create_mutex(self, name: str) -> tuple[int, bool]: ...
 
     def close_handle(self, handle: int) -> None: ...
 
@@ -15,15 +13,23 @@ class KernelApi(Protocol):
 class WindowsKernelApi:
     def __init__(self) -> None:
         self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.kernel32.CreateMutexW.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_bool,
+            ctypes.c_wchar_p,
+        )
+        self.kernel32.CreateMutexW.restype = ctypes.c_void_p
+        self.kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        self.kernel32.CloseHandle.restype = ctypes.c_bool
 
-    def create_mutex(self, name: str) -> int:
-        return int(self.kernel32.CreateMutexW(None, False, name) or 0)
-
-    def get_last_error(self) -> int:
-        return ctypes.get_last_error()
+    def create_mutex(self, name: str) -> tuple[int, bool]:
+        ctypes.set_last_error(0)
+        handle = int(self.kernel32.CreateMutexW(None, False, name) or 0)
+        already_exists = ctypes.get_last_error() == WindowsInstanceGuard.ERROR_ALREADY_EXISTS
+        return handle, already_exists
 
     def close_handle(self, handle: int) -> None:
-        self.kernel32.CloseHandle(handle)
+        self.kernel32.CloseHandle(ctypes.c_void_p(handle))
 
 
 class WindowsInstanceGuard:
@@ -35,10 +41,10 @@ class WindowsInstanceGuard:
         self.handle = 0
 
     def acquire(self) -> bool:
-        handle = self.kernel.create_mutex(self.MUTEX_NAME)
+        handle, already_exists = self.kernel.create_mutex(self.MUTEX_NAME)
         if not handle:
             raise OSError("无法创建程序单实例保护")
-        if self.kernel.get_last_error() == self.ERROR_ALREADY_EXISTS:
+        if already_exists:
             self.kernel.close_handle(handle)
             return False
         self.handle = handle

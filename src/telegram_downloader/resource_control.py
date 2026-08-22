@@ -4,6 +4,7 @@ import asyncio
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -105,12 +106,19 @@ class AsyncBandwidthLimiter:
                 self._configuration_cancels.pop(current_task, None)
 
 
+@dataclass(slots=True)
+class _ConcurrencyWaiter:
+    key: object | None
+    future: asyncio.Future[None]
+
+
 class AdjustableConcurrencyLimiter:
     def __init__(self, limit: int) -> None:
         self._validate_limit(limit)
         self._limit = limit
         self._active = 0
-        self._waiters: deque[asyncio.Future[None]] = deque()
+        self._waiters: deque[_ConcurrencyWaiter] = deque()
+        self._last_granted_key: object | None = None
 
     @property
     def limit(self) -> int:
@@ -122,21 +130,26 @@ class AdjustableConcurrencyLimiter:
 
     @property
     def waiting(self) -> int:
-        return sum(not waiter.done() for waiter in self._waiters)
+        return sum(not waiter.future.done() for waiter in self._waiters)
 
-    async def acquire(self) -> None:
+    async def acquire(self, key: object | None = None) -> None:
         if self._active < self._limit and not self._waiters:
             self._active += 1
+            self._last_granted_key = key
             return
 
-        waiter = asyncio.get_running_loop().create_future()
+        waiter = _ConcurrencyWaiter(
+            key,
+            asyncio.get_running_loop().create_future(),
+        )
         self._waiters.append(waiter)
+        self._wake_waiters()
         try:
-            await asyncio.shield(waiter)
+            await asyncio.shield(waiter.future)
         except BaseException:
             if waiter in self._waiters:
                 self._waiters.remove(waiter)
-            elif waiter.done() and not waiter.cancelled():
+            elif waiter.future.done() and not waiter.future.cancelled():
                 self._active -= 1
             self._wake_waiters()
             raise
@@ -161,11 +174,20 @@ class AdjustableConcurrencyLimiter:
 
     def _wake_waiters(self) -> None:
         while self._active < self._limit and self._waiters:
-            waiter = self._waiters.popleft()
-            if waiter.done():
+            waiter = self._pop_next_waiter()
+            if waiter.future.done():
                 continue
             self._active += 1
-            waiter.set_result(None)
+            self._last_granted_key = waiter.key
+            waiter.future.set_result(None)
+
+    def _pop_next_waiter(self) -> _ConcurrencyWaiter:
+        if self._last_granted_key is not None:
+            for index, waiter in enumerate(self._waiters):
+                if waiter.key != self._last_granted_key:
+                    del self._waiters[index]
+                    return waiter
+        return self._waiters.popleft()
 
     @staticmethod
     def _validate_limit(value: int) -> None:

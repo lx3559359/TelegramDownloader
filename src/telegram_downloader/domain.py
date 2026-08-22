@@ -10,6 +10,7 @@ class SourceKind(StrEnum):
     SINGLE_MESSAGE = "single_message"
     CHANNEL_OR_GROUP = "channel_or_group"
     ACCOUNT_SEARCH = "account_search"
+    BATCH_IMPORT = "batch_import"
 
 
 class MediaKind(StrEnum):
@@ -30,6 +31,11 @@ class TaskStatus(StrEnum):
     WAITING_RETRY = "waiting_retry"
     COMPLETED = "completed"
     PARTIAL_FAILURE = "partial_failure"
+
+
+class PauseReason(StrEnum):
+    USER = "user"
+    SCHEDULE = "schedule"
 
 
 class ItemStatus(StrEnum):
@@ -81,6 +87,7 @@ class TaskRecord:
     display_title: str | None = None
     archived_at: datetime | None = None
     queue_priority: int = 0
+    pause_reason: PauseReason | None = None
 
 
 @dataclass(frozen=True, slots=True)

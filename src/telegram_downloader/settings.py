@@ -6,11 +6,38 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from telegram_downloader.files import DownloadNamingSettings
 from telegram_downloader.resource_control import validate_speed_limit_kib
 
 
 class SettingsError(ValueError):
     """Raised when project-local settings are malformed or unsafe."""
+
+
+@dataclass(frozen=True, slots=True)
+class DownloadScheduleSettings:
+    enabled: bool = False
+    weekdays: tuple[int, ...] = tuple(range(7))
+    start_minute: int = 0
+    end_minute: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise SettingsError("下载时段开关必须是布尔值")
+        if not isinstance(self.weekdays, (tuple, list)) or not self.weekdays or any(
+            not isinstance(day, int) or isinstance(day, bool) or not 0 <= day <= 6
+            for day in self.weekdays
+        ):
+            raise SettingsError("下载星期必须是周一到周日的非空集合")
+        normalized = tuple(dict.fromkeys(self.weekdays))
+        if any(
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not 0 <= value <= 1439
+            for value in (self.start_minute, self.end_minute)
+        ):
+            raise SettingsError("下载时段分钟必须在 0 到 1439 之间")
+        object.__setattr__(self, "weekdays", normalized)
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +65,12 @@ class AppSettings:
     proxy: ProxySettings = ProxySettings()
     check_updates_on_startup: bool = True
     speed_limit_kib: int = 0
+    close_to_tray: bool = True
+    notifications_enabled: bool = True
+    autostart_enabled: bool = False
+    tray_hint_shown: bool = False
+    download_schedule: DownloadScheduleSettings = DownloadScheduleSettings()
+    download_naming: DownloadNamingSettings = DownloadNamingSettings()
 
     def __post_init__(self) -> None:
         if not isinstance(self.api_id, int) or isinstance(self.api_id, bool) or self.api_id < 0:
@@ -52,6 +85,20 @@ class AppSettings:
             raise SettingsError("代理设置格式无效")
         if not isinstance(self.check_updates_on_startup, bool):
             raise SettingsError("自动检查更新必须是布尔值")
+        if not all(
+            isinstance(value, bool)
+            for value in (
+                self.close_to_tray,
+                self.notifications_enabled,
+                self.autostart_enabled,
+                self.tray_hint_shown,
+            )
+        ):
+            raise SettingsError("后台设置开关必须是布尔值")
+        if not isinstance(self.download_schedule, DownloadScheduleSettings):
+            raise SettingsError("下载时段设置格式无效")
+        if not isinstance(self.download_naming, DownloadNamingSettings):
+            raise SettingsError("下载路径模板设置格式无效")
         try:
             validate_speed_limit_kib(self.speed_limit_kib)
         except ValueError as exc:
@@ -72,8 +119,19 @@ class SettingsStore:
             proxy_raw = raw.get("proxy", {})
             if not isinstance(proxy_raw, dict):
                 raise SettingsError("代理设置必须是对象")
+            schedule_raw = raw.get("download_schedule", {})
+            if not isinstance(schedule_raw, dict):
+                raise SettingsError("下载时段设置必须是对象")
+            naming_raw = raw.get("download_naming", {})
+            if not isinstance(naming_raw, dict):
+                raise SettingsError("下载路径模板设置必须是对象")
             values = dict(raw)
             values["proxy"] = ProxySettings(**proxy_raw)
+            values["download_schedule"] = DownloadScheduleSettings(**schedule_raw)
+            try:
+                values["download_naming"] = DownloadNamingSettings(**naming_raw)
+            except ValueError as error:
+                raise SettingsError(str(error)) from error
             return AppSettings(**values)
         except SettingsError:
             raise

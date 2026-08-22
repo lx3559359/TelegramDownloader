@@ -1,7 +1,12 @@
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QGraphicsDropShadowEffect, QLineEdit
 
-from telegram_downloader.settings import AppSettings, ProxySettings
+from telegram_downloader.files import DownloadNamingSettings
+from telegram_downloader.settings import (
+    AppSettings,
+    DownloadScheduleSettings,
+    ProxySettings,
+)
 from telegram_downloader.ui.effects import ElevationLevel
 from telegram_downloader.ui.settings import SettingsDialog
 from telegram_downloader.ui.theme import APP_STYLESHEET
@@ -25,7 +30,7 @@ def test_round_trip_manual_proxy_form(qtbot) -> None:
     assert dialog.values() == settings
     assert dialog.concurrency.minimum() == 1
     assert dialog.concurrency.maximum() == 5
-    assert dialog.concurrency_label.text() == "文件并发"
+    assert dialog.concurrency_label.text() == "全局媒体槽"
     assert tuple(
         dialog.speed_limit.itemData(index)
         for index in range(dialog.speed_limit.count())
@@ -60,6 +65,16 @@ def test_invalid_proxy_shows_error_and_does_not_accept(qtbot) -> None:
 
     assert dialog.result() == 0
     assert "代理" in dialog.error_label.text()
+
+
+def test_valid_save_emits_without_closing_until_runtime_apply_succeeds(qtbot) -> None:
+    dialog = SettingsDialog(AppSettings())
+    qtbot.addWidget(dialog)
+
+    with qtbot.waitSignal(dialog.save_requested, timeout=500):
+        qtbot.mouseClick(dialog.save_button, Qt.MouseButton.LeftButton)
+
+    assert dialog.result() == 0
 
 
 def test_thumbnail_cache_clear_emits_without_closing_dialog(qtbot) -> None:
@@ -100,3 +115,90 @@ def test_cache_and_save_busy_states_are_immediate(qtbot) -> None:
     dialog.set_save_busy(False)
     assert dialog.thumbnail_cache_clear_button.isEnabled() is True
     assert dialog.save_button.isEnabled() is True
+
+
+def test_background_tab_round_trips_all_values(qtbot) -> None:
+    settings = AppSettings(
+        close_to_tray=False,
+        notifications_enabled=False,
+        autostart_enabled=True,
+        tray_hint_shown=True,
+        download_schedule=DownloadScheduleSettings(
+            True,
+            (0, 2, 4),
+            22 * 60,
+            2 * 60,
+        ),
+    )
+    dialog = SettingsDialog(settings, autostart_available=True)
+    qtbot.addWidget(dialog)
+
+    assert dialog.tabs.count() == 3
+    assert [dialog.tabs.tabText(index) for index in range(3)] == [
+        "常规",
+        "下载路径",
+        "后台与通知",
+    ]
+    assert dialog.values() == settings
+
+
+def test_download_naming_tab_round_trips_and_previews_custom_templates(qtbot) -> None:
+    naming = DownloadNamingSettings(
+        "{year}/{month}/{source}/{media_type}",
+        "{message_date}_{message_id}_{original_name}",
+    )
+    dialog = SettingsDialog(AppSettings(download_naming=naming))
+    qtbot.addWidget(dialog)
+
+    assert dialog.directory_template.currentText() == naming.directory_template
+    assert dialog.filename_template.currentText() == naming.filename_template
+    assert dialog.values().download_naming == naming
+    assert "2026/08/示例频道/video/2026-08-22_12345_video.mp4" in dialog.naming_preview.text()
+
+    assert [
+        dialog.directory_template.itemText(index)
+        for index in range(dialog.directory_template.count())
+    ] == [
+        "{source}/{year_month}/{media_type}",
+        "{year}/{month}/{source}/{media_type}",
+        "{source}/{message_date}",
+    ]
+    assert [
+        dialog.filename_template.itemText(index)
+        for index in range(dialog.filename_template.count())
+    ] == [
+        "{original_name}",
+        "{stem}_{message_id}{extension}",
+        "{message_date}_{message_id}_{original_name}",
+    ]
+
+
+def test_download_naming_tab_rejects_unsafe_template_before_save(qtbot) -> None:
+    dialog = SettingsDialog(AppSettings())
+    qtbot.addWidget(dialog)
+    emitted = []
+    dialog.save_requested.connect(lambda: emitted.append(True))
+
+    dialog.directory_template.setEditText("../{source}")
+    qtbot.mouseClick(dialog.save_button, Qt.MouseButton.LeftButton)
+
+    assert emitted == []
+    assert dialog.error_label.isHidden() is False
+    assert "安全相对路径" in dialog.error_label.text()
+    assert "模板错误" in dialog.naming_preview.text()
+
+
+def test_unavailable_integrations_and_disabled_schedule_disable_controls(qtbot) -> None:
+    dialog = SettingsDialog(
+        AppSettings(),
+        autostart_available=False,
+        tray_available=False,
+    )
+    qtbot.addWidget(dialog)
+
+    assert dialog.autostart.isEnabled() is False
+    assert dialog.close_to_tray.isEnabled() is False
+    assert all(not widget.isEnabled() for widget in dialog.schedule_detail_widgets)
+
+    dialog.schedule_enabled.setChecked(True)
+    assert all(widget.isEnabled() for widget in dialog.schedule_detail_widgets)

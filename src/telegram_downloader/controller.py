@@ -26,7 +26,6 @@ from telegram_downloader.domain import (
     ItemStatus,
     MediaKind,
     ScanFilters,
-    SourceKind,
     TaskStatus,
 )
 from telegram_downloader.file_integrity import (
@@ -43,6 +42,7 @@ from telegram_downloader.gateway import (
     TransientNetworkError,
 )
 from telegram_downloader.links import InvalidTelegramLink, parse_telegram_link
+from telegram_downloader.notifications import ApplicationEvent, auth_required_event
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.scheduler import SchedulerSnapshot
 from telegram_downloader.settings import AppSettings, ProxySettings
@@ -72,6 +72,14 @@ class _MemoryVault:
 
     def save(self, value: dict[str, str]) -> None:
         self.value = dict(value)
+
+
+class _SettingsStoreRuntimeEffects:
+    def __init__(self, settings_store: Any) -> None:
+        self.settings_store = settings_store
+
+    async def apply(self, _previous: AppSettings, current: AppSettings) -> None:
+        await asyncio.to_thread(self.settings_store.save, current)
 
 
 class _NullStatusBar:
@@ -110,6 +118,12 @@ class _NullWindow:
         pass
 
     def set_scan_busy(self, _busy: bool) -> None:
+        pass
+
+    def set_batch_scan_progress(self, _progress: object) -> None:
+        pass
+
+    def finish_batch_preflight(self, _success: bool, _error: str = "") -> None:
         pass
 
     def set_integrity_busy(self, _busy: bool) -> None:
@@ -259,6 +273,9 @@ class _NullSubscriptionPage:
     def show_error(self, _message: str) -> None:
         pass
 
+    def finish_editor_save(self, _success: bool, _error: str = "") -> None:
+        pass
+
 
 class _NullDiagnosticsPage:
     report = None
@@ -300,6 +317,9 @@ class _NullRepository:
 
 
 class _NullScheduler:
+    async def set_schedule_open(self, _opened: bool) -> set[str]:
+        return set()
+
     async def run_task(self, _task_id: str) -> None:
         pass
 
@@ -319,7 +339,7 @@ class _NullScheduler:
         return set()
 
     def snapshot(self) -> SchedulerSnapshot:
-        return SchedulerSnapshot(None, (), 3, 0)
+        return SchedulerSnapshot((), (), 3, 0)
 
     def queue_positions(self) -> dict[str, int]:
         return {}
@@ -422,6 +442,8 @@ class AppController:
         update_coordinator: Any | None = None,
         update_prompt: Callable[[Any], bool] | None = None,
         update_shutdown: Callable[[], None] | None = None,
+        publish: Callable[[ApplicationEvent], None] | None = None,
+        runtime_settings_effects: Any | None = None,
         settings: AppSettings | None = None,
         secrets: dict[str, str] | None = None,
         connection_recovery: ConnectionRecovery | None = None,
@@ -455,6 +477,10 @@ class AppController:
         self.update_coordinator = update_coordinator
         self.update_prompt = update_prompt or (lambda _manifest: False)
         self.update_shutdown = update_shutdown or (lambda: None)
+        self.publish = publish or (lambda _event: None)
+        self.runtime_settings_effects = runtime_settings_effects or (
+            _SettingsStoreRuntimeEffects(settings_store)
+        )
         self.settings = settings or settings_store.load()
         self.secrets = dict(secrets if secrets is not None else vault.load())
         self.connection_recovery = connection_recovery or ConnectionRecovery()
@@ -464,6 +490,7 @@ class AppController:
         self.phone_code_hash = ""
         self._background: set[asyncio.Task[Any]] = set()
         self._connection_monitor_task: asyncio.Task[None] | None = None
+        self._update_check_task: asyncio.Task[Any] | None = None
         self._session_restore_task: asyncio.Task[None] | None = None
         self._qr_wait_task: asyncio.Task[None] | None = None
         self._qr_generation = 0
@@ -486,9 +513,8 @@ class AppController:
         self._progress_samples: dict[str, tuple[float, int]] = {}
         self._session_expiry_lock = asyncio.Lock()
         self._session_expiry_handled = False
-        self._last_authorization_failure_reason: (
-            AuthorizationFailureReason | None
-        ) = None
+        self._background_launch = False
+        self._last_authorization_failure_reason: AuthorizationFailureReason | None = None
 
     @classmethod
     def for_test(cls, **dependencies) -> AppController:
@@ -619,13 +645,17 @@ class AppController:
         method = getattr(gateway, "is_connected", None)
         return bool(method()) if callable(method) else False
 
-    async def start(self) -> None:
+    async def start(self, *, background: bool = False) -> None:
+        self._background_launch = bool(background)
         self.refresh_tasks()
         await self.activate_cached_content_account()
         if self.update_coordinator is not None and self.settings.check_updates_on_startup:
-            self._spawn_background(self._run_update_check())
+            self.check_for_updates()
         if self.gateway is None:
-            self.show_login()
+            if background:
+                self._publish_event(auth_required_event())
+            else:
+                self.show_login()
             return
         self._ensure_connection_monitor()
         self._session_restore_task = self._spawn_background(self._restore_saved_session())
@@ -642,7 +672,7 @@ class AppController:
         try:
             name = await self._account_name()
             if name is None:
-                self.show_login()
+                self._request_login()
                 return
             self.window.set_account(name)
             await self.activate_content_account()
@@ -912,6 +942,70 @@ class AppController:
         except Exception as error:
             _LOGGER.error("scan failed (%s)", type(error).__name__)
             self._show_error(self._safe_error(error))
+        finally:
+            self.window.set_scan_busy(False)
+
+    async def scan_links(
+        self,
+        links: tuple[str, ...],
+        filters: ScanFilters,
+    ) -> None:
+        self.window.set_scan_busy(True)
+        preflight_finished = False
+        try:
+            if not await self.ensure_telegram_online():
+                self.window.finish_batch_preflight(False, "请先登录 Telegram 账号")
+                return
+            if self.planner is None:
+                self.window.finish_batch_preflight(False, "请先登录 Telegram 账号")
+                return
+            batch = await self.planner.scan_batch(
+                links,
+                filters,
+                on_progress=self.window.set_batch_scan_progress,
+            )
+            self.window.finish_batch_preflight(True)
+            preflight_finished = True
+            if not await self._confirm_download_preview(batch):
+                self._show_status("已取消批量创建任务")
+                return
+            committed = self.planner.commit(batch.preview)
+            await self.refresh_tasks_async()
+            self._start_task(committed.task.id)
+            self._show_status(
+                f"批量加入 {len(committed.accepted_keys)} 项，"
+                f"确认时另跳过重复 {committed.skipped_count} 项；任务已开始下载"
+            )
+        except asyncio.CancelledError:
+            if not preflight_finished:
+                self.window.finish_batch_preflight(False, "批量预检已取消")
+            raise
+        except SessionExpiredError as error:
+            if not preflight_finished:
+                self.window.finish_batch_preflight(False, self._safe_error(error))
+            await self._handle_session_expired(error)
+        except (InvalidTelegramLink, ValueError, GatewayError) as error:
+            safe = self._safe_error(error)
+            _LOGGER.warning(
+                "batch scan rejected (%s); input_count=%s",
+                type(error).__name__,
+                len(links),
+            )
+            if preflight_finished:
+                self._show_error(safe)
+            else:
+                self.window.finish_batch_preflight(False, safe)
+        except Exception as error:
+            _LOGGER.error(
+                "batch scan failed (%s); input_count=%s",
+                type(error).__name__,
+                len(links),
+            )
+            safe = self._safe_error(error)
+            if preflight_finished:
+                self._show_error(safe)
+            else:
+                self.window.finish_batch_preflight(False, safe)
         finally:
             self.window.set_scan_busy(False)
 
@@ -1435,8 +1529,9 @@ class AppController:
             title = getattr(saved, "dialog_title", "")
             keyword = getattr(saved, "keyword", "")
             self._show_status(f"已创建自动订阅：{title} {keyword}".strip())
+            page.finish_editor_save(True)
         except Exception as error:
-            page.show_error(self._safe_error(error))
+            page.finish_editor_save(False, self._safe_error(error))
         finally:
             self._subscription_actions_active -= 1
             page.set_rule_busy(None, False)
@@ -1454,8 +1549,9 @@ class AppController:
             await self._reload_subscriptions()
             self.subscription_scheduler.wake()
             self._show_status("自动订阅已更新")
+            page.finish_editor_save(True)
         except Exception as error:
-            page.show_error(self._safe_error(error))
+            page.finish_editor_save(False, self._safe_error(error))
         finally:
             self._subscription_actions_active -= 1
             page.set_rule_busy(None, False)
@@ -1577,6 +1673,7 @@ class AppController:
             page.show_error("请先完成一次健康诊断")
             return
         try:
+
             def export_report():
                 register = getattr(self.diagnostic_store, "register_secrets", None)
                 if callable(register):
@@ -1620,26 +1717,31 @@ class AppController:
                 await probe.disconnect()
 
     async def apply_settings(self, settings: AppSettings, proxy_password: str) -> None:
+        previous_settings = self.settings
         connection_changed = (
-            settings.api_id != self.settings.api_id
-            or settings.proxy != self.settings.proxy
+            settings.api_id != previous_settings.api_id or settings.proxy != previous_settings.proxy
         )
         updated_secrets = dict(self.secrets)
         if proxy_password:
             updated_secrets["proxy_password"] = proxy_password
         else:
             updated_secrets.pop("proxy_password", None)
-        def persist_settings() -> None:
-            self.settings_store.save(settings)
-            self.vault.save(updated_secrets)
-
-        await asyncio.to_thread(persist_settings)
+        await self.runtime_settings_effects.apply(previous_settings, settings)
+        try:
+            await asyncio.to_thread(self.vault.save, updated_secrets)
+        except Exception:
+            with suppress(Exception):
+                await self.runtime_settings_effects.apply(settings, previous_settings)
+            raise
         self.settings = settings
         self.secrets = updated_secrets
         configure = getattr(self.scheduler, "configure_resources", None)
         if callable(configure):
             configure(settings.concurrency, settings.speed_limit_kib)
-        message = "设置已保存；下载资源设置已即时应用"
+        configure_naming = getattr(self.planner, "configure_naming", None)
+        if callable(configure_naming):
+            configure_naming(settings.download_naming)
+        message = "设置已保存；下载资源与路径模板已即时应用"
         if connection_changed:
             message += "，API/代理变更将在下次连接时生效"
         self._show_status(message)
@@ -1669,9 +1771,7 @@ class AppController:
         ]
         accepted = self.scheduler.pause_tasks(eligible)
         await self.refresh_tasks_async()
-        self._show_status(
-            f"已暂停 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个"
-        )
+        self._show_status(f"已暂停 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个")
 
     async def prioritize_task(self, task_id: str) -> None:
         tasks = await asyncio.to_thread(self.repository.get_tasks, [task_id])
@@ -1687,9 +1787,7 @@ class AppController:
 
         prioritize = getattr(self.repository, "prioritize_task", None)
         persisted = (
-            bool(await asyncio.to_thread(prioritize, task_id))
-            if callable(prioritize)
-            else False
+            bool(await asyncio.to_thread(prioritize, task_id)) if callable(prioritize) else False
         )
         reordered = self.scheduler.prioritize_task(task_id) if persisted else False
         if not reordered:
@@ -1716,9 +1814,7 @@ class AppController:
         ]
         accepted = await self.scheduler.resume_tasks(eligible) if eligible else set()
         await self.refresh_tasks_async()
-        self._show_status(
-            f"已继续 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个"
-        )
+        self._show_status(f"已继续 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个")
 
     async def retry_failed_tasks(self, task_ids: list[str]) -> None:
         unique = self._unique_task_ids(task_ids)
@@ -1730,9 +1826,7 @@ class AppController:
         ]
         accepted = await self.scheduler.resume_tasks(eligible) if eligible else set()
         await self.refresh_tasks_async()
-        self._show_status(
-            f"已重试 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个"
-        )
+        self._show_status(f"已重试 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个")
 
     async def archive_tasks(self, task_ids: list[str]) -> None:
         unique = self._unique_task_ids(task_ids)
@@ -1842,15 +1936,11 @@ class AppController:
                         for task_id, selected in grouped.items()
                     )
                 )
-            repaired = [
-                self.repository.get_item(item_id)
-                for item_id in prepared.accepted_ids
-            ]
+            repaired = [self.repository.get_item(item_id) for item_id in prepared.accepted_ids]
             succeeded = sum(item.status is ItemStatus.COMPLETED for item in repaired)
             failed = len(repaired) - succeeded
             self._show_status(
-                "精准修复完成："
-                f"成功 {succeeded}，失败 {failed}，跳过 {prepared.skipped}"
+                f"精准修复完成：成功 {succeeded}，失败 {failed}，跳过 {prepared.skipped}"
             )
         finally:
             self._finish_integrity_operation(current)
@@ -1948,17 +2038,32 @@ class AppController:
     def open_task_directory(self, task_id: str) -> None:
         if self.paths is None:
             return
-        task = self.repository.get_task(task_id)
-        directory = (
-            self.paths.downloads
-            if task.source_kind is SourceKind.ACCOUNT_SEARCH
-            else self.paths.downloads / task.source_title
-        )
-        directory = self.paths.guard(directory)
-        directory.mkdir(parents=True, exist_ok=True)
-        startfile = getattr(os, "startfile", None)
-        if startfile is not None:
-            startfile(directory)
+        try:
+            self.repository.get_task(task_id)
+            items = self.repository.list_items(task_id)
+            downloads = self.paths.downloads.resolve()
+            parents: list[Path] = []
+            for item in items:
+                parent = Path(item.target_path).resolve().parent
+                parent.relative_to(downloads)
+                parents.append(self.paths.guard(parent))
+            directory = (
+                Path(os.path.commonpath([str(path) for path in parents]))
+                if parents
+                else downloads
+            )
+            directory = self.paths.guard(directory)
+            directory.mkdir(parents=True, exist_ok=True)
+            startfile = getattr(os, "startfile", None)
+            if startfile is not None:
+                startfile(directory)
+        except ValueError:
+            self._show_status("安全限制：下载目录不在应用下载目录内")
+        except KeyError:
+            self._show_status("任务不存在，任务列表已刷新")
+            self._schedule_task_refresh()
+        except OSError:
+            self._show_status("Windows 无法打开下载目录")
 
     async def shutdown(self) -> None:
         if self._shutting_down:
@@ -2062,16 +2167,14 @@ class AppController:
             snapshot_method()
             if callable(snapshot_method)
             else SchedulerSnapshot(
-                None,
+                (),
                 (),
                 self.settings.concurrency,
                 self.settings.speed_limit_kib,
             )
         )
         queue_positions_method = getattr(self.scheduler, "queue_positions", None)
-        queue_positions = (
-            queue_positions_method() if callable(queue_positions_method) else {}
-        )
+        queue_positions = queue_positions_method() if callable(queue_positions_method) else {}
         return scheduler_state, queue_positions
 
     def _summaries_from_snapshots(
@@ -2138,7 +2241,7 @@ class AppController:
         set_scheduler_summary = getattr(self.window, "set_scheduler_summary", None)
         if callable(set_scheduler_summary):
             set_scheduler_summary(
-                active=1 if scheduler_state.active_task_id is not None else 0,
+                active=scheduler_state.active_count,
                 queued=scheduler_state.queued_count,
                 concurrency=scheduler_state.concurrency,
                 speed_limit_kib=scheduler_state.speed_limit_kib,
@@ -2225,6 +2328,7 @@ class AppController:
             if self._session_expiry_handled:
                 return
             self._session_expiry_handled = True
+            self._publish_event(auth_required_event())
             _LOGGER.warning(
                 "Telegram authorization expired (reason=%s)",
                 error.reason.value,
@@ -2264,11 +2368,7 @@ class AppController:
                     await previous_gateway.disconnect()
 
             api_hash = self.secrets.get("api_hash", "")
-            if (
-                self.gateway_factory is not None
-                and self.settings.api_id > 0
-                and api_hash
-            ):
+            if self.gateway_factory is not None and self.settings.api_id > 0 and api_hash:
                 fresh_gateway = self.gateway_factory(
                     self.settings.api_id,
                     api_hash,
@@ -2294,7 +2394,24 @@ class AppController:
                     else:
                         self.planner, self.scheduler = services
 
-            self.show_login()
+            self._request_login(publish=False)
+
+    def _publish_event(self, event: ApplicationEvent) -> None:
+        try:
+            self.publish(event)
+        except Exception:
+            _LOGGER.error("notification event callback failed")
+
+    def _request_login(self, *, publish: bool = True) -> None:
+        if publish:
+            self._publish_event(auth_required_event())
+        visible = getattr(self.window, "isVisible", None)
+        if callable(visible):
+            if not visible():
+                return
+        elif self._background_launch:
+            return
+        self.show_login()
 
     @property
     def last_authorization_failure_reason(
@@ -2322,6 +2439,7 @@ class AppController:
     async def _reload_subscriptions(self) -> None:
         page = self._subscription_page()
         try:
+
             def load_snapshot():
                 snapshot = getattr(self.subscriptions, "snapshot", None)
                 if callable(snapshot):
@@ -2427,6 +2545,15 @@ class AppController:
                 self._show_status("更新检查暂不可用，已继续使用当前版本")
         except Exception as error:
             self._show_status(f"更新检查失败（{type(error).__name__}）")
+
+    def check_for_updates(self) -> asyncio.Task[Any] | None:
+        if self.update_coordinator is None or self._shutting_down:
+            return None
+        current = self._update_check_task
+        if current is not None and not current.done():
+            return current
+        self._update_check_task = self._spawn_background(self._run_update_check())
+        return self._update_check_task
 
     async def _run_and_refresh(self, task_id: str) -> None:
         operation = asyncio.create_task(self.scheduler.run_task(task_id))

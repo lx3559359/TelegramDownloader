@@ -5,8 +5,10 @@ from datetime import datetime
 from enum import StrEnum
 
 from telegram_downloader.domain import MediaKind
+from telegram_downloader.subscription_matching import SubscriptionCriteria
 
 SUPPORTED_INTERVAL_MINUTES = frozenset({5, 15, 30, 60, 180})
+SUPPORTED_HISTORY_DAYS = frozenset({0, 1, 3, 7, 30})
 
 
 class SubscriptionState(StrEnum):
@@ -25,46 +27,50 @@ class SubscriptionRunStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
-def _normalized_keyword(value: str) -> str:
-    return " ".join(value.casefold().split())
-
-
 def _validate_rule_fields(
     peer_ref: str,
-    keyword: str,
+    criteria: SubscriptionCriteria,
     media_kinds: frozenset[MediaKind],
     interval_minutes: int,
+    history_days: int,
 ) -> None:
     if not peer_ref.strip():
         raise ValueError("请选择群组或频道")
-    if not keyword.strip():
-        raise ValueError("订阅关键词不能为空")
+    if not isinstance(criteria, SubscriptionCriteria):
+        raise ValueError("订阅规则条件无效")
     if not media_kinds:
         raise ValueError("请至少选择一种媒体类型")
     if interval_minutes not in SUPPORTED_INTERVAL_MINUTES:
         raise ValueError("不支持的检查间隔")
+    if history_days not in SUPPORTED_HISTORY_DAYS:
+        raise ValueError("不支持的历史补抓范围")
 
 
 @dataclass(frozen=True, slots=True)
 class SubscriptionDraft:
     peer_ref: str
-    keyword: str
+    criteria: SubscriptionCriteria
     media_kinds: frozenset[MediaKind]
     interval_minutes: int = 30
+    history_days: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "peer_ref", self.peer_ref.strip())
-        object.__setattr__(self, "keyword", self.keyword.strip())
         _validate_rule_fields(
             self.peer_ref,
-            self.keyword,
+            self.criteria,
             self.media_kinds,
             self.interval_minutes,
+            self.history_days,
         )
 
     @property
-    def normalized_keyword(self) -> str:
-        return _normalized_keyword(self.keyword)
+    def keyword(self) -> str:
+        return self.criteria.summary
+
+    @property
+    def matcher_fingerprint(self) -> str:
+        return self.criteria.fingerprint
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,12 +79,15 @@ class SubscriptionRule:
     account_id: str
     peer_ref: str
     dialog_title: str
-    keyword: str
+    criteria: SubscriptionCriteria
     media_kinds: frozenset[MediaKind]
     interval_minutes: int
+    history_days: int
     enabled: bool
     state: SubscriptionState
     last_message_id: int | None
+    backfill_from_utc: datetime | None
+    backfill_through_id: int | None
     next_run_at: datetime | None
     last_run_at: datetime | None
     last_error: str | None
@@ -93,18 +102,33 @@ class SubscriptionRule:
             raise ValueError("群组或频道名称不能为空")
         _validate_rule_fields(
             self.peer_ref,
-            self.keyword,
+            self.criteria,
             self.media_kinds,
             self.interval_minutes,
+            self.history_days,
         )
         if self.last_message_id is not None and self.last_message_id < 0:
             raise ValueError("消息游标不能为负数")
+        if self.backfill_through_id is not None and self.backfill_through_id < 0:
+            raise ValueError("补抓截止消息不能为负数")
+        if self.backfill_through_id is not None and self.backfill_from_utc is None:
+            raise ValueError("补抓截止消息缺少补抓起点")
+        if self.backfill_from_utc is not None and self.backfill_from_utc.tzinfo is None:
+            raise ValueError("补抓起点必须包含时区")
+        if self.history_days == 0 and (
+            self.backfill_from_utc is not None or self.backfill_through_id is not None
+        ):
+            raise ValueError("未启用历史补抓时不能保存补抓状态")
         if self.failure_count < 0:
             raise ValueError("失败次数不能为负数")
 
     @property
+    def keyword(self) -> str:
+        return self.criteria.summary
+
+    @property
     def normalized_keyword(self) -> str:
-        return _normalized_keyword(self.keyword)
+        return self.criteria.fingerprint
 
 
 @dataclass(frozen=True, slots=True)

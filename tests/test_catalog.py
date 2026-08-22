@@ -22,6 +22,10 @@ from telegram_downloader.content import (
     SearchStatus,
 )
 from telegram_downloader.domain import MediaKind, ScanFilters
+from telegram_downloader.subscription_matching import (
+    SubscriptionCriteria,
+    SubscriptionMatchMode,
+)
 from telegram_downloader.subscriptions import (
     SubscriptionRule,
     SubscriptionRun,
@@ -80,22 +84,25 @@ def subscription(
     next_run_at: datetime | None = None,
 ) -> SubscriptionRule:
     return SubscriptionRule(
-        rule_id,
-        account_id,
-        peer_ref,
-        f"群-{account_id}",
-        "美女",
-        frozenset({MediaKind.PHOTO, MediaKind.VIDEO}),
-        30,
-        enabled,
-        state,
-        last_message_id,
-        next_run_at if next_run_at is not None else now,
-        None,
-        None,
-        0,
-        now,
-        now,
+        id=rule_id,
+        account_id=account_id,
+        peer_ref=peer_ref,
+        dialog_title=f"群-{account_id}",
+        criteria=SubscriptionCriteria(("美女",)),
+        media_kinds=frozenset({MediaKind.PHOTO, MediaKind.VIDEO}),
+        interval_minutes=30,
+        history_days=0,
+        enabled=enabled,
+        state=state,
+        last_message_id=last_message_id,
+        backfill_from_utc=None,
+        backfill_through_id=None,
+        next_run_at=next_run_at if next_run_at is not None else now,
+        last_run_at=None,
+        last_error=None,
+        failure_count=0,
+        created_at=now,
+        updated_at=now,
     )
 
 
@@ -158,14 +165,30 @@ def create_v2_catalog_with_run(database: Path, now: datetime) -> None:
         )
 
 
+def create_v4_catalog_with_subscription(
+    database: Path,
+    now: datetime,
+    *,
+    keyword: str = "资料",
+) -> Path:
+    create_v2_catalog_with_run(database, now)
+    with sqlite3.connect(database) as connection:
+        connection.executescript(catalog_module._SCHEMA_V3_MIGRATION)
+        connection.executescript(catalog_module._SCHEMA_V4_MIGRATION)
+        connection.execute(
+            "UPDATE subscription_rules SET keyword=?, normalized_keyword=? WHERE id=?",
+            (keyword, " ".join(keyword.casefold().split()), "r1"),
+        )
+    return database
+
+
 def create_v3_catalog_with_search(database: Path, now: datetime) -> None:
     with sqlite3.connect(database) as connection:
         connection.executescript(catalog_module._SCHEMA_V1)
         connection.executescript(catalog_module._SCHEMA_V2_MIGRATION)
         connection.executescript(catalog_module._SCHEMA_V3_MIGRATION)
         connection.execute(
-            "INSERT INTO accounts(account_id, display_name, last_used_at) "
-            "VALUES(?, ?, ?)",
+            "INSERT INTO accounts(account_id, display_name, last_used_at) VALUES(?, ?, ?)",
             ("a1", "旧账号", now.isoformat()),
         )
         connection.execute(
@@ -281,13 +304,13 @@ def test_most_recent_account_supports_offline_history(tmp_path: Path) -> None:
 def test_initialize_rejects_unknown_newer_schema(tmp_path: Path) -> None:
     database = tmp_path / "catalog.sqlite3"
     with sqlite3.connect(database) as connection:
-        connection.execute("PRAGMA user_version=5")
+        connection.execute("PRAGMA user_version=6")
 
     with pytest.raises(CatalogError, match="版本"):
         CatalogRepository(database).initialize()
 
 
-def test_catalog_schema_v4_keeps_existing_search_tables(tmp_path: Path) -> None:
+def test_catalog_schema_v5_keeps_existing_search_tables(tmp_path: Path) -> None:
     now = datetime(2026, 8, 14, tzinfo=UTC)
     database = tmp_path / "catalog.sqlite3"
     repo = CatalogRepository(database)
@@ -303,11 +326,11 @@ def test_catalog_schema_v4_keeps_existing_search_tables(tmp_path: Path) -> None:
     reopened.initialize()
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
     assert reopened.list_sessions("a1")[0].query.keyword == "资料"
 
 
-def test_catalog_migrates_v3_searches_to_v4_without_losing_state(
+def test_catalog_migrates_v3_searches_through_v5_without_losing_state(
     tmp_path: Path,
 ) -> None:
     now = datetime(2026, 8, 17, tzinfo=UTC)
@@ -317,7 +340,7 @@ def test_catalog_migrates_v3_searches_to_v4_without_losing_state(
     repository = CatalogRepository(database)
     repository.initialize()
 
-    assert repository.schema_version() == 4
+    assert repository.schema_version() == 5
     session = repository.get_session("a1", "legacy-search")
     saved = repository.list_results("a1", session.id)
     assert session.scope is SearchScope.SINGLE_DIALOG
@@ -399,7 +422,7 @@ def test_catalog_migrates_existing_v1_database_without_losing_accounts(
     repo = CatalogRepository(database)
     repo.initialize()
 
-    assert repo.schema_version() == 4
+    assert repo.schema_version() == 5
     assert repo.most_recent_account() == AccountProfile("a1", "旧账号")
     assert repo.list_subscriptions("a1") == []
 
@@ -520,10 +543,118 @@ def test_catalog_migrates_v2_subscription_runs_to_v3(tmp_path: Path) -> None:
     repository = CatalogRepository(database)
     repository.initialize()
 
-    assert repository.schema_version() == 4
+    assert repository.schema_version() == 5
     run = repository.list_subscription_runs("a1", "r1")[0]
     assert run.keyword_hits == 0
     assert (run.inspected, run.matched, run.queued, run.duplicate) == (5, 2, 1, 1)
+
+
+def test_catalog_migrates_single_keyword_rules_to_schema_five(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    database = create_v4_catalog_with_subscription(
+        tmp_path / "catalog.sqlite3",
+        now,
+        keyword=" 资料 ",
+    )
+
+    repository = CatalogRepository(database)
+    repository.initialize()
+
+    saved = repository.get_subscription("a1", "r1")
+    assert repository.schema_version() == 5
+    assert saved.criteria == SubscriptionCriteria(("资料",))
+    assert saved.history_days == 0
+    assert saved.last_message_id == 10
+    assert saved.state is SubscriptionState.WAITING
+    assert repository.list_subscription_runs("a1", "r1")[0].id == "run-old"
+
+
+def test_structured_subscription_round_trip_preserves_backfill_state(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    repository = CatalogRepository(tmp_path / "catalog.sqlite3")
+    repository.initialize()
+    repository.upsert_account(AccountProfile("a1", "账号"), now)
+    repository.replace_dialogs(
+        "a1",
+        [dialog("a1", "-1001", "群-a1", now)],
+        now,
+    )
+    saved = replace(
+        subscription("a1", "-1001", now),
+        criteria=SubscriptionCriteria(
+            ("AI", "模型"),
+            ("广告",),
+            SubscriptionMatchMode.ALL,
+        ),
+        history_days=7,
+        backfill_from_utc=now - timedelta(days=7),
+        backfill_through_id=900,
+    )
+
+    repository.save_subscription(saved)
+
+    assert repository.get_subscription("a1", saved.id) == saved
+
+
+def test_schema_five_migration_rolls_back_on_invalid_legacy_rule(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    database = create_v4_catalog_with_subscription(
+        tmp_path / "catalog.sqlite3",
+        now,
+    )
+
+    class InvalidCriteria:
+        def __init__(self, *_args, **_kwargs) -> None:
+            raise ValueError("invalid")
+
+    monkeypatch.setattr(catalog_module, "SubscriptionCriteria", InvalidCriteria)
+
+    with pytest.raises(ValueError, match="invalid"):
+        CatalogRepository(database).initialize()
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(subscription_rules)")}
+    assert "include_keywords_json" not in columns
+
+
+def test_subscription_cursor_can_atomically_complete_backfill(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    repository = CatalogRepository(tmp_path / "catalog.sqlite3")
+    repository.initialize()
+    repository.upsert_account(AccountProfile("a1", "账号"), now)
+    repository.replace_dialogs(
+        "a1",
+        [dialog("a1", "-1001", "群-a1", now)],
+        now,
+    )
+    saved = replace(
+        subscription("a1", "-1001", now),
+        history_days=7,
+        backfill_from_utc=now - timedelta(days=7),
+        backfill_through_id=900,
+    )
+    repository.save_subscription(saved)
+
+    repository.advance_subscription(
+        "a1",
+        saved.id,
+        900,
+        now,
+        complete_backfill=True,
+    )
+
+    completed = repository.get_subscription("a1", saved.id)
+    assert completed.last_message_id == 900
+    assert completed.backfill_from_utc is None
+    assert completed.backfill_through_id is None
 
 
 def test_subscription_run_round_trip_includes_keyword_hits(tmp_path: Path) -> None:
@@ -772,9 +903,7 @@ def test_thumbnail_reference_queries_follow_history_deletion(tmp_path: Path) -> 
 
     assert repo.list_thumbnail_keys("a1") == {"a1:shared"}
     assert repo.list_thumbnail_keys("a1", first.id) == {"a1:shared"}
-    assert repo.referenced_thumbnail_keys("a1", {"a1:shared", "missing"}) == {
-        "a1:shared"
-    }
+    assert repo.referenced_thumbnail_keys("a1", {"a1:shared", "missing"}) == {"a1:shared"}
 
     repo.delete_session("a1", first.id)
     assert repo.referenced_thumbnail_keys("a1", {"a1:shared"}) == {"a1:shared"}

@@ -17,6 +17,7 @@ from telegram_downloader.paths import PortablePaths
 from telegram_downloader.planner import TaskPlanner
 from telegram_downloader.repository import TaskRepository
 from telegram_downloader.scheduler import DownloadScheduler
+from telegram_downloader.subscription_matching import SubscriptionCriteria
 from telegram_downloader.subscription_service import SubscriptionService
 from telegram_downloader.subscriptions import (
     SubscriptionDraft,
@@ -63,11 +64,19 @@ def message(message_id: int, text: str) -> RemoteMessage:
 class Gateway:
     def __init__(self) -> None:
         self.latest_id = 10
+        self.boundary_id = 0
         self.messages: tuple[RemoteMessage, ...] = ()
         self.recent: tuple[RemoteMessage, ...] = ()
 
     async def latest_message_id(self, _peer_ref: str) -> int:
         return self.latest_id
+
+    async def message_id_before(
+        self,
+        _peer_ref: str,
+        _before_utc: datetime,
+    ) -> int:
+        return self.boundary_id
 
     async def incremental_messages(
         self,
@@ -77,11 +86,9 @@ class Gateway:
         through_id: int,
         limit: int,
     ) -> tuple[RemoteMessage, ...]:
-        return tuple(
-            item
-            for item in self.messages
-            if after_id < item.message_id <= through_id
-        )[:limit]
+        return tuple(item for item in self.messages if after_id < item.message_id <= through_id)[
+            :limit
+        ]
 
     async def recent_messages(
         self,
@@ -145,7 +152,11 @@ async def test_probe_formal_run_download_and_restart_stay_project_local(
     service.bind_online(gateway, planner)
     service.set_account(profile)
     rule = await service.create_rule(
-        SubscriptionDraft("-1001", "资料", frozenset({MediaKind.PHOTO}))
+        SubscriptionDraft(
+            "-1001",
+            SubscriptionCriteria(("资料",)),
+            frozenset({MediaKind.PHOTO}),
+        )
     )
 
     seeded = planner.plan_subscription("-1001", "测试群", "预置", [remote(11)])
@@ -184,10 +195,7 @@ async def test_probe_formal_run_download_and_restart_stay_project_local(
     scheduler = DownloadScheduler(tasks, Downloader(), concurrency=1)
     await scheduler.run_task(formal.task_ids[0])
     assert tasks.get_task(formal.task_ids[0]).status is TaskStatus.COMPLETED
-    assert all(
-        item.status is ItemStatus.COMPLETED
-        for item in tasks.list_items(formal.task_ids[0])
-    )
+    assert all(item.status is ItemStatus.COMPLETED for item in tasks.list_items(formal.task_ids[0]))
 
     restarted_catalog = CatalogRepository(paths.catalog_database)
     restarted_catalog.initialize()
@@ -216,22 +224,25 @@ async def test_probe_formal_run_download_and_restart_stay_project_local(
 
 def ui_rule() -> SubscriptionRule:
     return SubscriptionRule(
-        "rule-1",
-        "a1",
-        "-1001",
-        "资料群",
-        "资料",
-        frozenset({MediaKind.PHOTO}),
-        30,
-        True,
-        SubscriptionState.WAITING,
-        10,
-        NOW + timedelta(minutes=30),
-        None,
-        None,
-        0,
-        NOW,
-        NOW,
+        id="rule-1",
+        account_id="a1",
+        peer_ref="-1001",
+        dialog_title="资料群",
+        criteria=SubscriptionCriteria(("资料",)),
+        media_kinds=frozenset({MediaKind.PHOTO}),
+        interval_minutes=30,
+        history_days=0,
+        enabled=True,
+        state=SubscriptionState.WAITING,
+        last_message_id=10,
+        backfill_from_utc=None,
+        backfill_through_id=None,
+        next_run_at=NOW + timedelta(minutes=30),
+        last_run_at=None,
+        last_error=None,
+        failure_count=0,
+        created_at=NOW,
+        updated_at=NOW,
     )
 
 
@@ -298,9 +309,7 @@ async def test_real_qt_page_controller_probe_cancel_and_complete(qtbot) -> None:
     running: list[asyncio.Task[None]] = []
     page.rule_selected.connect(controller.show_subscription_details)
     page.probe_requested.connect(
-        lambda rule_id: running.append(
-            asyncio.create_task(controller.probe_subscription(rule_id))
-        )
+        lambda rule_id: running.append(asyncio.create_task(controller.probe_subscription(rule_id)))
     )
     page.probe_cancel_requested.connect(controller.cancel_subscription_probe)
     page.rule_table.selectRow(0)

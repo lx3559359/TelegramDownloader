@@ -10,6 +10,7 @@ from telegram_downloader.domain import (
     ItemStatus,
     MediaItem,
     MediaKind,
+    PauseReason,
     ScanFilters,
     SourceKind,
     TaskRecord,
@@ -59,6 +60,29 @@ def test_round_trip_and_unique_source_item(tmp_path: Path) -> None:
     assert repo.get_task(task.id) == task
     assert repo.list_items(task.id)[0].downloaded_bytes == 4
     assert repo.insert_item_if_new(replace(item, id="duplicate")) is False
+
+
+def test_pause_reason_round_trips_and_clears_for_non_paused_status(tmp_path: Path) -> None:
+    repo = TaskRepository(tmp_path / "tasks.sqlite3")
+    repo.initialize()
+    task, item = records(tmp_path)
+    repo.create_task(task, [item])
+
+    repo.update_task_status(task.id, TaskStatus.PAUSED)
+    assert repo.get_task(task.id).pause_reason is PauseReason.USER
+
+    repo.update_task_status(
+        task.id,
+        TaskStatus.PAUSED,
+        pause_reason=PauseReason.SCHEDULE,
+    )
+    assert repo.get_task(task.id).pause_reason is PauseReason.SCHEDULE
+    assert [value.id for value in repo.list_paused_by_reason(PauseReason.SCHEDULE)] == [
+        task.id
+    ]
+
+    repo.update_task_status(task.id, TaskStatus.QUEUED)
+    assert repo.get_task(task.id).pause_reason is None
 
 
 def test_create_task_is_atomic_when_an_item_conflicts(tmp_path: Path) -> None:
@@ -434,6 +458,23 @@ def _create_v080_database(database: Path, target: Path) -> None:
                 None,
             ),
         )
+
+
+def test_existing_paused_task_migrates_as_user_pause(tmp_path: Path) -> None:
+    database = tmp_path / "tasks.sqlite3"
+    _create_v080_database(database, tmp_path / "legacy.mp4")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE tasks SET status = ? WHERE id = 'legacy-task'",
+            (TaskStatus.PAUSED.value,),
+        )
+
+    repo = TaskRepository(database)
+    repo.initialize()
+
+    paused = repo.list_paused_by_reason(PauseReason.USER)
+    assert [task.id for task in paused] == ["legacy-task"]
+    assert paused[0].pause_reason is PauseReason.USER
 
 
 def test_initialize_migrates_v080_media_to_unverified(tmp_path: Path) -> None:

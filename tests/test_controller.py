@@ -2,6 +2,7 @@ import asyncio
 import logging
 import threading
 import time
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -41,6 +42,7 @@ from telegram_downloader.file_integrity import (
     IntegritySummary,
     RepairPreparation,
 )
+from telegram_downloader.files import DownloadNamingSettings
 from telegram_downloader.gateway import (
     AccessDeniedError,
     AuthorizationFailureReason,
@@ -50,6 +52,7 @@ from telegram_downloader.gateway import (
     SessionExpiredError,
     TransientNetworkError,
 )
+from telegram_downloader.notifications import EventKind
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.scheduler import SchedulerSnapshot
 from telegram_downloader.settings import AppSettings, ProxySettings
@@ -356,11 +359,13 @@ async def test_concurrent_session_expiry_runs_one_relogin_flow(monkeypatch) -> N
     window.subscriptions_page = SimpleNamespace(
         set_logged_in=subscription_login_states.append
     )
+    events = []
     controller = AppController.for_test(
         gateway=gateway,
         vault=vault,
         secrets=vault.load(),
         window=window,
+        publish=events.append,
     )
     shown: list[str] = []
     controller.show_login = lambda: shown.append("login")
@@ -384,6 +389,7 @@ async def test_concurrent_session_expiry_runs_one_relogin_flow(monkeypatch) -> N
     assert "auth-key-duplicated" in serialized
     assert "private server text" not in serialized
     assert "private server text" not in repr(window.content_page.errors)
+    assert [event.kind for event in events] == [EventKind.AUTH_REQUIRED]
 
 
 @pytest.mark.asyncio
@@ -1286,6 +1292,80 @@ async def test_confirmed_scan_awaits_async_task_refresh_before_start() -> None:
 
 
 @pytest.mark.asyncio
+async def test_confirmed_batch_scan_previews_and_commits_one_task() -> None:
+    batch = SimpleNamespace(
+        preview="combined-preview",
+        unique_link_count=2,
+    )
+
+    class Planner:
+        def __init__(self):
+            self.commits = []
+
+        async def scan_batch(self, links, filters, *, on_progress):
+            assert links == ("https://t.me/first", "https://t.me/second")
+            on_progress(SimpleNamespace(completed=1, total=2))
+            return batch
+
+        def commit(self, preview):
+            self.commits.append(preview)
+            return SimpleNamespace(
+                task=SimpleNamespace(id="batch-task"),
+                accepted_keys=frozenset({("peer", 1, "media")}),
+                skipped_count=2,
+            )
+
+    planner = Planner()
+    confirmed = []
+    controller = AppController.for_test(
+        gateway=ConnectedGateway(),
+        planner=planner,
+        confirm_preview=lambda preview: confirmed.append(preview) or True,
+    )
+    controller.window.finish_batch_preflight = Mock()
+    controller.window.set_batch_scan_progress = Mock()
+    controller.refresh_tasks_async = AsyncMock()
+    controller._start_task = Mock()
+
+    await controller.scan_links(
+        ("https://t.me/first", "https://t.me/second"),
+        controller.default_filters(datetime(2026, 8, 13, tzinfo=UTC)),
+    )
+
+    assert confirmed == [batch]
+    assert planner.commits == ["combined-preview"]
+    controller.window.finish_batch_preflight.assert_called_once_with(True)
+    controller.window.set_batch_scan_progress.assert_called_once()
+    controller._start_task.assert_called_once_with("batch-task")
+    assert controller.window.message.last_message == (
+        "批量加入 1 项，确认时另跳过重复 2 项；任务已开始下载"
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_batch_preflight_keeps_input_dialog_open() -> None:
+    class Planner:
+        async def scan_batch(self, _links, _filters, *, on_progress):
+            raise ValueError("批量链接没有新媒体")
+
+    controller = AppController.for_test(
+        gateway=ConnectedGateway(),
+        planner=Planner(),
+    )
+    controller.window.finish_batch_preflight = Mock()
+
+    await controller.scan_links(
+        ("https://t.me/first",),
+        controller.default_filters(datetime(2026, 8, 13, tzinfo=UTC)),
+    )
+
+    controller.window.finish_batch_preflight.assert_called_once_with(
+        False,
+        "批量链接没有新媒体",
+    )
+
+
+@pytest.mark.asyncio
 async def test_running_task_refreshes_window_before_download_finishes() -> None:
     release = asyncio.Event()
     started = asyncio.Event()
@@ -1429,6 +1509,7 @@ def test_search_task_uses_display_title_but_opens_source_directory(tmp_path, mon
         expected_size=100,
         downloaded_bytes=0,
         last_error=None,
+        target_path=tmp_path / "downloads" / "资料群" / "2026-08" / "video" / "video.mp4",
     )
 
     class Repository:
@@ -1449,6 +1530,10 @@ def test_search_task_uses_display_title_but_opens_source_directory(tmp_path, mon
         def get_task(self, task_id):
             assert task_id == task.id
             return task
+
+        def list_items(self, task_id):
+            assert task_id == task.id
+            return [item]
 
     class Window:
         def __init__(self):
@@ -1476,7 +1561,7 @@ def test_search_task_uses_display_title_but_opens_source_directory(tmp_path, mon
     controller.open_task_directory(task.id)
 
     assert window.tasks[0].title == "资料群（搜索：安装）"
-    assert opened == [(paths.downloads / "资料群").resolve()]
+    assert opened == [(paths.downloads / "资料群" / "2026-08" / "video").resolve()]
     assert not (paths.downloads / "资料群（搜索：安装）").exists()
 
 
@@ -1492,6 +1577,17 @@ def test_account_search_task_opens_download_root(tmp_path, monkeypatch) -> None:
             assert task_id == task.id
             return task
 
+        def list_items(self, task_id):
+            assert task_id == task.id
+            return [
+                SimpleNamespace(
+                    target_path=tmp_path / "downloads" / "来源甲" / "video" / "a.mp4"
+                ),
+                SimpleNamespace(
+                    target_path=tmp_path / "downloads" / "来源乙" / "photo" / "b.jpg"
+                ),
+            ]
+
     opened = []
     monkeypatch.setattr(
         controller_module.os,
@@ -1506,6 +1602,39 @@ def test_account_search_task_opens_download_root(tmp_path, monkeypatch) -> None:
 
     assert opened == [paths.downloads.resolve()]
     assert not (paths.downloads / ALL_DIALOGS_TITLE).exists()
+
+
+def test_task_directory_rejects_persisted_path_outside_download_root(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    task = SimpleNamespace(id="unsafe-task")
+
+    class Repository:
+        def get_task(self, task_id):
+            assert task_id == task.id
+            return task
+
+        def list_items(self, task_id):
+            assert task_id == task.id
+            return [SimpleNamespace(target_path=tmp_path / "data" / "secret.bin")]
+
+    opened = []
+    monkeypatch.setattr(
+        controller_module.os,
+        "startfile",
+        lambda directory: opened.append(directory),
+        raising=False,
+    )
+    controller = AppController.for_test(
+        repository=Repository(),
+        paths=PortablePaths(tmp_path),
+    )
+
+    controller.open_task_directory(task.id)
+
+    assert opened == []
+    assert "安全限制" in controller.window.message.last_message
 
 
 def test_task_detail_selection_loads_only_one_selected_task() -> None:
@@ -3539,7 +3668,7 @@ def test_refresh_tasks_exposes_queue_positions_and_scheduler_summary() -> None:
 
     class Scheduler:
         def snapshot(self):
-            return SchedulerSnapshot("active", ("queued",), 4, 2048)
+            return SchedulerSnapshot(("active", "active-2"), ("queued",), 4, 2048)
 
         def queue_positions(self):
             return {"queued": 1}
@@ -3567,7 +3696,7 @@ def test_refresh_tasks_exposes_queue_positions_and_scheduler_summary() -> None:
     assert window.tasks[0].queue_position == 1
     assert window.tasks[1].queue_position is None
     assert window.scheduler_summary == {
-        "active": 1,
+        "active": 2,
         "queued": 1,
         "concurrency": 4,
         "speed_limit_kib": 2048,
@@ -3661,10 +3790,24 @@ async def test_apply_settings_reconfigures_active_scheduler_after_persistence() 
         def configure_resources(self, concurrency, speed_limit_kib):
             events.append(("scheduler", concurrency, speed_limit_kib))
 
-    updated = AppSettings(api_id=1, concurrency=5, speed_limit_kib=2048)
+    class Planner:
+        def configure_naming(self, naming):
+            events.append(("planner", naming))
+
+    naming = DownloadNamingSettings(
+        "{year}/{source}/{media_type}",
+        "{message_id}_{original_name}",
+    )
+    updated = AppSettings(
+        api_id=1,
+        concurrency=5,
+        speed_limit_kib=2048,
+        download_naming=naming,
+    )
     controller = AppController.for_test(
         settings_store=Store(),
         vault=SecretStore(),
+        planner=Planner(),
         scheduler=Scheduler(),
     )
 
@@ -3674,9 +3817,82 @@ async def test_apply_settings_reconfigures_active_scheduler_after_persistence() 
         ("settings", updated),
         ("secrets", {}),
         ("scheduler", 5, 2048),
+        ("planner", naming),
     ]
     assert controller.settings == updated
     assert "即时应用" in controller.window.message.last_message
+
+
+@pytest.mark.asyncio
+async def test_apply_settings_runs_runtime_effects_before_assigning_state() -> None:
+    previous = AppSettings()
+    current = replace(previous, close_to_tray=False)
+    observed = []
+
+    class Effects:
+        async def apply(self, old, new) -> None:
+            observed.append((old, new, controller.settings))
+
+    controller = AppController.for_test(
+        settings=previous,
+        runtime_settings_effects=Effects(),
+    )
+
+    await controller.apply_settings(current, "")
+
+    assert observed == [(previous, current, previous)]
+    assert controller.settings == current
+
+
+@pytest.mark.asyncio
+async def test_apply_settings_rolls_back_runtime_effects_when_vault_save_fails() -> None:
+    previous = AppSettings()
+    current = replace(previous, notifications_enabled=False)
+    observed = []
+
+    class Effects:
+        async def apply(self, old, new) -> None:
+            observed.append((old, new))
+
+    class FailingVault:
+        def save(self, _value) -> None:
+            raise OSError("private vault path")
+
+    controller = AppController.for_test(
+        settings=previous,
+        secrets={},
+        vault=FailingVault(),
+        runtime_settings_effects=Effects(),
+    )
+
+    with pytest.raises(OSError, match="private vault path"):
+        await controller.apply_settings(current, "")
+
+    assert observed == [(previous, current), (current, previous)]
+    assert controller.settings == previous
+
+
+@pytest.mark.asyncio
+async def test_background_start_requests_login_without_showing_dialog() -> None:
+    events = []
+
+    class LoginDialog:
+        shows = 0
+
+        def show(self) -> None:
+            self.shows += 1
+
+    login = LoginDialog()
+    controller = AppController.for_test(
+        gateway=None,
+        login_dialog=login,
+        publish=events.append,
+    )
+
+    await controller.start(background=True)
+
+    assert login.shows == 0
+    assert events[-1].kind is EventKind.AUTH_REQUIRED
 
 
 @pytest.mark.asyncio
