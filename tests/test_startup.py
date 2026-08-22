@@ -9,7 +9,7 @@ def test_startup_indicator_is_visible_updates_and_closes(qtbot) -> None:
     qtbot.addWidget(indicator.widget)
 
     assert indicator.widget.isVisible() is True
-    assert indicator.status == "正在启动 Telegram 下载器…"
+    assert indicator.status == "正在启动 TG 快取…"
 
     indicator.set_status("正在准备本地数据…")
 

@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from telegram_downloader.branding import APP_NAME
 from telegram_downloader.settings import ProxySettings, SettingsError
 from telegram_downloader.ui.effects import ElevationLevel, apply_elevation
 from telegram_downloader.ui.qr import render_qr_image
@@ -53,7 +54,7 @@ class LoginDialog(QDialog):
         super().__init__(parent)
         ensure_cjk_font()
         self.setStyleSheet(APP_STYLESHEET)
-        self.setWindowTitle("登录 Telegram")
+        self.setWindowTitle(f"登录 {APP_NAME}")
         self.setModal(True)
         self.setMinimumWidth(520)
         self._qr_expires_at: datetime | None = None

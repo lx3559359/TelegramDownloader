@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from PySide6.QtCore import QDate, QItemSelectionModel, QSignalBlocker, Qt, Signal
+from PySide6.QtCore import QDate, QItemSelectionModel, QSignalBlocker, QSize, Qt, Signal
+from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -27,6 +28,13 @@ from PySide6.QtWidgets import (
 )
 
 from telegram_downloader import __version__
+from telegram_downloader.branding import (
+    APP_CHANNEL,
+    APP_NAME,
+    APP_SUBTITLE,
+    app_icon_path,
+    app_logo_path,
+)
 from telegram_downloader.domain import IntegrityStatus, ItemStatus, MediaKind, TaskStatus
 from telegram_downloader.file_integrity import IntegrityProgress
 from telegram_downloader.planner import BatchScanProgress
@@ -104,7 +112,8 @@ class MainWindow(QMainWindow):
         self._integrity_busy = False
         self._batch_dialogs: set[BatchImportDialog] = set()
         self._pending_batch_dialog: BatchImportDialog | None = None
-        self.setWindowTitle("Telegram 下载器")
+        self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(QIcon(str(app_icon_path())))
         self.setMinimumSize(1180, 720)
         self.resize(1280, 780)
         ensure_cjk_font()
@@ -191,18 +200,25 @@ class MainWindow(QMainWindow):
         layout.setSpacing(9)
 
         brand = QHBoxLayout()
-        mark = QLabel("T")
-        mark.setObjectName("brandMark")
-        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.brand_mark = QLabel()
+        self.brand_mark.setObjectName("brandMark")
+        self.brand_mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.brand_mark.setPixmap(
+            QPixmap(str(app_logo_path())).scaled(
+                QSize(34, 34),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
         names = QVBoxLayout()
         names.setSpacing(1)
-        name = QLabel("Telegram")
-        name.setObjectName("brandName")
-        caption = QLabel("下载工作台")
-        caption.setObjectName("brandCaption")
-        names.addWidget(name)
-        names.addWidget(caption)
-        brand.addWidget(mark)
+        self.brand_name = QLabel(APP_NAME)
+        self.brand_name.setObjectName("brandName")
+        self.brand_caption = QLabel(APP_SUBTITLE)
+        self.brand_caption.setObjectName("brandCaption")
+        names.addWidget(self.brand_name)
+        names.addWidget(self.brand_caption)
+        brand.addWidget(self.brand_mark)
         brand.addSpacing(8)
         brand.addLayout(names)
         brand.addStretch()
@@ -230,7 +246,7 @@ class MainWindow(QMainWindow):
         privacy.setObjectName("muted")
         privacy.setWordWrap(True)
         layout.addWidget(privacy)
-        self.version_label = QLabel(f"v{__version__} · stable")
+        self.version_label = QLabel(f"v{__version__} · {APP_CHANNEL}")
         self.version_label.setObjectName("muted")
         layout.addWidget(self.version_label)
         return rail

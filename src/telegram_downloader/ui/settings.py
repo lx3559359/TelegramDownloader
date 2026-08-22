@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from telegram_downloader import __version__
+from telegram_downloader.branding import APP_CHANNEL, APP_NAME, APP_SUBTITLE
 from telegram_downloader.domain import MediaKind
 from telegram_downloader.files import DownloadNamingSettings, render_download_target
 from telegram_downloader.settings import (
@@ -290,12 +291,12 @@ class SettingsDialog(QDialog):
         about_layout = QVBoxLayout(self.about_update_tab)
         about_layout.setContentsMargins(12, 16, 12, 12)
         about_layout.setSpacing(10)
-        product_name = QLabel("Telegram 下载器")
-        product_name.setObjectName("sectionTitle")
-        product_subtitle = QLabel("Telegram 媒体下载工具")
-        product_subtitle.setObjectName("muted")
+        self.product_name_label = QLabel(APP_NAME)
+        self.product_name_label.setObjectName("sectionTitle")
+        self.product_subtitle_label = QLabel(APP_SUBTITLE)
+        self.product_subtitle_label.setObjectName("muted")
         self.update_version_label = QLabel(f"当前版本：{application_version}")
-        self.update_channel_label = QLabel("更新通道：stable")
+        self.update_channel_label = QLabel(f"更新通道：{APP_CHANNEL}")
         self.update_last_checked_label = QLabel(
             self._format_update_check_time(settings.last_successful_update_check_utc)
         )
@@ -306,8 +307,8 @@ class SettingsDialog(QDialog):
         self.update_status_label.setWordWrap(True)
         self.update_check_button = QPushButton("检查更新")
         self.update_check_button.setObjectName("primaryButton")
-        about_layout.addWidget(product_name)
-        about_layout.addWidget(product_subtitle)
+        about_layout.addWidget(self.product_name_label)
+        about_layout.addWidget(self.product_subtitle_label)
         about_layout.addSpacing(8)
         about_layout.addWidget(self.update_version_label)
         about_layout.addWidget(self.update_channel_label)

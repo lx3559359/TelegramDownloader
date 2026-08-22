@@ -3,6 +3,8 @@ from __future__ import annotations
 import ctypes
 from typing import Protocol
 
+from telegram_downloader.branding import APP_NAME
+
 
 class KernelApi(Protocol):
     def create_mutex(self, name: str) -> tuple[int, bool]: ...
@@ -53,8 +55,8 @@ class WindowsInstanceGuard:
     def notify_already_running(self) -> None:
         ctypes.windll.user32.MessageBoxW(
             None,
-            "Telegram 下载器已经在运行。",
-            "Telegram 下载器",
+            f"{APP_NAME} 已经在运行。",
+            APP_NAME,
             0x40,
         )
 

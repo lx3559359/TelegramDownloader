@@ -10,7 +10,19 @@ a = Analysis(
         (
             str(root / "src" / "telegram_downloader" / "trusted_update_keys.json"),
             "telegram_downloader",
-        )
+        ),
+        (
+            str(root / "src" / "telegram_downloader" / "resources" / "tg_quick_fetch.svg"),
+            "telegram_downloader/resources",
+        ),
+        (
+            str(root / "src" / "telegram_downloader" / "resources" / "tg_quick_fetch.ico"),
+            "telegram_downloader/resources",
+        ),
+        (
+            str(root / "src" / "telegram_downloader" / "resources" / "tg_quick_fetch-256.png"),
+            "telegram_downloader/resources",
+        ),
     ],
     hiddenimports=[
         "qasync",
@@ -43,6 +55,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
+    icon=str(root / "src" / "telegram_downloader" / "resources" / "tg_quick_fetch.ico"),
 )
 coll = COLLECT(
     exe,

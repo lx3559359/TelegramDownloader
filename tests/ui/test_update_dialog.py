@@ -1,6 +1,7 @@
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QGraphicsDropShadowEffect
 
+from telegram_downloader.branding import APP_NAME
 from telegram_downloader.ui.effects import ElevationLevel
 from telegram_downloader.ui.theme import APP_STYLESHEET
 from telegram_downloader.ui.update_dialog import UpdateDialog
@@ -22,6 +23,7 @@ def test_update_dialog_shows_signed_release_details(qtbot) -> None:
     assert dialog.dialog_surface.objectName() == "dialogSurface"
     assert dialog.dialog_surface.property("elevation") == ElevationLevel.MAJOR.value
     assert isinstance(dialog.dialog_surface.graphicsEffect(), QGraphicsDropShadowEffect)
+    assert dialog.title_label.text() == f"{APP_NAME} 有新版本"
     assert "0.2.0" in dialog.version_label.text()
     assert "10 B" in dialog.size_label.text()
     assert "首个在线更新测试版本" in dialog.notes.toPlainText()

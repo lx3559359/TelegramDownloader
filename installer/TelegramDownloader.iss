@@ -19,13 +19,13 @@
 
 [Setup]
 AppId={{B19D534A-A414-4D17-9BB6-CE9A60D8243C}
-AppName=Telegram 下载器
+AppName=TG 快取
 AppVersion={#AppVersion}
 AppPublisher=lx3559359
 AppPublisherURL=https://github.com/lx3559359/TelegramDownloader
 AppSupportURL=https://github.com/lx3559359/TelegramDownloader/issues
 DefaultDirName={code:GetDefaultInstallDir}
-DefaultGroupName=Telegram 下载器
+DefaultGroupName=TG 快取
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
@@ -42,6 +42,8 @@ CloseApplications=yes
 RestartApplications=no
 Uninstallable=yes
 UninstallDisplayIcon={app}\TelegramDownloader.exe
+UninstallDisplayName=TG 快取
+SetupIconFile=..\src\telegram_downloader\resources\tg_quick_fetch.ico
 UsePreviousAppDir=yes
 UsePreviousLanguage=no
 ChangesAssociations=no
@@ -61,11 +63,15 @@ Name: "{app}\data"; Flags: uninsneveruninstall
 Name: "{app}\downloads"; Flags: uninsneveruninstall
 
 [Icons]
-Name: "{userprograms}\Telegram 下载器"; Filename: "{app}\TelegramDownloader.exe"; WorkingDir: "{app}"
-Name: "{userdesktop}\Telegram 下载器"; Filename: "{app}\TelegramDownloader.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{userprograms}\TG 快取"; Filename: "{app}\TelegramDownloader.exe"; WorkingDir: "{app}"
+Name: "{userdesktop}\TG 快取"; Filename: "{app}\TelegramDownloader.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+
+[InstallDelete]
+Type: files; Name: "{userprograms}\Telegram 下载器.lnk"
+Type: files; Name: "{userdesktop}\Telegram 下载器.lnk"
 
 [Run]
-Filename: "{app}\TelegramDownloader.exe"; Description: "启动 Telegram 下载器"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\TelegramDownloader.exe"; Description: "启动 TG 快取"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
 
 [Code]
 const

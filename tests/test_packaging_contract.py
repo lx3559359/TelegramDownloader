@@ -11,6 +11,13 @@ def test_build_contract_uses_onedir_and_project_local_workpaths() -> None:
     assert "COLLECT(" in spec
     assert 'name="UpdateHelper"' in spec
     assert "trusted_update_keys.json" in spec
+    assert "tg_quick_fetch.ico" in spec
+    assert "tg_quick_fetch-256.png" in spec
+    icon_contract = (
+        'icon=str(root / "src" / "telegram_downloader" / "resources" '
+        '/ "tg_quick_fetch.ico")'
+    )
+    assert icon_contract in spec
     assert "console=False" in spec
     assert "QtWebEngine" in spec
     assert "--onefile" not in build
@@ -70,7 +77,7 @@ def test_chinese_guide_documents_portable_data_and_security() -> None:
         "浏览…选择下载根目录",
         "已有任务保持原路径",
         "启动时不会自动检查更新",
-        "搜索摘要完整换行",
+        "搜索摘要单行省略",
     ):
         assert required in readme
 

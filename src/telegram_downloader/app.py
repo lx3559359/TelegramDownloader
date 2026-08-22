@@ -30,6 +30,7 @@ from telegram_downloader.background import (
     QtTrayAdapter,
     QtWindowPort,
 )
+from telegram_downloader.branding import APP_NAME, app_icon_path
 from telegram_downloader.catalog import CatalogRepository
 from telegram_downloader.content import ContentSearchQuery, SearchScope
 from telegram_downloader.content_browser import ContentBrowserService
@@ -375,6 +376,7 @@ def create_application(
     publish_event: Callable[[ApplicationEvent], None] | None = None,
 ):
     import qasync
+    from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication, QMessageBox
 
     from telegram_downloader.ui.account_status import AccountStatusDialog
@@ -393,8 +395,10 @@ def create_application(
     paths.ensure_layout()
     application = QApplication.instance() or QApplication(sys.argv[:1])
     install_checkmark_style(application)
-    application.setApplicationName("TelegramDownloader")
+    application.setApplicationName(APP_NAME)
+    application.setApplicationDisplayName(APP_NAME)
     application.setApplicationVersion(__version__)
+    application.setWindowIcon(QIcon(str(app_icon_path())))
     application.setQuitOnLastWindowClosed(True)
 
     loop = qasync.QEventLoop(application)

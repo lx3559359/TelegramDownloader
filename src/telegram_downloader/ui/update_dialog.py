@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from telegram_downloader.branding import APP_NAME
 from telegram_downloader.ui.effects import ElevationLevel, apply_elevation
 from telegram_downloader.ui.theme import APP_STYLESHEET, ensure_cjk_font
 from telegram_downloader.update_contract import ReleaseManifest
@@ -35,9 +36,9 @@ class UpdateDialog(QDialog):
         layout = QVBoxLayout(self.dialog_surface)
         layout.setContentsMargins(22, 20, 22, 18)
         layout.setSpacing(12)
-        title = QLabel("Telegram 下载器有新版本")
-        title.setObjectName("pageTitle")
-        layout.addWidget(title)
+        self.title_label = QLabel(f"{APP_NAME} 有新版本")
+        self.title_label.setObjectName("pageTitle")
+        layout.addWidget(self.title_label)
 
         summary = QHBoxLayout()
         self.version_label = QLabel(f"版本 {manifest.version}")

@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
 )
 
+from telegram_downloader.branding import APP_NAME
 from telegram_downloader.settings import ProxySettings
 from telegram_downloader.ui.effects import ElevationLevel
 from telegram_downloader.ui.login import LoginDialog, LoginPage
@@ -18,6 +19,7 @@ def test_login_pages_mask_sensitive_fields(qtbot) -> None:
     dialog = LoginDialog()
     qtbot.addWidget(dialog)
 
+    assert dialog.windowTitle() == f"登录 {APP_NAME}"
     assert dialog.styleSheet() == APP_STYLESHEET
     assert dialog.dialog_surface.objectName() == "dialogSurface"
     assert dialog.dialog_surface.property("elevation") == ElevationLevel.MAJOR.value

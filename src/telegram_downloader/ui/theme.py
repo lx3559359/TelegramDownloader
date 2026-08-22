@@ -62,11 +62,8 @@ QLabel#brandMark {
     min-height: 34px;
     max-width: 34px;
     max-height: 34px;
-    border-radius: 9px;
-    background: #17A8C2;
-    color: #FFFFFF;
-    font-size: 18px;
-    font-weight: 800;
+    border: none;
+    background: transparent;
 }
 QLabel#brandName { color: #172033; font-size: 15px; font-weight: 700; }
 QLabel#pageTitle { color: #172033; font-size: 24px; font-weight: 750; }

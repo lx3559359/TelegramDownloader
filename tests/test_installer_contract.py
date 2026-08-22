@@ -19,8 +19,16 @@ def test_installer_is_current_user_x64_and_rejects_system_volumes() -> None:
         "TelegramDownloader.exe",
         "UpdateHelper.exe",
         "runtime-manifest.json",
+        "AppName=TG 快取",
+        "UninstallDisplayName=TG 快取",
+        "SetupIconFile=..\\src\\telegram_downloader\\resources\\tg_quick_fetch.ico",
+        'Name: "{userprograms}\\TG 快取"',
+        'Name: "{userdesktop}\\TG 快取"',
     ):
         assert required in script
+
+    assert 'Name: "{userprograms}\\Telegram 下载器.lnk"' in script
+    assert 'Name: "{userdesktop}\\Telegram 下载器.lnk"' in script
 
 
 def test_installer_preserves_local_data_unless_separately_confirmed() -> None:

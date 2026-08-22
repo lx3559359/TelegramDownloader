@@ -4,6 +4,7 @@ from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QSystemTrayIcon, QWidget
 
 from telegram_downloader.background import BackgroundModeController, QtTrayAdapter
+from telegram_downloader.branding import APP_NAME
 from telegram_downloader.notifications import NotificationPayload, NotificationRoute
 
 
@@ -162,6 +163,8 @@ def test_tray_menu_uses_explicit_readable_palette(qapp, qtbot, monkeypatch) -> N
         adapter = QtTrayAdapter(window)
         palette = adapter.menu.palette()
 
+        assert adapter.icon.toolTip() == APP_NAME
+        assert adapter.icon.icon().isNull() is False
         assert palette.color(QPalette.ColorRole.Window).name().lower() == "#ffffff"
         assert palette.color(QPalette.ColorRole.WindowText).name().lower() == "#22394a"
         assert palette.color(QPalette.ColorRole.Text).name().lower() == "#22394a"

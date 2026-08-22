@@ -1,6 +1,7 @@
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFileDialog, QGraphicsDropShadowEffect, QLineEdit
 
+from telegram_downloader.branding import APP_CHANNEL, APP_NAME, APP_SUBTITLE
 from telegram_downloader.files import DownloadNamingSettings
 from telegram_downloader.settings import (
     AppSettings,
@@ -52,9 +53,11 @@ def test_manual_update_button_emits_and_reports_result(qtbot) -> None:
     ]
     assert labels == ["常规", "下载路径", "后台与通知", "关于与更新"]
     assert dialog.tabs.indexOf(dialog.about_update_tab) == 3
+    assert dialog.product_name_label.text() == APP_NAME
+    assert dialog.product_subtitle_label.text() == APP_SUBTITLE
     assert dialog.update_check_button.isVisibleTo(dialog.about_update_tab)
     assert "0.16.0" in dialog.update_version_label.text()
-    assert "stable" in dialog.update_channel_label.text()
+    assert APP_CHANNEL in dialog.update_channel_label.text()
     assert "尚未检查" in dialog.update_last_checked_label.text()
     with qtbot.waitSignal(dialog.update_check_requested, timeout=500):
         qtbot.mouseClick(

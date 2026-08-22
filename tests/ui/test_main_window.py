@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from telegram_downloader import __version__
+from telegram_downloader.branding import APP_CHANNEL, APP_NAME, APP_SUBTITLE
 from telegram_downloader.domain import IntegrityStatus, ItemStatus, MediaKind, TaskStatus
 from telegram_downloader.file_integrity import IntegrityProgress
 from telegram_downloader.ui.effects import ElevationLevel
@@ -85,7 +86,11 @@ def test_workbench_contains_required_controls(qtbot) -> None:
     window = MainWindow()
     qtbot.addWidget(window)
 
-    assert window.windowTitle() == "Telegram 下载器"
+    assert window.windowTitle() == APP_NAME
+    assert window.windowIcon().isNull() is False
+    assert window.brand_mark.pixmap().isNull() is False
+    assert window.brand_name.text() == APP_NAME
+    assert window.brand_caption.text() == APP_SUBTITLE
     assert window.minimumSize().width() >= 1180
     assert window.minimumSize().height() >= 720
     assert window.link_input.placeholderText().startswith("粘贴")
@@ -94,7 +99,7 @@ def test_workbench_contains_required_controls(qtbot) -> None:
     assert window.limit_input.value() == 500
     assert window.task_table.model().columnCount() == 7
     assert window.account_badge.text() == "未登录"
-    assert window.version_label.text() == f"v{__version__} · stable"
+    assert window.version_label.text() == f"v{__version__} · {APP_CHANNEL}"
     assert set(window.media_checks) == set(MediaKind)
     assert all(check.isChecked() for check in window.media_checks.values())
 

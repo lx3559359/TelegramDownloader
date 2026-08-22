@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QMessageBox, QWidget
 
 from telegram_downloader import app
 from telegram_downloader.account_access import OnlineServices
+from telegram_downloader.branding import APP_NAME
 from telegram_downloader.catalog import CatalogRepository
 from telegram_downloader.connectivity import ConnectionRecovery
 from telegram_downloader.content import (
@@ -154,6 +155,18 @@ def close_created_application(application, loop, controller) -> None:
     controller.window.close()
     loop.close()
     application.processEvents()
+
+
+def test_create_application_applies_user_visible_brand(tmp_path) -> None:
+    application, loop, controller = app.create_application(tmp_path)
+
+    try:
+        assert application.applicationName() == APP_NAME
+        assert application.applicationDisplayName() == APP_NAME
+        assert application.windowIcon().isNull() is False
+        assert controller.window.windowTitle() == APP_NAME
+    finally:
+        close_created_application(application, loop, controller)
 
 
 def test_create_application_recovers_only_unsafe_download_setting(tmp_path) -> None:

@@ -8,6 +8,7 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QPalette
 from PySide6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon
 
+from telegram_downloader.branding import APP_NAME, app_icon_path
 from telegram_downloader.notifications import NotificationPayload, NotificationRoute
 
 _LOGGER = logging.getLogger(__name__)
@@ -182,13 +183,15 @@ class QtTrayAdapter(QObject):
         super().__init__(window)
         self.available = QSystemTrayIcon.isSystemTrayAvailable()
         self._notification_route: NotificationRoute | None = None
-        icon = window.windowIcon()
+        icon = QIcon(str(app_icon_path()))
+        if icon.isNull():
+            icon = window.windowIcon()
         if icon.isNull():
             icon = QApplication.style().standardIcon(
                 QStyle.StandardPixmap.SP_ArrowDown
             )
         self.icon = QSystemTrayIcon(QIcon(icon), window)
-        self.icon.setToolTip("Telegram 下载器")
+        self.icon.setToolTip(APP_NAME)
         self.menu = QMenu(window)
         self.menu.setObjectName("trayMenu")
         palette = self.menu.palette()
@@ -247,7 +250,7 @@ class QtTrayAdapter(QObject):
 
     def show_close_hint(self) -> None:
         self.icon.showMessage(
-            "Telegram 下载器仍在运行",
+            f"{APP_NAME} 仍在运行",
             "下载和自动订阅将在后台继续；可从托盘菜单彻底退出。",
             QSystemTrayIcon.MessageIcon.Information,
             5000,
