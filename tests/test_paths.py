@@ -50,3 +50,10 @@ def test_guard_rejects_relative_path_and_root_itself(tmp_path: Path) -> None:
         paths.guard(Path("relative.bin"))
     with pytest.raises(PathOutsideRootError):
         paths.guard(tmp_path)
+
+
+def test_application_guard_does_not_expand_to_external_media(tmp_path: Path) -> None:
+    paths = PortablePaths(tmp_path / "app")
+
+    with pytest.raises(PathOutsideRootError):
+        paths.guard(tmp_path / "external" / "media.bin")
