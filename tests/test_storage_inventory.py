@@ -179,6 +179,12 @@ def test_symlink_is_reported_unsafe_and_not_followed(tmp_path: Path) -> None:
 
     entry = next(item for item in inventory.entries if item.relative_path.name == link.name)
     assert entry.selectable is False
+    temp_summary = next(
+        summary
+        for summary in inventory.summaries
+        if summary.category is StorageCategory.TEMP
+    )
+    assert temp_summary.total_count == 1
     assert outside.exists()
 
 

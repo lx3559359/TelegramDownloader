@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
+from telegram_downloader.domain import IntegrityStatus, ItemStatus
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.storage_models import (
     StorageCategory,
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
 _REPARSE_POINT = 0x400
 _ROTATED_LOG = re.compile(r"app\.log\.[1-9]\d*\Z")
 _BACKUP_DIRECTORY = re.compile(r".+-[a-f0-9]{8}\Z")
+_CORRUPT_ARCHIVE = re.compile(r"\.corrupt(?:\.\d+)?\Z")
 
 
 class StorageInventoryCancelled(RuntimeError):
@@ -173,8 +175,8 @@ class StorageInventoryService:
             ),
         )
         summaries = tuple(
-            self._summary(category, now, records, selected)
-            for category, records, _unsafe, selected in groups
+            self._summary(category, now, records, selected, unsafe)
+            for category, records, unsafe, selected in groups
         )
         entries = [entry for _category, _records, unsafe, _selected in groups for entry in unsafe]
         entries.extend(
@@ -183,6 +185,89 @@ class StorageInventoryService:
             for record in selected
         )
         entries.sort(key=lambda item: (item.category.value, item.relative_path.as_posix()))
+        return StorageInventory(
+            scanned_at=now,
+            disk_free_bytes=int(self.disk_usage(self.paths.root).free),
+            entries=tuple(entries),
+            summaries=summaries,
+        )
+
+    def scan_download_candidates(
+        self,
+        now: datetime,
+        *,
+        active_paths: Collection[Path],
+        progress: Callable[[int], None] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> StorageInventory:
+        if now.tzinfo is not UTC:
+            raise ValueError("下载残留扫描时间必须使用 UTC")
+        if self.repository is None:
+            raise ValueError("下载残留扫描需要任务仓库")
+        active = frozenset(Path(path).resolve() for path in active_paths)
+        counter = [0]
+        check_cancelled = cancelled or (lambda: False)
+        candidates, unsafe = self._walk_download_candidates(
+            progress,
+            check_cancelled,
+            counter,
+        )
+        self._raise_if_cancelled(check_cancelled)
+        targets = tuple(
+            target
+            for _record, _category, target in candidates
+            if target is not None
+        )
+        media_by_target = self.repository.maintenance_media_by_targets(targets)
+        self._raise_if_cancelled(check_cancelled)
+
+        entries = list(unsafe)
+        selected_by_category: dict[StorageCategory, list[_FileRecord]] = {
+            StorageCategory.DOWNLOAD_PART: [],
+            StorageCategory.CORRUPT_ARCHIVE: [],
+        }
+        records_by_category: dict[StorageCategory, list[_FileRecord]] = {
+            StorageCategory.DOWNLOAD_PART: [],
+            StorageCategory.CORRUPT_ARCHIVE: [],
+        }
+        for record, category, target in candidates:
+            records_by_category[category].append(record)
+            media = media_by_target.get(target) if target is not None else None
+            selectable = bool(
+                media is not None
+                and media.item_status is ItemStatus.COMPLETED
+                and media.integrity_status is IntegrityStatus.VERIFIED
+                and self._is_ordinary_file(target)
+                and not self._protected(record.path, active)
+                and not self._protected(target, active)
+            )
+            if selectable:
+                selected_by_category[category].append(record)
+            entries.append(
+                self._download_entry(
+                    category,
+                    record,
+                    selectable=selectable,
+                    task_id=media.task_id if media is not None else None,
+                    display_name=media.task_title if media is not None else None,
+                )
+            )
+
+        categories = (
+            StorageCategory.DOWNLOAD_PART,
+            StorageCategory.CORRUPT_ARCHIVE,
+        )
+        summaries = tuple(
+            self._summary(
+                category,
+                now,
+                records_by_category[category],
+                selected_by_category[category],
+                tuple(entry for entry in unsafe if entry.category is category),
+            )
+            for category in categories
+        )
+        entries.sort(key=lambda item: item.relative_path.as_posix())
         return StorageInventory(
             scanned_at=now,
             disk_free_bytes=int(self.disk_usage(self.paths.root).free),
@@ -353,6 +438,94 @@ class StorageInventoryService:
         walk(root)
         return records, unsafe
 
+    def _walk_download_candidates(
+        self,
+        progress: Callable[[int], None] | None,
+        cancelled: Callable[[], bool],
+        counter: list[int],
+    ) -> tuple[
+        list[tuple[_FileRecord, StorageCategory, Path | None]],
+        list[StorageEntry],
+    ]:
+        root = self.paths.downloads
+        candidates: list[tuple[_FileRecord, StorageCategory, Path | None]] = []
+        unsafe: list[StorageEntry] = []
+        if not root.exists():
+            return candidates, unsafe
+
+        def walk(directory: Path) -> None:
+            try:
+                guarded = self.paths.guard(directory)
+                with os.scandir(guarded) as stream:
+                    children = sorted(stream, key=lambda item: item.name.casefold())
+            except (OSError, ValueError):
+                return
+            for item in children:
+                self._tick(progress, cancelled, counter)
+                path = Path(item.path)
+                category = self._download_category(item.name)
+                try:
+                    item_stat = item.stat(follow_symlinks=False)
+                except OSError:
+                    if category is not None:
+                        unsafe.append(self._unsafe_entry(category, path, 0, 0))
+                    continue
+                size = max(0, int(item_stat.st_size))
+                mtime_ns = max(0, int(item_stat.st_mtime_ns))
+                if self._is_reparse(item, item_stat):
+                    if category is not None:
+                        unsafe.append(
+                            self._unsafe_entry(category, path, size, mtime_ns)
+                        )
+                    continue
+                if stat_module.S_ISDIR(item_stat.st_mode):
+                    walk(path)
+                    continue
+                if category is None:
+                    continue
+                if not stat_module.S_ISREG(item_stat.st_mode):
+                    unsafe.append(self._unsafe_entry(category, path, size, mtime_ns))
+                    continue
+                record = _FileRecord(path, self._relative(path), size, mtime_ns)
+                candidates.append((record, category, self._leftover_target(path)))
+
+        walk(root)
+        return candidates, unsafe
+
+    @staticmethod
+    def _download_category(name: str) -> StorageCategory | None:
+        if name.endswith(".part"):
+            return StorageCategory.DOWNLOAD_PART
+        if _CORRUPT_ARCHIVE.search(name) is not None:
+            return StorageCategory.CORRUPT_ARCHIVE
+        return None
+
+    @staticmethod
+    def _leftover_target(path: Path) -> Path | None:
+        name = _CORRUPT_ARCHIVE.sub("", path.name)
+        if name.endswith(".part"):
+            name = name[: -len(".part")]
+        if not name:
+            return None
+        return path.with_name(name).resolve()
+
+    @staticmethod
+    def _is_ordinary_file(path: Path | None) -> bool:
+        if path is None:
+            return False
+        try:
+            path_stat = path.stat(follow_symlinks=False)
+        except OSError:
+            return False
+        return stat_module.S_ISREG(path_stat.st_mode) and not bool(
+            getattr(path_stat, "st_file_attributes", 0) & _REPARSE_POINT
+        )
+
+    @staticmethod
+    def _raise_if_cancelled(cancelled: Callable[[], bool]) -> None:
+        if cancelled():
+            raise StorageInventoryCancelled("存储扫描已取消")
+
     @staticmethod
     def _is_reparse(item: os.DirEntry[str], item_stat: os.stat_result) -> bool:
         return item.is_symlink() or bool(
@@ -398,12 +571,14 @@ class StorageInventoryService:
         now: datetime,
         records: list[_FileRecord],
         selected: list[_FileRecord],
+        protected: Collection[StorageEntry] = (),
     ) -> StorageCategorySummary:
         return StorageCategorySummary(
             category=category,
             scanned_at=now,
-            total_count=len(records),
-            total_bytes=sum(record.size for record in records),
+            total_count=len(records) + len(protected),
+            total_bytes=sum(record.size for record in records)
+            + sum(entry.size for entry in protected),
             reclaimable_count=len(selected),
             reclaimable_bytes=sum(record.size for record in selected),
         )
@@ -420,4 +595,25 @@ class StorageInventoryService:
             size=record.size,
             mtime_ns=record.mtime_ns,
             selectable=True,
+        )
+
+    @staticmethod
+    def _download_entry(
+        category: StorageCategory,
+        record: _FileRecord,
+        *,
+        selectable: bool,
+        task_id: str | None,
+        display_name: str | None,
+    ) -> StorageEntry:
+        return StorageEntry(
+            id=storage_entry_id(category, record.relative_path),
+            relative_path=record.relative_path,
+            category=category,
+            size=record.size,
+            mtime_ns=record.mtime_ns,
+            selectable=selectable,
+            reason=None if selectable else StorageResultCode.PROTECTED_BY_TASK,
+            task_id=task_id,
+            display_name=display_name,
         )
