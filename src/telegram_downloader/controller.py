@@ -482,6 +482,7 @@ class AppController:
         connection_monitor_interval: float = 30.0,
         connection_sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
         progress_refresh_interval: float = 0.5,
+        utc_now: Callable[[], datetime] | None = None,
     ) -> None:
         if progress_refresh_interval <= 0:
             raise ValueError("进度刷新间隔必须大于零")
@@ -528,6 +529,7 @@ class AppController:
         self.connection_recovery = connection_recovery or ConnectionRecovery()
         self._connection_monitor_interval = connection_monitor_interval
         self._connection_sleeper = connection_sleeper
+        self._utc_now = utc_now or (lambda: datetime.now(UTC))
         self.phone = ""
         self.phone_code_hash = ""
         self._background: set[asyncio.Task[Any]] = set()
@@ -2609,6 +2611,12 @@ class AppController:
                 self.update_prompt,
                 self.update_shutdown,
             )
+            if result in {
+                UpdateStartupResult.NO_UPDATE,
+                UpdateStartupResult.DECLINED,
+                UpdateStartupResult.LAUNCHED,
+            }:
+                self._record_successful_update_check()
             if result is UpdateStartupResult.NO_UPDATE:
                 self._show_status("当前已是最新正式版")
             elif result is UpdateStartupResult.BLOCKED:
@@ -2620,6 +2628,21 @@ class AppController:
         except Exception as error:
             self._show_status(f"更新检查失败（{type(error).__name__}）")
             raise
+
+    def _record_successful_update_check(self) -> str:
+        stamp = (
+            self._utc_now()
+            .astimezone(UTC)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+        updated = replace(
+            self.settings,
+            last_successful_update_check_utc=stamp,
+        )
+        self.settings_store.save(updated)
+        self.settings = updated
+        return stamp
 
     def check_for_updates(self) -> asyncio.Task[Any] | None:
         if self.update_coordinator is None or self._shutting_down:

@@ -541,18 +541,22 @@ def test_settings_storage_shortcut_navigates_without_direct_cache_delete(
 
 def test_settings_manual_update_button_awaits_controller_result(
     tmp_path,
-    monkeypatch,
 ) -> None:
     application, loop, controller = app.create_application(tmp_path)
 
-    async def result() -> UpdateStartupResult:
-        await asyncio.sleep(0)
-        return UpdateStartupResult.NO_UPDATE
+    class Coordinator:
+        async def startup(self, _prompt, _shutdown):
+            await asyncio.sleep(0)
+            return UpdateStartupResult.NO_UPDATE
 
-    monkeypatch.setattr(
-        controller,
-        "check_for_updates",
-        lambda: asyncio.create_task(result()),
+    controller.update_coordinator = Coordinator()
+    controller._utc_now = lambda: datetime(
+        2026,
+        8,
+        23,
+        2,
+        20,
+        tzinfo=UTC,
     )
 
     async def exercise() -> None:
@@ -560,10 +564,19 @@ def test_settings_manual_update_button_awaits_controller_result(
         await controller._async_actions.wait_idle()
         dialog = controller._settings_dialog
         assert dialog is not None
+        dialog.concurrency.setValue(5)
         dialog.update_check_button.click()
         await controller._async_actions.wait_idle()
         assert dialog.update_status_label.text() == "当前已是最新正式版"
+        assert dialog.update_status_label.property("updateState") == "success"
         assert dialog.update_check_button.isEnabled() is True
+        persisted = controller.settings_store.load()
+        assert persisted.concurrency == 3
+        assert (
+            persisted.last_successful_update_check_utc
+            == "2026-08-23T02:20:00Z"
+        )
+        assert "2026-08-23" in dialog.update_last_checked_label.text()
 
     try:
         loop.run_until_complete(exercise())

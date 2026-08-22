@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +18,7 @@ from telegram_downloader.maintenance_activity import (
 )
 from telegram_downloader.notifications import EventKind, NotificationRoute
 from telegram_downloader.paths import PortablePaths
+from telegram_downloader.settings import AppSettings
 from telegram_downloader.update import (
     HelperLaunchRequest,
     UpdateCoordinator,
@@ -329,6 +331,43 @@ async def test_manual_update_check_returns_result_and_reports_no_update() -> Non
     assert task is not None
     assert await task is UpdateStartupResult.NO_UPDATE
     assert "最新正式版" in controller.window.message.last_message
+
+
+@pytest.mark.asyncio
+async def test_manual_update_success_records_utc_without_draft_settings() -> None:
+    class Coordinator:
+        async def startup(self, _prompt, _shutdown):
+            return UpdateStartupResult.NO_UPDATE
+
+    class RecordingSettingsStore:
+        def __init__(self) -> None:
+            self.current = AppSettings(concurrency=3)
+            self.saved = self.current
+
+        def load(self) -> AppSettings:
+            return self.current
+
+        def save(self, value: AppSettings) -> None:
+            self.saved = value
+            self.current = value
+
+    store = RecordingSettingsStore()
+    controller = AppController.for_test(
+        settings_store=store,
+        settings=store.current,
+        update_coordinator=Coordinator(),
+        utc_now=lambda: datetime(2026, 8, 23, 2, 20, tzinfo=UTC),
+    )
+
+    task = controller.check_for_updates()
+
+    assert task is not None
+    assert await task is UpdateStartupResult.NO_UPDATE
+    assert store.saved.concurrency == 3
+    assert (
+        store.saved.last_successful_update_check_utc
+        == "2026-08-23T02:20:00Z"
+    )
 
 
 @pytest.mark.asyncio

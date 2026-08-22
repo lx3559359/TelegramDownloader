@@ -1027,18 +1027,35 @@ def create_application(
             )
 
         async def check_updates() -> None:
+            previous_check = controller.settings.last_successful_update_check_utc
             task = controller.check_for_updates()
             if task is None:
-                dialog.set_update_result("更新检查当前不可用")
+                dialog.set_update_result(
+                    "更新检查当前不可用",
+                    state="warning",
+                )
                 return
             result = await task
             messages = {
-                UpdateStartupResult.NO_UPDATE: "当前已是最新正式版",
-                UpdateStartupResult.BLOCKED: "更新检查暂不可用，请稍后重试",
-                UpdateStartupResult.DECLINED: "已取消本次更新",
-                UpdateStartupResult.LAUNCHED: "正在安装更新并重新启动",
+                UpdateStartupResult.NO_UPDATE: (
+                    "当前已是最新正式版",
+                    "success",
+                ),
+                UpdateStartupResult.BLOCKED: (
+                    "更新检查暂不可用，请稍后重试",
+                    "warning",
+                ),
+                UpdateStartupResult.DECLINED: ("已取消更新", "neutral"),
+                UpdateStartupResult.LAUNCHED: (
+                    "更新安装程序已启动",
+                    "success",
+                ),
             }
-            dialog.set_update_result(messages[result])
+            message, state = messages[result]
+            dialog.set_update_result(message, state=state)
+            current_check = controller.settings.last_successful_update_check_utc
+            if current_check != previous_check:
+                dialog.set_last_successful_update_check(current_check)
 
         dialog.test_proxy_requested.connect(proxy_test_requested)
         dialog.storage_maintenance_requested.connect(open_storage_maintenance)
@@ -1049,7 +1066,8 @@ def create_application(
             hooks=ActionHooks(
                 started=lambda: dialog.set_update_busy(True),
                 failed=lambda error: dialog.set_update_result(
-                    f"更新检查失败：{controller._safe_error(error)}"
+                    f"更新检查失败：{controller._safe_error(error)}",
+                    state="error",
                 ),
                 finished=lambda: dialog.set_update_busy(False),
             ),
