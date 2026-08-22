@@ -114,6 +114,10 @@ QLabel#updateStatus[updateState="warning"] {
 QLabel#updateStatus[updateState="error"] {
     border-color: #E7A8B3; background: #FFF0F3; color: #A33C50;
 }
+QLabel#accountGuard {
+    padding: 8px 11px; border: 1px solid #E7C878; border-radius: 7px;
+    background: #FFF8E5; color: #8A6418;
+}
 QLabel#errorText, QLabel#errorBanner {
     padding: 8px 11px; border: 1px solid #E7A8B3; border-radius: 7px;
     background: #FFF0F3; color: #A33C50;
