@@ -226,7 +226,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.settings_nav_button)
         layout.addStretch()
 
-        privacy = QLabel("本地存储\n数据不离开应用目录")
+        privacy = QLabel("本地存储\n应用数据保存在本机\n媒体目录可自定义")
         privacy.setObjectName("muted")
         privacy.setWordWrap(True)
         layout.addWidget(privacy)

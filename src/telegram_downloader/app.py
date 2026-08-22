@@ -997,6 +997,7 @@ def create_application(
                 getattr(controller.runtime_settings_effects, "autostart_available", False)
             ),
             tray_available=bool(getattr(controller, "tray_available", False)),
+            default_download_root=paths.downloads,
         )
         controller._settings_dialog = dialog
 

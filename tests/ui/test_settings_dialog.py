@@ -1,11 +1,13 @@
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QGraphicsDropShadowEffect, QLineEdit
+from PySide6.QtWidgets import QFileDialog, QGraphicsDropShadowEffect, QLineEdit
 
 from telegram_downloader.files import DownloadNamingSettings
 from telegram_downloader.settings import (
     AppSettings,
     DownloadScheduleSettings,
+    DownloadStorageSettings,
     ProxySettings,
+    StorageMaintenanceSettings,
 )
 from telegram_downloader.ui.effects import ElevationLevel
 from telegram_downloader.ui.settings import SettingsDialog
@@ -158,7 +160,14 @@ def test_download_naming_tab_round_trips_and_previews_custom_templates(qtbot) ->
     assert dialog.directory_template.currentText() == naming.directory_template
     assert dialog.filename_template.currentText() == naming.filename_template
     assert dialog.values().download_naming == naming
-    assert "2026/08/示例频道/video/2026-08-22_12345_video.mp4" in dialog.naming_preview.text()
+    assert str(
+        dialog.default_download_root
+        / "2026"
+        / "08"
+        / "示例频道"
+        / "video"
+        / "2026-08-22_12345_video.mp4"
+    ) in dialog.naming_preview.text()
 
     assert [
         dialog.directory_template.itemText(index)
@@ -176,6 +185,75 @@ def test_download_naming_tab_round_trips_and_previews_custom_templates(qtbot) ->
         "{stem}_{message_id}{extension}",
         "{message_date}_{message_id}_{original_name}",
     ]
+
+
+def test_download_root_uses_folder_browser_and_round_trips(
+    qtbot,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    default = tmp_path / "app" / "downloads"
+    selected = tmp_path / "media"
+    default.mkdir(parents=True)
+    selected.mkdir()
+    dialog = SettingsDialog(AppSettings(), default_download_root=default)
+    qtbot.addWidget(dialog)
+    assert dialog.download_root.isReadOnly() is True
+    monkeypatch.setattr(
+        QFileDialog,
+        "getExistingDirectory",
+        lambda *_args, **_kwargs: str(selected),
+    )
+
+    qtbot.mouseClick(
+        dialog.browse_download_root_button,
+        Qt.MouseButton.LeftButton,
+    )
+
+    assert dialog.download_root.text() == str(selected.resolve())
+    assert dialog.values().download_storage.root == str(selected.resolve())
+    assert str(selected.resolve()) in dialog.naming_preview.text()
+
+
+def test_cancel_folder_browser_keeps_value_and_reset_restores_default(
+    qtbot,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    default = tmp_path / "downloads"
+    selected = tmp_path / "selected"
+    default.mkdir()
+    selected.mkdir()
+    settings = AppSettings(
+        download_storage=DownloadStorageSettings(str(selected.resolve()))
+    )
+    dialog = SettingsDialog(settings, default_download_root=default)
+    qtbot.addWidget(dialog)
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *_a, **_k: "")
+
+    qtbot.mouseClick(
+        dialog.browse_download_root_button,
+        Qt.MouseButton.LeftButton,
+    )
+    assert dialog.download_root.text() == str(selected.resolve())
+
+    qtbot.mouseClick(
+        dialog.reset_download_root_button,
+        Qt.MouseButton.LeftButton,
+    )
+
+    assert dialog.download_root.text() == str(default.resolve())
+    assert dialog.values().download_storage.root == ""
+
+
+def test_settings_values_preserve_storage_maintenance_policy(qtbot) -> None:
+    settings = AppSettings(
+        storage_maintenance=StorageMaintenanceSettings(automatic_enabled=True)
+    )
+    dialog = SettingsDialog(settings)
+    qtbot.addWidget(dialog)
+
+    assert dialog.values().storage_maintenance == settings.storage_maintenance
 
 
 def test_download_naming_tab_rejects_unsafe_template_before_save(qtbot) -> None:

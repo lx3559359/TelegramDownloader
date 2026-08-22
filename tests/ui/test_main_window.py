@@ -7,6 +7,7 @@ from PySide6.QtTest import QSignalSpy
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QGraphicsDropShadowEffect,
+    QLabel,
     QMessageBox,
 )
 
@@ -95,6 +96,10 @@ def test_workbench_contains_required_controls(qtbot) -> None:
     assert window.version_label.text() == f"v{__version__} · stable"
     assert set(window.media_checks) == set(MediaKind)
     assert all(check.isChecked() for check in window.media_checks.values())
+
+    sidebar_text = "\n".join(label.text() for label in window.findChildren(QLabel))
+    assert "媒体目录可自定义" in sidebar_text
+    assert "数据不离开应用目录" not in sidebar_text
 
 
 def test_scan_button_emits_trimmed_link(qtbot) -> None:

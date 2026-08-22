@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -26,6 +27,7 @@ from telegram_downloader.files import DownloadNamingSettings, render_download_ta
 from telegram_downloader.settings import (
     AppSettings,
     DownloadScheduleSettings,
+    DownloadStorageSettings,
     ProxySettings,
     SettingsError,
 )
@@ -49,6 +51,7 @@ class SettingsDialog(QDialog):
         thumbnail_cache_bytes: int = 0,
         autostart_available: bool = True,
         tray_available: bool = True,
+        default_download_root: Path | None = None,
     ) -> None:
         super().__init__(parent)
         ensure_cjk_font()
@@ -57,6 +60,18 @@ class SettingsDialog(QDialog):
         self.setModal(True)
         self.setMinimumWidth(520)
         self._settings = settings
+        self.default_download_root = (
+            default_download_root or Path("downloads")
+        ).resolve()
+        configured_root = settings.download_storage.root
+        selected_root = (
+            Path(configured_root).resolve()
+            if configured_root
+            else self.default_download_root
+        )
+        self._download_root_value = (
+            "" if selected_root == self.default_download_root else str(selected_root)
+        )
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(16, 16, 16, 18)
@@ -155,6 +170,15 @@ class SettingsDialog(QDialog):
         naming_form = QFormLayout()
         naming_form.setHorizontalSpacing(14)
         naming_form.setVerticalSpacing(10)
+        self.download_root = QLineEdit(str(selected_root))
+        self.download_root.setReadOnly(True)
+        self.browse_download_root_button = QPushButton("浏览…")
+        self.reset_download_root_button = QPushButton("恢复默认")
+        root_row = QHBoxLayout()
+        root_row.addWidget(self.download_root, 1)
+        root_row.addWidget(self.browse_download_root_button)
+        root_row.addWidget(self.reset_download_root_button)
+        naming_form.addRow("下载根目录", root_row)
         self.directory_template = QComboBox()
         self.directory_template.setEditable(True)
         self.directory_template.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -176,7 +200,7 @@ class SettingsDialog(QDialog):
         ):
             self.filename_template.addItem(template)
         self.filename_template.setEditText(settings.download_naming.filename_template)
-        naming_form.addRow("目录模板", self.directory_template)
+        naming_form.addRow("目录组织模板（高级）", self.directory_template)
         naming_form.addRow("文件名模板", self.filename_template)
 
         placeholders = QLabel(
@@ -288,6 +312,8 @@ class SettingsDialog(QDialog):
         self.schedule_enabled.toggled.connect(self._update_schedule_fields)
         self.directory_template.editTextChanged.connect(self._update_naming_preview)
         self.filename_template.editTextChanged.connect(self._update_naming_preview)
+        self.browse_download_root_button.clicked.connect(self._browse_download_root)
+        self.reset_download_root_button.clicked.connect(self._reset_download_root)
         self.test_button.clicked.connect(self._test_proxy)
         self.thumbnail_cache_clear_button.clicked.connect(self._open_storage_maintenance)
         cancel_button.clicked.connect(self.reject)
@@ -331,6 +357,11 @@ class SettingsDialog(QDialog):
                 self.directory_template.currentText().strip(),
                 self.filename_template.currentText().strip(),
             ),
+            storage_maintenance=self._settings.storage_maintenance,
+            download_storage=DownloadStorageSettings(
+                self._download_root_value,
+                self._settings.download_storage.trusted_roots,
+            ),
         )
 
     @property
@@ -359,7 +390,7 @@ class SettingsDialog(QDialog):
                 self.directory_template.currentText().strip(),
                 self.filename_template.currentText().strip(),
             )
-            root = Path("downloads").resolve()
+            root = Path(self.download_root.text()).resolve()
             target = render_download_target(
                 root,
                 naming,
@@ -369,10 +400,30 @@ class SettingsDialog(QDialog):
                 12345,
                 "video.mp4",
             )
-            preview = (Path("downloads") / target.relative_to(root)).as_posix()
-            self.naming_preview.setText(f"{preview}")
+            self.naming_preview.setText(str(target))
         except ValueError as error:
             self.naming_preview.setText(f"模板错误：{error}")
+
+    def _browse_download_root(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "选择下载根目录",
+            self.download_root.text(),
+            QFileDialog.Option.ShowDirsOnly,
+        )
+        if not selected:
+            return
+        resolved = Path(selected).resolve()
+        self.download_root.setText(str(resolved))
+        self._download_root_value = (
+            "" if resolved == self.default_download_root else str(resolved)
+        )
+        self._update_naming_preview()
+
+    def _reset_download_root(self) -> None:
+        self.download_root.setText(str(self.default_download_root))
+        self._download_root_value = ""
+        self._update_naming_preview()
 
     def _test_proxy(self) -> None:
         try:
