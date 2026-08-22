@@ -32,8 +32,8 @@ from telegram_downloader.file_integrity import IntegrityProgress
 from telegram_downloader.planner import BatchScanProgress
 from telegram_downloader.ui.batch_import import BatchImportDialog
 from telegram_downloader.ui.content_browser import ContentBrowserPage
-from telegram_downloader.ui.diagnostics import DiagnosticsPage
 from telegram_downloader.ui.effects import ElevationLevel, apply_elevation
+from telegram_downloader.ui.maintenance import MaintenancePage
 from telegram_downloader.ui.models import (
     TaskFilter,
     TaskItemSummary,
@@ -120,12 +120,14 @@ class MainWindow(QMainWindow):
         self.task_page = self._build_workspace()
         self.content_page = ContentBrowserPage()
         self.subscriptions_page = SubscriptionPage()
-        self.diagnostics_page = DiagnosticsPage()
+        self.maintenance_page = MaintenancePage()
+        self.diagnostics_page = self.maintenance_page.diagnostics_page
+        self.storage_page = self.maintenance_page.storage_page
         self.page_stack = QStackedWidget()
         self.page_stack.addWidget(self.task_page)
         self.page_stack.addWidget(self.content_page)
         self.page_stack.addWidget(self.subscriptions_page)
-        self.page_stack.addWidget(self.diagnostics_page)
+        self.page_stack.addWidget(self.maintenance_page)
         root_layout.addWidget(self.page_stack, 1)
         self.statistics_panel = self._build_statistics()
         apply_elevation(self.statistics_panel, ElevationLevel.SECONDARY)
@@ -176,7 +178,7 @@ class MainWindow(QMainWindow):
         self.tasks_nav_button.clicked.connect(lambda: self.show_page("tasks"))
         self.content_nav_button.clicked.connect(lambda: self.show_page("content"))
         self.subscriptions_nav_button.clicked.connect(lambda: self.show_page("subscriptions"))
-        self.diagnostics_nav_button.clicked.connect(lambda: self.show_page("diagnostics"))
+        self.maintenance_nav_button.clicked.connect(lambda: self.show_page("maintenance"))
         self._update_action_state()
         self._update_task_filter_labels()
 
@@ -210,7 +212,8 @@ class MainWindow(QMainWindow):
         self.tasks_nav_button = self._nav_button("任务中心", active=True)
         self.content_nav_button = self._nav_button("账号内容")
         self.subscriptions_nav_button = self._nav_button("自动订阅")
-        self.diagnostics_nav_button = self._nav_button("健康诊断")
+        self.maintenance_nav_button = self._nav_button("维护中心")
+        self.diagnostics_nav_button = self.maintenance_nav_button
         self.login_nav_button = self._nav_button("账号登录")
         self.settings_nav_button = self._nav_button("设置")
         self.login_nav_button.clicked.connect(self.login_requested.emit)
@@ -218,7 +221,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.tasks_nav_button)
         layout.addWidget(self.content_nav_button)
         layout.addWidget(self.subscriptions_nav_button)
-        layout.addWidget(self.diagnostics_nav_button)
+        layout.addWidget(self.maintenance_nav_button)
         layout.addWidget(self.login_nav_button)
         layout.addWidget(self.settings_nav_button)
         layout.addStretch()
@@ -630,9 +633,7 @@ class MainWindow(QMainWindow):
             any(not task.archived and task.status is TaskStatus.PAUSED for task in tasks)
         )
         self.prioritize_button.setEnabled(
-            len(tasks) == 1
-            and not tasks[0].archived
-            and tasks[0].status is TaskStatus.QUEUED
+            len(tasks) == 1 and not tasks[0].archived and tasks[0].status is TaskStatus.QUEUED
         )
         self.retry_button.setEnabled(
             any(not task.archived and task.status is TaskStatus.PARTIAL_FAILURE for task in tasks)
@@ -734,19 +735,13 @@ class MainWindow(QMainWindow):
         concurrency: int,
         speed_limit_kib: int,
     ) -> None:
-        activity = (
-            f"{active} 个活动任务 · {queued} 个等待"
-            if active > 0
-            else "空闲"
-        )
+        activity = f"{active} 个活动任务 · {queued} 个等待" if active > 0 else "空闲"
         speed = (
             "不限速"
             if speed_limit_kib == 0
             else f"限速 {self._format_rate(speed_limit_kib * 1024)}"
         )
-        self.scheduler_summary.setText(
-            f"调度：{activity} · 全局媒体槽 {concurrency} · {speed}"
-        )
+        self.scheduler_summary.setText(f"调度：{activity} · 全局媒体槽 {concurrency} · {speed}")
 
     def set_task_items(
         self,
@@ -756,9 +751,7 @@ class MainWindow(QMainWindow):
         tasks = self._selected_task_summaries()
         if len(tasks) != 1 or tasks[0].id != task_id:
             return
-        selected_media_ids = (
-            self.selected_media_ids() if self._detail_task_id == task_id else []
-        )
+        selected_media_ids = self.selected_media_ids() if self._detail_task_id == task_id else []
         self._detail_task_id = task_id
         self.task_detail_title.setText(tasks[0].title)
         self.task_detail_hint.setText(f"共 {len(items)} 个媒体文件")
@@ -889,23 +882,17 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _can_open_media(item: TaskItemSummary) -> bool:
         return (
-            item.status is ItemStatus.COMPLETED
-            and item.integrity_status not in _INTEGRITY_FAILURES
+            item.status is ItemStatus.COMPLETED and item.integrity_status not in _INTEGRITY_FAILURES
         )
 
     @staticmethod
     def _can_verify_media(item: TaskItemSummary) -> bool:
-        return (
-            item.status is ItemStatus.COMPLETED
-            or item.integrity_status in _INTEGRITY_FAILURES
-        )
+        return item.status is ItemStatus.COMPLETED or item.integrity_status in _INTEGRITY_FAILURES
 
     def _update_media_action_state(self, *_args) -> None:
         items = self._selected_media_summaries()
         single = items[0] if len(items) == 1 else None
-        self.open_file_button.setEnabled(
-            single is not None and self._can_open_media(single)
-        )
+        self.open_file_button.setEnabled(single is not None and self._can_open_media(single))
         self.verify_media_button.setEnabled(
             not self._integrity_busy and any(self._can_verify_media(item) for item in items)
         )
@@ -926,9 +913,7 @@ class MainWindow(QMainWindow):
 
     def _emit_verify_media(self) -> None:
         item_ids = [
-            item.id
-            for item in self._selected_media_summaries()
-            if self._can_verify_media(item)
+            item.id for item in self._selected_media_summaries() if self._can_verify_media(item)
         ]
         if item_ids and not self._integrity_busy:
             self.verify_media_requested.emit(item_ids)
@@ -944,8 +929,7 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "重新下载异常文件",
-            f"重新下载所选 {len(item_ids)} 个异常文件？"
-            "现有文件和分片会先保留为 .corrupt* 留档。",
+            f"重新下载所选 {len(item_ids)} 个异常文件？现有文件和分片会先保留为 .corrupt* 留档。",
         )
         if answer is QMessageBox.StandardButton.Yes:
             self.repair_media_requested.emit(item_ids)
@@ -991,9 +975,7 @@ class MainWindow(QMainWindow):
         self.integrity_progress_label.setText(f"正在校验 {progress.file_name}")
         self.integrity_progress.setRange(0, max(1, progress.total))
         self.integrity_progress.setValue(progress.completed)
-        self.integrity_progress.setFormat(
-            f"{progress.completed} / {progress.total}"
-        )
+        self.integrity_progress.setFormat(f"{progress.completed} / {progress.total}")
 
     @staticmethod
     def _format_rate(value: float) -> str:
@@ -1018,24 +1000,27 @@ class MainWindow(QMainWindow):
         content = name == "content"
         subscriptions = name == "subscriptions"
         diagnostics = name == "diagnostics"
+        maintenance = name == "maintenance" or diagnostics
+        if diagnostics:
+            self.maintenance_page.show_health()
         page = (
             self.content_page
             if content
             else self.subscriptions_page
             if subscriptions
-            else self.diagnostics_page
-            if diagnostics
+            else self.maintenance_page
+            if maintenance
             else self.task_page
         )
         self.page_stack.setCurrentWidget(page)
-        self.statistics_panel.setVisible(not (content or subscriptions or diagnostics))
+        self.statistics_panel.setVisible(not (content or subscriptions or maintenance))
         active = (
             self.content_nav_button
             if content
             else self.subscriptions_nav_button
             if subscriptions
-            else self.diagnostics_nav_button
-            if diagnostics
+            else self.maintenance_nav_button
+            if maintenance
             else self.tasks_nav_button
         )
         self._set_nav_active(active)
@@ -1043,7 +1028,7 @@ class MainWindow(QMainWindow):
             self.content_activated.emit()
         elif subscriptions:
             self.subscriptions_activated.emit()
-        elif diagnostics:
+        elif maintenance:
             self.diagnostics_activated.emit()
 
     def open_link_preview(self, link: str) -> None:
@@ -1056,7 +1041,7 @@ class MainWindow(QMainWindow):
             self.tasks_nav_button,
             self.content_nav_button,
             self.subscriptions_nav_button,
-            self.diagnostics_nav_button,
+            self.maintenance_nav_button,
         ):
             button.setProperty("active", button is active_button)
             button.style().unpolish(button)

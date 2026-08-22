@@ -207,8 +207,7 @@ def test_scheduler_summary_formats_active_and_idle_resources(qtbot) -> None:
         speed_limit_kib=0,
     )
     assert (
-        window.scheduler_summary.text()
-        == "调度：1 个活动任务 · 3 个等待 · 全局媒体槽 3 · 不限速"
+        window.scheduler_summary.text() == "调度：1 个活动任务 · 3 个等待 · 全局媒体槽 3 · 不限速"
     )
 
     window.set_scheduler_summary(
@@ -510,9 +509,7 @@ def test_progress_only_task_update_does_not_reset_model(qtbot) -> None:
     resets = QSignalSpy(window.task_model.modelReset)
     changes = QSignalSpy(window.task_model.dataChanged)
 
-    window.set_task_summaries(
-        [replace(first, downloaded_bytes=2, progress_text="2 / 10")]
-    )
+    window.set_task_summaries([replace(first, downloaded_bytes=2, progress_text="2 / 10")])
 
     assert resets.count() == 0
     assert changes.count() >= 1
@@ -630,8 +627,7 @@ def test_integrity_actions_use_stable_selected_media_ids(qtbot, monkeypatch) -> 
     selection.select(window.task_item_model.index(1, 0), flags)
 
     assert (
-        window.task_item_table.selectionMode()
-        is QAbstractItemView.SelectionMode.ExtendedSelection
+        window.task_item_table.selectionMode() is QAbstractItemView.SelectionMode.ExtendedSelection
     )
     assert window.selected_media_ids() == ["healthy", "broken"]
     assert window.open_file_button.isEnabled() is False
@@ -862,7 +858,7 @@ def test_diagnostics_navigation_switches_page_and_emits_activation(qtbot) -> Non
     with qtbot.waitSignal(window.diagnostics_activated, timeout=500):
         qtbot.mouseClick(window.diagnostics_nav_button, Qt.MouseButton.LeftButton)
 
-    assert window.page_stack.currentWidget() is window.diagnostics_page
+    assert window.page_stack.currentWidget() is window.maintenance_page
     assert window.statistics_panel.isHidden() is True
     assert window.diagnostics_nav_button.property("active") is True
     assert window.diagnostics_page.start_button.isVisible()
