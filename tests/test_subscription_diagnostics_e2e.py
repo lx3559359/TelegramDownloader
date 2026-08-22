@@ -64,11 +64,19 @@ def message(message_id: int, text: str) -> RemoteMessage:
 class Gateway:
     def __init__(self) -> None:
         self.latest_id = 10
+        self.boundary_id = 0
         self.messages: tuple[RemoteMessage, ...] = ()
         self.recent: tuple[RemoteMessage, ...] = ()
 
     async def latest_message_id(self, _peer_ref: str) -> int:
         return self.latest_id
+
+    async def message_id_before(
+        self,
+        _peer_ref: str,
+        _before_utc: datetime,
+    ) -> int:
+        return self.boundary_id
 
     async def incremental_messages(
         self,

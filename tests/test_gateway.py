@@ -185,7 +185,6 @@ async def test_qr_wait_reports_2fa_requirement() -> None:
     assert await password_gateway.wait_qr_login() is AuthState.PASSWORD_REQUIRED
 
 
-
 @pytest.mark.asyncio
 async def test_qr_wait_preserves_timeout_for_controller_refresh() -> None:
     class FakeQr:
@@ -285,14 +284,9 @@ async def test_login_reports_password_requirement() -> None:
         async def sign_in(self, **kwargs):
             raise PasswordNeeded
 
-    gateway = TelethonGateway.from_client_for_test(
-        Client(), password_needed_error=PasswordNeeded
-    )
+    gateway = TelethonGateway.from_client_for_test(Client(), password_needed_error=PasswordNeeded)
 
-    assert (
-        await gateway.sign_in("+8613800000000", "12345", "hash")
-        is AuthState.PASSWORD_REQUIRED
-    )
+    assert await gateway.sign_in("+8613800000000", "12345", "hash") is AuthState.PASSWORD_REQUIRED
 
 
 def test_message_metadata_classifies_voice_and_name() -> None:
@@ -353,9 +347,7 @@ async def test_private_link_recovers_entity_from_dialogs_when_cache_is_empty() -
 
         def iter_dialogs(self):
             async def dialogs():
-                yield SimpleNamespace(
-                    entity=SimpleNamespace(peer_id=-100123456, title="私有频道")
-                )
+                yield SimpleNamespace(entity=SimpleNamespace(peer_id=-100123456, title="私有频道"))
 
             return dialogs()
 
@@ -370,10 +362,7 @@ async def test_private_link_recovers_entity_from_dialogs_when_cache_is_empty() -
     filters = ScanFilters(now - timedelta(days=1), now, frozenset(MediaKind), 10)
 
     result = [
-        item
-        async for item in gateway.scan(
-            parse_telegram_link("https://t.me/c/123456/7"), filters
-        )
+        item async for item in gateway.scan(parse_telegram_link("https://t.me/c/123456/7"), filters)
     ]
 
     assert [item.message_id for item in result] == [7]
@@ -398,9 +387,7 @@ async def test_private_link_reports_membership_error_when_dialog_is_absent() -> 
     )
     now = datetime(2026, 8, 14, tzinfo=UTC)
 
-    with pytest.raises(
-        AccessDeniedError, match="当前账号未加入该私有频道或群组"
-    ):
+    with pytest.raises(AccessDeniedError, match="当前账号未加入该私有频道或群组"):
         _ = [
             item
             async for item in gateway.scan(
@@ -430,10 +417,7 @@ async def test_public_link_does_not_enumerate_private_dialogs() -> None:
     filters = ScanFilters(now - timedelta(days=1), now, frozenset(MediaKind), 10)
 
     result = [
-        item
-        async for item in gateway.scan(
-            parse_telegram_link("https://t.me/example/7"), filters
-        )
+        item async for item in gateway.scan(parse_telegram_link("https://t.me/example/7"), filters)
     ]
 
     assert result[0].source_title == "公开频道"
@@ -709,9 +693,7 @@ async def test_content_dialogs_map_archived_enumeration_access_error() -> None:
 
             return generate()
 
-    gateway = TelethonGateway.from_client_for_test(
-        Client(), access_errors=(DialogAccessError,)
-    )
+    gateway = TelethonGateway.from_client_for_test(Client(), access_errors=(DialogAccessError,))
 
     with pytest.raises(AccessDeniedError) as caught:
         _ = [item async for item in gateway.iter_content_dialogs("42")]
@@ -730,9 +712,7 @@ async def test_search_media_page_uses_server_search_and_raw_message_cursor() -> 
             kind="video" if index % 2 == 0 else "voice",
         )
         message.message = (
-            "\x00安装\t教程\n" + "文" * 600 + "\x07"
-            if message_id == 200
-            else f"结果 {message_id}"
+            "\x00安装\t教程\n" + "文" * 600 + "\x07" if message_id == 200 else f"结果 {message_id}"
         )
         messages.append(message)
 
@@ -983,6 +963,55 @@ async def test_latest_message_id_returns_zero_for_empty_dialog() -> None:
 
 
 @pytest.mark.asyncio
+async def test_message_id_before_uses_utc_date_cursor_and_returns_boundary() -> None:
+    cutoff = datetime(2026, 8, 10, 12, tzinfo=UTC)
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def get_entity(self, entity):
+            assert entity == -1001
+            return SimpleNamespace(title="资料群")
+
+        def iter_messages(self, entity, **kwargs):
+            assert entity.title == "资料群"
+            self.calls.append(kwargs)
+
+            async def generate():
+                yield SimpleNamespace(id=73)
+
+            return generate()
+
+    client = Client()
+    gateway = TelethonGateway.from_client_for_test(client)
+
+    assert await gateway.message_id_before("-1001", cutoff) == 73
+    assert client.calls == [{"offset_date": cutoff, "limit": 1}]
+
+
+@pytest.mark.asyncio
+async def test_message_id_before_returns_zero_and_rejects_naive_datetime() -> None:
+    class Client:
+        async def get_entity(self, _entity):
+            return SimpleNamespace(title="空群组")
+
+        def iter_messages(self, _entity, **_kwargs):
+            async def generate():
+                if False:
+                    yield None
+
+            return generate()
+
+    gateway = TelethonGateway.from_client_for_test(Client())
+    cutoff = datetime(2026, 8, 10, 12, tzinfo=UTC)
+
+    assert await gateway.message_id_before("-1001", cutoff) == 0
+    with pytest.raises(ValueError, match="时区"):
+        await gateway.message_id_before("-1001", cutoff.replace(tzinfo=None))
+
+
+@pytest.mark.asyncio
 async def test_incremental_messages_are_oldest_first_and_bounded() -> None:
     now = datetime(2026, 8, 15, tzinfo=UTC)
     media = media_message(12, now, kind="video")
@@ -1022,9 +1051,7 @@ async def test_incremental_messages_are_oldest_first_and_bounded() -> None:
         limit=500,
     )
 
-    assert client.calls == [
-        {"min_id": 10, "max_id": 13, "reverse": True, "limit": 500}
-    ]
+    assert client.calls == [{"min_id": 10, "max_id": 13, "reverse": True, "limit": 500}]
     assert [item.message_id for item in values] == [11, 12]
     assert values[0].media is None
     assert values[0].text == "普通消息"
@@ -1258,9 +1285,7 @@ async def test_load_thumbnail_maps_access_errors() -> None:
         async def get_entity(self, entity):
             raise ThumbnailAccessError("private detail")
 
-    gateway = TelethonGateway.from_client_for_test(
-        Client(), access_errors=(ThumbnailAccessError,)
-    )
+    gateway = TelethonGateway.from_client_for_test(Client(), access_errors=(ThumbnailAccessError,))
 
     with pytest.raises(AccessDeniedError) as caught:
         await gateway.load_thumbnail("-1001", 50, "m50")

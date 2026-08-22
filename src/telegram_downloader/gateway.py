@@ -189,6 +189,12 @@ class TelegramGateway(Protocol):
 
     async def latest_message_id(self, entity_ref: str) -> int: ...
 
+    async def message_id_before(
+        self,
+        entity_ref: str,
+        before_utc: datetime,
+    ) -> int: ...
+
     async def recent_messages(
         self,
         entity_ref: str,
@@ -263,16 +269,10 @@ class TelethonGateway:
         )
         self._password_needed_error: type[BaseException] = errors.SessionPasswordNeededError
         self._flood_wait_error: type[BaseException] = errors.FloodWaitError
-        self._authorization_error_reasons: dict[
-            type[BaseException], AuthorizationFailureReason
-        ] = {
-            errors.AuthKeyDuplicatedError: (
-                AuthorizationFailureReason.AUTH_KEY_DUPLICATED
-            ),
+        self._authorization_error_reasons: dict[type[BaseException], AuthorizationFailureReason] = {
+            errors.AuthKeyDuplicatedError: (AuthorizationFailureReason.AUTH_KEY_DUPLICATED),
             errors.AuthKeyInvalidError: AuthorizationFailureReason.AUTH_KEY_INVALID,
-            errors.AuthKeyUnregisteredError: (
-                AuthorizationFailureReason.AUTH_KEY_UNREGISTERED
-            ),
+            errors.AuthKeyUnregisteredError: (AuthorizationFailureReason.AUTH_KEY_UNREGISTERED),
             errors.SessionRevokedError: AuthorizationFailureReason.SESSION_REVOKED,
         }
         self._authorization_errors = tuple(self._authorization_error_reasons)
@@ -310,9 +310,7 @@ class TelethonGateway:
         password_needed_error: type[BaseException] = _NoTelethonError,
         flood_wait_error: type[BaseException] = _NoTelethonError,
         authorization_errors: tuple[type[BaseException], ...] = (),
-        authorization_error_reasons: Mapping[
-            type[BaseException], AuthorizationFailureReason
-        ]
+        authorization_error_reasons: Mapping[type[BaseException], AuthorizationFailureReason]
         | None = None,
         reference_expired_errors: tuple[type[BaseException], ...] = (),
         access_errors: tuple[type[BaseException], ...] = (),
@@ -346,9 +344,7 @@ class TelethonGateway:
         gateway._peer_id_getter = peer_id_getter or (lambda entity: entity)
         gateway._search_global_request_factory = search_global_request_factory
         gateway._input_peer_empty_factory = input_peer_empty_factory
-        gateway._input_messages_filter_empty_factory = (
-            input_messages_filter_empty_factory
-        )
+        gateway._input_messages_filter_empty_factory = input_messages_filter_empty_factory
         gateway._qr_login = None
         gateway._connected = connected
         gateway._entity_cache = {}
@@ -558,9 +554,7 @@ class TelethonGateway:
         try:
             await self._client.connect()
             if await self._client.get_me() is None:
-                raise SessionExpiredError(
-                    reason=AuthorizationFailureReason.NOT_AUTHORIZED
-                )
+                raise SessionExpiredError(reason=AuthorizationFailureReason.NOT_AUTHORIZED)
         except GatewayError:
             raise
         except Exception as exc:
@@ -600,9 +594,7 @@ class TelethonGateway:
                         continue
                     seen.add(peer_ref)
                     title = str(
-                        getattr(dialog, "name", "")
-                        or getattr(entity, "title", "")
-                        or peer_ref
+                        getattr(dialog, "name", "") or getattr(entity, "title", "") or peer_ref
                     )
                     yield ContentDialog(
                         account_id=account_id,
@@ -672,9 +664,7 @@ class TelethonGateway:
 
         exhausted = reached_start_date or inspected < self._SEARCH_PAGE_SIZE
         next_cursor = (
-            None
-            if exhausted or last_inspected_id is None
-            else SearchCursor(last_inspected_id)
+            None if exhausted or last_inspected_id is None else SearchCursor(last_inspected_id)
         )
         return RemoteSearchPage(tuple(items), next_cursor, exhausted)
 
@@ -750,9 +740,7 @@ class TelethonGateway:
                     if message_date is None:
                         continue
                     if not (
-                        query.filters.date_from_utc
-                        <= message_date
-                        <= query.filters.date_to_utc
+                        query.filters.date_from_utc <= message_date <= query.filters.date_to_utc
                     ):
                         continue
                     remote = self.remote_media_from_message(peer_ref, message, title)
@@ -776,9 +764,7 @@ class TelethonGateway:
         next_rate = getattr(response, "next_rate", None)
         next_cursor = (
             SearchCursor(last_message_id, int(next_rate), last_peer_ref)
-            if last_message_id is not None
-            and last_peer_ref is not None
-            and next_rate is not None
+            if last_message_id is not None and last_peer_ref is not None and next_rate is not None
             else None
         )
         return RemoteSearchPage(tuple(items), next_cursor, next_cursor is None)
@@ -787,6 +773,27 @@ class TelethonGateway:
         try:
             entity = await self._resolve_entity(entity_ref)
             async for message in self._client.iter_messages(entity, limit=1):
+                message_id = getattr(message, "id", None)
+                return int(message_id) if isinstance(message_id, int) else 0
+            return 0
+        except Exception as exc:
+            self._raise_mapped(exc)
+
+    async def message_id_before(
+        self,
+        entity_ref: str,
+        before_utc: datetime,
+    ) -> int:
+        if before_utc.tzinfo is None:
+            raise ValueError("历史边界必须包含时区")
+        before_utc = before_utc.astimezone(UTC)
+        try:
+            entity = await self._resolve_entity(entity_ref)
+            async for message in self._client.iter_messages(
+                entity,
+                offset_date=before_utc,
+                limit=1,
+            ):
                 message_id = getattr(message, "id", None)
                 return int(message_id) if isinstance(message_id, int) else 0
             return 0
@@ -916,17 +923,13 @@ class TelethonGateway:
         return RemoteSearchHit(
             remote=remote,
             excerpt=cls._message_excerpt(message),
-            thumbnail_key=(
-                f"{remote.peer_ref}:{remote.message_id}:{remote.media_id}"
-            ),
+            thumbnail_key=(f"{remote.peer_ref}:{remote.message_id}:{remote.media_id}"),
         )
 
     @staticmethod
     def _message_excerpt(message: object) -> str:
         raw = str(getattr(message, "message", "") or "")
-        visible = "".join(
-            char for char in raw if char.isprintable() or char in "\n\t"
-        )
+        visible = "".join(char for char in raw if char.isprintable() or char in "\n\t")
         return " ".join(visible.split())[:500]
 
     @classmethod
@@ -975,9 +978,7 @@ class TelethonGateway:
                 if self._check_invite_request is None:
                     entity = await self._client.get_entity(entity_ref)
                 else:
-                    invitation = await self._client(
-                        self._check_invite_request(entity_ref[1:])
-                    )
+                    invitation = await self._client(self._check_invite_request(entity_ref[1:]))
                     entity = getattr(invitation, "chat", None)
                 if entity is None:
                     raise AccessDeniedError("请先使用 Telegram 加入该邀请链接")

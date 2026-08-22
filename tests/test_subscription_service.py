@@ -78,7 +78,10 @@ def message(
 class Gateway:
     def __init__(self) -> None:
         self.latest_id = 42
+        self.latest_calls = 0
         self.latest_error: Exception | None = None
+        self.boundary_id = 0
+        self.boundary_calls: list[tuple[str, datetime]] = []
         self.messages: tuple[RemoteMessage, ...] = ()
         self.incremental_error: Exception | None = None
         self.albums: dict[int, tuple[RemoteSearchHit, ...]] = {}
@@ -89,9 +92,18 @@ class Gateway:
         self.recent_release: asyncio.Event | None = None
 
     async def latest_message_id(self, _peer_ref: str) -> int:
+        self.latest_calls += 1
         if self.latest_error is not None:
             raise self.latest_error
         return self.latest_id
+
+    async def message_id_before(
+        self,
+        peer_ref: str,
+        before_utc: datetime,
+    ) -> int:
+        self.boundary_calls.append((peer_ref, before_utc))
+        return self.boundary_id
 
     async def incremental_messages(
         self,
