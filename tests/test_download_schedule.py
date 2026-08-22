@@ -1,8 +1,13 @@
+import asyncio
 from datetime import datetime, timedelta
 
 import pytest
 
-from telegram_downloader.download_schedule import evaluate_download_schedule
+from telegram_downloader.download_schedule import (
+    DownloadScheduleController,
+    evaluate_download_schedule,
+)
+from telegram_downloader.notifications import EventKind
 from telegram_downloader.settings import DownloadScheduleSettings
 
 MONDAY = datetime(2026, 8, 24, 10, 0).astimezone()
@@ -85,3 +90,93 @@ def test_next_boundary_wraps_to_next_selected_week() -> None:
 def test_naive_time_is_rejected() -> None:
     with pytest.raises(ValueError, match="时区"):
         evaluate_download_schedule(schedule(0, 0), datetime(2026, 8, 24))
+
+
+class FakeScheduler:
+    def __init__(self) -> None:
+        self.schedule_states: list[bool] = []
+
+    async def set_schedule_open(self, opened: bool) -> set[str]:
+        self.schedule_states.append(opened)
+        return set()
+
+
+@pytest.mark.asyncio
+async def test_schedule_controller_applies_initial_gate_before_queue_restore() -> None:
+    scheduler = FakeScheduler()
+    events = []
+    controller = DownloadScheduleController(
+        lambda: scheduler,
+        schedule(9 * 60, 17 * 60),
+        now=lambda: MONDAY.replace(hour=8),
+        sleep=lambda _seconds: _never_return(),
+        publish=events.append,
+    )
+
+    await controller.start()
+    await controller.shutdown()
+
+    assert scheduler.schedule_states == [False]
+    assert events[-1].kind is EventKind.SCHEDULE_CLOSED
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_recalculates_and_opens_immediately() -> None:
+    scheduler = FakeScheduler()
+    controller = DownloadScheduleController(
+        lambda: scheduler,
+        schedule(9 * 60, 17 * 60),
+        now=lambda: MONDAY.replace(hour=8),
+        sleep=lambda _seconds: _never_return(),
+    )
+    await controller.start()
+
+    await controller.reconfigure(DownloadScheduleSettings())
+    await controller.shutdown()
+
+    assert scheduler.schedule_states == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_new_scheduler_receives_current_gate_even_without_time_transition() -> None:
+    schedulers = [FakeScheduler(), FakeScheduler()]
+    selected = 0
+    controller = DownloadScheduleController(
+        lambda: schedulers[selected],
+        schedule(9 * 60, 17 * 60),
+        now=lambda: MONDAY.replace(hour=8),
+        sleep=lambda _seconds: _never_return(),
+    )
+    await controller.start()
+    selected = 1
+
+    await controller.refresh()
+    await controller.shutdown()
+
+    assert schedulers[0].schedule_states == [False]
+    assert schedulers[1].schedule_states == [False]
+
+
+@pytest.mark.asyncio
+async def test_controller_sleeps_only_until_nearby_schedule_boundary() -> None:
+    sleeps: list[float] = []
+
+    async def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        await asyncio.Event().wait()
+
+    controller = DownloadScheduleController(
+        lambda: FakeScheduler(),
+        schedule(9 * 60, 17 * 60),
+        now=lambda: MONDAY.replace(hour=16, minute=59, second=30),
+        sleep=record_sleep,
+    )
+    await controller.start()
+    await asyncio.sleep(0)
+
+    assert sleeps == [30.0]
+    await controller.shutdown()
+
+
+async def _never_return() -> None:
+    await asyncio.Event().wait()

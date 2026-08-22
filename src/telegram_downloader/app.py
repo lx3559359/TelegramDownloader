@@ -6,7 +6,7 @@ import json
 import os
 import platform
 import sys
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -44,6 +44,10 @@ from telegram_downloader.diagnostic_probes import (
 from telegram_downloader.diagnostic_store import DiagnosticReportStore
 from telegram_downloader.diagnostics import DiagnosticResult, DiagnosticsService
 from telegram_downloader.domain import TaskStatus
+from telegram_downloader.download_schedule import (
+    DownloadScheduleController,
+    evaluate_download_schedule,
+)
 from telegram_downloader.downloader import MediaDownloader
 from telegram_downloader.file_integrity import FileIntegrityService
 from telegram_downloader.gateway import SessionExpiredError, TelethonGateway
@@ -105,9 +109,16 @@ async def _telegram_health(controller: AppController) -> DiagnosticResult:
 
 
 class _GracefulShutdown:
-    def __init__(self, controller: Any, quit_application: Callable[[], None]) -> None:
+    def __init__(
+        self,
+        controller: Any,
+        quit_application: Callable[[], None],
+        *,
+        before_controller_shutdown: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         self.controller = controller
         self.quit_application = quit_application
+        self.before_controller_shutdown = before_controller_shutdown
         self.task: asyncio.Task[None] | None = None
         self.completed = False
 
@@ -125,6 +136,8 @@ class _GracefulShutdown:
             async_actions = getattr(self.controller, "_async_actions", None)
             if async_actions is not None:
                 await async_actions.shutdown()
+            if self.before_controller_shutdown is not None:
+                await self.before_controller_shutdown()
             await self.controller.shutdown()
         finally:
             self.completed = True
@@ -319,6 +332,11 @@ def create_application(root: Path):
             concurrency=resource_settings.concurrency,
             bandwidth=bandwidth,
         )
+        schedule_state = evaluate_download_schedule(
+            resource_settings.download_schedule,
+            datetime.now().astimezone(),
+        )
+        scheduler.set_admission_open(schedule_state.allowed)
         content_browser.bind_online(gateway, planner)
         subscriptions.bind_online(gateway, planner)
         return planner, scheduler, content_browser
@@ -1044,7 +1062,16 @@ def run(
         _startup_status(startup_indicator, "正在准备本地数据…")
         application, loop, controller = create_application(root)
 
-        graceful_shutdown = _GracefulShutdown(controller, application.quit)
+        download_schedule = DownloadScheduleController(
+            lambda: controller.scheduler,
+            controller.settings.download_schedule,
+        )
+        controller.download_schedule = download_schedule
+        graceful_shutdown = _GracefulShutdown(
+            controller,
+            application.quit,
+            before_controller_shutdown=download_schedule.shutdown,
+        )
         window_port = QtWindowPort(
             controller.window,
             {
@@ -1143,6 +1170,7 @@ def run(
                 _startup_status(startup_indicator, "正在恢复任务与账号…")
                 controller.window.show()
                 _startup_finish(startup_indicator, controller.window)
+                await download_schedule.start()
                 await controller.start()
 
             startup_task = loop.create_task(start_application())

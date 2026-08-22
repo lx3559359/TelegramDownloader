@@ -116,6 +116,37 @@ def test_graceful_shutdown_cleans_async_work_before_quitting() -> None:
     assert events == ["actions", "controller", "quit"]
 
 
+def test_graceful_shutdown_stops_schedule_before_controller() -> None:
+    events: list[str] = []
+
+    class AsyncActions:
+        async def shutdown(self) -> None:
+            events.append("actions")
+
+    class Schedule:
+        async def shutdown(self) -> None:
+            events.append("schedule")
+
+    class Controller:
+        _async_actions = AsyncActions()
+
+        async def shutdown(self) -> None:
+            events.append("controller")
+
+    async def exercise() -> None:
+        shutdown = app._GracefulShutdown(
+            Controller(),
+            lambda: events.append("quit"),
+            before_controller_shutdown=Schedule().shutdown,
+        )
+        shutdown.request()
+        await shutdown.wait()
+
+    asyncio.run(exercise())
+
+    assert events == ["actions", "schedule", "controller", "quit"]
+
+
 def test_window_close_filter_delegates_to_background_without_shutdown(qapp) -> None:
     class Controller:
         window = QWidget()
@@ -158,6 +189,9 @@ def test_run_keeps_startup_inside_the_continuous_event_loop() -> None:
     assert "run_until_complete(controller.start())" not in source
     assert "loop.create_task(start_application())" in source
     assert source.index("controller.window.show()") < source.index(
+        "await controller.start()"
+    )
+    assert source.index("await download_schedule.start()") < source.index(
         "await controller.start()"
     )
 
