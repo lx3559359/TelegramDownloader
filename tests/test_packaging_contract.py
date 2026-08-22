@@ -130,7 +130,7 @@ def test_v0160_version_and_download_ui_contract_are_consistent() -> None:
     )
     readme = (root / "README.md").read_text(encoding="utf-8")
     release_notes = root / "docs/releases/v0.16.0.md"
-    verification = root / "docs/verification/2026-08-22-download-location-ui-polish.md"
+    verification = root / "docs/verification/v0.16.0-download-location-ui-polish.md"
 
     assert project["project"]["version"] == "0.16.0"
     assert '__version__ = "0.16.0"' in package_init
@@ -177,7 +177,15 @@ def test_v0160_version_and_download_ui_contract_are_consistent() -> None:
     )
     assert verification.is_file()
     evidence = verification.read_text(encoding="utf-8")
-    assert all(term in evidence for term in ("第一轮", "第二轮", "第三轮"))
+    assert all(
+        term in evidence
+        for term in (
+            "PACKAGED_SMOKE_OK",
+            "INSTALLER_SMOKE_OK",
+            "RELEASE_PUBLISHED v0.16.0",
+            "blocked=false",
+        )
+    )
     assert "v0.1.0 · stable" not in main
     for component in (
         "ContentBrowserService",
