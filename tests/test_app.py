@@ -126,7 +126,10 @@ def test_run_keeps_startup_inside_the_continuous_event_loop() -> None:
     )
 
 
-def test_duplicate_instance_exits_before_application_construction(tmp_path, monkeypatch) -> None:
+def test_duplicate_instance_falls_back_before_application_construction(
+    tmp_path,
+    monkeypatch,
+) -> None:
     events: list[str] = []
 
     class Guard:
@@ -144,6 +147,7 @@ def test_duplicate_instance_exits_before_application_construction(tmp_path, monk
             events.append("close")
 
     guard = Guard()
+    monkeypatch.setattr(app, "request_activation", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(
         app,
         "create_application",
@@ -160,6 +164,31 @@ def test_duplicate_instance_exits_before_application_construction(tmp_path, monk
     )
     assert guard.notified is True
     assert events == ["close"]
+
+
+def test_duplicate_instance_requests_activation_without_fallback(tmp_path, monkeypatch) -> None:
+    class Guard:
+        notified = False
+
+        def acquire(self) -> bool:
+            return False
+
+        def notify_already_running(self) -> None:
+            self.notified = True
+
+        def release(self) -> None:
+            raise AssertionError("unowned guard must not be released")
+
+    guard = Guard()
+    monkeypatch.setattr(app, "request_activation", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        app,
+        "create_application",
+        lambda _root: (_ for _ in ()).throw(AssertionError()),
+    )
+
+    assert app.run(tmp_path, instance_guard=guard) == 2
+    assert guard.notified is False
 
 
 def test_create_application_initializes_project_local_content_services(

@@ -13,6 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from telegram_downloader import __version__
+from telegram_downloader.activation import (
+    ACTIVATION_CHANNEL,
+    LocalActivationServer,
+    request_activation,
+)
 from telegram_downloader.catalog import CatalogRepository
 from telegram_downloader.content import ContentSearchQuery, SearchScope
 from telegram_downloader.content_browser import ContentBrowserService
@@ -1015,13 +1020,26 @@ def run(
 ) -> int:
     guard = instance_guard or WindowsInstanceGuard()
     if not guard.acquire():
-        guard.notify_already_running()
+        if not request_activation(ACTIVATION_CHANNEL, timeout_ms=1000):
+            guard.notify_already_running()
         _startup_close(startup_indicator)
         return 2
 
+    activation_server: LocalActivationServer | None = None
     try:
         _startup_status(startup_indicator, "正在准备本地数据…")
         application, loop, controller = create_application(root)
+
+        def activate_main_window() -> None:
+            controller.window.show()
+            controller.window.raise_()
+            controller.window.activateWindow()
+
+        activation_server = LocalActivationServer(
+            ACTIVATION_CHANNEL,
+            activate_main_window,
+        )
+        activation_server.start()
         graceful_shutdown, close_filter = _install_graceful_shutdown(
             application,
             controller,
@@ -1054,5 +1072,7 @@ def run(
         del close_filter
         return 0
     finally:
+        if activation_server is not None:
+            activation_server.close()
         _startup_close(startup_indicator)
         guard.release()
