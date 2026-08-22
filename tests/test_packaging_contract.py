@@ -108,7 +108,7 @@ def test_subscription_modules_do_not_escape_project_local_storage() -> None:
         assert all(value not in source for value in diagnostic_forbidden), module.name
 
 
-def test_v0130_version_and_background_runtime_contract_are_consistent() -> None:
+def test_v0140_version_and_p1_experience_contract_are_consistent() -> None:
     root = Path(__file__).parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     package_init = (root / "src/telegram_downloader/__init__.py").read_text(
@@ -125,11 +125,11 @@ def test_v0130_version_and_background_runtime_contract_are_consistent() -> None:
         encoding="utf-8"
     )
     readme = (root / "README.md").read_text(encoding="utf-8")
-    release_notes = root / "docs/releases/v0.13.0.md"
+    release_notes = root / "docs/releases/v0.14.0.md"
 
-    assert project["project"]["version"] == "0.13.0"
-    assert '__version__ = "0.13.0"' in package_init
-    assert '#define AppVersion "0.13.0"' in installer
+    assert project["project"]["version"] == "0.14.0"
+    assert '__version__ = "0.14.0"' in package_init
+    assert '#define AppVersion "0.14.0"' in installer
     assert "qrcode==8.2" in requirements
     assert '"qrcode"' in spec
     assert "app_version=__version__" in gateway
@@ -156,8 +156,16 @@ def test_v0130_version_and_background_runtime_contract_are_consistent() -> None:
     assert '"--background"' in entry
     assert release_notes.is_file()
     notes = release_notes.read_text(encoding="utf-8")
-    assert "# TelegramDownloader v0.13.0" in notes
-    assert all(term in notes for term in ("托盘", "系统通知", "下载时段"))
+    assert "# TelegramDownloader v0.14.0" in notes
+    assert all(
+        term in notes
+        for term in (
+            "高级订阅",
+            "批量导入",
+            "全局媒体槽",
+            "下载路径",
+        )
+    )
     assert "v0.1.0 · stable" not in main
     for component in (
         "ContentBrowserService",
