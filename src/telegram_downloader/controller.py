@@ -309,6 +309,9 @@ class _NullRepository:
 
 
 class _NullScheduler:
+    async def set_schedule_open(self, _opened: bool) -> set[str]:
+        return set()
+
     async def run_task(self, _task_id: str) -> None:
         pass
 

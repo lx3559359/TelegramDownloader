@@ -19,6 +19,7 @@ from telegram_downloader.content import (
 )
 from telegram_downloader.content_browser import ContentBrowserService
 from telegram_downloader.domain import MediaKind
+from telegram_downloader.download_schedule import DownloadScheduleController
 from telegram_downloader.file_integrity import FileIntegrityService
 from telegram_downloader.gateway import (
     AuthorizationFailureReason,
@@ -241,6 +242,18 @@ def test_run_keeps_startup_inside_the_continuous_event_loop() -> None:
     assert source.index("await download_schedule.start()") < source.index(
         "await controller.start("
     )
+
+
+@pytest.mark.asyncio
+async def test_download_schedule_starts_without_configured_telegram_gateway() -> None:
+    controller = app.AppController.for_test(gateway=None)
+    schedule = DownloadScheduleController(
+        lambda: controller.scheduler,
+        AppSettings().download_schedule,
+    )
+
+    await schedule.start()
+    await schedule.shutdown()
 
 
 def test_duplicate_instance_falls_back_before_application_construction(
