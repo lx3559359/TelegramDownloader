@@ -32,6 +32,11 @@ class TaskStatus(StrEnum):
     PARTIAL_FAILURE = "partial_failure"
 
 
+class PauseReason(StrEnum):
+    USER = "user"
+    SCHEDULE = "schedule"
+
+
 class ItemStatus(StrEnum):
     QUEUED = "queued"
     DOWNLOADING = "downloading"
@@ -81,6 +86,7 @@ class TaskRecord:
     display_title: str | None = None
     archived_at: datetime | None = None
     queue_priority: int = 0
+    pause_reason: PauseReason | None = None
 
 
 @dataclass(frozen=True, slots=True)
