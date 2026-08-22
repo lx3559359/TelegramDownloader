@@ -145,7 +145,7 @@ def test_v0160_version_and_download_ui_contract_are_consistent() -> None:
     assert "qrcode==8.2" in requirements
     assert '"qrcode"' in spec
     assert "app_version=__version__" in gateway
-    assert 'f"v{__version__} · stable"' in main
+    assert 'f"v{__version__} · {APP_CHANNEL}"' in main
     assert '"telegram_downloader.subscription_diagnostics"' in spec
     assert '"telegram_downloader.ui.subscription_diagnostics"' in spec
     assert '"telegram_downloader.ui.models"' in spec
