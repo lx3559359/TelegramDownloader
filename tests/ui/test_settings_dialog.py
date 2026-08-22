@@ -43,11 +43,19 @@ def test_round_trip_manual_proxy_form(qtbot) -> None:
 
 
 def test_manual_update_button_emits_and_reports_result(qtbot) -> None:
-    dialog = SettingsDialog(AppSettings(), application_version="0.15.0")
+    dialog = SettingsDialog(AppSettings(), application_version="0.16.0")
     qtbot.addWidget(dialog)
 
     assert not hasattr(dialog, "check_updates")
-    assert "0.15.0" in dialog.update_version_label.text()
+    labels = [
+        dialog.tabs.tabText(index) for index in range(dialog.tabs.count())
+    ]
+    assert labels == ["常规", "下载路径", "后台与通知", "关于与更新"]
+    assert dialog.tabs.indexOf(dialog.about_update_tab) == 3
+    assert dialog.update_check_button.isVisibleTo(dialog.about_update_tab)
+    assert "0.16.0" in dialog.update_version_label.text()
+    assert "stable" in dialog.update_channel_label.text()
+    assert "尚未检查" in dialog.update_last_checked_label.text()
     with qtbot.waitSignal(dialog.update_check_requested, timeout=500):
         qtbot.mouseClick(
             dialog.update_check_button,
@@ -56,11 +64,18 @@ def test_manual_update_button_emits_and_reports_result(qtbot) -> None:
     dialog.set_update_busy(True)
     assert dialog.update_check_button.isEnabled() is False
     assert "正在检查" in dialog.update_check_button.text()
-    dialog.set_update_result("当前已是最新正式版")
+    dialog.set_update_result("当前已是最新正式版", state="success")
     assert dialog.update_status_label.text() == "当前已是最新正式版"
+    assert dialog.update_status_label.property("updateState") == "success"
+    dialog.set_last_successful_update_check("2026-08-23T02:20:00Z")
+    assert "2026-08-23" in dialog.update_last_checked_label.text()
     dialog.set_update_busy(False)
     assert dialog.update_check_button.isEnabled() is True
     assert dialog.values().check_updates_on_startup is False
+    assert (
+        dialog.values().last_successful_update_check_utc
+        == "2026-08-23T02:20:00Z"
+    )
 
 
 def test_proxy_test_emits_without_accepting_dialog(qtbot) -> None:
@@ -161,11 +176,12 @@ def test_background_tab_round_trips_all_values(qtbot) -> None:
     dialog = SettingsDialog(settings, autostart_available=True)
     qtbot.addWidget(dialog)
 
-    assert dialog.tabs.count() == 3
-    assert [dialog.tabs.tabText(index) for index in range(3)] == [
+    assert dialog.tabs.count() == 4
+    assert [dialog.tabs.tabText(index) for index in range(4)] == [
         "常规",
         "下载路径",
         "后台与通知",
+        "关于与更新",
     ]
     assert dialog.values() == settings
 

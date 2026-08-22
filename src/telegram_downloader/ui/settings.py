@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -128,18 +129,6 @@ class SettingsDialog(QDialog):
             )
             selected_speed = self.speed_limit.count() - 1
         self.speed_limit.setCurrentIndex(selected_speed)
-        update_panel = QWidget()
-        update_layout = QVBoxLayout(update_panel)
-        update_layout.setContentsMargins(0, 0, 0, 0)
-        update_layout.setSpacing(6)
-        self.update_version_label = QLabel(f"当前版本：{application_version}")
-        self.update_status_label = QLabel("仅在点击后检查正式版更新")
-        self.update_status_label.setObjectName("muted")
-        self.update_status_label.setWordWrap(True)
-        self.update_check_button = QPushButton("检查更新")
-        update_layout.addWidget(self.update_version_label)
-        update_layout.addWidget(self.update_status_label)
-        update_layout.addWidget(self.update_check_button, 0)
         self.proxy_kind = QComboBox()
         self.proxy_kind.addItem("不使用代理", "none")
         self.proxy_kind.addItem("SOCKS5", "socks5")
@@ -156,7 +145,6 @@ class SettingsDialog(QDialog):
         self.concurrency_label = QLabel("全局媒体槽")
         form.addRow(self.concurrency_label, self.concurrency)
         form.addRow("总下载限速", self.speed_limit)
-        form.addRow("在线更新", update_panel)
         form.addRow("代理类型", self.proxy_kind)
         form.addRow("代理地址", self.proxy_host)
         form.addRow("代理端口", self.proxy_port)
@@ -298,6 +286,37 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(background_tab, "后台与通知")
         self.schedule_detail_widgets = (*self.weekdays, self.schedule_start, self.schedule_end)
 
+        self.about_update_tab = QWidget()
+        about_layout = QVBoxLayout(self.about_update_tab)
+        about_layout.setContentsMargins(12, 16, 12, 12)
+        about_layout.setSpacing(10)
+        product_name = QLabel("Telegram 下载器")
+        product_name.setObjectName("sectionTitle")
+        product_subtitle = QLabel("Telegram 媒体下载工具")
+        product_subtitle.setObjectName("muted")
+        self.update_version_label = QLabel(f"当前版本：{application_version}")
+        self.update_channel_label = QLabel("更新通道：stable")
+        self.update_last_checked_label = QLabel(
+            self._format_update_check_time(settings.last_successful_update_check_utc)
+        )
+        self.update_last_checked_label.setObjectName("muted")
+        self.update_status_label = QLabel("仅在点击后检查正式版更新")
+        self.update_status_label.setObjectName("updateStatus")
+        self.update_status_label.setProperty("updateState", "neutral")
+        self.update_status_label.setWordWrap(True)
+        self.update_check_button = QPushButton("检查更新")
+        self.update_check_button.setObjectName("primaryButton")
+        about_layout.addWidget(product_name)
+        about_layout.addWidget(product_subtitle)
+        about_layout.addSpacing(8)
+        about_layout.addWidget(self.update_version_label)
+        about_layout.addWidget(self.update_channel_label)
+        about_layout.addWidget(self.update_last_checked_label)
+        about_layout.addWidget(self.update_status_label)
+        about_layout.addWidget(self.update_check_button, 0)
+        about_layout.addStretch()
+        self.tabs.addTab(self.about_update_tab, "关于与更新")
+
         if not tray_available:
             self.close_to_tray.setEnabled(False)
             self.close_to_tray.setToolTip("当前系统托盘不可用")
@@ -376,6 +395,9 @@ class SettingsDialog(QDialog):
             download_storage=DownloadStorageSettings(
                 self._download_root_value,
                 self._settings.download_storage.trusted_roots,
+            ),
+            last_successful_update_check_utc=(
+                self._settings.last_successful_update_check_utc
             ),
         )
 
@@ -485,8 +507,27 @@ class SettingsDialog(QDialog):
         self.update_check_button.setEnabled(not busy)
         self.update_check_button.setText("正在检查…" if busy else "检查更新")
 
-    def set_update_result(self, text: str) -> None:
+    def set_update_result(self, text: str, *, state: str = "neutral") -> None:
+        self.update_status_label.setProperty("updateState", state)
         self.update_status_label.setText(str(text))
+        self.update_status_label.style().unpolish(self.update_status_label)
+        self.update_status_label.style().polish(self.update_status_label)
+
+    def set_last_successful_update_check(self, utc_text: str) -> None:
+        self._settings = replace(
+            self._settings,
+            last_successful_update_check_utc=utc_text,
+        )
+        self.update_last_checked_label.setText(
+            self._format_update_check_time(utc_text)
+        )
+
+    @staticmethod
+    def _format_update_check_time(utc_text: str) -> str:
+        if not utc_text:
+            return "上次成功检查：尚未检查"
+        parsed = datetime.fromisoformat(utc_text[:-1] + "+00:00")
+        return f"上次成功检查：{parsed.astimezone():%Y-%m-%d %H:%M}"
 
     @staticmethod
     def _format_bytes(value: int) -> str:
