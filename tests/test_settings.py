@@ -6,11 +6,62 @@ from telegram_downloader.files import DownloadNamingSettings
 from telegram_downloader.settings import (
     AppSettings,
     DownloadScheduleSettings,
+    DownloadStorageSettings,
     ProxySettings,
     SettingsError,
     SettingsStore,
     StorageMaintenanceSettings,
 )
+
+
+def test_download_storage_defaults_to_portable_downloads() -> None:
+    assert DownloadStorageSettings() == DownloadStorageSettings("", ())
+    assert AppSettings().download_storage == DownloadStorageSettings()
+
+
+def test_old_auto_update_field_is_ignored_and_not_saved(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text(
+        '{"api_id": 7, "concurrency": 2, "check_updates_on_startup": true}',
+        encoding="utf-8",
+    )
+    store = SettingsStore(path)
+
+    loaded = store.load()
+
+    assert loaded.check_updates_on_startup is False
+    store.save(loaded)
+    assert "check_updates_on_startup" not in path.read_text(encoding="utf-8")
+
+
+def test_download_storage_round_trips_root_and_history(tmp_path) -> None:
+    store = SettingsStore(tmp_path / "settings.json")
+    expected = AppSettings(
+        download_storage=DownloadStorageSettings(
+            root=r"D:\Telegram Media",
+            trusted_roots=(r"E:\Old Telegram",),
+        )
+    )
+
+    store.save(expected)
+
+    assert store.load() == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        {"root": 1},
+        {"trusted_roots": "D:/media"},
+        {"trusted_roots": ["D:/media", "D:/media"]},
+    ),
+)
+def test_download_storage_rejects_malformed_json(tmp_path, value) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"download_storage": value}), encoding="utf-8")
+
+    with pytest.raises(SettingsError):
+        SettingsStore(path).load()
 
 
 def test_settings_round_trip_is_atomic(tmp_path) -> None:
