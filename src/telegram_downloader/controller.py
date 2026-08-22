@@ -75,6 +75,14 @@ class _MemoryVault:
         self.value = dict(value)
 
 
+class _SettingsStoreRuntimeEffects:
+    def __init__(self, settings_store: Any) -> None:
+        self.settings_store = settings_store
+
+    async def apply(self, _previous: AppSettings, current: AppSettings) -> None:
+        await asyncio.to_thread(self.settings_store.save, current)
+
+
 class _NullStatusBar:
     def __init__(self) -> None:
         self.last_message = ""
@@ -424,6 +432,7 @@ class AppController:
         update_prompt: Callable[[Any], bool] | None = None,
         update_shutdown: Callable[[], None] | None = None,
         publish: Callable[[ApplicationEvent], None] | None = None,
+        runtime_settings_effects: Any | None = None,
         settings: AppSettings | None = None,
         secrets: dict[str, str] | None = None,
         connection_recovery: ConnectionRecovery | None = None,
@@ -458,6 +467,9 @@ class AppController:
         self.update_prompt = update_prompt or (lambda _manifest: False)
         self.update_shutdown = update_shutdown or (lambda: None)
         self.publish = publish or (lambda _event: None)
+        self.runtime_settings_effects = runtime_settings_effects or (
+            _SettingsStoreRuntimeEffects(settings_store)
+        )
         self.settings = settings or settings_store.load()
         self.secrets = dict(secrets if secrets is not None else vault.load())
         self.connection_recovery = connection_recovery or ConnectionRecovery()
@@ -1623,20 +1635,23 @@ class AppController:
                 await probe.disconnect()
 
     async def apply_settings(self, settings: AppSettings, proxy_password: str) -> None:
+        previous_settings = self.settings
         connection_changed = (
-            settings.api_id != self.settings.api_id
-            or settings.proxy != self.settings.proxy
+            settings.api_id != previous_settings.api_id
+            or settings.proxy != previous_settings.proxy
         )
         updated_secrets = dict(self.secrets)
         if proxy_password:
             updated_secrets["proxy_password"] = proxy_password
         else:
             updated_secrets.pop("proxy_password", None)
-        def persist_settings() -> None:
-            self.settings_store.save(settings)
-            self.vault.save(updated_secrets)
-
-        await asyncio.to_thread(persist_settings)
+        await self.runtime_settings_effects.apply(previous_settings, settings)
+        try:
+            await asyncio.to_thread(self.vault.save, updated_secrets)
+        except Exception:
+            with suppress(Exception):
+                await self.runtime_settings_effects.apply(settings, previous_settings)
+            raise
         self.settings = settings
         self.secrets = updated_secrets
         configure = getattr(self.scheduler, "configure_resources", None)

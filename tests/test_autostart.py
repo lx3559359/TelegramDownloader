@@ -70,6 +70,20 @@ def test_source_mode_rejects_enabling_autostart(tmp_path: Path) -> None:
         ).reconcile(True)
 
 
+def test_source_mode_does_not_touch_registry_when_disabled(tmp_path: Path) -> None:
+    registry = FakeRegistry({RUN_VALUE_NAME: "packaged-value"})
+    service = CurrentUserAutostart(
+        registry,
+        tmp_path / "python.exe",
+        frozen=False,
+    )
+
+    service.reconcile(False)
+
+    assert registry.values[RUN_VALUE_NAME] == "packaged-value"
+    assert registry.calls == []
+
+
 def test_enabled_reports_only_the_exact_owned_command(tmp_path: Path) -> None:
     registry = FakeRegistry()
     service, _executable = packaged_service(tmp_path, registry)

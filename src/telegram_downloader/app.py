@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import logging
 import os
 import platform
 import sys
@@ -21,6 +22,7 @@ from telegram_downloader.activation import (
     LocalActivationServer,
     request_activation,
 )
+from telegram_downloader.autostart import CurrentUserAutostart, WindowsCurrentUserRegistry
 from telegram_downloader.background import (
     BackgroundModeController,
     QtTrayAdapter,
@@ -64,6 +66,7 @@ from telegram_downloader.paths import PortablePaths
 from telegram_downloader.planner import ScanPreview, TaskPlanner
 from telegram_downloader.repository import TaskRepository
 from telegram_downloader.resource_control import AsyncBandwidthLimiter
+from telegram_downloader.runtime_settings import RuntimeSettingsCoordinator
 from telegram_downloader.scheduler import DownloadScheduler
 from telegram_downloader.security import SecretsError, SecretsVault
 from telegram_downloader.settings import AppSettings, SettingsError, SettingsStore
@@ -73,6 +76,8 @@ from telegram_downloader.thumbnail_cache import ThumbnailCache
 from telegram_downloader.update import HttpBytesClient, UpdateCoordinator
 from telegram_downloader.update_contract import load_trusted_keys
 from telegram_downloader.update_download import ResumableUpdateDownloader
+
+_LOGGER = logging.getLogger("telegram_downloader.app")
 
 
 class _FunctionDiagnosticProbe:
@@ -723,6 +728,10 @@ def create_application(
             controller.secrets.get("proxy_password", ""),
             window,
             thumbnail_cache_bytes=thumbnail_cache_bytes,
+            autostart_available=bool(
+                getattr(controller.runtime_settings_effects, "autostart_available", False)
+            ),
+            tray_available=bool(getattr(controller, "tray_available", False)),
         )
         controller._settings_dialog = dialog
 
@@ -751,11 +760,12 @@ def create_application(
             ),
         )
         async_actions.connect(
-            dialog.accepted,
+            dialog.save_requested,
             "settings.save",
             save_settings,
             hooks=ActionHooks(
                 started=lambda: dialog.set_save_busy(True),
+                succeeded=dialog.accept,
                 failed=lambda error: dialog._show_error(controller._safe_error(error)),
                 finished=lambda: dialog.set_save_busy(False),
             ),
@@ -1126,6 +1136,24 @@ def run(
             close_to_tray=controller.settings.close_to_tray,
             notifications_enabled=controller.settings.notifications_enabled,
         )
+        autostart = CurrentUserAutostart(
+            WindowsCurrentUserRegistry(),
+            Path(sys.executable),
+            frozen=bool(getattr(sys, "frozen", False)),
+        )
+        runtime_settings = RuntimeSettingsCoordinator(
+            controller.settings_store,
+            autostart,
+            background,
+            download_schedule,
+        )
+        controller.runtime_settings_effects = runtime_settings
+        controller.tray_available = tray_adapter.available
+        if controller.settings.autostart_enabled and autostart.available:
+            try:
+                autostart.reconcile(True)
+            except Exception:
+                _LOGGER.warning("无法校正开机启动配置")
 
         from PySide6.QtCore import QTimer
 

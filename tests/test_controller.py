@@ -2,6 +2,7 @@ import asyncio
 import logging
 import threading
 import time
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -3681,6 +3682,55 @@ async def test_apply_settings_reconfigures_active_scheduler_after_persistence() 
     ]
     assert controller.settings == updated
     assert "即时应用" in controller.window.message.last_message
+
+
+@pytest.mark.asyncio
+async def test_apply_settings_runs_runtime_effects_before_assigning_state() -> None:
+    previous = AppSettings()
+    current = replace(previous, close_to_tray=False)
+    observed = []
+
+    class Effects:
+        async def apply(self, old, new) -> None:
+            observed.append((old, new, controller.settings))
+
+    controller = AppController.for_test(
+        settings=previous,
+        runtime_settings_effects=Effects(),
+    )
+
+    await controller.apply_settings(current, "")
+
+    assert observed == [(previous, current, previous)]
+    assert controller.settings == current
+
+
+@pytest.mark.asyncio
+async def test_apply_settings_rolls_back_runtime_effects_when_vault_save_fails() -> None:
+    previous = AppSettings()
+    current = replace(previous, notifications_enabled=False)
+    observed = []
+
+    class Effects:
+        async def apply(self, old, new) -> None:
+            observed.append((old, new))
+
+    class FailingVault:
+        def save(self, _value) -> None:
+            raise OSError("private vault path")
+
+    controller = AppController.for_test(
+        settings=previous,
+        secrets={},
+        vault=FailingVault(),
+        runtime_settings_effects=Effects(),
+    )
+
+    with pytest.raises(OSError, match="private vault path"):
+        await controller.apply_settings(current, "")
+
+    assert observed == [(previous, current), (current, previous)]
+    assert controller.settings == previous
 
 
 @pytest.mark.asyncio

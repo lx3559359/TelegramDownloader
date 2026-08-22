@@ -110,6 +110,10 @@ class CurrentUserAutostart:
         return self.registry.get_value(RUN_KEY, RUN_VALUE_NAME) == self.command()
 
     def reconcile(self, enabled: bool) -> None:
+        if not self.frozen:
+            if enabled:
+                raise AutostartUnavailableError("开机启动只支持正式打包程序")
+            return
         if enabled:
             if not self.available:
                 raise AutostartUnavailableError("开机启动只支持正式打包程序")

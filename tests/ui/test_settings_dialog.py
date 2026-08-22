@@ -1,7 +1,11 @@
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QGraphicsDropShadowEffect, QLineEdit
 
-from telegram_downloader.settings import AppSettings, ProxySettings
+from telegram_downloader.settings import (
+    AppSettings,
+    DownloadScheduleSettings,
+    ProxySettings,
+)
 from telegram_downloader.ui.effects import ElevationLevel
 from telegram_downloader.ui.settings import SettingsDialog
 from telegram_downloader.ui.theme import APP_STYLESHEET
@@ -62,6 +66,16 @@ def test_invalid_proxy_shows_error_and_does_not_accept(qtbot) -> None:
     assert "代理" in dialog.error_label.text()
 
 
+def test_valid_save_emits_without_closing_until_runtime_apply_succeeds(qtbot) -> None:
+    dialog = SettingsDialog(AppSettings())
+    qtbot.addWidget(dialog)
+
+    with qtbot.waitSignal(dialog.save_requested, timeout=500):
+        qtbot.mouseClick(dialog.save_button, Qt.MouseButton.LeftButton)
+
+    assert dialog.result() == 0
+
+
 def test_thumbnail_cache_clear_emits_without_closing_dialog(qtbot) -> None:
     dialog = SettingsDialog(
         AppSettings(),
@@ -100,3 +114,43 @@ def test_cache_and_save_busy_states_are_immediate(qtbot) -> None:
     dialog.set_save_busy(False)
     assert dialog.thumbnail_cache_clear_button.isEnabled() is True
     assert dialog.save_button.isEnabled() is True
+
+
+def test_background_tab_round_trips_all_values(qtbot) -> None:
+    settings = AppSettings(
+        close_to_tray=False,
+        notifications_enabled=False,
+        autostart_enabled=True,
+        tray_hint_shown=True,
+        download_schedule=DownloadScheduleSettings(
+            True,
+            (0, 2, 4),
+            22 * 60,
+            2 * 60,
+        ),
+    )
+    dialog = SettingsDialog(settings, autostart_available=True)
+    qtbot.addWidget(dialog)
+
+    assert dialog.tabs.count() == 2
+    assert [dialog.tabs.tabText(index) for index in range(2)] == [
+        "常规",
+        "后台与通知",
+    ]
+    assert dialog.values() == settings
+
+
+def test_unavailable_integrations_and_disabled_schedule_disable_controls(qtbot) -> None:
+    dialog = SettingsDialog(
+        AppSettings(),
+        autostart_available=False,
+        tray_available=False,
+    )
+    qtbot.addWidget(dialog)
+
+    assert dialog.autostart.isEnabled() is False
+    assert dialog.close_to_tray.isEnabled() is False
+    assert all(not widget.isEnabled() for widget in dialog.schedule_detail_widgets)
+
+    dialog.schedule_enabled.setChecked(True)
+    assert all(widget.isEnabled() for widget in dialog.schedule_detail_widgets)
