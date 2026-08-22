@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -20,6 +21,10 @@ from telegram_downloader.content import (
     SearchStatus,
 )
 from telegram_downloader.domain import MediaKind, ScanFilters
+from telegram_downloader.subscription_matching import (
+    SubscriptionCriteria,
+    SubscriptionMatchMode,
+)
 from telegram_downloader.subscriptions import (
     SubscriptionRule,
     SubscriptionRun,
@@ -27,7 +32,7 @@ from telegram_downloader.subscriptions import (
     SubscriptionState,
 )
 
-CATALOG_SCHEMA_VERSION = 4
+CATALOG_SCHEMA_VERSION = 5
 
 
 class CatalogError(RuntimeError):
@@ -185,6 +190,19 @@ SET source_kind = COALESCE(
 PRAGMA user_version=4;
 """
 
+_SCHEMA_V5_COLUMN_MIGRATIONS = (
+    "ALTER TABLE subscription_rules ADD COLUMN include_keywords_json TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE subscription_rules ADD COLUMN exclude_keywords_json TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE subscription_rules ADD COLUMN match_mode TEXT NOT NULL DEFAULT 'any'",
+    "ALTER TABLE subscription_rules ADD COLUMN matcher_fingerprint TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE subscription_rules "
+    "ADD COLUMN history_days INTEGER NOT NULL DEFAULT 0 "
+    "CHECK(history_days IN (0, 1, 3, 7, 30))",
+    "ALTER TABLE subscription_rules ADD COLUMN backfill_from_utc TEXT",
+    "ALTER TABLE subscription_rules ADD COLUMN backfill_through_id INTEGER "
+    "CHECK(backfill_through_id IS NULL OR backfill_through_id >= 0)",
+)
+
 
 class CatalogRepository:
     def __init__(self, database: Path) -> None:
@@ -220,8 +238,43 @@ class CatalogRepository:
             if version == 3:
                 connection.executescript(_SCHEMA_V4_MIGRATION)
                 version = 4
+            if version == 4:
+                self._migrate_v4_to_v5(connection)
+                version = 5
             if version != CATALOG_SCHEMA_VERSION:
                 raise CatalogError(f"不支持的内容目录版本：{version}")
+
+    @staticmethod
+    def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
+        connection.execute("SAVEPOINT catalog_schema_v5")
+        try:
+            for statement in _SCHEMA_V5_COLUMN_MIGRATIONS:
+                connection.execute(statement)
+            rows = connection.execute(
+                "SELECT id, keyword FROM subscription_rules ORDER BY id"
+            ).fetchall()
+            for row in rows:
+                criteria = SubscriptionCriteria((str(row["keyword"]),))
+                connection.execute(
+                    "UPDATE subscription_rules SET keyword=?, normalized_keyword=?, "
+                    "include_keywords_json=?, exclude_keywords_json=?, match_mode=?, "
+                    "matcher_fingerprint=?, history_days=0 WHERE id=?",
+                    (
+                        criteria.summary,
+                        criteria.fingerprint,
+                        CatalogRepository._keywords_json(criteria.include_keywords),
+                        CatalogRepository._keywords_json(criteria.exclude_keywords),
+                        criteria.mode.value,
+                        criteria.fingerprint,
+                        str(row["id"]),
+                    ),
+                )
+            connection.execute("PRAGMA user_version=5")
+        except Exception:
+            connection.execute("ROLLBACK TO SAVEPOINT catalog_schema_v5")
+            connection.execute("RELEASE SAVEPOINT catalog_schema_v5")
+            raise
+        connection.execute("RELEASE SAVEPOINT catalog_schema_v5")
 
     def schema_version(self) -> int:
         with self._connection() as connection:
@@ -379,8 +432,7 @@ class CatalogRepository:
     def list_sessions(self, account_id: str) -> list[SearchSession]:
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM search_sessions WHERE account_id=? "
-                "ORDER BY updated_at DESC, id",
+                "SELECT * FROM search_sessions WHERE account_id=? ORDER BY updated_at DESC, id",
                 (account_id,),
             ).fetchall()
         return [self._session_from_row(row) for row in rows]
@@ -421,8 +473,7 @@ class CatalogRepository:
     ) -> SearchPageCommit:
         with self._connection() as connection:
             session = connection.execute(
-                "SELECT * FROM search_sessions "
-                "WHERE account_id=? AND id=? AND generation=?",
+                "SELECT * FROM search_sessions WHERE account_id=? AND id=? AND generation=?",
                 (account_id, search_id, generation),
             ).fetchone()
             if session is None:
@@ -481,15 +532,11 @@ class CatalogRepository:
         *,
         session: sqlite3.Row | None = None,
     ) -> None:
-        if any(
-            item.search_id != search_id or item.account_id != account_id
-            for item in results
-        ):
+        if any(item.search_id != search_id or item.account_id != account_id for item in results):
             raise ValueError("搜索结果不属于当前搜索")
         if session is None:
             session = connection.execute(
-                "SELECT * FROM search_sessions "
-                "WHERE account_id=? AND id=?",
+                "SELECT * FROM search_sessions WHERE account_id=? AND id=?",
                 (account_id, search_id),
             ).fetchone()
         if session is None or int(session["generation"]) != generation:
@@ -557,8 +604,7 @@ class CatalogRepository:
     ) -> None:
         with self._connection() as connection:
             session = connection.execute(
-                "SELECT 1 FROM search_sessions "
-                "WHERE account_id=? AND id=? AND generation=?",
+                "SELECT 1 FROM search_sessions WHERE account_id=? AND id=? AND generation=?",
                 (account_id, search_id, generation),
             ).fetchone()
             if session is None:
@@ -615,8 +661,7 @@ class CatalogRepository:
         )
         if status is SearchStatus.COMPLETED:
             connection.execute(
-                "DELETE FROM search_results WHERE account_id=? AND search_id=? "
-                "AND generation<>?",
+                "DELETE FROM search_results WHERE account_id=? AND search_id=? AND generation<>?",
                 (account_id, search_id, generation),
             )
 
@@ -812,6 +857,8 @@ class CatalogRepository:
 
     def save_subscription(self, rule: SubscriptionRule) -> None:
         media_kinds = ",".join(sorted(kind.value for kind in rule.media_kinds))
+        include_keywords = self._keywords_json(rule.criteria.include_keywords)
+        exclude_keywords = self._keywords_json(rule.criteria.exclude_keywords)
         with self._connection() as connection:
             existing = connection.execute(
                 "SELECT account_id FROM subscription_rules WHERE id=?",
@@ -825,8 +872,11 @@ class CatalogRepository:
                     "id, account_id, peer_ref, dialog_title, keyword, "
                     "normalized_keyword, media_kinds, interval_minutes, enabled, "
                     "state, last_message_id, next_run_at, last_run_at, last_error, "
-                    "failure_count, created_at, updated_at) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "failure_count, created_at, updated_at, include_keywords_json, "
+                    "exclude_keywords_json, match_mode, matcher_fingerprint, "
+                    "history_days, backfill_from_utc, backfill_through_id) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(id) DO UPDATE SET "
                     "peer_ref=excluded.peer_ref, dialog_title=excluded.dialog_title, "
                     "keyword=excluded.keyword, "
@@ -839,6 +889,13 @@ class CatalogRepository:
                     "last_run_at=excluded.last_run_at, "
                     "last_error=excluded.last_error, "
                     "failure_count=excluded.failure_count, "
+                    "include_keywords_json=excluded.include_keywords_json, "
+                    "exclude_keywords_json=excluded.exclude_keywords_json, "
+                    "match_mode=excluded.match_mode, "
+                    "matcher_fingerprint=excluded.matcher_fingerprint, "
+                    "history_days=excluded.history_days, "
+                    "backfill_from_utc=excluded.backfill_from_utc, "
+                    "backfill_through_id=excluded.backfill_through_id, "
                     "updated_at=excluded.updated_at",
                     (
                         rule.id,
@@ -858,10 +915,17 @@ class CatalogRepository:
                         rule.failure_count,
                         rule.created_at.isoformat(),
                         rule.updated_at.isoformat(),
+                        include_keywords,
+                        exclude_keywords,
+                        rule.criteria.mode.value,
+                        rule.criteria.fingerprint,
+                        rule.history_days,
+                        self._datetime_value(rule.backfill_from_utc),
+                        rule.backfill_through_id,
                     ),
                 )
             except sqlite3.IntegrityError as error:
-                raise CatalogError("相同群组和关键词的订阅已经存在") from error
+                raise CatalogError("相同群组和规则的订阅已经存在") from error
 
     def get_subscription(self, account_id: str, rule_id: str) -> SubscriptionRule:
         with self._connection() as connection:
@@ -916,12 +980,14 @@ class CatalogRepository:
         rule_id: str,
         message_id: int,
         now: datetime,
+        *,
+        complete_backfill: bool = False,
     ) -> None:
         if message_id < 0:
             raise ValueError("消息游标不能为负数")
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT last_message_id FROM subscription_rules "
+                "SELECT last_message_id, backfill_through_id FROM subscription_rules "
                 "WHERE account_id=? AND id=?",
                 (account_id, rule_id),
             ).fetchone()
@@ -930,11 +996,22 @@ class CatalogRepository:
             previous = row["last_message_id"]
             if previous is not None and message_id < int(previous):
                 raise ValueError("订阅消息游标不能倒退")
-            connection.execute(
-                "UPDATE subscription_rules SET last_message_id=?, updated_at=? "
-                "WHERE account_id=? AND id=?",
-                (message_id, now.isoformat(), account_id, rule_id),
-            )
+            if complete_backfill:
+                through_id = row["backfill_through_id"]
+                if through_id is None or message_id != int(through_id):
+                    raise ValueError("订阅补抓尚未到达固定截止消息")
+                connection.execute(
+                    "UPDATE subscription_rules SET last_message_id=?, "
+                    "backfill_from_utc=NULL, backfill_through_id=NULL, updated_at=? "
+                    "WHERE account_id=? AND id=?",
+                    (message_id, now.isoformat(), account_id, rule_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE subscription_rules SET last_message_id=?, updated_at=? "
+                    "WHERE account_id=? AND id=?",
+                    (message_id, now.isoformat(), account_id, rule_id),
+                )
 
     def update_subscription_runtime(
         self,
@@ -1094,11 +1171,7 @@ class CatalogRepository:
         filters = ScanFilters(
             datetime.fromisoformat(str(row["date_from_utc"])),
             datetime.fromisoformat(str(row["date_to_utc"])),
-            frozenset(
-                MediaKind(value)
-                for value in str(row["media_kinds"]).split(",")
-                if value
-            ),
+            frozenset(MediaKind(value) for value in str(row["media_kinds"]).split(",") if value),
             int(row["item_limit"]),
         )
         cursor_json = row["cursor_json"]
@@ -1123,9 +1196,7 @@ class CatalogRepository:
             result_count=int(row["result_count"]),
             created_at=datetime.fromisoformat(str(row["created_at"])),
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
-            last_error=(
-                str(row["last_error"]) if row["last_error"] is not None else None
-            ),
+            last_error=(str(row["last_error"]) if row["last_error"] is not None else None),
             scope=SearchScope(str(row["scope"])),
         )
 
@@ -1157,32 +1228,46 @@ class CatalogRepository:
     @staticmethod
     def _subscription_from_row(row: sqlite3.Row) -> SubscriptionRule:
         last_message_id = row["last_message_id"]
+        backfill_through_id = row["backfill_through_id"]
+        try:
+            criteria = SubscriptionCriteria(
+                tuple(json.loads(str(row["include_keywords_json"]))),
+                tuple(json.loads(str(row["exclude_keywords_json"]))),
+                SubscriptionMatchMode(str(row["match_mode"])),
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise CatalogError("订阅规则数据无效") from error
+        if str(row["matcher_fingerprint"]) != criteria.fingerprint:
+            raise CatalogError("订阅规则指纹不一致")
         return SubscriptionRule(
             id=str(row["id"]),
             account_id=str(row["account_id"]),
             peer_ref=str(row["peer_ref"]),
             dialog_title=str(row["dialog_title"]),
-            keyword=str(row["keyword"]),
+            criteria=criteria,
             media_kinds=frozenset(
-                MediaKind(value)
-                for value in str(row["media_kinds"]).split(",")
-                if value
+                MediaKind(value) for value in str(row["media_kinds"]).split(",") if value
             ),
             interval_minutes=int(row["interval_minutes"]),
+            history_days=int(row["history_days"]),
             enabled=bool(row["enabled"]),
             state=SubscriptionState(str(row["state"])),
-            last_message_id=(
-                int(last_message_id) if last_message_id is not None else None
+            last_message_id=(int(last_message_id) if last_message_id is not None else None),
+            backfill_from_utc=CatalogRepository._datetime_from_row(row["backfill_from_utc"]),
+            backfill_through_id=(
+                int(backfill_through_id) if backfill_through_id is not None else None
             ),
             next_run_at=CatalogRepository._datetime_from_row(row["next_run_at"]),
             last_run_at=CatalogRepository._datetime_from_row(row["last_run_at"]),
-            last_error=(
-                str(row["last_error"]) if row["last_error"] is not None else None
-            ),
+            last_error=(str(row["last_error"]) if row["last_error"] is not None else None),
             failure_count=int(row["failure_count"]),
             created_at=datetime.fromisoformat(str(row["created_at"])),
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
         )
+
+    @staticmethod
+    def _keywords_json(values: tuple[str, ...]) -> str:
+        return json.dumps(values, ensure_ascii=False, separators=(",", ":"))
 
     @staticmethod
     def _subscription_run_from_row(row: sqlite3.Row) -> SubscriptionRun:
