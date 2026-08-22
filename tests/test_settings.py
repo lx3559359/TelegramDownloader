@@ -34,6 +34,26 @@ def test_old_auto_update_field_is_ignored_and_not_saved(tmp_path) -> None:
     assert "check_updates_on_startup" not in path.read_text(encoding="utf-8")
 
 
+def test_settings_round_trip_last_successful_update_check(tmp_path) -> None:
+    store = SettingsStore(tmp_path / "settings.json")
+    expected = AppSettings(
+        last_successful_update_check_utc="2026-08-23T02:20:00Z"
+    )
+
+    store.save(expected)
+
+    assert store.load() == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["yesterday", "2026-08-23", "2026-08-23T10:20:00", 123],
+)
+def test_settings_reject_non_utc_update_check_time(value) -> None:
+    with pytest.raises(SettingsError, match="最近更新检查时间"):
+        AppSettings(last_successful_update_check_utc=value)
+
+
 def test_download_storage_round_trips_root_and_history(tmp_path) -> None:
     store = SettingsStore(tmp_path / "settings.json")
     expected = AppSettings(

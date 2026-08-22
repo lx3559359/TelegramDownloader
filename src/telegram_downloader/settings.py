@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,19 @@ from telegram_downloader.resource_control import validate_speed_limit_kib
 
 class SettingsError(ValueError):
     """Raised when project-local settings are malformed or unsafe."""
+
+
+def _validate_update_check_time(value: str) -> None:
+    if value == "":
+        return
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise SettingsError("最近更新检查时间必须是 UTC ISO 8601 文本")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise SettingsError("最近更新检查时间格式无效") from error
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise SettingsError("最近更新检查时间必须使用 UTC")
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +145,7 @@ class AppSettings:
     download_naming: DownloadNamingSettings = DownloadNamingSettings()
     storage_maintenance: StorageMaintenanceSettings = StorageMaintenanceSettings()
     download_storage: DownloadStorageSettings = DownloadStorageSettings()
+    last_successful_update_check_utc: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.api_id, int) or isinstance(self.api_id, bool) or self.api_id < 0:
@@ -163,6 +178,7 @@ class AppSettings:
             raise SettingsError("存储维护设置格式无效")
         if not isinstance(self.download_storage, DownloadStorageSettings):
             raise SettingsError("下载存储设置格式无效")
+        _validate_update_check_time(self.last_successful_update_check_utc)
         try:
             validate_speed_limit_kib(self.speed_limit_kib)
         except ValueError as exc:
