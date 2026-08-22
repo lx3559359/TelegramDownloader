@@ -23,6 +23,10 @@ from telegram_downloader.gateway import (
     MediaReferenceExpired,
     TransientNetworkError,
 )
+from telegram_downloader.maintenance_activity import (
+    ActivityKind,
+    OperationActivityRegistry,
+)
 from telegram_downloader.notifications import (
     ApplicationEvent,
     EventKind,
@@ -142,6 +146,7 @@ class DownloadScheduler:
         shutdown_grace_seconds: float = 30.0,
         bandwidth: AsyncBandwidthLimiter | None = None,
         publish: Callable[[ApplicationEvent], None] | None = None,
+        activity: OperationActivityRegistry | None = None,
     ) -> None:
         if shutdown_grace_seconds <= 0:
             raise ValueError("关闭等待时间必须大于零")
@@ -154,6 +159,7 @@ class DownloadScheduler:
         downloader_bandwidth = getattr(downloader, "bandwidth", None)
         self._bandwidth = bandwidth or downloader_bandwidth or AsyncBandwidthLimiter()
         self.publish = publish or (lambda _event: None)
+        self.activity = activity
         self._pause_flags: dict[str, asyncio.Event] = {}
         self._pause_reasons: dict[str, PauseReason] = {}
         self._disk_full_tasks: set[str] = set()
@@ -390,6 +396,13 @@ class DownloadScheduler:
             )
 
     async def _perform(self, operation: _QueuedOperation) -> None:
+        if self.activity is None:
+            await self._perform_active(operation)
+            return
+        with self.activity.track(ActivityKind.DOWNLOAD):
+            await self._perform_active(operation)
+
+    async def _perform_active(self, operation: _QueuedOperation) -> None:
         clear_priority = getattr(self.repository, "clear_task_priority", None)
         if clear_priority is not None:
             clear_priority(operation.task_id)

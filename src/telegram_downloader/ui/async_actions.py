@@ -64,6 +64,15 @@ ACTION_POLICIES: dict[str, ActionPolicy] = {
     "tasks.resume": ActionPolicy.DEDUPLICATE,
     "tasks.retry": ActionPolicy.DEDUPLICATE,
     "integrity.operation": ActionPolicy.DEDUPLICATE,
+    "maintenance.storage.activate": ActionPolicy.DEDUPLICATE,
+    "maintenance.storage.scan": ActionPolicy.DEDUPLICATE,
+    "maintenance.storage.prepare-safe": ActionPolicy.DEDUPLICATE,
+    "maintenance.storage.execute-safe": ActionPolicy.DEDUPLICATE,
+    "maintenance.storage.scan-downloads": ActionPolicy.DEDUPLICATE,
+    "maintenance.storage.prepare-manual": ActionPolicy.DEDUPLICATE,
+    "maintenance.storage.execute-manual": ActionPolicy.DEDUPLICATE,
+    "maintenance.storage.automatic": ActionPolicy.DEDUPLICATE,
+    "maintenance.storage.cancel": ActionPolicy.DEDUPLICATE,
 }
 
 

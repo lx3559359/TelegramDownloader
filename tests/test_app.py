@@ -26,6 +26,7 @@ from telegram_downloader.gateway import (
     AuthorizationFailureReason,
     SessionExpiredError,
 )
+from telegram_downloader.maintenance_activity import OperationActivityRegistry
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.settings import AppSettings
 from telegram_downloader.subscription_matching import SubscriptionCriteria
@@ -46,6 +47,15 @@ EXPECTED_POLICIES = {
     "login.phone": ActionPolicy.DEDUPLICATE,
     "settings.save": ActionPolicy.DEDUPLICATE,
     "settings.thumbnail_cache.clear": ActionPolicy.DEDUPLICATE,
+    "maintenance.storage.activate": ActionPolicy.DEDUPLICATE,
+    "maintenance.storage.scan": ActionPolicy.DEDUPLICATE,
+    "maintenance.storage.prepare-safe": ActionPolicy.DEDUPLICATE,
+    "maintenance.storage.execute-safe": ActionPolicy.DEDUPLICATE,
+    "maintenance.storage.scan-downloads": ActionPolicy.DEDUPLICATE,
+    "maintenance.storage.prepare-manual": ActionPolicy.DEDUPLICATE,
+    "maintenance.storage.execute-manual": ActionPolicy.DEDUPLICATE,
+    "maintenance.storage.automatic": ActionPolicy.DEDUPLICATE,
+    "maintenance.storage.cancel": ActionPolicy.DEDUPLICATE,
 }
 
 
@@ -144,16 +154,15 @@ def test_graceful_shutdown_cleans_async_work_before_quitting() -> None:
     assert events == ["actions", "controller", "quit"]
 
 
-def test_graceful_shutdown_stops_schedule_before_controller() -> None:
+def test_graceful_shutdown_runs_ordered_lifecycle_callbacks() -> None:
     events: list[str] = []
+
+    async def record(value: str) -> None:
+        events.append(value)
 
     class AsyncActions:
         async def shutdown(self) -> None:
             events.append("actions")
-
-    class Schedule:
-        async def shutdown(self) -> None:
-            events.append("schedule")
 
     class Controller:
         _async_actions = AsyncActions()
@@ -165,14 +174,15 @@ def test_graceful_shutdown_stops_schedule_before_controller() -> None:
         shutdown = app._GracefulShutdown(
             Controller(),
             lambda: events.append("quit"),
-            before_controller_shutdown=Schedule().shutdown,
+            before_async_shutdown=lambda: record("storage"),
+            after_controller_shutdown=lambda: record("runtime"),
         )
         shutdown.request()
         await shutdown.wait()
 
     asyncio.run(exercise())
 
-    assert events == ["actions", "schedule", "controller", "quit"]
+    assert events == ["storage", "actions", "controller", "runtime", "quit"]
 
 
 def test_window_close_filter_delegates_to_background_without_shutdown(qapp) -> None:
@@ -366,6 +376,12 @@ def test_create_application_initializes_project_local_content_services(
             == (tmp_path / "data" / "database" / "catalog.sqlite3").resolve()
         )
         assert isinstance(controller.subscription_scheduler, SubscriptionScheduler)
+        assert isinstance(controller.activity, OperationActivityRegistry)
+        assert controller.subscription_scheduler.activity is controller.activity
+        assert controller.update_coordinator.activity is controller.activity
+        assert controller.storage_service.activity is controller.activity
+        assert controller.storage_scheduler.activity is controller.activity
+        assert controller.storage_scheduler.service is controller.storage_service
         assert controller.window.subscriptions_page is not None
         assert isinstance(controller.connection_recovery, ConnectionRecovery)
         assert isinstance(controller.integrity_service, FileIntegrityService)
@@ -374,7 +390,7 @@ def test_create_application_initializes_project_local_content_services(
         assert "content_preview_requested" in slot_names
         assert "subscription_probe_requested" in slot_names
         assert controller._async_actions.active_keys == frozenset()
-        assert len(controller._async_actions._slots) == 29
+        assert len(controller._async_actions._slots) == 38
         assert controller.diagnostics is not None
         assert controller.diagnostic_store.paths.root == tmp_path.resolve()
         controller.window.content_page.link_requested.emit("https://t.me/example/1#fragment")

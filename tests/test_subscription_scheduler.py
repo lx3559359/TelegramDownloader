@@ -14,6 +14,10 @@ from telegram_downloader.gateway import (
     SessionExpiredError,
     TransientNetworkError,
 )
+from telegram_downloader.maintenance_activity import (
+    ActivityKind,
+    OperationActivityRegistry,
+)
 from telegram_downloader.notifications import EventKind
 from telegram_downloader.subscription_matching import SubscriptionCriteria
 from telegram_downloader.subscription_scheduler import SubscriptionScheduler
@@ -184,6 +188,39 @@ async def test_scheduler_runs_due_rules_serially_and_starts_created_tasks() -> N
     assert service.run_calls == ["r1", "r2"]
     assert service.max_active == 1
     assert started_tasks == ["task-r1", "task-r2"]
+
+
+@pytest.mark.asyncio
+async def test_storage_maintenance_defers_subscription_without_failure() -> None:
+    selected = rule("r1", failure_count=2)
+    service = Service(selected)
+    changed: list[bool] = []
+    progress: list[object] = []
+    activity = OperationActivityRegistry()
+    token = activity.try_track_maintenance(ActivityKind.STORAGE_CLEANUP)
+    assert token is not None
+    scheduler = SubscriptionScheduler(
+        service,
+        clock=lambda: NOW,
+        foreground_busy=lambda: False,
+        on_rules_changed=lambda: changed.append(True),
+        on_progress=progress.append,
+        activity=activity,
+    )
+
+    try:
+        await scheduler._execute(selected)
+    finally:
+        token.release()
+
+    deferred = service.rules["r1"]
+    assert service.run_calls == []
+    assert deferred.state is SubscriptionState.WAITING
+    assert deferred.next_run_at == NOW + timedelta(minutes=15)
+    assert deferred.failure_count == 2
+    assert deferred.last_error is None
+    assert progress == [None]
+    assert changed == [True]
 
 
 @pytest.mark.asyncio

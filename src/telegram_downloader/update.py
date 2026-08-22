@@ -16,6 +16,10 @@ from urllib.request import Request, urlopen
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from telegram_downloader.maintenance_activity import (
+    ActivityKind,
+    OperationActivityRegistry,
+)
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.update_contract import (
     LATEST_MAX_BYTES,
@@ -102,6 +106,7 @@ class UpdateCoordinator:
         github: GitHubSourceUrls | None = None,
         modelscope: ModelScopeSourceUrls | None = None,
         clock: Callable[[], float] = time.monotonic,
+        activity: OperationActivityRegistry | None = None,
     ) -> None:
         self.paths = paths
         self.current_version = current_version
@@ -112,6 +117,7 @@ class UpdateCoordinator:
         self.github = github or GitHubSourceUrls("lx3559359", "TelegramDownloader")
         self.modelscope = modelscope or ModelScopeSourceUrls("lx3559359/TelegramDownloader")
         self.clock = clock
+        self.activity = activity
 
     async def check_for_update(self) -> ReconciledUpdate:
         checks = await self.check_sources()
@@ -156,6 +162,18 @@ class UpdateCoordinator:
         urls = tuple(url_by_source[source] for source in update.available_sources)
         if not urls:
             return UpdateStartupResult.BLOCKED
+        if self.activity is None:
+            return await self._apply_update(update.manifest, urls, request_shutdown)
+        with self.activity.track(ActivityKind.UPDATE):
+            return await self._apply_update(update.manifest, urls, request_shutdown)
+
+    async def _apply_update(
+        self,
+        manifest: ReleaseManifest,
+        urls: tuple[str, ...],
+        request_shutdown: Callable[[], None],
+    ) -> UpdateStartupResult:
+        asset = manifest.runtime
         package = self.paths.guard(self.paths.update_staging / asset.name)
         await asyncio.to_thread(
             self.downloader.download,
@@ -165,12 +183,12 @@ class UpdateCoordinator:
             asset.sha256,
         )
         verify_asset(package, asset.size, asset.sha256)
-        helper = self._stage_helper(update.manifest.version)
+        helper = self._stage_helper(manifest.version)
         request = HelperLaunchRequest(
             helper,
             self.paths.root,
             package,
-            update.manifest.version,
+            manifest.version,
             os.getpid(),
         )
         self.helper_launcher(request)

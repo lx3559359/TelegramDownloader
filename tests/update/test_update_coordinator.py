@@ -10,6 +10,11 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from telegram_downloader.app import BackgroundUpdatePrompt
 from telegram_downloader.controller import AppController
+from telegram_downloader.maintenance_activity import (
+    ActivityKind,
+    MaintenanceBusyError,
+    OperationActivityRegistry,
+)
 from telegram_downloader.notifications import EventKind, NotificationRoute
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.update import (
@@ -183,6 +188,35 @@ async def test_accepted_update_downloads_then_launches_project_local_helper(tmp_
     assert launched[0].package.is_relative_to(tmp_path)
     assert launched[0].parent_pid > 0
     assert shutdown == [True]
+
+
+@pytest.mark.asyncio
+async def test_accepted_update_waits_for_storage_maintenance_boundary(tmp_path) -> None:
+    runtime = b"runtime"
+    documents, keys = release_documents("0.2.0", runtime)
+    downloader = Downloader(runtime)
+    launched: list[HelperLaunchRequest] = []
+    activity = OperationActivityRegistry()
+    token = activity.try_track_maintenance(ActivityKind.STORAGE_CLEANUP)
+    assert token is not None
+    coordinator = UpdateCoordinator(
+        PortablePaths(tmp_path),
+        "0.1.0",
+        keys,
+        BytesClient(documents),
+        downloader,
+        launched.append,
+        activity=activity,
+    )
+
+    try:
+        with pytest.raises(MaintenanceBusyError, match="存储维护正在收尾"):
+            await coordinator.startup(lambda _manifest: True, lambda: None)
+    finally:
+        token.release()
+
+    assert downloader.calls == []
+    assert launched == []
 
 
 @pytest.mark.asyncio

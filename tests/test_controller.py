@@ -52,6 +52,10 @@ from telegram_downloader.gateway import (
     SessionExpiredError,
     TransientNetworkError,
 )
+from telegram_downloader.maintenance_activity import (
+    ActivityKind,
+    OperationActivityRegistry,
+)
 from telegram_downloader.notifications import EventKind
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.scheduler import SchedulerSnapshot
@@ -1175,6 +1179,32 @@ async def test_scan_requires_user_confirmation_before_commit() -> None:
     )
 
     assert planner.committed is False
+
+
+@pytest.mark.asyncio
+async def test_storage_maintenance_rejects_scan_before_ui_state_changes() -> None:
+    class Planner:
+        async def scan(self, source, filters):
+            raise AssertionError("maintenance must reject before planner access")
+
+    activity = OperationActivityRegistry()
+    token = activity.try_track_maintenance(ActivityKind.STORAGE_CLEANUP)
+    assert token is not None
+    controller = AppController.for_test(
+        gateway=ConnectedGateway(),
+        planner=Planner(),
+        activity=activity,
+    )
+
+    try:
+        await controller.scan_link(
+            "https://t.me/example/42",
+            controller.default_filters(datetime(2026, 8, 13, tzinfo=UTC)),
+        )
+    finally:
+        token.release()
+
+    assert controller.window.statusBar().last_message == "存储维护正在收尾，请稍后重试"
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,11 @@ import pytest
 from telegram_downloader.domain import ItemStatus, PauseReason, TaskStatus
 from telegram_downloader.downloader import DownloadPaused, InsufficientSpaceError
 from telegram_downloader.gateway import FloodWaitError, TransientNetworkError
+from telegram_downloader.maintenance_activity import (
+    ActivityKind,
+    MaintenanceBusyError,
+    OperationActivityRegistry,
+)
 from telegram_downloader.notifications import EventKind
 from telegram_downloader.resource_control import AsyncBandwidthLimiter
 from telegram_downloader.scheduler import (
@@ -279,6 +284,31 @@ async def test_closed_admission_keeps_task_queued_until_opened() -> None:
 
     assert entered == ["a"]
     assert repo.task_statuses["a"] is TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_maintenance_busy_preserves_queued_download_state() -> None:
+    repo = QueueRepo(("a",))
+    entered: list[str] = []
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            entered.append(item.task_id)
+
+    activity = OperationActivityRegistry()
+    token = activity.try_track_maintenance(ActivityKind.STORAGE_CLEANUP)
+    assert token is not None
+    scheduler = DownloadScheduler(repo, Downloader(), activity=activity)
+
+    try:
+        with pytest.raises(MaintenanceBusyError, match="存储维护正在收尾"):
+            await scheduler.run_task("a")
+    finally:
+        token.release()
+
+    assert entered == []
+    assert repo.cleared == []
+    assert repo.task_statuses["a"] is TaskStatus.QUEUED
 
 
 @pytest.mark.asyncio

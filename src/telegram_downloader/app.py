@@ -58,6 +58,7 @@ from telegram_downloader.file_integrity import FileIntegrityService
 from telegram_downloader.gateway import SessionExpiredError, TelethonGateway
 from telegram_downloader.instance_guard import WindowsInstanceGuard
 from telegram_downloader.logging import configure_logging
+from telegram_downloader.maintenance_activity import OperationActivityRegistry
 from telegram_downloader.notifications import (
     ApplicationEvent,
     NotificationBatcher,
@@ -72,12 +73,18 @@ from telegram_downloader.runtime_settings import RuntimeSettingsCoordinator
 from telegram_downloader.scheduler import DownloadScheduler
 from telegram_downloader.security import SecretsError, SecretsVault
 from telegram_downloader.settings import AppSettings, SettingsError, SettingsStore
+from telegram_downloader.storage_cleanup import StorageCleanupExecutor, StorageCleanupPlanner
+from telegram_downloader.storage_inventory import StorageInventoryService
+from telegram_downloader.storage_maintenance import StorageMaintenanceService
+from telegram_downloader.storage_scheduler import StorageMaintenanceScheduler
+from telegram_downloader.storage_state import StorageStateStore
 from telegram_downloader.subscription_scheduler import SubscriptionScheduler
 from telegram_downloader.subscription_service import SubscriptionService
 from telegram_downloader.thumbnail_cache import ThumbnailCache
 from telegram_downloader.update import HttpBytesClient, UpdateCoordinator
 from telegram_downloader.update_contract import load_trusted_keys
 from telegram_downloader.update_download import ResumableUpdateDownloader
+from telegram_downloader.update_protection import UpdateProtectionProvider
 
 _LOGGER = logging.getLogger("telegram_downloader.app")
 
@@ -148,11 +155,13 @@ class _GracefulShutdown:
         controller: Any,
         quit_application: Callable[[], None],
         *,
-        before_controller_shutdown: Callable[[], Awaitable[None]] | None = None,
+        before_async_shutdown: Callable[[], Awaitable[None]] | None = None,
+        after_controller_shutdown: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.controller = controller
         self.quit_application = quit_application
-        self.before_controller_shutdown = before_controller_shutdown
+        self.before_async_shutdown = before_async_shutdown
+        self.after_controller_shutdown = after_controller_shutdown
         self.task: asyncio.Task[None] | None = None
         self.completed = False
 
@@ -167,12 +176,20 @@ class _GracefulShutdown:
 
     async def _run(self) -> None:
         try:
-            async_actions = getattr(self.controller, "_async_actions", None)
-            if async_actions is not None:
-                await async_actions.shutdown()
-            if self.before_controller_shutdown is not None:
-                await self.before_controller_shutdown()
-            await self.controller.shutdown()
+            try:
+                if self.before_async_shutdown is not None:
+                    await self.before_async_shutdown()
+            finally:
+                try:
+                    async_actions = getattr(self.controller, "_async_actions", None)
+                    if async_actions is not None:
+                        await async_actions.shutdown()
+                finally:
+                    try:
+                        await self.controller.shutdown()
+                    finally:
+                        if self.after_controller_shutdown is not None:
+                            await self.after_controller_shutdown()
         finally:
             self.completed = True
             self.quit_application()
@@ -380,6 +397,31 @@ def create_application(
     repository = TaskRepository(paths.database)
     repository.initialize()
     repository.recover_interrupted()
+    controller_ref: dict[str, AppController] = {}
+    activity = OperationActivityRegistry()
+    update_protection = UpdateProtectionProvider(paths)
+    storage_state = StorageStateStore(paths.storage_maintenance_state)
+    storage_inventory = StorageInventoryService(paths, repository)
+    storage_cleanup = StorageCleanupExecutor(paths, repository, update_protection)
+    storage_service = StorageMaintenanceService(
+        paths=paths,
+        settings=settings.storage_maintenance,
+        state_store=storage_state,
+        inventory=storage_inventory,
+        planner=StorageCleanupPlanner(),
+        executor=storage_cleanup,
+        activity=activity,
+        publish=publish_event,
+    )
+    storage_scheduler = StorageMaintenanceScheduler(
+        storage_service,
+        activity,
+        lambda: (
+            controller_ref["controller"].settings.storage_maintenance
+            if "controller" in controller_ref
+            else settings.storage_maintenance
+        ),
+    )
     integrity_service = FileIntegrityService(repository, paths)
     catalog = CatalogRepository(paths.catalog_database)
     catalog_error: Exception | None = None
@@ -420,6 +462,7 @@ def create_application(
             concurrency=resource_settings.concurrency,
             bandwidth=bandwidth,
             publish=publish_event,
+            activity=activity,
         )
         schedule_state = evaluate_download_schedule(
             resource_settings.download_schedule,
@@ -482,6 +525,7 @@ def create_application(
         trusted_keys,
         HttpBytesClient(),
         ResumableUpdateDownloader(),
+        activity=activity,
     )
     diagnostic_store = DiagnosticReportStore(paths, secrets=set(secrets.values()))
 
@@ -511,8 +555,6 @@ def create_application(
         show_dialog=confirm_update,
         publish=publish_event,
     )
-
-    controller_ref: dict[str, AppController] = {}
 
     def credential_health() -> DiagnosticResult:
         try:
@@ -628,6 +670,7 @@ def create_application(
         on_progress=window.subscriptions_page.set_progress,
         on_session_expired=subscription_session_expired,
         publish=publish_event,
+        activity=activity,
     )
 
     controller = AppController(
@@ -653,6 +696,11 @@ def create_application(
         update_prompt=update_prompt,
         update_shutdown=application.quit,
         publish=publish_event,
+        activity=activity,
+        storage_service=storage_service,
+        storage_scheduler=storage_scheduler,
+        update_protection=update_protection,
+        storage_state=storage_state,
         settings=settings,
         secrets=secrets,
     )
@@ -763,6 +811,74 @@ def create_application(
 
     async def repair_media_requested(value: object) -> None:
         await controller.repair_media(_task_ids(value))
+
+    def storage_progress_callback() -> Callable[[int], None]:
+        active_loop = asyncio.get_running_loop()
+
+        def update(scanned: int) -> None:
+            active_loop.call_soon_threadsafe(window.storage_page.set_progress, scanned)
+
+        return update
+
+    async def activate_storage() -> None:
+        page = window.storage_page
+        page.set_automatic_enabled(
+            controller.settings.storage_maintenance.automatic_enabled
+        )
+        page.set_state(storage_service.load_state())
+        inventory = await storage_service.scan_automatic(storage_progress_callback())
+        page.set_inventory(inventory)
+
+    async def scan_storage() -> None:
+        inventory = await storage_service.scan_automatic(storage_progress_callback())
+        window.storage_page.set_inventory(inventory)
+
+    async def prepare_safe_storage() -> None:
+        confirmation = await storage_service.prepare_safe()
+        window.storage_page.present_safe_confirmation(confirmation)
+
+    async def execute_safe_storage(confirmation_id: str) -> None:
+        result = await storage_service.execute_safe(confirmation_id)
+        window.storage_page.show_result(result)
+        window.storage_page.set_state(storage_service.load_state())
+
+    async def scan_download_storage() -> None:
+        inventory = await storage_service.scan_downloads(storage_progress_callback())
+        window.storage_page.set_inventory(inventory)
+
+    async def prepare_manual_storage(value: object) -> None:
+        selected = tuple(str(item) for item in value) if isinstance(value, (list, tuple)) else ()
+        confirmation = storage_service.prepare_manual(selected)
+        window.storage_page.present_manual_confirmation(confirmation)
+
+    async def execute_manual_storage(confirmation_id: str) -> None:
+        result = await storage_service.execute_manual(confirmation_id)
+        window.storage_page.show_result(result)
+        window.storage_page.set_state(storage_service.load_state())
+
+    async def set_automatic_storage(enabled: bool) -> None:
+        page = window.storage_page
+        previous = controller.settings
+        maintenance = replace(
+            previous.storage_maintenance,
+            automatic_enabled=bool(enabled),
+        )
+        updated = replace(previous, storage_maintenance=maintenance)
+        try:
+            await asyncio.to_thread(settings_store.save, updated)
+        except Exception:
+            page.set_automatic_enabled(
+                previous.storage_maintenance.automatic_enabled
+            )
+            raise
+        controller.settings = updated
+        storage_service.settings = maintenance
+        storage_scheduler.reconfigure(maintenance)
+        page.set_automatic_enabled(maintenance.automatic_enabled)
+
+    async def cancel_storage() -> None:
+        storage_service.cancel()
+        await asyncio.sleep(0)
 
     def integrity_cancel_requested() -> None:
         controller.cancel_integrity()
@@ -909,6 +1025,24 @@ def create_application(
     def content_failure(error: Exception) -> None:
         window.content_page.show_error(controller._safe_error(error))
 
+    def storage_failure(error: Exception) -> None:
+        window.storage_page.show_error(controller._safe_error(error))
+
+    def storage_started() -> None:
+        window.storage_page.show_error("")
+        window.storage_page.set_busy(True)
+
+    def storage_finished() -> None:
+        window.storage_page.set_progress(None)
+        window.storage_page.set_busy(False)
+
+    def storage_hooks() -> ActionHooks:
+        return ActionHooks(
+            started=storage_started,
+            failed=storage_failure,
+            finished=storage_finished,
+        )
+
     def login_hooks(action: str) -> ActionHooks:
         return ActionHooks(
             started=lambda: login_dialog.set_action_busy(action, True),
@@ -974,6 +1108,60 @@ def create_application(
                 controller._safe_error(error)
             )
         ),
+    )
+    async_actions.connect(
+        window.storage_page.activated,
+        "maintenance.storage.activate",
+        activate_storage,
+        hooks=storage_hooks(),
+    )
+    async_actions.connect(
+        window.storage_page.scan_requested,
+        "maintenance.storage.scan",
+        scan_storage,
+        hooks=storage_hooks(),
+    )
+    async_actions.connect(
+        window.storage_page.safe_prepare_requested,
+        "maintenance.storage.prepare-safe",
+        prepare_safe_storage,
+        hooks=storage_hooks(),
+    )
+    async_actions.connect_payload(
+        window.storage_page.safe_execute_requested,
+        "maintenance.storage.execute-safe",
+        execute_safe_storage,
+        hooks=storage_hooks(),
+    )
+    async_actions.connect(
+        window.storage_page.download_scan_requested,
+        "maintenance.storage.scan-downloads",
+        scan_download_storage,
+        hooks=storage_hooks(),
+    )
+    async_actions.connect_payload(
+        window.storage_page.manual_prepare_requested,
+        "maintenance.storage.prepare-manual",
+        prepare_manual_storage,
+        hooks=storage_hooks(),
+    )
+    async_actions.connect_payload(
+        window.storage_page.manual_execute_requested,
+        "maintenance.storage.execute-manual",
+        execute_manual_storage,
+        hooks=storage_hooks(),
+    )
+    async_actions.connect_payload(
+        window.storage_page.automatic_changed,
+        "maintenance.storage.automatic",
+        set_automatic_storage,
+        hooks=ActionHooks(failed=storage_failure),
+    )
+    async_actions.connect(
+        window.storage_page.cancel_requested,
+        "maintenance.storage.cancel",
+        cancel_storage,
+        hooks=ActionHooks(failed=storage_failure),
     )
     async_actions.connect(
         window.diagnostics_page.export_requested,
@@ -1209,10 +1397,19 @@ def run(
             publish=publish_event,
         )
         controller.download_schedule = download_schedule
+
+        async def stop_storage_runtime() -> None:
+            await controller.storage_scheduler.shutdown()
+
+        async def stop_remaining_runtime() -> None:
+            await download_schedule.shutdown()
+            controller.activity.close()
+
         graceful_shutdown = _GracefulShutdown(
             controller,
             application.quit,
-            before_controller_shutdown=download_schedule.shutdown,
+            before_async_shutdown=stop_storage_runtime,
+            after_controller_shutdown=stop_remaining_runtime,
         )
         window_port = QtWindowPort(
             controller.window,
@@ -1360,6 +1557,7 @@ def run(
                 await controller.start(
                     background=launch_in_background and tray_adapter.available
                 )
+                controller.storage_scheduler.start()
 
             startup_task = loop.create_task(start_application())
 
@@ -1369,13 +1567,18 @@ def run(
 
             startup_task.add_done_callback(startup_finished)
             loop.run_forever()
-            loop.run_until_complete(graceful_shutdown.wait())
-            loop.run_until_complete(controller._async_actions.shutdown())
-            loop.run_until_complete(controller.shutdown())
             if not startup_task.done():
                 startup_task.cancel()
-                loop.run_until_complete(asyncio.gather(startup_task, return_exceptions=True))
-            if not startup_task.cancelled():
+                loop.run_until_complete(
+                    asyncio.gather(startup_task, return_exceptions=True)
+                )
+            loop.run_until_complete(graceful_shutdown.wait())
+            if not graceful_shutdown.completed:
+                loop.run_until_complete(stop_storage_runtime())
+                loop.run_until_complete(controller._async_actions.shutdown())
+                loop.run_until_complete(controller.shutdown())
+                loop.run_until_complete(stop_remaining_runtime())
+            if startup_task.done() and not startup_task.cancelled():
                 startup_task.result()
         del close_filter
         del session_shutdown

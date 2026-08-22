@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
+from functools import wraps
 from pathlib import Path
 from threading import Event
 from time import monotonic as monotonic_clock
@@ -42,14 +43,37 @@ from telegram_downloader.gateway import (
     TransientNetworkError,
 )
 from telegram_downloader.links import InvalidTelegramLink, parse_telegram_link
+from telegram_downloader.maintenance_activity import (
+    ActivityKind,
+    MaintenanceBusyError,
+    OperationActivityRegistry,
+)
 from telegram_downloader.notifications import ApplicationEvent, auth_required_event
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.scheduler import SchedulerSnapshot
 from telegram_downloader.settings import AppSettings, ProxySettings
+from telegram_downloader.storage_maintenance import StorageMaintenanceError
 from telegram_downloader.subscriptions import SubscriptionDraft
 from telegram_downloader.ui.models import TaskItemSummary, TaskSummary
 
 _LOGGER = logging.getLogger("telegram_downloader.controller")
+
+
+def _tracked_activity(kind: ActivityKind):
+    def decorate(method):
+        @wraps(method)
+        async def tracked(self, *args, **kwargs):
+            try:
+                token = self.activity.track(kind)
+            except MaintenanceBusyError as error:
+                self._show_error(str(error))
+                return None
+            with token:
+                return await method(self, *args, **kwargs)
+
+        return tracked
+
+    return decorate
 
 
 class _MemorySettingsStore:
@@ -444,6 +468,11 @@ class AppController:
         update_shutdown: Callable[[], None] | None = None,
         publish: Callable[[ApplicationEvent], None] | None = None,
         runtime_settings_effects: Any | None = None,
+        activity: OperationActivityRegistry | None = None,
+        storage_service: Any | None = None,
+        storage_scheduler: Any | None = None,
+        update_protection: Any | None = None,
+        storage_state: Any | None = None,
         settings: AppSettings | None = None,
         secrets: dict[str, str] | None = None,
         connection_recovery: ConnectionRecovery | None = None,
@@ -481,6 +510,11 @@ class AppController:
         self.runtime_settings_effects = runtime_settings_effects or (
             _SettingsStoreRuntimeEffects(settings_store)
         )
+        self.activity = activity or OperationActivityRegistry()
+        self.storage_service = storage_service
+        self.storage_scheduler = storage_scheduler
+        self.update_protection = update_protection
+        self.storage_state = storage_state
         self.settings = settings or settings_store.load()
         self.secrets = dict(secrets if secrets is not None else vault.load())
         self.connection_recovery = connection_recovery or ConnectionRecovery()
@@ -542,6 +576,11 @@ class AppController:
             update_coordinator=dependencies.pop("update_coordinator", None),
             update_prompt=dependencies.pop("update_prompt", None),
             update_shutdown=dependencies.pop("update_shutdown", None),
+            activity=dependencies.pop("activity", None),
+            storage_service=dependencies.pop("storage_service", None),
+            storage_scheduler=dependencies.pop("storage_scheduler", None),
+            update_protection=dependencies.pop("update_protection", None),
+            storage_state=dependencies.pop("storage_state", None),
             settings=dependencies.pop("settings", None),
             secrets=dependencies.pop("secrets", None),
             connection_recovery=dependencies.pop("connection_recovery", None),
@@ -913,6 +952,7 @@ class AppController:
         except Exception as error:
             self.login_dialog.show_error(self._safe_error(error))
 
+    @_tracked_activity(ActivityKind.SCAN)
     async def scan_link(self, link: str, filters: ScanFilters) -> None:
         self.window.set_scan_busy(True)
         try:
@@ -945,6 +985,7 @@ class AppController:
         finally:
             self.window.set_scan_busy(False)
 
+    @_tracked_activity(ActivityKind.SCAN)
     async def scan_links(
         self,
         links: tuple[str, ...],
@@ -1105,6 +1146,7 @@ class AppController:
             return
         self._dialog_sync_task = self._spawn_background(self.refresh_content_dialogs())
 
+    @_tracked_activity(ActivityKind.SEARCH)
     async def refresh_content_dialogs(self) -> None:
         if self.content_browser is None:
             return
@@ -1153,6 +1195,7 @@ class AppController:
             if self._dialog_sync_task is current:
                 self._dialog_sync_task = None
 
+    @_tracked_activity(ActivityKind.SEARCH)
     async def search_content(
         self,
         peer_ref: str,
@@ -1225,6 +1268,7 @@ class AppController:
             if self._content_search_task is current:
                 self._content_search_task = None
 
+    @_tracked_activity(ActivityKind.SEARCH)
     async def load_more_content(self, search_id: str) -> None:
         if self.content_browser is None:
             return
@@ -1472,6 +1516,7 @@ class AppController:
             page.set_selected_rule_details(None, [])
             page.show_error(self._safe_error(error))
 
+    @_tracked_activity(ActivityKind.SUBSCRIPTION)
     async def probe_subscription(self, rule_id: str) -> None:
         current = asyncio.current_task()
         if current is None:
@@ -1632,6 +1677,7 @@ class AppController:
         self._diagnostic_report = report
         page.set_report(report, historical=True)
 
+    @_tracked_activity(ActivityKind.DIAGNOSTICS)
     async def run_diagnostics(self) -> None:
         page = self._diagnostics_page()
         if self.diagnostics is None or self.diagnostic_store is None:
@@ -1894,6 +1940,7 @@ class AppController:
             return
         await self._verify_integrity_items(unique)
 
+    @_tracked_activity(ActivityKind.INTEGRITY)
     async def _verify_integrity_items(self, item_ids: list[str]) -> None:
         operation = self._begin_integrity_operation()
         if operation is None:
@@ -1910,6 +1957,7 @@ class AppController:
             self._finish_integrity_operation(current)
             await self._refresh_integrity_views()
 
+    @_tracked_activity(ActivityKind.INTEGRITY)
     async def repair_media(self, item_ids: list[str]) -> None:
         unique = self._unique_task_ids(item_ids)
         if not unique:
@@ -2543,6 +2591,8 @@ class AppController:
             )
             if str(result) == "blocked":
                 self._show_status("更新检查暂不可用，已继续使用当前版本")
+        except MaintenanceBusyError as error:
+            self._show_status(str(error))
         except Exception as error:
             self._show_status(f"更新检查失败（{type(error).__name__}）")
 
@@ -2581,7 +2631,16 @@ class AppController:
 
     @staticmethod
     def _safe_error(error: Exception) -> str:
-        if isinstance(error, (GatewayError, InvalidTelegramLink, ValueError)):
+        if isinstance(
+            error,
+            (
+                GatewayError,
+                InvalidTelegramLink,
+                MaintenanceBusyError,
+                StorageMaintenanceError,
+                ValueError,
+            ),
+        ):
             return str(error)
         return f"操作失败（{type(error).__name__}）"
 

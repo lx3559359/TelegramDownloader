@@ -14,6 +14,11 @@ from telegram_downloader.gateway import (
     SessionExpiredError,
     TransientNetworkError,
 )
+from telegram_downloader.maintenance_activity import (
+    ActivityKind,
+    MaintenanceBusyError,
+    OperationActivityRegistry,
+)
 from telegram_downloader.notifications import (
     ApplicationEvent,
     subscription_match_event,
@@ -50,6 +55,7 @@ class SubscriptionScheduler:
         | None = None,
         publish: Callable[[ApplicationEvent], None] | None = None,
         idle_delay: float = 1.0,
+        activity: OperationActivityRegistry | None = None,
     ) -> None:
         if idle_delay <= 0:
             raise ValueError("订阅调度检查间隔必须大于零")
@@ -62,6 +68,7 @@ class SubscriptionScheduler:
         self.on_session_expired = on_session_expired or _ignore_session_expired
         self.publish = publish or (lambda _event: None)
         self.idle_delay = idle_delay
+        self.activity = activity
         self.account_id: str | None = None
         self._wake_event = asyncio.Event()
         self._pending: deque[str] = deque()
@@ -147,6 +154,26 @@ class SubscriptionScheduler:
         return due[0] if due else None
 
     async def _execute(self, rule: SubscriptionRule) -> None:
+        if self.activity is None:
+            await self._execute_active(rule)
+            return
+        try:
+            with self.activity.track(ActivityKind.SUBSCRIPTION):
+                await self._execute_active(rule)
+        except MaintenanceBusyError:
+            now = self.clock()
+            self.service.update_runtime(
+                rule.id,
+                state=SubscriptionState.WAITING,
+                next_run_at=now + timedelta(minutes=15),
+                last_run_at=now,
+                last_error=None,
+                failure_count=rule.failure_count,
+            )
+            self.on_progress(None)
+            self._notify_rules_changed()
+
+    async def _execute_active(self, rule: SubscriptionRule) -> None:
         now = self.clock()
         try:
             report = await self.service.run_rule(
