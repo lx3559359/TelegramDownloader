@@ -60,8 +60,10 @@ class SubscriptionTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.UserRole:
             return item.id
         if role == Qt.ItemDataRole.ToolTipRole:
+            history = "不补抓历史" if item.history_days == 0 else f"补抓最近 {item.history_days} 天"
             details = [
-                f"{item.dialog_title} · {item.keyword}",
+                f"{item.dialog_title} · {item.criteria.summary}",
+                history,
                 "、".join(sorted(kind.value for kind in item.media_kinds)),
             ]
             if item.last_error:
@@ -70,7 +72,7 @@ class SubscriptionTableModel(QAbstractTableModel):
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         values = (
-            f"{item.keyword} · 每 {item.interval_minutes} 分钟",
+            f"{item.criteria.summary} · 每 {item.interval_minutes} 分钟",
             item.dialog_title,
             self.STATUS_LABELS[item.state],
             self._last_result(item, self._latest_runs.get(item.id)),
@@ -102,13 +104,8 @@ class SubscriptionTableModel(QAbstractTableModel):
             previous_runs = self._latest_runs
             self._rules = target_rules
             self._latest_runs = target_runs
-            for row, (before, after) in enumerate(
-                zip(previous_rules, target_rules, strict=True)
-            ):
-                if (
-                    before == after
-                    and previous_runs.get(after.id) == target_runs.get(after.id)
-                ):
+            for row, (before, after) in enumerate(zip(previous_rules, target_rules, strict=True)):
+                if before == after and previous_runs.get(after.id) == target_runs.get(after.id):
                     continue
                 self.dataChanged.emit(
                     self.index(row, 0),

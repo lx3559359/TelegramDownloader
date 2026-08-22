@@ -12,8 +12,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QSplitter,
@@ -25,7 +25,12 @@ from PySide6.QtWidgets import (
 from telegram_downloader.content import ContentDialog
 from telegram_downloader.domain import MediaKind
 from telegram_downloader.subscription_diagnostics import explain_probe
+from telegram_downloader.subscription_matching import (
+    SubscriptionCriteria,
+    SubscriptionMatchMode,
+)
 from telegram_downloader.subscriptions import (
+    SUPPORTED_HISTORY_DAYS,
     SUPPORTED_INTERVAL_MINUTES,
     SubscriptionDraft,
     SubscriptionProbeProgress,
@@ -53,6 +58,8 @@ _MEDIA_LABELS = {
 
 
 class SubscriptionEditorDialog(QDialog):
+    save_requested = Signal(object)
+
     def __init__(
         self,
         dialogs: list[ContentDialog],
@@ -82,10 +89,20 @@ class SubscriptionEditorDialog(QDialog):
             self.dialog_combo.addItem(item.title, item.peer_ref)
         form.addRow("群组或频道", self.dialog_combo)
 
-        self.keyword_input = QLineEdit()
-        self.keyword_input.setPlaceholderText("输入需要持续关注的关键词")
-        self.keyword_input.setClearButtonEnabled(True)
-        form.addRow("关键词", self.keyword_input)
+        self.include_input = QPlainTextEdit()
+        self.include_input.setPlaceholderText("每行一个包含词，最多 20 个")
+        self.include_input.setMaximumHeight(96)
+        form.addRow("包含词", self.include_input)
+
+        self.match_mode_combo = QComboBox()
+        self.match_mode_combo.addItem("命中任意一个（OR）", SubscriptionMatchMode.ANY.value)
+        self.match_mode_combo.addItem("必须全部命中（AND）", SubscriptionMatchMode.ALL.value)
+        form.addRow("包含词关系", self.match_mode_combo)
+
+        self.exclude_input = QPlainTextEdit()
+        self.exclude_input.setPlaceholderText("可选；每行一个，命中任意排除词即跳过")
+        self.exclude_input.setMaximumHeight(82)
+        form.addRow("排除词", self.exclude_input)
 
         media_panel = QWidget()
         media_layout = QHBoxLayout(media_panel)
@@ -106,12 +123,21 @@ class SubscriptionEditorDialog(QDialog):
             self.interval_combo.findData(rule.interval_minutes if rule else 30)
         )
         form.addRow("检查间隔", self.interval_combo)
+
+        self.history_combo = QComboBox()
+        for value in sorted(SUPPORTED_HISTORY_DAYS):
+            label = "不补抓历史" if value == 0 else f"最近 {value} 天"
+            self.history_combo.addItem(label, value)
+        self.history_combo.setCurrentIndex(
+            self.history_combo.findData(rule.history_days if rule else 0)
+        )
+        form.addRow("历史补抓", self.history_combo)
         layout.addLayout(form)
 
-        baseline = QLabel("首次保存只建立当前位置，从之后出现的新消息开始检查。")
-        baseline.setObjectName("muted")
-        baseline.setWordWrap(True)
-        layout.addWidget(baseline)
+        self.baseline_label = QLabel("")
+        self.baseline_label.setObjectName("muted")
+        self.baseline_label.setWordWrap(True)
+        layout.addWidget(self.baseline_label)
         self.error_label = QLabel("")
         self.error_label.setObjectName("errorBanner")
         self.error_label.setWordWrap(True)
@@ -119,22 +145,27 @@ class SubscriptionEditorDialog(QDialog):
         layout.addWidget(self.error_label)
 
         self.buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save
-            | QDialogButtonBox.StandardButton.Cancel
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
         self.buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存")
         self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         self.buttons.accepted.connect(self._validate_accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
+        self.history_combo.currentIndexChanged.connect(self._update_baseline_label)
 
         if rule is not None:
             peer_index = self.dialog_combo.findData(rule.peer_ref)
             if peer_index >= 0:
                 self.dialog_combo.setCurrentIndex(peer_index)
-            self.keyword_input.setText(rule.keyword)
+            self.include_input.setPlainText("\n".join(rule.criteria.include_keywords))
+            self.exclude_input.setPlainText("\n".join(rule.criteria.exclude_keywords))
+            self.match_mode_combo.setCurrentIndex(
+                self.match_mode_combo.findData(rule.criteria.mode.value)
+            )
             for kind, check in self.media_checks.items():
                 check.setChecked(kind in rule.media_kinds)
+        self._update_baseline_label()
 
     def draft(self) -> SubscriptionDraft:
         if self._draft is None:
@@ -145,11 +176,14 @@ class SubscriptionEditorDialog(QDialog):
         peer_ref = self.dialog_combo.currentData()
         return SubscriptionDraft(
             str(peer_ref or ""),
-            self.keyword_input.text(),
-            frozenset(
-                kind for kind, check in self.media_checks.items() if check.isChecked()
+            SubscriptionCriteria(
+                self._lines(self.include_input.toPlainText()),
+                self._lines(self.exclude_input.toPlainText()),
+                SubscriptionMatchMode(str(self.match_mode_combo.currentData())),
             ),
+            frozenset(kind for kind, check in self.media_checks.items() if check.isChecked()),
             int(self.interval_combo.currentData()),
+            int(self.history_combo.currentData()),
         )
 
     def _validate_accept(self) -> None:
@@ -160,7 +194,28 @@ class SubscriptionEditorDialog(QDialog):
             self.error_label.show()
             return
         self.error_label.hide()
-        self.accept()
+        self.buttons.setEnabled(False)
+        self.save_requested.emit(self._draft)
+
+    def finish_save(self, success: bool, error: str = "") -> None:
+        if success:
+            self.accept()
+            return
+        self.buttons.setEnabled(True)
+        self.error_label.setText(error or "保存失败，请稍后重试")
+        self.error_label.show()
+
+    def _update_baseline_label(self) -> None:
+        days = int(self.history_combo.currentData())
+        if days == 0:
+            text = "保存后从当前最新消息开始检查，不补抓此前消息。"
+        else:
+            text = f"保存后补抓最近 {days} 天，并锁定当前消息快照；中断或重启后会从进度处继续。"
+        self.baseline_label.setText(text)
+
+    @staticmethod
+    def _lines(value: str) -> tuple[str, ...]:
+        return tuple(value.splitlines())
 
 
 class SubscriptionPage(QWidget):
@@ -187,6 +242,7 @@ class SubscriptionPage(QWidget):
         self._probe_rule_id: str | None = None
         self._probe_report: SubscriptionProbeReport | None = None
         self._editors: set[SubscriptionEditorDialog] = set()
+        self._pending_editor: SubscriptionEditorDialog | None = None
         self._build_ui()
         self._connect_signals()
         self._refresh_actions()
@@ -233,12 +289,8 @@ class SubscriptionPage(QWidget):
 
         self.rule_table = QTableView()
         self.rule_table.setModel(self.rule_model)
-        self.rule_table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows
-        )
-        self.rule_table.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection
-        )
+        self.rule_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.rule_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.rule_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.rule_table.setAlternatingRowColors(True)
         self.rule_table.setShowGrid(False)
@@ -391,9 +443,7 @@ class SubscriptionPage(QWidget):
         self.probe_button.clicked.connect(self._emit_probe)
         self.probe_cancel_button.clicked.connect(self.probe_cancel_requested.emit)
         self.rule_table.doubleClicked.connect(lambda _index: self._open_edit())
-        self.rule_table.selectionModel().selectionChanged.connect(
-            self._selection_changed
-        )
+        self.rule_table.selectionModel().selectionChanged.connect(self._selection_changed)
 
     def set_logged_in(self, logged_in: bool) -> None:
         self._logged_in = logged_in
@@ -462,7 +512,7 @@ class SubscriptionPage(QWidget):
         self._probe_rule_id = progress.rule_id
         self._probe_busy = True
         self.probe_progress_label.setText(
-            f"已扫描 {progress.inspected} 条 · 关键词 {progress.keyword_hits} 条 · "
+            f"已扫描 {progress.inspected} 条 · 规则命中 {progress.keyword_hits} 条 · "
             f"匹配 {progress.matched} 项 · {progress.phase}"
         )
         self.probe_progress_label.show()
@@ -483,9 +533,7 @@ class SubscriptionPage(QWidget):
         self.set_probe_busy(None, False)
 
     def show_probe_cancelled(self) -> None:
-        self.probe_result_label.setText(
-            "测试已取消；规则、游标和下载队列均未改变"
-        )
+        self.probe_result_label.setText("测试已取消；规则、游标和下载队列均未改变")
         self.probe_sample_model.set_samples(())
         self.set_probe_progress(None)
         self.set_probe_busy(None, False)
@@ -517,7 +565,7 @@ class SubscriptionPage(QWidget):
         self._busy_rule_id = progress.rule_id
         self._busy = True
         self.progress_label.setText(
-            f"已扫描 {progress.inspected} 条 · 关键词 {progress.keyword_hits} 条 · "
+            f"已扫描 {progress.inspected} 条 · 规则命中 {progress.keyword_hits} 条 · "
             f"匹配 {progress.matched} 项 · "
             f"新增 {progress.queued} 项 · 重复 {progress.duplicate} 项 · "
             f"{progress.phase}"
@@ -533,7 +581,9 @@ class SubscriptionPage(QWidget):
     def _open_create(self) -> None:
         editor = SubscriptionEditorDialog(self._dialogs, parent=self)
         self._retain_editor(editor)
-        editor.accepted.connect(lambda retained=editor: self._create_from(retained))
+        editor.save_requested.connect(
+            lambda draft, retained=editor: self._create_from(retained, draft)
+        )
         editor.open()
 
     def _open_edit(self) -> None:
@@ -542,27 +592,54 @@ class SubscriptionPage(QWidget):
             return
         editor = SubscriptionEditorDialog(self._dialogs, current, self)
         self._retain_editor(editor)
-        editor.accepted.connect(
-            lambda retained=editor, rule_id=current.id: self._update_from(
+        editor.save_requested.connect(
+            lambda draft, retained=editor, rule_id=current.id: self._update_from(
                 rule_id,
                 retained,
+                draft,
             )
         )
         editor.open()
 
     def _retain_editor(self, editor: SubscriptionEditorDialog) -> None:
         self._editors.add(editor)
-        editor.finished.connect(
-            lambda _result, retained=editor: self._editors.discard(retained)
-        )
+        editor.finished.connect(lambda _result, retained=editor: self._release_editor(retained))
 
-    def _create_from(self, editor: SubscriptionEditorDialog) -> None:
+    def _release_editor(self, editor: SubscriptionEditorDialog) -> None:
+        self._editors.discard(editor)
+        if self._pending_editor is editor:
+            self._pending_editor = None
+
+    def _create_from(
+        self,
+        editor: SubscriptionEditorDialog,
+        draft: SubscriptionDraft,
+    ) -> None:
+        if self._pending_editor not in (None, editor):
+            return
+        self._pending_editor = editor
         self.set_rule_busy(None, True, "正在建立订阅基线…")
-        self.create_requested.emit(editor.draft())
+        self.create_requested.emit(draft)
 
-    def _update_from(self, rule_id: str, editor: SubscriptionEditorDialog) -> None:
+    def _update_from(
+        self,
+        rule_id: str,
+        editor: SubscriptionEditorDialog,
+        draft: SubscriptionDraft,
+    ) -> None:
+        if self._pending_editor not in (None, editor):
+            return
+        self._pending_editor = editor
         self.set_rule_busy(rule_id, True, "正在更新订阅…")
-        self.update_requested.emit(rule_id, editor.draft())
+        self.update_requested.emit(rule_id, draft)
+
+    def finish_editor_save(self, success: bool, error: str = "") -> None:
+        editor = self._pending_editor
+        if editor is None:
+            return
+        if success:
+            self._pending_editor = None
+        editor.finish_save(success, error)
 
     def _emit_run(self) -> None:
         current = self._selected_rule()
@@ -623,9 +700,7 @@ class SubscriptionPage(QWidget):
         self.run_history_model.set_runs([])
         self._probe_report = None
         self.probe_sample_model.set_samples(())
-        self.probe_result_label.setText(
-            "点击测试可只读检查最近消息，不会改变游标或队列"
-        )
+        self.probe_result_label.setText("点击测试可只读检查最近消息，不会改变游标或队列")
         self.detail_summary.setText(
             self._format_rule_summary(current)
             if current is not None
@@ -641,15 +716,11 @@ class SubscriptionPage(QWidget):
         has_dialog = any(item.available for item in self._dialogs)
         self.new_button.setEnabled(online_ready and has_dialog)
         self.edit_button.setEnabled(online_ready and current is not None)
-        self.run_button.setEnabled(
-            online_ready and current is not None and current.enabled
-        )
+        self.run_button.setEnabled(online_ready and current is not None and current.enabled)
         self.toggle_button.setEnabled(online_ready and current is not None)
         self.delete_button.setEnabled(online_ready and current is not None)
         self.probe_button.setEnabled(online_ready and current is not None)
-        self.toggle_button.setText(
-            "暂停" if current is None or current.enabled else "继续"
-        )
+        self.toggle_button.setText("暂停" if current is None or current.enabled else "继续")
 
     @staticmethod
     def _configure_read_only_table(table: QTableView) -> None:
@@ -665,8 +736,7 @@ class SubscriptionPage(QWidget):
     @staticmethod
     def _format_rule_summary(rule: SubscriptionRule) -> str:
         kinds = "、".join(
-            _MEDIA_LABELS[kind]
-            for kind in sorted(rule.media_kinds, key=lambda item: item.value)
+            _MEDIA_LABELS[kind] for kind in sorted(rule.media_kinds, key=lambda item: item.value)
         )
         state = SubscriptionTableModel.STATUS_LABELS[rule.state]
         next_run = (
@@ -675,9 +745,11 @@ class SubscriptionPage(QWidget):
             else "暂无"
         )
         summary = (
-            f"{rule.dialog_title} · 关键词：{rule.keyword} · {kinds} · "
+            f"{rule.dialog_title} · 规则：{rule.criteria.summary} · {kinds} · "
             f"每 {rule.interval_minutes} 分钟 · {state} · 下次：{next_run}"
         )
+        history = "不补抓历史" if rule.history_days == 0 else f"补抓最近 {rule.history_days} 天"
+        summary += f" · {history}"
         if rule.last_error:
             summary += f" · 最近错误：{rule.last_error}"
         return summary

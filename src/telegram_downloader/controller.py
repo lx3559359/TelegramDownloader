@@ -268,6 +268,9 @@ class _NullSubscriptionPage:
     def show_error(self, _message: str) -> None:
         pass
 
+    def finish_editor_save(self, _success: bool, _error: str = "") -> None:
+        pass
+
 
 class _NullDiagnosticsPage:
     report = None
@@ -506,9 +509,7 @@ class AppController:
         self._session_expiry_lock = asyncio.Lock()
         self._session_expiry_handled = False
         self._background_launch = False
-        self._last_authorization_failure_reason: (
-            AuthorizationFailureReason | None
-        ) = None
+        self._last_authorization_failure_reason: AuthorizationFailureReason | None = None
 
     @classmethod
     def for_test(cls, **dependencies) -> AppController:
@@ -1459,8 +1460,9 @@ class AppController:
             title = getattr(saved, "dialog_title", "")
             keyword = getattr(saved, "keyword", "")
             self._show_status(f"已创建自动订阅：{title} {keyword}".strip())
+            page.finish_editor_save(True)
         except Exception as error:
-            page.show_error(self._safe_error(error))
+            page.finish_editor_save(False, self._safe_error(error))
         finally:
             self._subscription_actions_active -= 1
             page.set_rule_busy(None, False)
@@ -1478,8 +1480,9 @@ class AppController:
             await self._reload_subscriptions()
             self.subscription_scheduler.wake()
             self._show_status("自动订阅已更新")
+            page.finish_editor_save(True)
         except Exception as error:
-            page.show_error(self._safe_error(error))
+            page.finish_editor_save(False, self._safe_error(error))
         finally:
             self._subscription_actions_active -= 1
             page.set_rule_busy(None, False)
@@ -1601,6 +1604,7 @@ class AppController:
             page.show_error("请先完成一次健康诊断")
             return
         try:
+
             def export_report():
                 register = getattr(self.diagnostic_store, "register_secrets", None)
                 if callable(register):
@@ -1646,8 +1650,7 @@ class AppController:
     async def apply_settings(self, settings: AppSettings, proxy_password: str) -> None:
         previous_settings = self.settings
         connection_changed = (
-            settings.api_id != previous_settings.api_id
-            or settings.proxy != previous_settings.proxy
+            settings.api_id != previous_settings.api_id or settings.proxy != previous_settings.proxy
         )
         updated_secrets = dict(self.secrets)
         if proxy_password:
@@ -1696,9 +1699,7 @@ class AppController:
         ]
         accepted = self.scheduler.pause_tasks(eligible)
         await self.refresh_tasks_async()
-        self._show_status(
-            f"已暂停 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个"
-        )
+        self._show_status(f"已暂停 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个")
 
     async def prioritize_task(self, task_id: str) -> None:
         tasks = await asyncio.to_thread(self.repository.get_tasks, [task_id])
@@ -1714,9 +1715,7 @@ class AppController:
 
         prioritize = getattr(self.repository, "prioritize_task", None)
         persisted = (
-            bool(await asyncio.to_thread(prioritize, task_id))
-            if callable(prioritize)
-            else False
+            bool(await asyncio.to_thread(prioritize, task_id)) if callable(prioritize) else False
         )
         reordered = self.scheduler.prioritize_task(task_id) if persisted else False
         if not reordered:
@@ -1743,9 +1742,7 @@ class AppController:
         ]
         accepted = await self.scheduler.resume_tasks(eligible) if eligible else set()
         await self.refresh_tasks_async()
-        self._show_status(
-            f"已继续 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个"
-        )
+        self._show_status(f"已继续 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个")
 
     async def retry_failed_tasks(self, task_ids: list[str]) -> None:
         unique = self._unique_task_ids(task_ids)
@@ -1757,9 +1754,7 @@ class AppController:
         ]
         accepted = await self.scheduler.resume_tasks(eligible) if eligible else set()
         await self.refresh_tasks_async()
-        self._show_status(
-            f"已重试 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个"
-        )
+        self._show_status(f"已重试 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个")
 
     async def archive_tasks(self, task_ids: list[str]) -> None:
         unique = self._unique_task_ids(task_ids)
@@ -1869,15 +1864,11 @@ class AppController:
                         for task_id, selected in grouped.items()
                     )
                 )
-            repaired = [
-                self.repository.get_item(item_id)
-                for item_id in prepared.accepted_ids
-            ]
+            repaired = [self.repository.get_item(item_id) for item_id in prepared.accepted_ids]
             succeeded = sum(item.status is ItemStatus.COMPLETED for item in repaired)
             failed = len(repaired) - succeeded
             self._show_status(
-                "精准修复完成："
-                f"成功 {succeeded}，失败 {failed}，跳过 {prepared.skipped}"
+                f"精准修复完成：成功 {succeeded}，失败 {failed}，跳过 {prepared.skipped}"
             )
         finally:
             self._finish_integrity_operation(current)
@@ -2096,9 +2087,7 @@ class AppController:
             )
         )
         queue_positions_method = getattr(self.scheduler, "queue_positions", None)
-        queue_positions = (
-            queue_positions_method() if callable(queue_positions_method) else {}
-        )
+        queue_positions = queue_positions_method() if callable(queue_positions_method) else {}
         return scheduler_state, queue_positions
 
     def _summaries_from_snapshots(
@@ -2292,11 +2281,7 @@ class AppController:
                     await previous_gateway.disconnect()
 
             api_hash = self.secrets.get("api_hash", "")
-            if (
-                self.gateway_factory is not None
-                and self.settings.api_id > 0
-                and api_hash
-            ):
+            if self.gateway_factory is not None and self.settings.api_id > 0 and api_hash:
                 fresh_gateway = self.gateway_factory(
                     self.settings.api_id,
                     api_hash,
@@ -2367,6 +2352,7 @@ class AppController:
     async def _reload_subscriptions(self) -> None:
         page = self._subscription_page()
         try:
+
             def load_snapshot():
                 snapshot = getattr(self.subscriptions, "snapshot", None)
                 if callable(snapshot):
