@@ -13,8 +13,13 @@ from telegram_downloader.domain import (
 )
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.repository import TaskRepository
+from telegram_downloader.storage_cleanup import (
+    StorageCleanupExecutor,
+    StorageCleanupPlanner,
+)
 from telegram_downloader.storage_inventory import StorageInventoryService
 from telegram_downloader.storage_models import StorageCategory, StorageResultCode
+from telegram_downloader.update_protection import UpdateProtectionProvider
 
 NOW = datetime(2026, 8, 22, 8, tzinfo=UTC)
 
@@ -144,3 +149,34 @@ def test_download_leftover_is_protected_while_path_is_active(tmp_path: Path) -> 
     assert len(inventory.entries) == 1
     assert inventory.entries[0].selectable is False
     assert inventory.entries[0].reason is StorageResultCode.PROTECTED_BY_TASK
+
+
+def test_manual_cleanup_rechecks_real_repository_state_before_delete(
+    tmp_path: Path,
+) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    repository, _targets = build_repository(paths)
+    candidate = paths.downloads / "done.mp4.part"
+    candidate.write_bytes(b"leftover")
+    inventory = StorageInventoryService(paths, repository).scan_download_candidates(
+        NOW,
+        active_paths=frozenset(),
+    )
+    entry = inventory.entries[0]
+    plan = StorageCleanupPlanner().manual_download(inventory, [entry.id], NOW)
+    repository.update_item_progress(
+        "item-done",
+        len(b"formal"),
+        ItemStatus.WAITING_RETRY,
+    )
+
+    result = StorageCleanupExecutor(
+        paths,
+        repository,
+        UpdateProtectionProvider(paths),
+        utc_clock=lambda: NOW,
+    ).execute(plan)
+
+    assert candidate.exists()
+    assert result.items[0].code is StorageResultCode.PROTECTED_BY_TASK
