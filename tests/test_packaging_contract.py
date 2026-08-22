@@ -62,6 +62,11 @@ def test_chinese_guide_documents_portable_data_and_security() -> None:
         "总下载限速",
         "等待中 · 第",
         "全局媒体槽",
+        "批量导入",
+        "包含词关系",
+        "历史补抓",
+        "下载路径",
+        "{message_id}",
     ):
         assert required in readme
 
