@@ -423,8 +423,17 @@ def create_application(
     activity = OperationActivityRegistry()
     update_protection = UpdateProtectionProvider(paths)
     storage_state = StorageStateStore(paths.storage_maintenance_state)
-    storage_inventory = StorageInventoryService(paths, repository)
-    storage_cleanup = StorageCleanupExecutor(paths, repository, update_protection)
+    storage_inventory = StorageInventoryService(
+        paths,
+        repository,
+        download_paths=download_paths,
+    )
+    storage_cleanup = StorageCleanupExecutor(
+        paths,
+        repository,
+        update_protection,
+        download_paths=download_paths,
+    )
     storage_service = StorageMaintenanceService(
         paths=paths,
         settings=settings.storage_maintenance,
@@ -617,6 +626,7 @@ def create_application(
                 "运行环境与路径",
                 lambda: probe_environment(
                     paths,
+                    download_paths=download_paths,
                     frozen=bool(getattr(sys, "frozen", False)),
                     windows_x64=(
                         sys.platform == "win32"

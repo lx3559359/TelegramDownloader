@@ -92,6 +92,37 @@ def test_storage_entry_requires_consistent_protection_reason() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "root_id",
+    ("", "downloads", "download-xyz", "download-00000000000000000"),
+)
+def test_storage_entry_rejects_invalid_root_ids(root_id: str) -> None:
+    with pytest.raises(ValueError, match="根目录标识"):
+        StorageEntry(
+            id="entry",
+            relative_path=PurePosixPath("file.bin.part"),
+            category=StorageCategory.DOWNLOAD_PART,
+            size=1,
+            mtime_ns=1,
+            selectable=True,
+            root_id=root_id,
+        )
+
+
+def test_storage_entry_accepts_app_and_download_root_ids() -> None:
+    assert make_entry().root_id == "app"
+    entry = StorageEntry(
+        id="entry",
+        relative_path=PurePosixPath("file.bin.part"),
+        category=StorageCategory.DOWNLOAD_PART,
+        size=1,
+        mtime_ns=1,
+        selectable=True,
+        root_id="download-0123456789abcdef",
+    )
+    assert entry.root_id == "download-0123456789abcdef"
+
+
 def test_plan_and_inventory_reject_duplicate_entries_and_are_immutable() -> None:
     entry = make_entry()
     with pytest.raises(ValueError, match="重复"):

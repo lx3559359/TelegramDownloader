@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
 
 from telegram_downloader.settings import StorageMaintenanceSettings
+
+_DOWNLOAD_ROOT_ID = re.compile(r"download-[0-9a-f]{16}\Z")
 
 
 class StorageCategory(StrEnum):
@@ -76,6 +79,7 @@ class StorageEntry:
     reason: StorageResultCode | None = None
     task_id: str | None = None
     display_name: str | None = None
+    root_id: str = "app"
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not self.id:
@@ -91,6 +95,11 @@ class StorageEntry:
             raise ValueError("存储条目相对路径不安全")
         if not isinstance(self.category, StorageCategory):
             raise ValueError("存储类别无效")
+        if self.root_id != "app" and (
+            not isinstance(self.root_id, str)
+            or _DOWNLOAD_ROOT_ID.fullmatch(self.root_id) is None
+        ):
+            raise ValueError("存储条目根目录标识无效")
         _require_nonnegative(self.size, "存储条目大小")
         _require_nonnegative(self.mtime_ns, "存储条目修改时间")
         if not isinstance(self.selectable, bool):

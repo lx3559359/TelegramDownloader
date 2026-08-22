@@ -35,6 +35,7 @@ from telegram_downloader.domain import (
     TaskRecord,
     TaskStatus,
 )
+from telegram_downloader.download_paths import DownloadPathPolicy
 from telegram_downloader.gateway import (
     AuthorizationFailureReason,
     SessionExpiredError,
@@ -42,6 +43,7 @@ from telegram_downloader.gateway import (
 )
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.repository import TaskRepository
+from telegram_downloader.settings import DownloadStorageSettings
 from telegram_downloader.update_sources import SourceCheck, SourceStatus, UpdateSourceId
 
 DiskUsage = namedtuple("DiskUsage", "total used free")
@@ -60,6 +62,47 @@ def test_managed_writable_paths_are_guarded_and_include_diagnostics(tmp_path: Pa
     assert values["diagnosticTemp"] == paths.diagnostic_temp
     assert values["maintenanceState"] == paths.storage_maintenance_state
     assert all(paths.guard(path) == path.resolve() for path in values.values())
+
+
+def test_managed_writable_paths_uses_current_external_download_root(tmp_path: Path) -> None:
+    paths = PortablePaths(tmp_path / "app")
+    paths.ensure_layout()
+    external = tmp_path / "external"
+    external.mkdir()
+    policy = DownloadPathPolicy(paths, DownloadStorageSettings())
+    prepared = policy.prepare(DownloadStorageSettings(str(external)))
+    policy.apply(prepared)
+
+    values = managed_writable_paths(paths, download_paths=policy)
+
+    assert values["downloads"] == external.resolve()
+    assert policy.guard(values["downloads"], allow_root=True) == external.resolve()
+    assert all(
+        paths.guard(path) == path.resolve()
+        for name, path in values.items()
+        if name != "downloads"
+    )
+
+
+def test_environment_probe_guards_external_downloads_with_media_policy(tmp_path: Path) -> None:
+    paths = PortablePaths(tmp_path / "app")
+    paths.ensure_layout()
+    external = tmp_path / "external"
+    external.mkdir()
+    policy = DownloadPathPolicy(paths, DownloadStorageSettings())
+    prepared = policy.prepare(DownloadStorageSettings(str(external)))
+    policy.apply(prepared)
+
+    result = probe_environment(
+        paths,
+        download_paths=policy,
+        frozen=False,
+        windows_x64=True,
+        system_drive=f"{tmp_path.drive}\\",
+    )
+
+    assert result.code != "runtime-path-invalid"
+    assert result.metrics["guardedPathCount"] == 16
 
 
 def test_environment_probe_requires_non_system_volume_for_frozen_runtime(

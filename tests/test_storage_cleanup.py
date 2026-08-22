@@ -7,7 +7,9 @@ from types import SimpleNamespace
 import pytest
 
 from telegram_downloader.domain import IntegrityStatus, ItemStatus
+from telegram_downloader.download_paths import DownloadPathPolicy
 from telegram_downloader.paths import PortablePaths
+from telegram_downloader.settings import DownloadStorageSettings
 from telegram_downloader.storage_cleanup import (
     StorageCleanupExecutor,
     StorageCleanupPlanner,
@@ -24,6 +26,94 @@ from telegram_downloader.storage_models import (
 from telegram_downloader.update_protection import UpdateProtectionSnapshot
 
 NOW = datetime(2026, 8, 22, 8, tzinfo=UTC)
+
+
+def custom_policy(tmp_path: Path) -> tuple[PortablePaths, DownloadPathPolicy]:
+    paths = PortablePaths(tmp_path / "app")
+    paths.ensure_layout()
+    old_root = tmp_path / "old-media"
+    current_root = tmp_path / "current-media"
+    old_root.mkdir()
+    current_root.mkdir()
+    policy = DownloadPathPolicy(paths, DownloadStorageSettings())
+    old_settings = policy.prepare(DownloadStorageSettings(str(old_root)))
+    policy.apply(old_settings)
+    current_settings = policy.prepare(
+        DownloadStorageSettings(str(current_root), old_settings.trusted_roots)
+    )
+    policy.apply(current_settings)
+    return paths, policy
+
+
+def test_cleanup_rejects_entry_with_unknown_download_root_id(tmp_path) -> None:
+    paths, policy = custom_policy(tmp_path)
+    target = policy.current_root / "file.bin.part"
+    target.write_bytes(b"part")
+    target_stat = target.stat(follow_symlinks=False)
+    entry = StorageEntry(
+        id="forged-root",
+        relative_path=PurePosixPath("file.bin.part"),
+        category=StorageCategory.DOWNLOAD_PART,
+        size=target_stat.st_size,
+        mtime_ns=target_stat.st_mtime_ns,
+        selectable=True,
+        root_id="download-0000000000000000",
+    )
+    plan = StorageCleanupPlan(
+        "manual-forged-root",
+        NOW,
+        StorageTrigger.MANUAL_DOWNLOAD,
+        (entry,),
+    )
+    cleanup = StorageCleanupExecutor(
+        paths,
+        repository=None,
+        update_protection=SnapshotProvider(),
+        download_paths=policy,
+        utc_clock=lambda: NOW,
+    )
+
+    result = cleanup.execute(plan)
+
+    assert result.items[0].code is StorageResultCode.UNSAFE_PATH
+    assert target.exists()
+
+
+def test_cleanup_deletes_verified_leftover_from_external_root(tmp_path) -> None:
+    paths, policy = custom_policy(tmp_path)
+    media = policy.current_root / "file.bin"
+    leftover = policy.current_root / "file.bin.part"
+    media.write_bytes(b"done")
+    leftover.write_bytes(b"part")
+    file_stat = leftover.stat(follow_symlinks=False)
+    entry = StorageEntry(
+        id="external-leftover",
+        relative_path=PurePosixPath("file.bin.part"),
+        category=StorageCategory.DOWNLOAD_PART,
+        size=file_stat.st_size,
+        mtime_ns=file_stat.st_mtime_ns,
+        selectable=True,
+        root_id=policy.root_id(policy.current_root),
+    )
+    plan = StorageCleanupPlan(
+        "manual-external",
+        NOW,
+        StorageTrigger.MANUAL_DOWNLOAD,
+        (entry,),
+    )
+    cleanup = StorageCleanupExecutor(
+        paths,
+        repository=FakeRepository(media),
+        update_protection=SnapshotProvider(),
+        download_paths=policy,
+        utc_clock=lambda: NOW,
+    )
+
+    result = cleanup.execute(plan)
+
+    assert result.items[0].code is StorageResultCode.COMPLETED
+    assert not leftover.exists()
+    assert media.read_bytes() == b"done"
 
 
 class SnapshotProvider:
@@ -63,14 +153,28 @@ def make_entry(
     selectable: bool = True,
 ) -> StorageEntry:
     file_stat = target.stat(follow_symlinks=False)
+    manual = category in {
+        StorageCategory.DOWNLOAD_PART,
+        StorageCategory.CORRUPT_ARCHIVE,
+    }
+    if manual:
+        root = paths.downloads.resolve()
+        root_id = DownloadPathPolicy(
+            paths,
+            DownloadStorageSettings(),
+        ).root_id(root)
+    else:
+        root = paths.root
+        root_id = "app"
     return StorageEntry(
         id=entry_id or target.name,
-        relative_path=PurePosixPath(target.relative_to(paths.root).as_posix()),
+        relative_path=PurePosixPath(target.relative_to(root).as_posix()),
         category=category,
         size=file_stat.st_size,
         mtime_ns=file_stat.st_mtime_ns,
         selectable=selectable,
         reason=None if selectable else StorageResultCode.PROTECTED_BY_TASK,
+        root_id=root_id,
     )
 
 

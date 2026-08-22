@@ -12,7 +12,9 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 from telegram_downloader.domain import IntegrityStatus, ItemStatus
+from telegram_downloader.download_paths import DownloadPathPolicy
 from telegram_downloader.paths import PortablePaths
+from telegram_downloader.settings import DownloadStorageSettings
 from telegram_downloader.storage_models import (
     StorageCategory,
     StorageCategorySummary,
@@ -44,10 +46,15 @@ class _FileRecord:
     relative_path: PurePosixPath
     size: int
     mtime_ns: int
+    root_id: str = "app"
 
 
-def storage_entry_id(category: StorageCategory, relative: PurePosixPath) -> str:
-    payload = f"{category.value}\0{relative.as_posix()}".encode("utf-8")  # noqa: UP012
+def storage_entry_id(
+    category: StorageCategory,
+    relative: PurePosixPath,
+    root_id: str = "app",
+) -> str:
+    payload = f"{root_id}\0{category.value}\0{relative.as_posix()}".encode()
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -58,11 +65,16 @@ class StorageInventoryService:
         repository: TaskRepository | None,
         *,
         policy: StoragePolicy | None = None,
+        download_paths: DownloadPathPolicy | None = None,
         disk_usage: Callable[[Path], Any] = shutil.disk_usage,
     ) -> None:
         self.paths = paths
         self.repository = repository
         self.policy = policy or StoragePolicy()
+        self.download_paths = download_paths or DownloadPathPolicy(
+            paths,
+            DownloadStorageSettings(),
+        )
         self.disk_usage = disk_usage
 
     def scan_automatic(
@@ -267,10 +279,10 @@ class StorageInventoryService:
             )
             for category in categories
         )
-        entries.sort(key=lambda item: item.relative_path.as_posix())
+        entries.sort(key=lambda item: (item.root_id, item.relative_path.as_posix()))
         return StorageInventory(
             scanned_at=now,
-            disk_free_bytes=int(self.disk_usage(self.paths.root).free),
+            disk_free_bytes=int(self.disk_usage(self.download_paths.current_root).free),
             entries=tuple(entries),
             summaries=summaries,
         )
@@ -447,49 +459,90 @@ class StorageInventoryService:
         list[tuple[_FileRecord, StorageCategory, Path | None]],
         list[StorageEntry],
     ]:
-        root = self.paths.downloads
         candidates: list[tuple[_FileRecord, StorageCategory, Path | None]] = []
         unsafe: list[StorageEntry] = []
-        if not root.exists():
-            return candidates, unsafe
+        for root in self.download_paths.roots:
+            if not root.exists():
+                continue
+            root_id = self.download_paths.root_id(root)
 
-        def walk(directory: Path) -> None:
-            try:
-                guarded = self.paths.guard(directory)
-                with os.scandir(guarded) as stream:
-                    children = sorted(stream, key=lambda item: item.name.casefold())
-            except (OSError, ValueError):
-                return
-            for item in children:
-                self._tick(progress, cancelled, counter)
-                path = Path(item.path)
-                category = self._download_category(item.name)
+            def walk(
+                directory: Path,
+                *,
+                trusted_root: Path = root,
+                trusted_root_id: str = root_id,
+            ) -> None:
                 try:
-                    item_stat = item.stat(follow_symlinks=False)
-                except OSError:
-                    if category is not None:
-                        unsafe.append(self._unsafe_entry(category, path, 0, 0))
-                    continue
-                size = max(0, int(item_stat.st_size))
-                mtime_ns = max(0, int(item_stat.st_mtime_ns))
-                if self._is_reparse(item, item_stat):
-                    if category is not None:
+                    guarded = self.download_paths.guard_in(
+                        trusted_root,
+                        directory,
+                        allow_root=True,
+                    )
+                    with os.scandir(guarded) as stream:
+                        children = sorted(stream, key=lambda item: item.name.casefold())
+                except (OSError, ValueError):
+                    return
+                for item in children:
+                    self._tick(progress, cancelled, counter)
+                    path = Path(item.path)
+                    category = self._download_category(item.name)
+                    try:
+                        item_stat = item.stat(follow_symlinks=False)
+                    except OSError:
+                        if category is not None:
+                            unsafe.append(
+                                self._unsafe_entry(
+                                    category,
+                                    path,
+                                    0,
+                                    0,
+                                    root=trusted_root,
+                                    root_id=trusted_root_id,
+                                )
+                            )
+                        continue
+                    size = max(0, int(item_stat.st_size))
+                    mtime_ns = max(0, int(item_stat.st_mtime_ns))
+                    if self._is_reparse(item, item_stat):
+                        if category is not None:
+                            unsafe.append(
+                                self._unsafe_entry(
+                                    category,
+                                    path,
+                                    size,
+                                    mtime_ns,
+                                    root=trusted_root,
+                                    root_id=trusted_root_id,
+                                )
+                            )
+                        continue
+                    if stat_module.S_ISDIR(item_stat.st_mode):
+                        walk(path)
+                        continue
+                    if category is None:
+                        continue
+                    if not stat_module.S_ISREG(item_stat.st_mode):
                         unsafe.append(
-                            self._unsafe_entry(category, path, size, mtime_ns)
+                            self._unsafe_entry(
+                                category,
+                                path,
+                                size,
+                                mtime_ns,
+                                root=trusted_root,
+                                root_id=trusted_root_id,
+                            )
                         )
-                    continue
-                if stat_module.S_ISDIR(item_stat.st_mode):
-                    walk(path)
-                    continue
-                if category is None:
-                    continue
-                if not stat_module.S_ISREG(item_stat.st_mode):
-                    unsafe.append(self._unsafe_entry(category, path, size, mtime_ns))
-                    continue
-                record = _FileRecord(path, self._relative(path), size, mtime_ns)
-                candidates.append((record, category, self._leftover_target(path)))
+                        continue
+                    record = _FileRecord(
+                        path,
+                        PurePosixPath(path.relative_to(trusted_root).as_posix()),
+                        size,
+                        mtime_ns,
+                        trusted_root_id,
+                    )
+                    candidates.append((record, category, self._leftover_target(path)))
 
-        walk(root)
+            walk(root)
         return candidates, unsafe
 
     @staticmethod
@@ -553,16 +606,24 @@ class StorageInventoryService:
         path: Path,
         size: int,
         mtime_ns: int,
+        *,
+        root: Path | None = None,
+        root_id: str = "app",
     ) -> StorageEntry:
-        relative = self._relative(path)
+        relative = (
+            PurePosixPath(path.relative_to(root).as_posix())
+            if root is not None
+            else self._relative(path)
+        )
         return StorageEntry(
-            id=storage_entry_id(category, relative),
+            id=storage_entry_id(category, relative, root_id),
             relative_path=relative,
             category=category,
             size=size,
             mtime_ns=mtime_ns,
             selectable=False,
             reason=StorageResultCode.UNSAFE_PATH,
+            root_id=root_id,
         )
 
     @staticmethod
@@ -589,12 +650,13 @@ class StorageInventoryService:
         record: _FileRecord,
     ) -> StorageEntry:
         return StorageEntry(
-            id=storage_entry_id(category, record.relative_path),
+            id=storage_entry_id(category, record.relative_path, record.root_id),
             relative_path=record.relative_path,
             category=category,
             size=record.size,
             mtime_ns=record.mtime_ns,
             selectable=True,
+            root_id=record.root_id,
         )
 
     @staticmethod
@@ -607,7 +669,7 @@ class StorageInventoryService:
         display_name: str | None,
     ) -> StorageEntry:
         return StorageEntry(
-            id=storage_entry_id(category, record.relative_path),
+            id=storage_entry_id(category, record.relative_path, record.root_id),
             relative_path=record.relative_path,
             category=category,
             size=record.size,
@@ -616,4 +678,5 @@ class StorageInventoryService:
             reason=None if selectable else StorageResultCode.PROTECTED_BY_TASK,
             task_id=task_id,
             display_name=display_name,
+            root_id=record.root_id,
         )

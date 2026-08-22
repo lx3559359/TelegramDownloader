@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from telegram_downloader.catalog import CATALOG_SCHEMA_VERSION
 from telegram_downloader.diagnostics import DiagnosticResult, DiagnosticStatus
+from telegram_downloader.download_paths import DownloadPathPolicy
 from telegram_downloader.gateway import (
     AuthorizationFailureReason,
     SessionExpiredError,
@@ -40,7 +41,11 @@ class UpdateSourceProbe(Protocol):
     async def check_sources(self) -> tuple[SourceCheck, SourceCheck]: ...
 
 
-def managed_writable_paths(paths: PortablePaths) -> dict[str, Path]:
+def managed_writable_paths(
+    paths: PortablePaths,
+    *,
+    download_paths: DownloadPathPolicy | None = None,
+) -> dict[str, Path]:
     return {
         "settings": paths.settings,
         "secrets": paths.secrets,
@@ -50,7 +55,11 @@ def managed_writable_paths(paths: PortablePaths) -> dict[str, Path]:
         "cache": paths.cache,
         "thumbnailCache": paths.thumbnail_cache,
         "temp": paths.temp,
-        "downloads": paths.downloads,
+        "downloads": (
+            download_paths.current_root
+            if download_paths is not None
+            else paths.downloads
+        ),
         "updateStaging": paths.update_staging,
         "updateBackup": paths.update_backup,
         "updateHelper": paths.update_helper,
@@ -64,14 +73,20 @@ def managed_writable_paths(paths: PortablePaths) -> dict[str, Path]:
 def probe_environment(
     paths: PortablePaths,
     *,
+    download_paths: DownloadPathPolicy | None = None,
     frozen: bool,
     windows_x64: bool,
     system_drive: str,
 ) -> DiagnosticResult:
     try:
-        guarded = {
-            name: paths.guard(path) for name, path in managed_writable_paths(paths).items()
-        }
+        managed = managed_writable_paths(paths, download_paths=download_paths)
+        guarded = {}
+        for name, path in managed.items():
+            guarded[name] = (
+                download_paths.guard(path, allow_root=True)
+                if name == "downloads" and download_paths is not None
+                else paths.guard(path)
+            )
     except (OSError, ValueError):
         return _result(
             "environment",

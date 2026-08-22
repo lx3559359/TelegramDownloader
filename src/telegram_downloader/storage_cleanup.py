@@ -11,7 +11,9 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from telegram_downloader.domain import IntegrityStatus, ItemStatus
+from telegram_downloader.download_paths import DownloadPathError, DownloadPathPolicy
 from telegram_downloader.paths import PortablePaths
+from telegram_downloader.settings import DownloadStorageSettings
 from telegram_downloader.storage_models import (
     StorageCategory,
     StorageCleanupPlan,
@@ -126,12 +128,17 @@ class StorageCleanupExecutor:
         repository: _Repository | None,
         update_protection: _UpdateProtection,
         *,
+        download_paths: DownloadPathPolicy | None = None,
         utc_clock: Callable[[], datetime] | None = None,
         remove_file: Callable[[Path], None] | None = None,
     ) -> None:
         self.paths = paths
         self.repository = repository
         self.update_protection = update_protection
+        self.download_paths = download_paths or DownloadPathPolicy(
+            paths,
+            DownloadStorageSettings(),
+        )
         self.utc_clock = utc_clock or (lambda: datetime.now(UTC))
         self.remove_file = remove_file or (lambda path: path.unlink())
 
@@ -209,18 +216,38 @@ class StorageCleanupExecutor:
             raise _EntryRejected(StorageResultCode.UNSAFE_PATH)
 
         relative = Path(entry.relative_path.as_posix())
-        target = self.paths.root / relative
-        try:
-            self.paths.guard(target)
-        except ValueError as exc:
-            raise _EntryRejected(StorageResultCode.UNSAFE_PATH) from exc
-        category_root = self._category_root(entry.category)
+        if entry.category in _MANUAL_CATEGORIES:
+            try:
+                category_root = self.download_paths.root_for_id(entry.root_id)
+                target = category_root / relative
+                self.download_paths.guard_in(category_root, target)
+            except (DownloadPathError, OSError, ValueError) as exc:
+                raise _EntryRejected(StorageResultCode.UNSAFE_PATH) from exc
+        else:
+            if entry.root_id != "app":
+                raise _EntryRejected(StorageResultCode.UNSAFE_PATH)
+            target = self.paths.root / relative
+            try:
+                self.paths.guard(target)
+            except ValueError as exc:
+                raise _EntryRejected(StorageResultCode.UNSAFE_PATH) from exc
+            category_root = self._category_root(entry.category)
         if not target.is_relative_to(category_root) or target == category_root:
             raise _EntryRejected(StorageResultCode.UNSAFE_PATH)
         self._validate_category_shape(entry.category, target, category_root)
 
-        current = self.paths.root
-        parts = target.relative_to(self.paths.root).parts
+        current = category_root
+        try:
+            root_stat = current.stat(follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise _EntryRejected(StorageResultCode.STATE_CHANGED) from exc
+        except OSError as exc:
+            raise _EntryRejected(self._os_error_code(exc)) from exc
+        if self._is_reparse(current, root_stat) or not stat_module.S_ISDIR(
+            root_stat.st_mode
+        ):
+            raise _EntryRejected(StorageResultCode.UNSAFE_PATH)
+        parts = target.relative_to(category_root).parts
         for index, part in enumerate(parts):
             current /= part
             try:
@@ -270,7 +297,7 @@ class StorageCleanupExecutor:
         if target is None or self.repository is None:
             raise _EntryRejected(StorageResultCode.PROTECTED_BY_TASK)
         try:
-            self.paths.guard(target)
+            self.download_paths.guard(target)
             target_stat = target.stat(follow_symlinks=False)
         except (OSError, ValueError) as exc:
             raise _EntryRejected(StorageResultCode.PROTECTED_BY_TASK) from exc

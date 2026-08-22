@@ -4,13 +4,66 @@ from pathlib import Path
 
 import pytest
 
+from telegram_downloader.download_paths import DownloadPathPolicy
 from telegram_downloader.paths import PortablePaths
+from telegram_downloader.repository import TaskRepository
+from telegram_downloader.settings import DownloadStorageSettings
 from telegram_downloader.storage_inventory import StorageInventoryService
 from telegram_downloader.storage_models import StorageCategory, StoragePolicy
 from telegram_downloader.update_contract import canonical_json
 from telegram_downloader.update_protection import UpdateProtectionSnapshot
 
 NOW = datetime(2026, 8, 22, 8, tzinfo=UTC)
+
+
+def custom_policy(tmp_path: Path) -> tuple[PortablePaths, DownloadPathPolicy]:
+    paths = PortablePaths(tmp_path / "app")
+    paths.ensure_layout()
+    old_root = tmp_path / "old-media"
+    current_root = tmp_path / "current-media"
+    old_root.mkdir()
+    current_root.mkdir()
+    policy = DownloadPathPolicy(paths, DownloadStorageSettings())
+    old_settings = policy.prepare(DownloadStorageSettings(str(old_root)))
+    policy.apply(old_settings)
+    current_settings = policy.prepare(
+        DownloadStorageSettings(str(current_root), old_settings.trusted_roots)
+    )
+    policy.apply(current_settings)
+    return paths, policy
+
+
+def test_inventory_scans_download_leftovers_in_every_trusted_root(tmp_path) -> None:
+    paths, policy = custom_policy(tmp_path)
+    repository = TaskRepository(paths.database)
+    repository.initialize()
+    old_root = (tmp_path / "old-media").resolve()
+    current_root = (tmp_path / "current-media").resolve()
+    (old_root / "old.bin.part").write_bytes(b"old")
+    (current_root / "new.bin.part").write_bytes(b"new")
+
+    inventory = StorageInventoryService(
+        paths,
+        repository,
+        download_paths=policy,
+    ).scan_download_candidates(
+        NOW,
+        active_paths=(),
+    )
+
+    entries = [
+        item
+        for item in inventory.entries
+        if item.category is StorageCategory.DOWNLOAD_PART
+    ]
+    assert {item.root_id for item in entries} == {
+        policy.root_id(old_root),
+        policy.root_id(current_root),
+    }
+    assert {item.relative_path.as_posix() for item in entries} == {
+        "old.bin.part",
+        "new.bin.part",
+    }
 
 
 def set_age(path: Path, age: timedelta) -> None:
