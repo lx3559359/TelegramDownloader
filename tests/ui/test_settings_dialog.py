@@ -220,6 +220,7 @@ def test_download_root_uses_folder_browser_and_round_trips(
     dialog = SettingsDialog(AppSettings(), default_download_root=default)
     qtbot.addWidget(dialog)
     assert dialog.download_root.isReadOnly() is True
+    assert dialog.download_root.cursorPosition() == 0
     monkeypatch.setattr(
         QFileDialog,
         "getExistingDirectory",
@@ -232,6 +233,7 @@ def test_download_root_uses_folder_browser_and_round_trips(
     )
 
     assert dialog.download_root.text() == str(selected.resolve())
+    assert dialog.download_root.cursorPosition() == 0
     assert dialog.values().download_storage.root == str(selected.resolve())
     assert str(selected.resolve()) in dialog.naming_preview.text()
 
@@ -264,6 +266,7 @@ def test_cancel_folder_browser_keeps_value_and_reset_restores_default(
     )
 
     assert dialog.download_root.text() == str(default.resolve())
+    assert dialog.download_root.cursorPosition() == 0
     assert dialog.values().download_storage.root == ""
 
 

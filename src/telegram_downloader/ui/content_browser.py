@@ -307,6 +307,12 @@ class ContentBrowserPage(QWidget):
         )
         self.result_table.setIconSize(QSize(88, 60))
         self.result_table.verticalHeader().setDefaultSectionSize(78)
+        self.result_table.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel
+        )
+        self.result_table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         self.result_table.setWordWrap(True)
         self.result_table.setTextElideMode(Qt.TextElideMode.ElideNone)
         self.summary_delegate = WrappedSummaryDelegate(self.result_table)

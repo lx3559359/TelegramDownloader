@@ -3,7 +3,11 @@ from datetime import UTC, date, datetime
 
 from PySide6.QtCore import QPoint, QSize, Qt
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QGraphicsDropShadowEffect, QHeaderView
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QGraphicsDropShadowEffect,
+    QHeaderView,
+)
 
 from telegram_downloader.content import (
     ALL_DIALOGS_SCOPE_REF,
@@ -94,6 +98,14 @@ def test_page_contains_content_browser_controls(qtbot) -> None:
     assert page.queue_button.text() == "加入下载队列"
     assert page.result_table.iconSize() == QSize(88, 60)
     assert page.result_table.verticalHeader().defaultSectionSize() == 78
+    assert (
+        page.result_table.verticalScrollMode()
+        == QAbstractItemView.ScrollMode.ScrollPerPixel
+    )
+    assert (
+        page.result_table.horizontalScrollBarPolicy()
+        == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    )
     assert page.result_table.wordWrap() is True
     assert (
         page.result_table.textElideMode()
@@ -157,7 +169,10 @@ def test_result_summary_wraps_without_squeezing_fixed_columns(qtbot) -> None:
     )
     qtbot.wait(80)
 
-    assert page.result_table.horizontalScrollBar().maximum() == 0
+    assert (
+        page.result_table.horizontalScrollBarPolicy()
+        == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    )
     assert page.result_table.columnWidth(4) > 0
     assert page.result_table.rowHeight(0) > 78
     assert page.summary_delegate.measurement_count == 1

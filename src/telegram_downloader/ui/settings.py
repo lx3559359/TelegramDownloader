@@ -185,6 +185,7 @@ class SettingsDialog(QDialog):
         naming_form.setVerticalSpacing(10)
         self.download_root = QLineEdit(str(selected_root))
         self.download_root.setReadOnly(True)
+        self.download_root.setCursorPosition(0)
         self.browse_download_root_button = QPushButton("浏览…")
         self.reset_download_root_button = QPushButton("恢复默认")
         root_row = QHBoxLayout()
@@ -429,6 +430,7 @@ class SettingsDialog(QDialog):
             return
         resolved = Path(selected).resolve()
         self.download_root.setText(str(resolved))
+        self.download_root.setCursorPosition(0)
         self._download_root_value = (
             "" if resolved == self.default_download_root else str(resolved)
         )
@@ -436,6 +438,7 @@ class SettingsDialog(QDialog):
 
     def _reset_download_root(self) -> None:
         self.download_root.setText(str(self.default_download_root))
+        self.download_root.setCursorPosition(0)
         self._download_root_value = ""
         self._update_naming_preview()
 
