@@ -1231,7 +1231,7 @@ class AppController:
         except Exception as error:
             page.show_error(self._safe_error(error))
 
-    async def activate_content_account(self) -> None:
+    async def activate_content_account(self, *, raise_errors: bool = False) -> None:
         if self.content_browser is None:
             return
         try:
@@ -1256,6 +1256,8 @@ class AppController:
             raise
         except Exception as error:
             self._content_page().show_error(self._safe_error(error))
+            if raise_errors:
+                raise
 
     async def activate_content_page(self) -> None:
         if self.content_browser is None:
@@ -2566,6 +2568,9 @@ class AppController:
         )
 
     async def _finish_login(self) -> None:
+        if self._candidate_login is not None:
+            await self._finish_candidate_login()
+            return
         if self.gateway is None:
             return
         session = self.gateway.export_session()
@@ -2581,6 +2586,123 @@ class AppController:
         self.login_dialog.accept()
         self._ensure_connection_monitor()
         await self.activate_content_account()
+
+    async def _finish_candidate_login(self) -> None:
+        candidate = self._candidate_login
+        if candidate is None:
+            return
+        try:
+            candidate.profile = await candidate.gateway.account_profile()
+            old_profile = await self._current_account_profile()
+            if candidate.profile.account_id != old_profile.account_id:
+                confirmation = self.confirm_account_switch(
+                    old_profile,
+                    candidate.profile,
+                )
+                if inspect.isawaitable(confirmation):
+                    confirmation = await confirmation
+                if not confirmation:
+                    await self._discard_candidate_login()
+                    return
+            if self.scheduler.snapshot().active_count:
+                self.account_status_dialog.show_error(
+                    "检测到活动下载，请暂停或等待完成后重试"
+                )
+                await self._discard_candidate_login()
+                return
+            await self._commit_candidate_services(candidate)
+        except Exception as error:
+            self.login_dialog.show_error(self._safe_error(error))
+            await self._discard_candidate_login()
+
+    async def _current_account_profile(self) -> AccountProfile:
+        gateway = self.gateway
+        if gateway is not None:
+            try:
+                return await gateway.account_profile()
+            except Exception:
+                pass
+        account = getattr(self.subscriptions, "account", None)
+        if isinstance(account, AccountProfile):
+            return account
+        display_name = getattr(self.window, "account", None) or "当前账号"
+        return AccountProfile("", display_name)
+
+    async def _commit_candidate_services(
+        self,
+        candidate: CandidateLoginSession,
+    ) -> None:
+        if self.build_online_services is None:
+            raise GatewayError("无法创建账号在线服务")
+        built = self.build_online_services(candidate.gateway, self.settings)
+        services = (
+            built
+            if isinstance(built, OnlineServices)
+            else OnlineServices(candidate.gateway, built[0], built[1])
+        )
+        old_services = OnlineServices(self.gateway, self.planner, self.scheduler)
+        old_secrets = dict(self.secrets)
+        new_secrets = {
+            **old_secrets,
+            "session": candidate.gateway.export_session(),
+        }
+        committed = False
+        vault_changed = False
+        self.scheduler.set_admission_open(False)
+        try:
+            await self._cancel_subscription_probe()
+            await self._cancel_content_operations()
+            self.bind_online_services(services)
+            self.vault.save(new_secrets)
+            vault_changed = True
+            self.gateway = services.gateway
+            self.planner = services.planner
+            self.scheduler = services.scheduler
+            self.secrets = new_secrets
+            await self.activate_content_account(raise_errors=True)
+            if candidate.profile is not None and self.content_browser is None:
+                self.window.set_account(candidate.profile.display_name)
+            committed = True
+        finally:
+            if not committed:
+                self.gateway = old_services.gateway
+                self.planner = old_services.planner
+                self.scheduler = old_services.scheduler
+                self.secrets = old_secrets
+                with suppress(Exception):
+                    self.bind_online_services(old_services)
+                if vault_changed:
+                    self.vault.save(old_secrets)
+                set_admission = getattr(self.scheduler, "set_admission_open", None)
+                if callable(set_admission):
+                    set_admission(True)
+                shutdown = getattr(services.scheduler, "shutdown", None)
+                if callable(shutdown):
+                    with suppress(Exception):
+                        await shutdown()
+                await self._discard_candidate_login()
+        if not committed:
+            return
+
+        self._candidate_login = None
+        candidate.qr_wait_task = None
+        self._session_expiry_handled = False
+        self._last_authorization_failure_reason = None
+        profile = candidate.profile or AccountProfile("", "已登录")
+        self.login_dialog.show_ready(profile.display_name)
+        self.login_dialog.accept()
+        self._ensure_connection_monitor()
+        old_shutdown = getattr(old_services.scheduler, "shutdown", None)
+        if callable(old_shutdown):
+            try:
+                await old_shutdown()
+            except Exception:
+                _LOGGER.warning("old scheduler cleanup failed after account commit")
+        if old_services.gateway is not None:
+            try:
+                await old_services.gateway.disconnect()
+            except Exception:
+                _LOGGER.warning("old gateway cleanup failed after account commit")
 
     async def _account_name(self) -> str | None:
         method = getattr(self.gateway, "account_name", None)

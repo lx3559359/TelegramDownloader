@@ -12,7 +12,9 @@ import pytest
 import telegram_downloader.controller as controller_module
 from telegram_downloader.account_access import (
     AuthorizationState,
+    CandidateLoginSession,
     ConnectionState,
+    OnlineServices,
 )
 from telegram_downloader.connectivity import ConnectionRecovery
 from telegram_downloader.content import (
@@ -822,6 +824,205 @@ async def test_repeated_candidate_login_focuses_existing_attempt() -> None:
     assert len(created) == 1
     assert dialog.show_calls == 2
     await controller.cancel_login()
+
+
+@pytest.mark.asyncio
+async def test_candidate_commit_same_account_skips_switch_confirmation() -> None:
+    class Gateway:
+        def __init__(self, account_id: str, name: str, session: str) -> None:
+            self.profile = AccountProfile(account_id, name)
+            self.session = session
+            self.disconnect_calls = 0
+
+        async def account_profile(self):
+            return self.profile
+
+        def export_session(self):
+            return self.session
+
+        async def disconnect(self):
+            self.disconnect_calls += 1
+
+    class Scheduler:
+        def __init__(self) -> None:
+            self.admission = []
+            self.shutdown_calls = 0
+
+        def snapshot(self):
+            return SchedulerSnapshot((), (), 3, 0)
+
+        def set_admission_open(self, value):
+            self.admission.append(value)
+
+        async def shutdown(self):
+            self.shutdown_calls += 1
+
+    old_gateway = Gateway("42", "旧账号", "old-session")
+    candidate_gateway = Gateway("42", "新显示名", "new-session")
+    old_scheduler = Scheduler()
+    candidate_scheduler = Scheduler()
+    vault = Vault()
+    vault.value = {"api_hash": "saved", "session": "old-session"}
+    switch_confirmations = []
+    bindings = []
+    controller = AppController.for_test(
+        gateway=old_gateway,
+        planner="old-planner",
+        scheduler=old_scheduler,
+        vault=vault,
+        settings=AppSettings(api_id=1),
+        secrets=dict(vault.value),
+        build_online_services=lambda gateway, _settings: OnlineServices(
+            gateway,
+            "candidate-planner",
+            candidate_scheduler,
+        ),
+        bind_online_services=bindings.append,
+        confirm_account_switch=lambda old, new: switch_confirmations.append(
+            (old, new)
+        ),
+    )
+    controller._candidate_login = CandidateLoginSession(candidate_gateway)
+
+    await controller._finish_candidate_login()
+
+    assert switch_confirmations == []
+    assert controller.gateway is candidate_gateway
+    assert controller.planner == "candidate-planner"
+    assert controller.scheduler is candidate_scheduler
+    assert controller.secrets["session"] == "new-session"
+    assert vault.value["session"] == "new-session"
+    assert bindings[-1].gateway is candidate_gateway
+    assert old_gateway.disconnect_calls == 1
+    assert old_scheduler.shutdown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_candidate_commit_different_account_requires_second_confirmation() -> None:
+    class Gateway:
+        def __init__(self, account_id: str, name: str) -> None:
+            self.profile = AccountProfile(account_id, name)
+            self.disconnect_calls = 0
+
+        async def account_profile(self):
+            return self.profile
+
+        async def disconnect(self):
+            self.disconnect_calls += 1
+
+    old_gateway = Gateway("old", "旧账号")
+    candidate_gateway = Gateway("new", "候选账号")
+    confirmations = []
+    bindings = []
+    controller = AppController.for_test(
+        gateway=old_gateway,
+        planner="old-planner",
+        secrets={"api_hash": "saved", "session": "old-session"},
+        settings=AppSettings(api_id=1),
+        bind_online_services=bindings.append,
+        confirm_account_switch=lambda old, new: confirmations.append(
+            (old.display_name, new.display_name)
+        )
+        or False,
+    )
+    controller._candidate_login = CandidateLoginSession(candidate_gateway)
+
+    await controller._finish_candidate_login()
+
+    assert confirmations == [("旧账号", "候选账号")]
+    assert controller.gateway is old_gateway
+    assert controller.planner == "old-planner"
+    assert controller.secrets["session"] == "old-session"
+    assert bindings == []
+    assert old_gateway.disconnect_calls == 0
+    assert candidate_gateway.disconnect_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["build", "bind", "vault", "activate"])
+async def test_candidate_rollback_preserves_active_account(failure_stage: str) -> None:
+    class Gateway:
+        def __init__(self, session: str) -> None:
+            self.session = session
+            self.disconnect_calls = 0
+
+        async def account_profile(self):
+            return AccountProfile("42", "测试账号")
+
+        def export_session(self):
+            return self.session
+
+        async def disconnect(self):
+            self.disconnect_calls += 1
+
+    class Scheduler:
+        def __init__(self) -> None:
+            self.admission = []
+            self.shutdown_calls = 0
+
+        def snapshot(self):
+            return SchedulerSnapshot((), (), 3, 0)
+
+        def set_admission_open(self, opened):
+            self.admission.append(opened)
+
+        async def shutdown(self):
+            self.shutdown_calls += 1
+
+    class FailingVault(Vault):
+        def save(self, value):
+            if failure_stage == "vault" and value.get("session") == "new-session":
+                raise OSError("vault failed")
+            super().save(value)
+
+    old_gateway = Gateway("old-session")
+    candidate_gateway = Gateway("new-session")
+    old_scheduler = Scheduler()
+    candidate_scheduler = Scheduler()
+    vault = FailingVault()
+    vault.value = {"api_hash": "saved", "session": "old-session"}
+    bindings = []
+
+    def build(gateway, _settings):
+        if failure_stage == "build":
+            raise RuntimeError("build failed")
+        return OnlineServices(gateway, "candidate-planner", candidate_scheduler)
+
+    def bind(services):
+        if failure_stage == "bind" and services.gateway is candidate_gateway:
+            raise RuntimeError("bind failed")
+        bindings.append(services)
+
+    controller = AppController.for_test(
+        gateway=old_gateway,
+        planner="old-planner",
+        scheduler=old_scheduler,
+        vault=vault,
+        settings=AppSettings(api_id=1),
+        secrets=dict(vault.value),
+        build_online_services=build,
+        bind_online_services=bind,
+    )
+    if failure_stage == "activate":
+        async def fail_activation(*, raise_errors=False):
+            raise RuntimeError("activate failed")
+
+        controller.activate_content_account = fail_activation
+    controller._candidate_login = CandidateLoginSession(candidate_gateway)
+
+    await controller._finish_candidate_login()
+
+    assert controller.gateway is old_gateway
+    assert controller.planner == "old-planner"
+    assert controller.scheduler is old_scheduler
+    assert controller.secrets["session"] == "old-session"
+    assert vault.value["session"] == "old-session"
+    assert old_gateway.disconnect_calls == 0
+    assert candidate_gateway.disconnect_calls == 1
+    assert controller._candidate_login is None
+    if failure_stage != "build":
+        assert candidate_scheduler.shutdown_calls == 1
+        assert old_scheduler.admission[-1] is True
 
 
 def test_show_login_prefills_saved_credentials_before_show() -> None:
