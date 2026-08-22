@@ -87,6 +87,79 @@ async def test_preview_summarizes_without_persisting_until_commit(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_batch_preview_reports_all_duplicate_layers_and_builds_one_task(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 13, tzinfo=UTC)
+
+    def media(peer: str, title: str, number: int) -> RemoteMedia:
+        return RemoteMedia(
+            peer,
+            title,
+            number,
+            None,
+            f"m{number}",
+            MediaKind.VIDEO,
+            f"{number}.mp4",
+            number,
+            now,
+        )
+
+    duplicate = media("shared", "共享来源", 2)
+    existing = media("second", "第二来源", 4)
+
+    class BatchGateway:
+        async def scan(self, source, _filters):
+            batches = {
+                "first_channel": [media("first", "第一来源", 1), duplicate],
+                "second_channel": [duplicate, media("second", "第二来源", 3), existing],
+            }
+            for item in batches[source.entity_ref]:
+                yield item
+
+    repo = FakeRepository()
+    repo.existing = {("second", 4, "m4")}
+    planner = TaskPlanner(
+        BatchGateway(),
+        repo,
+        tmp_path,
+        uuid_factory=iter(("batch-task", "item-1", "item-2", "item-3")).__next__,
+        clock=lambda: now,
+    )
+    progress = []
+
+    batch = await planner.scan_batch(
+        (
+            "https://t.me/first_channel",
+            "HTTPS://WWW.T.ME/first_channel/",
+            "invalid",
+            "https://t.me/second_channel",
+        ),
+        ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 20),
+        on_progress=progress.append,
+    )
+
+    assert batch.input_count == 4
+    assert batch.unique_link_count == 2
+    assert batch.invalid_link_count == 1
+    assert batch.duplicate_link_count == 1
+    assert batch.scanned_media_count == 5
+    assert batch.internal_duplicate_count == 1
+    assert batch.existing_media_count == 1
+    assert len(batch.preview.items) == 3
+    assert batch.preview.task.source_kind is SourceKind.BATCH_IMPORT
+    assert batch.preview.task.display_title == "批量链接导入（2 个链接）"
+    assert [item.completed for item in progress] == [1, 2]
+    assert repo.saved is None
+
+    committed = planner.commit(batch.preview)
+
+    assert committed.task.id == "batch-task"
+    assert len(committed.accepted_keys) == 3
+    assert repo.saved[0].source_kind is SourceKind.BATCH_IMPORT
+
+
+@pytest.mark.asyncio
 async def test_planner_deduplicates_source_items_and_avoids_existing_files(
     tmp_path: Path,
 ) -> None:

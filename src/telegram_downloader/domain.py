@@ -10,6 +10,7 @@ class SourceKind(StrEnum):
     SINGLE_MESSAGE = "single_message"
     CHANNEL_OR_GROUP = "channel_or_group"
     ACCOUNT_SEARCH = "account_search"
+    BATCH_IMPORT = "batch_import"
 
 
 class MediaKind(StrEnum):

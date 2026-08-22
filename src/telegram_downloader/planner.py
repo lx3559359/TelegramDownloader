@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -7,6 +8,11 @@ from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 
+from telegram_downloader.batch_import import (
+    MAX_BATCH_MEDIA,
+    BatchLinkIssue,
+    parse_batch_links,
+)
 from telegram_downloader.content import (
     ALL_DIALOGS_SCOPE_REF,
     ALL_DIALOGS_TITLE,
@@ -59,6 +65,38 @@ class SelectedCommit:
     skipped_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class BatchScanProgress:
+    completed: int
+    total: int
+
+
+@dataclass(frozen=True, slots=True)
+class BatchScanPreview:
+    preview: ScanPreview
+    input_count: int
+    unique_link_count: int
+    invalid_link_count: int
+    duplicate_link_count: int
+    scanned_media_count: int
+    internal_duplicate_count: int
+    existing_media_count: int
+    empty_link_count: int
+    issues: tuple[BatchLinkIssue, ...]
+
+    @property
+    def items(self) -> tuple[MediaItem, ...]:
+        return self.preview.items
+
+    @property
+    def known_bytes(self) -> int:
+        return self.preview.known_bytes
+
+    @property
+    def unknown_size_count(self) -> int:
+        return self.preview.unknown_size_count
+
+
 class TaskPlanner:
     def __init__(
         self,
@@ -89,6 +127,78 @@ class TaskPlanner:
             display_title=None,
             empty_message="扫描媒体已全部存在于下载队列",
             skip_existing=True,
+        )
+
+    async def scan_batch(
+        self,
+        values: tuple[str, ...],
+        filters: ScanFilters,
+        *,
+        on_progress: Callable[[BatchScanProgress], None] | None = None,
+    ) -> BatchScanPreview:
+        collection = parse_batch_links(values)
+        remote: list[RemoteMedia] = []
+        seen: set[tuple[str, int, str]] = set()
+        scanned_media_count = 0
+        internal_duplicate_count = 0
+        empty_link_count = 0
+        total = len(collection.links)
+        for completed, source in enumerate(collection.links, 1):
+            source_count = 0
+            async for item in self.gateway.scan(source, filters):
+                source_count += 1
+                scanned_media_count += 1
+                key = (item.peer_ref, item.message_id, item.media_id)
+                if key in seen:
+                    internal_duplicate_count += 1
+                    continue
+                seen.add(key)
+                remote.append(item)
+                if len(remote) > MAX_BATCH_MEDIA:
+                    raise ValueError(
+                        f"批量预检最多支持 {MAX_BATCH_MEDIA} 个唯一媒体，"
+                        "请缩小链接数量、日期范围或数量上限"
+                    )
+            if source_count == 0:
+                empty_link_count += 1
+            if on_progress is not None:
+                on_progress(BatchScanProgress(completed, total))
+
+        if not remote:
+            raise EmptyScanError("批量链接在当前筛选范围内没有找到可下载媒体")
+        existing = self.repository.existing_media_keys(seen)
+        available = [
+            item
+            for item in remote
+            if (item.peer_ref, item.message_id, item.media_id) not in existing
+        ]
+        if not available:
+            raise EmptyScanError("批量扫描媒体已全部存在于下载队列")
+
+        normalized = "\n".join(item.normalized_url for item in collection.links)
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+        preview = self._build_preview(
+            source_kind=SourceKind.BATCH_IMPORT,
+            source_ref=f"batch:{digest}",
+            source_title="批量链接导入",
+            source_url=f"telegram-batch://{digest}",
+            filters=filters,
+            remote=available,
+            display_title=f"批量链接导入（{len(collection.links)} 个链接）",
+            empty_message="批量扫描媒体已全部存在于下载队列",
+            skip_existing=False,
+        )
+        return BatchScanPreview(
+            preview,
+            collection.input_count,
+            len(collection.links),
+            len(collection.issues),
+            collection.duplicate_count,
+            scanned_media_count,
+            internal_duplicate_count,
+            len(existing),
+            empty_link_count,
+            collection.issues,
         )
 
     def plan_selected(
