@@ -91,6 +91,22 @@ def test_ready_state_updates_account_label_and_clears_sensitive_values(qtbot) ->
     assert dialog.password.text() == ""
 
 
+def test_reset_authentication_clears_attempt_fields(qtbot) -> None:
+    dialog = LoginDialog()
+    qtbot.addWidget(dialog)
+    dialog.phone.setText("+8613800000000")
+    dialog.code.setText("12345")
+    dialog.password.setText("secret")
+    dialog.show_error("old error")
+
+    dialog.reset_authentication()
+
+    assert dialog.phone.text() == ""
+    assert dialog.code.text() == ""
+    assert dialog.password.text() == ""
+    assert dialog.error_label.isHidden()
+
+
 def test_qr_page_renders_in_memory_and_exposes_login_choices(qtbot) -> None:
     dialog = LoginDialog()
     qtbot.addWidget(dialog)

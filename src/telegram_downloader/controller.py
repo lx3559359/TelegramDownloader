@@ -17,6 +17,7 @@ from typing import Any
 from telegram_downloader.account_access import (
     AccountStatusSnapshot,
     AuthorizationState,
+    CandidateLoginSession,
     ConnectionState,
 )
 from telegram_downloader.connectivity import ConnectionRecovery
@@ -496,6 +497,10 @@ class AppController:
         ]
         | None = None,
         confirm_preview: Callable[[Any], bool | Awaitable[bool]] | None = None,
+        confirm_reauthentication: Callable[[], bool | Awaitable[bool]] | None = None,
+        confirm_account_switch: (
+            Callable[[AccountProfile, AccountProfile], bool | Awaitable[bool]] | None
+        ) = None,
         update_coordinator: Any | None = None,
         update_prompt: Callable[[Any], bool] | None = None,
         update_shutdown: Callable[[], None] | None = None,
@@ -540,6 +545,10 @@ class AppController:
         self.gateway_factory = gateway_factory
         self.service_builder = service_builder
         self.confirm_preview = confirm_preview or (lambda _preview: True)
+        self.confirm_reauthentication = confirm_reauthentication or (lambda: False)
+        self.confirm_account_switch = confirm_account_switch or (
+            lambda _old, _candidate: False
+        )
         self.update_coordinator = update_coordinator
         self.update_prompt = update_prompt or (lambda _manifest: False)
         self.update_shutdown = update_shutdown or (lambda: None)
@@ -571,6 +580,7 @@ class AppController:
         self._session_restore_task: asyncio.Task[None] | None = None
         self._qr_wait_task: asyncio.Task[None] | None = None
         self._qr_generation = 0
+        self._candidate_login: CandidateLoginSession | None = None
         self._ui_slots: list[object] = []
         self._shutting_down = False
         self._settings_dialog: Any | None = None
@@ -618,6 +628,11 @@ class AppController:
             gateway_factory=dependencies.pop("gateway_factory", None),
             service_builder=dependencies.pop("service_builder", None),
             confirm_preview=dependencies.pop("confirm_preview", None),
+            confirm_reauthentication=dependencies.pop(
+                "confirm_reauthentication",
+                None,
+            ),
+            confirm_account_switch=dependencies.pop("confirm_account_switch", None),
             update_coordinator=dependencies.pop("update_coordinator", None),
             update_prompt=dependencies.pop("update_prompt", None),
             update_shutdown=dependencies.pop("update_shutdown", None),
@@ -842,30 +857,75 @@ class AppController:
         except Exception as error:
             self.login_dialog.show_error(self._safe_error(error))
 
+    async def start_candidate_login(self) -> None:
+        if self._candidate_login is not None:
+            self._show_login_dialog()
+            return
+        if self.scheduler.snapshot().active_count:
+            self.account_status_dialog.show_error(
+                "请先暂停或等待活动下载完成"
+            )
+            return
+        confirmation = self.confirm_reauthentication()
+        if inspect.isawaitable(confirmation):
+            confirmation = await confirmation
+        if not confirmation:
+            return
+        if self.gateway_factory is None:
+            self.account_status_dialog.show_error("无法创建 Telegram 连接")
+            return
+        candidate_gateway = self.gateway_factory(
+            self.settings.api_id,
+            self.secrets.get("api_hash", ""),
+            "",
+            self.settings.proxy,
+            self.secrets.get("proxy_password", ""),
+        )
+        try:
+            await candidate_gateway.connect()
+        except Exception as error:
+            with suppress(Exception):
+                await candidate_gateway.disconnect()
+            self.account_status_dialog.show_error(self._safe_error(error))
+            return
+        self._candidate_login = CandidateLoginSession(candidate_gateway)
+        reset = getattr(self.login_dialog, "reset_authentication", None)
+        if callable(reset):
+            reset()
+        self._show_login_dialog()
+        await self.begin_qr_login()
+
+    def _login_gateway(self):
+        candidate = self._candidate_login
+        return candidate.gateway if candidate is not None else self.gateway
+
     async def begin_qr_login(self) -> None:
-        if self.gateway is None:
+        gateway = self._login_gateway()
+        if gateway is None:
             self.login_dialog.show_error("请先填写 API 凭据")
             return
         try:
             await self._cancel_qr_wait()
-            info = await self.gateway.begin_qr_login()
+            info = await gateway.begin_qr_login()
             self._show_qr_and_wait(info)
         except TransientNetworkError as error:
-            from telegram_downloader.ui.login import LoginPage
+            if self._candidate_login is None:
+                from telegram_downloader.ui.login import LoginPage
 
-            self._prefill_login()
-            self.login_dialog.show_page(LoginPage.CREDENTIALS)
+                self._prefill_login()
+                self.login_dialog.show_page(LoginPage.CREDENTIALS)
             self.login_dialog.show_error(self._safe_error(error))
         except Exception as error:
             self.login_dialog.show_error(self._safe_error(error))
 
     async def refresh_qr_login(self) -> None:
-        if self.gateway is None:
+        gateway = self._login_gateway()
+        if gateway is None:
             self.login_dialog.show_error("请先填写 API 凭据")
             return
         try:
             await self._cancel_qr_wait()
-            info = await self.gateway.refresh_qr_login()
+            info = await gateway.refresh_qr_login()
             self._show_qr_and_wait(info)
         except TransientNetworkError as error:
             from telegram_downloader.ui.login import LoginPage
@@ -884,6 +944,10 @@ class AppController:
 
     async def edit_credentials(self) -> None:
         await self._cancel_qr_wait()
+        if self._candidate_login is not None:
+            await self._discard_candidate_login()
+            self.show_login_credentials()
+            return
         await self._cancel_subscription_probe()
         await self.connection_recovery.cancel()
         if self.gateway is not None:
@@ -895,6 +959,12 @@ class AppController:
 
     async def cancel_login(self) -> None:
         await self._cancel_qr_wait()
+        if self._candidate_login is not None:
+            await self._discard_candidate_login()
+            reset = getattr(self.login_dialog, "reset_authentication", None)
+            if callable(reset):
+                reset()
+            return
         await self._cancel_subscription_probe()
         if self.gateway is not None:
             await self.gateway.disconnect()
@@ -905,6 +975,8 @@ class AppController:
         generation = self._qr_generation
         task = asyncio.create_task(self._wait_for_qr(generation))
         self._qr_wait_task = task
+        if self._candidate_login is not None:
+            self._candidate_login.qr_wait_task = task
 
     def _display_qr(self, info) -> None:
         self.login_dialog.show_qr(info.url, info.expires_at)
@@ -913,6 +985,8 @@ class AppController:
     async def _cancel_qr_wait(self) -> None:
         task = self._qr_wait_task
         self._qr_wait_task = None
+        if self._candidate_login is not None:
+            self._candidate_login.qr_wait_task = None
         self._qr_generation += 1
         if task is None or task is asyncio.current_task():
             return
@@ -922,14 +996,15 @@ class AppController:
             await task
 
     async def _wait_for_qr(self, generation: int) -> None:
-        if self.gateway is None:
+        gateway = self._login_gateway()
+        if gateway is None:
             return
         try:
             while generation == self._qr_generation:
                 try:
-                    state = await self.gateway.wait_qr_login()
+                    state = await gateway.wait_qr_login()
                 except TimeoutError:
-                    info = await self.gateway.refresh_qr_login()
+                    info = await gateway.refresh_qr_login()
                     if generation != self._qr_generation:
                         return
                     self._display_qr(info)
@@ -957,12 +1032,18 @@ class AppController:
                 self._qr_wait_task = None
 
     async def submit_phone(self, phone: str) -> None:
-        if self.gateway is None:
+        gateway = self._login_gateway()
+        if gateway is None:
             self.login_dialog.show_error("请先填写 API 凭据")
             return
         try:
-            self.phone_code_hash = await self.gateway.request_code(phone)
-            self.phone = phone
+            phone_code_hash = await gateway.request_code(phone)
+            if self._candidate_login is not None:
+                self._candidate_login.phone_code_hash = phone_code_hash
+                self._candidate_login.phone = phone
+            else:
+                self.phone_code_hash = phone_code_hash
+                self.phone = phone
             from telegram_downloader.ui.login import LoginPage
 
             self.login_dialog.show_page(LoginPage.CODE)
@@ -970,11 +1051,19 @@ class AppController:
             self.login_dialog.show_error(self._safe_error(error))
 
     async def submit_code(self, code: str) -> None:
-        if self.gateway is None or not self.phone or not self.phone_code_hash:
+        gateway = self._login_gateway()
+        candidate = self._candidate_login
+        phone = candidate.phone if candidate is not None else self.phone
+        phone_code_hash = (
+            candidate.phone_code_hash
+            if candidate is not None
+            else self.phone_code_hash
+        )
+        if gateway is None or not phone or not phone_code_hash:
             self.login_dialog.show_error("验证码会话已失效，请重新发送验证码")
             return
         try:
-            state = await self.gateway.sign_in(self.phone, code, self.phone_code_hash)
+            state = await gateway.sign_in(phone, code, phone_code_hash)
             if state is AuthState.PASSWORD_REQUIRED:
                 from telegram_downloader.ui.login import LoginPage
 
@@ -985,15 +1074,24 @@ class AppController:
             self.login_dialog.show_error(self._safe_error(error))
 
     async def submit_password(self, password: str) -> None:
-        if self.gateway is None:
+        gateway = self._login_gateway()
+        if gateway is None:
             self.login_dialog.show_error("Telegram 连接尚未创建")
             return
         try:
-            state = await self.gateway.check_password(password)
+            state = await gateway.check_password(password)
             if state is AuthState.READY:
                 await self._finish_login()
         except Exception as error:
             self.login_dialog.show_error(self._safe_error(error))
+
+    async def _discard_candidate_login(self) -> None:
+        candidate = self._candidate_login
+        self._candidate_login = None
+        if candidate is not None:
+            candidate.qr_wait_task = None
+            with suppress(Exception):
+                await candidate.close()
 
     @_tracked_activity(ActivityKind.SCAN)
     async def scan_link(self, link: str, filters: ScanFilters) -> None:

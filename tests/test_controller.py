@@ -669,6 +669,161 @@ async def test_show_account_access_for_authorized_account_never_starts_qr() -> N
     assert status_dialog.snapshot.display_name == "测试账号"
 
 
+@pytest.mark.asyncio
+async def test_candidate_login_uses_isolated_gateway_and_cancel_keeps_active() -> None:
+    expires = datetime(2026, 8, 23, 3, tzinfo=UTC)
+
+    class ActiveGateway:
+        def __init__(self) -> None:
+            self.begin_qr_calls = 0
+            self.disconnect_calls = 0
+
+        async def begin_qr_login(self):
+            self.begin_qr_calls += 1
+
+        async def disconnect(self):
+            self.disconnect_calls += 1
+
+    class CandidateGateway:
+        def __init__(self) -> None:
+            self.connect_calls = 0
+            self.begin_qr_calls = 0
+            self.disconnect_calls = 0
+
+        async def connect(self):
+            self.connect_calls += 1
+
+        async def begin_qr_login(self):
+            self.begin_qr_calls += 1
+            return QrLoginInfo("tg://login?token=candidate", expires)
+
+        async def wait_qr_login(self):
+            await asyncio.Event().wait()
+
+        async def disconnect(self):
+            self.disconnect_calls += 1
+
+    class Dialog:
+        def __init__(self) -> None:
+            self.show_calls = 0
+            self.reset_calls = 0
+
+        def reset_authentication(self):
+            self.reset_calls += 1
+
+        def show(self):
+            self.show_calls += 1
+
+        def raise_(self):
+            pass
+
+        def activateWindow(self):
+            pass
+
+        def show_qr(self, _url, _expires_at):
+            pass
+
+        def show_qr_status(self, _text):
+            pass
+
+        def show_error(self, _text):
+            pass
+
+    active = ActiveGateway()
+    candidate = CandidateGateway()
+    dialog = Dialog()
+    controller = AppController.for_test(
+        gateway=active,
+        login_dialog=dialog,
+        gateway_factory=lambda *_args: candidate,
+        settings=AppSettings(api_id=123),
+        secrets={"api_hash": "saved", "session": "old-session"},
+        confirm_reauthentication=lambda: True,
+    )
+
+    await controller.start_candidate_login()
+    await asyncio.sleep(0)
+
+    assert controller.gateway is active
+    assert controller.secrets["session"] == "old-session"
+    assert candidate.connect_calls == 1
+    assert candidate.begin_qr_calls == 1
+    assert active.begin_qr_calls == 0
+
+    await controller.cancel_login()
+
+    assert controller.gateway is active
+    assert controller.secrets["session"] == "old-session"
+    assert candidate.disconnect_calls == 1
+    assert active.disconnect_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_repeated_candidate_login_focuses_existing_attempt() -> None:
+    expires = datetime(2026, 8, 23, 3, tzinfo=UTC)
+    created = []
+
+    class CandidateGateway:
+        async def connect(self):
+            pass
+
+        async def begin_qr_login(self):
+            return QrLoginInfo("tg://login?token=candidate", expires)
+
+        async def wait_qr_login(self):
+            await asyncio.Event().wait()
+
+        async def disconnect(self):
+            pass
+
+    class Dialog:
+        def __init__(self) -> None:
+            self.show_calls = 0
+
+        def reset_authentication(self):
+            pass
+
+        def show(self):
+            self.show_calls += 1
+
+        def raise_(self):
+            pass
+
+        def activateWindow(self):
+            pass
+
+        def show_qr(self, _url, _expires_at):
+            pass
+
+        def show_qr_status(self, _text):
+            pass
+
+        def show_error(self, _text):
+            pass
+
+    def factory(*_args):
+        gateway = CandidateGateway()
+        created.append(gateway)
+        return gateway
+
+    dialog = Dialog()
+    controller = AppController.for_test(
+        gateway=object(),
+        login_dialog=dialog,
+        gateway_factory=factory,
+        settings=AppSettings(api_id=123),
+        secrets={"api_hash": "saved", "session": "old-session"},
+        confirm_reauthentication=lambda: True,
+    )
+
+    await controller.start_candidate_login()
+    await controller.start_candidate_login()
+
+    assert len(created) == 1
+    assert dialog.show_calls == 2
+    await controller.cancel_login()
+
+
 def test_show_login_prefills_saved_credentials_before_show() -> None:
     calls = []
     proxy = ProxySettings("http", "127.0.0.1", 8080, "alice")

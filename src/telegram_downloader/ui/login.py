@@ -365,6 +365,15 @@ class LoginDialog(QDialog):
         self.ready_label.setText(f"登录成功 · {display_name}")
         self.show_page(LoginPage.READY)
 
+    def reset_authentication(self) -> None:
+        self._clear_qr()
+        self.phone.clear()
+        self.code.clear()
+        self.password.clear()
+        self.error_label.clear()
+        self.error_label.hide()
+        self._busy_action = None
+
     def _update_proxy_fields(self) -> None:
         enabled = self.proxy_kind.currentData() != "none"
         for widget in (
