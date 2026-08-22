@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from pathlib import Path
+
 from PySide6.QtCore import QTime, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -18,6 +21,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from telegram_downloader.domain import MediaKind
+from telegram_downloader.files import DownloadNamingSettings, render_download_target
 from telegram_downloader.settings import (
     AppSettings,
     DownloadScheduleSettings,
@@ -142,6 +147,56 @@ class SettingsDialog(QDialog):
         general_layout.addStretch()
         self.tabs.addTab(general_tab, "常规")
 
+        naming_tab = QWidget()
+        naming_layout = QVBoxLayout(naming_tab)
+        naming_layout.setContentsMargins(8, 12, 8, 8)
+        naming_form = QFormLayout()
+        naming_form.setHorizontalSpacing(14)
+        naming_form.setVerticalSpacing(10)
+        self.directory_template = QComboBox()
+        self.directory_template.setEditable(True)
+        self.directory_template.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        for template in (
+            "{source}/{year_month}/{media_type}",
+            "{year}/{month}/{source}/{media_type}",
+            "{source}/{message_date}",
+        ):
+            self.directory_template.addItem(template)
+        self.directory_template.setEditText(settings.download_naming.directory_template)
+
+        self.filename_template = QComboBox()
+        self.filename_template.setEditable(True)
+        self.filename_template.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        for template in (
+            "{original_name}",
+            "{stem}_{message_id}{extension}",
+            "{message_date}_{message_id}_{original_name}",
+        ):
+            self.filename_template.addItem(template)
+        self.filename_template.setEditText(settings.download_naming.filename_template)
+        naming_form.addRow("目录模板", self.directory_template)
+        naming_form.addRow("文件名模板", self.filename_template)
+
+        placeholders = QLabel(
+            "目录：{source} {year} {month} {year_month} {media_type} "
+            "{message_date} {message_id}\n"
+            "文件名另支持：{original_name} {stem} {extension}"
+        )
+        placeholders.setObjectName("muted")
+        placeholders.setWordWrap(True)
+        naming_form.addRow("可用占位符", placeholders)
+        self.naming_preview = QLabel()
+        self.naming_preview.setObjectName("muted")
+        self.naming_preview.setWordWrap(True)
+        naming_form.addRow("路径预览", self.naming_preview)
+        naming_note = QLabel("模板只影响新建任务；已入队任务会继续使用原保存路径。")
+        naming_note.setObjectName("muted")
+        naming_note.setWordWrap(True)
+        naming_form.addRow("", naming_note)
+        naming_layout.addLayout(naming_form)
+        naming_layout.addStretch()
+        self.tabs.addTab(naming_tab, "下载路径")
+
         background_tab = QWidget()
         background_layout = QVBoxLayout(background_tab)
         background_layout.setContentsMargins(8, 12, 8, 8)
@@ -229,6 +284,8 @@ class SettingsDialog(QDialog):
 
         self.proxy_kind.currentIndexChanged.connect(self._update_proxy_fields)
         self.schedule_enabled.toggled.connect(self._update_schedule_fields)
+        self.directory_template.editTextChanged.connect(self._update_naming_preview)
+        self.filename_template.editTextChanged.connect(self._update_naming_preview)
         self.test_button.clicked.connect(self._test_proxy)
         self.thumbnail_cache_clear_button.clicked.connect(
             self.thumbnail_cache_clear_requested.emit
@@ -237,6 +294,7 @@ class SettingsDialog(QDialog):
         self.save_button.clicked.connect(self._save)
         self._update_proxy_fields()
         self._update_schedule_fields()
+        self._update_naming_preview()
 
     def proxy_values(self) -> ProxySettings:
         kind = str(self.proxy_kind.currentData())
@@ -269,6 +327,10 @@ class SettingsDialog(QDialog):
                 start_minute=self._minute_from_time(self.schedule_start.time()),
                 end_minute=self._minute_from_time(self.schedule_end.time()),
             ),
+            download_naming=DownloadNamingSettings(
+                self.directory_template.currentText().strip(),
+                self.filename_template.currentText().strip(),
+            ),
         )
 
     @property
@@ -291,6 +353,27 @@ class SettingsDialog(QDialog):
         for widget in self.schedule_detail_widgets:
             widget.setEnabled(enabled)
 
+    def _update_naming_preview(self) -> None:
+        try:
+            naming = DownloadNamingSettings(
+                self.directory_template.currentText().strip(),
+                self.filename_template.currentText().strip(),
+            )
+            root = Path("downloads").resolve()
+            target = render_download_target(
+                root,
+                naming,
+                "示例频道",
+                datetime(2026, 8, 22, tzinfo=UTC),
+                MediaKind.VIDEO,
+                12345,
+                "video.mp4",
+            )
+            preview = (Path("downloads") / target.relative_to(root)).as_posix()
+            self.naming_preview.setText(f"{preview}")
+        except ValueError as error:
+            self.naming_preview.setText(f"模板错误：{error}")
+
     def _test_proxy(self) -> None:
         try:
             proxy = self.proxy_values()
@@ -303,7 +386,7 @@ class SettingsDialog(QDialog):
     def _save(self) -> None:
         try:
             self.values()
-        except SettingsError as error:
+        except ValueError as error:
             self._show_error(str(error))
             return
         self.error_label.setVisible(False)

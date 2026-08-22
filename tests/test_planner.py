@@ -16,6 +16,7 @@ from telegram_downloader.domain import (
     TaskRecord,
     TaskStatus,
 )
+from telegram_downloader.files import DownloadNamingSettings
 from telegram_downloader.gateway import RemoteMedia
 from telegram_downloader.links import parse_telegram_link
 from telegram_downloader.planner import EmptyScanError, TaskPlanner
@@ -84,6 +85,53 @@ async def test_preview_summarizes_without_persisting_until_commit(tmp_path: Path
     assert committed.skipped_count == 0
     assert repo.saved[0] == committed.task
     assert [item.message_id for item in repo.saved[1]] == [9, 8]
+
+
+@pytest.mark.asyncio
+async def test_planner_uses_and_reconfigures_download_naming_for_new_previews(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 13, tzinfo=UTC)
+    remote = RemoteMedia(
+        "peer",
+        "资料群",
+        42,
+        None,
+        "m42",
+        MediaKind.VIDEO,
+        "clip.mp4",
+        100,
+        now,
+    )
+    planner = TaskPlanner(
+        FakeGateway([remote]),
+        FakeRepository(),
+        tmp_path,
+        uuid_factory=iter(("first-task", "first-item", "second-task", "second-item")).__next__,
+        clock=lambda: now,
+        naming=DownloadNamingSettings(
+            "{year}/{month}/{source}/{media_type}",
+            "{stem}_{message_id}{extension}",
+        ),
+    )
+    filters = ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 20)
+
+    first = await planner.scan(parse_telegram_link("https://t.me/example"), filters)
+    planner.configure_naming(
+        DownloadNamingSettings(
+            "{source}/{message_date}",
+            "{message_id}_{original_name}",
+        )
+    )
+    second = await planner.scan(parse_telegram_link("https://t.me/example"), filters)
+
+    assert first.items[0].target_path == (
+        tmp_path / "2026" / "08" / "资料群" / "video" / "clip_42.mp4"
+    )
+    assert second.items[0].target_path == (
+        tmp_path / "资料群" / "2026-08-13" / "42_clip.mp4"
+    )
+    assert first.items[0].target_path != second.items[0].target_path
 
 
 @pytest.mark.asyncio

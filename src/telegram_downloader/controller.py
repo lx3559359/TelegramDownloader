@@ -26,7 +26,6 @@ from telegram_downloader.domain import (
     ItemStatus,
     MediaKind,
     ScanFilters,
-    SourceKind,
     TaskStatus,
 )
 from telegram_downloader.file_integrity import (
@@ -1739,7 +1738,10 @@ class AppController:
         configure = getattr(self.scheduler, "configure_resources", None)
         if callable(configure):
             configure(settings.concurrency, settings.speed_limit_kib)
-        message = "设置已保存；下载资源设置已即时应用"
+        configure_naming = getattr(self.planner, "configure_naming", None)
+        if callable(configure_naming):
+            configure_naming(settings.download_naming)
+        message = "设置已保存；下载资源与路径模板已即时应用"
         if connection_changed:
             message += "，API/代理变更将在下次连接时生效"
         self._show_status(message)
@@ -2036,17 +2038,32 @@ class AppController:
     def open_task_directory(self, task_id: str) -> None:
         if self.paths is None:
             return
-        task = self.repository.get_task(task_id)
-        directory = (
-            self.paths.downloads
-            if task.source_kind is SourceKind.ACCOUNT_SEARCH
-            else self.paths.downloads / task.source_title
-        )
-        directory = self.paths.guard(directory)
-        directory.mkdir(parents=True, exist_ok=True)
-        startfile = getattr(os, "startfile", None)
-        if startfile is not None:
-            startfile(directory)
+        try:
+            self.repository.get_task(task_id)
+            items = self.repository.list_items(task_id)
+            downloads = self.paths.downloads.resolve()
+            parents: list[Path] = []
+            for item in items:
+                parent = Path(item.target_path).resolve().parent
+                parent.relative_to(downloads)
+                parents.append(self.paths.guard(parent))
+            directory = (
+                Path(os.path.commonpath([str(path) for path in parents]))
+                if parents
+                else downloads
+            )
+            directory = self.paths.guard(directory)
+            directory.mkdir(parents=True, exist_ok=True)
+            startfile = getattr(os, "startfile", None)
+            if startfile is not None:
+                startfile(directory)
+        except ValueError:
+            self._show_status("安全限制：下载目录不在应用下载目录内")
+        except KeyError:
+            self._show_status("任务不存在，任务列表已刷新")
+            self._schedule_task_refresh()
+        except OSError:
+            self._show_status("Windows 无法打开下载目录")
 
     async def shutdown(self) -> None:
         if self._shutting_down:

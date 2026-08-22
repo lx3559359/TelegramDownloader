@@ -1,6 +1,7 @@
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QGraphicsDropShadowEffect, QLineEdit
 
+from telegram_downloader.files import DownloadNamingSettings
 from telegram_downloader.settings import (
     AppSettings,
     DownloadScheduleSettings,
@@ -132,12 +133,42 @@ def test_background_tab_round_trips_all_values(qtbot) -> None:
     dialog = SettingsDialog(settings, autostart_available=True)
     qtbot.addWidget(dialog)
 
-    assert dialog.tabs.count() == 2
-    assert [dialog.tabs.tabText(index) for index in range(2)] == [
+    assert dialog.tabs.count() == 3
+    assert [dialog.tabs.tabText(index) for index in range(3)] == [
         "常规",
+        "下载路径",
         "后台与通知",
     ]
     assert dialog.values() == settings
+
+
+def test_download_naming_tab_round_trips_and_previews_custom_templates(qtbot) -> None:
+    naming = DownloadNamingSettings(
+        "{year}/{month}/{source}/{media_type}",
+        "{message_date}_{message_id}_{original_name}",
+    )
+    dialog = SettingsDialog(AppSettings(download_naming=naming))
+    qtbot.addWidget(dialog)
+
+    assert dialog.directory_template.currentText() == naming.directory_template
+    assert dialog.filename_template.currentText() == naming.filename_template
+    assert dialog.values().download_naming == naming
+    assert "2026/08/示例频道/video/2026-08-22_12345_video.mp4" in dialog.naming_preview.text()
+
+
+def test_download_naming_tab_rejects_unsafe_template_before_save(qtbot) -> None:
+    dialog = SettingsDialog(AppSettings())
+    qtbot.addWidget(dialog)
+    emitted = []
+    dialog.save_requested.connect(lambda: emitted.append(True))
+
+    dialog.directory_template.setEditText("../{source}")
+    qtbot.mouseClick(dialog.save_button, Qt.MouseButton.LeftButton)
+
+    assert emitted == []
+    assert dialog.error_label.isHidden() is False
+    assert "安全相对路径" in dialog.error_label.text()
+    assert "模板错误" in dialog.naming_preview.text()
 
 
 def test_unavailable_integrations_and_disabled_schedule_disable_controls(qtbot) -> None:

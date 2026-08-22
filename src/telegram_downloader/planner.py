@@ -26,7 +26,11 @@ from telegram_downloader.domain import (
     TaskRecord,
     TaskStatus,
 )
-from telegram_downloader.files import archive_target, disambiguate_target
+from telegram_downloader.files import (
+    DownloadNamingSettings,
+    disambiguate_target,
+    render_download_target,
+)
 from telegram_downloader.gateway import RemoteMedia, TelegramGateway
 from telegram_downloader.repository import AllMediaAlreadyExists
 
@@ -105,12 +109,19 @@ class TaskPlanner:
         downloads: Path,
         uuid_factory: Callable[[], str] | None = None,
         clock: Callable[[], datetime] | None = None,
+        naming: DownloadNamingSettings | None = None,
     ) -> None:
         self.gateway = gateway
         self.repository = repository
         self.downloads = downloads.resolve()
         self.uuid_factory = uuid_factory or (lambda: str(uuid4()))
         self.clock = clock or (lambda: datetime.now(UTC))
+        self.naming = naming or DownloadNamingSettings()
+
+    def configure_naming(self, naming: DownloadNamingSettings) -> None:
+        if not isinstance(naming, DownloadNamingSettings):
+            raise ValueError("下载命名设置无效")
+        self.naming = naming
 
     async def scan(self, source: ParsedLink, filters: ScanFilters) -> ScanPreview:
         remote = [item async for item in self.gateway.scan(source, filters)]
@@ -313,11 +324,13 @@ class TaskPlanner:
         planned: list[MediaItem] = []
         used: set[Path] = set()
         for item in remote:
-            target = archive_target(
+            target = render_download_target(
                 self.downloads,
+                self.naming,
                 item.source_title,
                 item.message_date_utc,
                 item.kind,
+                item.message_id,
                 item.original_name,
             )
             target = self._available_target(target, item.message_id, used)

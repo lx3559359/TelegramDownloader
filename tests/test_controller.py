@@ -42,6 +42,7 @@ from telegram_downloader.file_integrity import (
     IntegritySummary,
     RepairPreparation,
 )
+from telegram_downloader.files import DownloadNamingSettings
 from telegram_downloader.gateway import (
     AccessDeniedError,
     AuthorizationFailureReason,
@@ -1508,6 +1509,7 @@ def test_search_task_uses_display_title_but_opens_source_directory(tmp_path, mon
         expected_size=100,
         downloaded_bytes=0,
         last_error=None,
+        target_path=tmp_path / "downloads" / "资料群" / "2026-08" / "video" / "video.mp4",
     )
 
     class Repository:
@@ -1528,6 +1530,10 @@ def test_search_task_uses_display_title_but_opens_source_directory(tmp_path, mon
         def get_task(self, task_id):
             assert task_id == task.id
             return task
+
+        def list_items(self, task_id):
+            assert task_id == task.id
+            return [item]
 
     class Window:
         def __init__(self):
@@ -1555,7 +1561,7 @@ def test_search_task_uses_display_title_but_opens_source_directory(tmp_path, mon
     controller.open_task_directory(task.id)
 
     assert window.tasks[0].title == "资料群（搜索：安装）"
-    assert opened == [(paths.downloads / "资料群").resolve()]
+    assert opened == [(paths.downloads / "资料群" / "2026-08" / "video").resolve()]
     assert not (paths.downloads / "资料群（搜索：安装）").exists()
 
 
@@ -1571,6 +1577,17 @@ def test_account_search_task_opens_download_root(tmp_path, monkeypatch) -> None:
             assert task_id == task.id
             return task
 
+        def list_items(self, task_id):
+            assert task_id == task.id
+            return [
+                SimpleNamespace(
+                    target_path=tmp_path / "downloads" / "来源甲" / "video" / "a.mp4"
+                ),
+                SimpleNamespace(
+                    target_path=tmp_path / "downloads" / "来源乙" / "photo" / "b.jpg"
+                ),
+            ]
+
     opened = []
     monkeypatch.setattr(
         controller_module.os,
@@ -1585,6 +1602,39 @@ def test_account_search_task_opens_download_root(tmp_path, monkeypatch) -> None:
 
     assert opened == [paths.downloads.resolve()]
     assert not (paths.downloads / ALL_DIALOGS_TITLE).exists()
+
+
+def test_task_directory_rejects_persisted_path_outside_download_root(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    task = SimpleNamespace(id="unsafe-task")
+
+    class Repository:
+        def get_task(self, task_id):
+            assert task_id == task.id
+            return task
+
+        def list_items(self, task_id):
+            assert task_id == task.id
+            return [SimpleNamespace(target_path=tmp_path / "data" / "secret.bin")]
+
+    opened = []
+    monkeypatch.setattr(
+        controller_module.os,
+        "startfile",
+        lambda directory: opened.append(directory),
+        raising=False,
+    )
+    controller = AppController.for_test(
+        repository=Repository(),
+        paths=PortablePaths(tmp_path),
+    )
+
+    controller.open_task_directory(task.id)
+
+    assert opened == []
+    assert "安全限制" in controller.window.message.last_message
 
 
 def test_task_detail_selection_loads_only_one_selected_task() -> None:
@@ -3740,10 +3790,24 @@ async def test_apply_settings_reconfigures_active_scheduler_after_persistence() 
         def configure_resources(self, concurrency, speed_limit_kib):
             events.append(("scheduler", concurrency, speed_limit_kib))
 
-    updated = AppSettings(api_id=1, concurrency=5, speed_limit_kib=2048)
+    class Planner:
+        def configure_naming(self, naming):
+            events.append(("planner", naming))
+
+    naming = DownloadNamingSettings(
+        "{year}/{source}/{media_type}",
+        "{message_id}_{original_name}",
+    )
+    updated = AppSettings(
+        api_id=1,
+        concurrency=5,
+        speed_limit_kib=2048,
+        download_naming=naming,
+    )
     controller = AppController.for_test(
         settings_store=Store(),
         vault=SecretStore(),
+        planner=Planner(),
         scheduler=Scheduler(),
     )
 
@@ -3753,6 +3817,7 @@ async def test_apply_settings_reconfigures_active_scheduler_after_persistence() 
         ("settings", updated),
         ("secrets", {}),
         ("scheduler", 5, 2048),
+        ("planner", naming),
     ]
     assert controller.settings == updated
     assert "即时应用" in controller.window.message.last_message

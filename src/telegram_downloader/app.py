@@ -406,7 +406,12 @@ def create_application(
         return TelethonGateway(api_id, api_hash, session, proxy, proxy_password)
 
     def build_services(gateway: TelethonGateway, resource_settings: AppSettings):
-        planner = TaskPlanner(gateway, repository, paths.downloads)
+        planner = TaskPlanner(
+            gateway,
+            repository,
+            paths.downloads,
+            naming=resource_settings.download_naming,
+        )
         bandwidth = AsyncBandwidthLimiter(resource_settings.speed_limit_kib)
         downloader = MediaDownloader(gateway, repository, paths, bandwidth=bandwidth)
         scheduler = DownloadScheduler(

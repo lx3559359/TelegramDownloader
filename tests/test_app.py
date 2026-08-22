@@ -21,6 +21,7 @@ from telegram_downloader.content_browser import ContentBrowserService
 from telegram_downloader.domain import MediaKind
 from telegram_downloader.download_schedule import DownloadScheduleController
 from telegram_downloader.file_integrity import FileIntegrityService
+from telegram_downloader.files import DownloadNamingSettings
 from telegram_downloader.gateway import (
     AuthorizationFailureReason,
     SessionExpiredError,
@@ -465,7 +466,15 @@ async def test_telegram_health_uses_retained_authorization_reason() -> None:
 
 def test_service_builder_shares_runtime_download_resource_settings(tmp_path) -> None:
     application, loop, controller = app.create_application(tmp_path)
-    settings = AppSettings(concurrency=4, speed_limit_kib=2048)
+    naming = DownloadNamingSettings(
+        "{year}/{source}/{media_type}",
+        "{message_id}_{original_name}",
+    )
+    settings = AppSettings(
+        concurrency=4,
+        speed_limit_kib=2048,
+        download_naming=naming,
+    )
 
     try:
         planner, scheduler, content = controller.service_builder(object(), settings)
@@ -475,6 +484,7 @@ def test_service_builder_shares_runtime_download_resource_settings(tmp_path) -> 
         assert scheduler.snapshot().concurrency == 4
         assert scheduler.snapshot().speed_limit_kib == 2048
         assert scheduler.downloader.bandwidth is scheduler._bandwidth
+        assert planner.naming == naming
     finally:
         loop.run_until_complete(controller._async_actions.shutdown())
         controller.window.close()
