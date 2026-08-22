@@ -34,6 +34,9 @@ class ActionPolicy(StrEnum):
 
 
 ACTION_POLICIES: dict[str, ActionPolicy] = {
+    "account.access.open": ActionPolicy.DEDUPLICATE,
+    "account.reauthenticate": ActionPolicy.DEDUPLICATE,
+    "account.reconnect": ActionPolicy.DEDUPLICATE,
     "content.activate": ActionPolicy.REPLACE_LATEST,
     "content.search": ActionPolicy.REPLACE_LATEST,
     "content.load_more": ActionPolicy.REPLACE_LATEST,

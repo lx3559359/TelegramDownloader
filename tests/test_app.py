@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from inspect import getsource, isawaitable
 from types import SimpleNamespace
@@ -42,6 +43,9 @@ from telegram_downloader.ui.async_actions import ActionPolicy
 from telegram_downloader.update import UpdateStartupResult
 
 EXPECTED_POLICIES = {
+    "account.access.open": ActionPolicy.DEDUPLICATE,
+    "account.reauthenticate": ActionPolicy.DEDUPLICATE,
+    "account.reconnect": ActionPolicy.DEDUPLICATE,
     "content.activate": ActionPolicy.REPLACE_LATEST,
     "content.search": ActionPolicy.REPLACE_LATEST,
     "content.load_more": ActionPolicy.REPLACE_LATEST,
@@ -98,6 +102,47 @@ def test_online_service_bundle_build_is_side_effect_free(
         assert content_bindings == [(gateway, services.planner)]
         assert subscription_bindings == [(gateway, services.planner)]
     finally:
+        loop.run_until_complete(controller._async_actions.shutdown())
+        controller.window.close()
+        loop.close()
+        application.processEvents()
+
+
+def test_account_navigation_opens_status_without_starting_qr(tmp_path) -> None:
+    application, loop, controller = app.create_application(tmp_path)
+
+    class Gateway:
+        def __init__(self) -> None:
+            self.qr_calls = 0
+
+        def is_connected(self) -> bool:
+            return True
+
+        async def account_profile(self):
+            return AccountProfile("42", "测试账号")
+
+        async def begin_qr_login(self):
+            self.qr_calls += 1
+            raise AssertionError("account navigation must be read-only")
+
+    gateway = Gateway()
+    controller.gateway = gateway
+    controller.settings = replace(controller.settings, api_id=123)
+    controller.secrets.update(
+        {"api_hash": "saved", "session": "encrypted-session"}
+    )
+
+    async def exercise() -> None:
+        controller.window.login_requested.emit()
+        await controller._async_actions.wait_idle()
+        snapshot = controller.account_status_dialog.account_name.text()
+        assert "测试账号" in snapshot
+        assert gateway.qr_calls == 0
+
+    try:
+        loop.run_until_complete(exercise())
+    finally:
+        controller.account_status_dialog.close()
         loop.run_until_complete(controller._async_actions.shutdown())
         controller.window.close()
         loop.close()
@@ -493,7 +538,7 @@ def test_create_application_initializes_project_local_content_services(
         assert "content_preview_requested" in slot_names
         assert "subscription_probe_requested" in slot_names
         assert controller._async_actions.active_keys == frozenset()
-        assert len(controller._async_actions._slots) == 38
+        assert len(controller._async_actions._slots) == 41
         assert controller.diagnostics is not None
         assert controller.diagnostic_store.paths.root == tmp_path.resolve()
         controller.window.content_page.link_requested.emit("https://t.me/example/1#fragment")

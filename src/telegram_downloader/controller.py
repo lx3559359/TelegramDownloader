@@ -2290,6 +2290,8 @@ class AppController:
         await self._cancel_integrity_for_shutdown()
         await self._cancel_connection_monitor()
         await self._cancel_qr_wait()
+        if self._candidate_login is not None:
+            await self._discard_candidate_login()
         await self._cancel_subscription_probe()
         await self._cancel_content_operations()
         await self.subscription_scheduler.shutdown()

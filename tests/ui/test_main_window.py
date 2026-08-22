@@ -51,6 +51,7 @@ def test_main_shell_and_task_cards_use_confirmed_elevation_hierarchy(qtbot) -> N
     assert window.task_queue_card.isAncestorOf(window.task_empty_hint)
     assert window.task_queue_card.isAncestorOf(window.task_table)
     assert window.task_detail_card.isAncestorOf(window.task_item_table)
+    assert window.login_nav_button.text() == "账号"
 
 
 def test_task_center_actions_stay_inside_cards_at_minimum_size(qtbot) -> None:

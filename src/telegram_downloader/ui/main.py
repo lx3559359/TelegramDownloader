@@ -214,7 +214,7 @@ class MainWindow(QMainWindow):
         self.subscriptions_nav_button = self._nav_button("自动订阅")
         self.maintenance_nav_button = self._nav_button("维护中心")
         self.diagnostics_nav_button = self.maintenance_nav_button
-        self.login_nav_button = self._nav_button("账号登录")
+        self.login_nav_button = self._nav_button("账号")
         self.settings_nav_button = self._nav_button("设置")
         self.login_nav_button.clicked.connect(self.login_requested.emit)
         self.settings_nav_button.clicked.connect(self.settings_requested.emit)

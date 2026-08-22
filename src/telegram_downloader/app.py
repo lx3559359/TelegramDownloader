@@ -377,6 +377,7 @@ def create_application(
     import qasync
     from PySide6.QtWidgets import QApplication, QMessageBox
 
+    from telegram_downloader.ui.account_status import AccountStatusDialog
     from telegram_downloader.ui.async_actions import (
         ActionHooks,
         AsyncActionBridge,
@@ -479,6 +480,7 @@ def create_application(
     if catalog_error is not None:
         window.content_page.show_error(f"内容目录不可用（{type(catalog_error).__name__}）")
     login_dialog = LoginDialog(window)
+    account_status_dialog = AccountStatusDialog(window)
 
     def gateway_factory(
         api_id: int,
@@ -557,6 +559,72 @@ def create_application(
         dialog.setText(_download_confirmation_text(preview))
         dialog.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         dialog.setDefaultButton(QMessageBox.StandardButton.Yes)
+        loop = asyncio.get_running_loop()
+        finished: asyncio.Future[bool] = loop.create_future()
+
+        def resolve(answer: int) -> None:
+            if not finished.done():
+                finished.set_result(
+                    _standard_button_selected(
+                        answer,
+                        QMessageBox.StandardButton.Yes,
+                    )
+                )
+
+        dialog.finished.connect(resolve)
+        dialog.open()
+        try:
+            return await finished
+        except asyncio.CancelledError:
+            dialog.reject()
+            raise
+        finally:
+            dialog.deleteLater()
+
+    async def confirm_reauthentication() -> bool:
+        dialog = QMessageBox(window)
+        dialog.setWindowTitle("确认重新登录")
+        dialog.setText(
+            "将创建一个独立登录会话。当前账号会一直保持可用，"
+            "直到新登录成功并通过确认。是否继续？"
+        )
+        dialog.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+        )
+        dialog.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        loop = asyncio.get_running_loop()
+        finished: asyncio.Future[bool] = loop.create_future()
+
+        def resolve(answer: int) -> None:
+            if not finished.done():
+                finished.set_result(
+                    _standard_button_selected(
+                        answer,
+                        QMessageBox.StandardButton.Yes,
+                    )
+                )
+
+        dialog.finished.connect(resolve)
+        dialog.open()
+        try:
+            return await finished
+        except asyncio.CancelledError:
+            dialog.reject()
+            raise
+        finally:
+            dialog.deleteLater()
+
+    async def confirm_account_switch(old_profile, candidate_profile) -> bool:
+        dialog = QMessageBox(window)
+        dialog.setWindowTitle("确认切换账号")
+        dialog.setText(
+            f"当前账号“{old_profile.display_name}”将切换为"
+            f"“{candidate_profile.display_name}”。是否确认切换？"
+        )
+        dialog.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+        )
+        dialog.setDefaultButton(QMessageBox.StandardButton.Cancel)
         loop = asyncio.get_running_loop()
         finished: asyncio.Future[bool] = loop.create_future()
 
@@ -747,6 +815,7 @@ def create_application(
         vault=vault,
         window=window,
         login_dialog=login_dialog,
+        account_status_dialog=account_status_dialog,
         content_browser=content_browser,
         subscriptions=subscriptions,
         subscription_scheduler=subscription_scheduler,
@@ -760,6 +829,8 @@ def create_application(
         bind_online_services=bind_online_services,
         unbind_online_services=unbind_online_services,
         confirm_preview=confirm_preview,
+        confirm_reauthentication=confirm_reauthentication,
+        confirm_account_switch=confirm_account_switch,
         update_coordinator=update_coordinator,
         update_prompt=update_prompt,
         update_shutdown=application.quit,
@@ -1114,7 +1185,21 @@ def create_application(
     window.open_media_requested.connect(open_media_requested)
     window.integrity_cancel_requested.connect(integrity_cancel_requested)
     window.open_directory_requested.connect(controller.open_task_directory)
-    window.login_requested.connect(controller.show_login)
+    async_actions.connect(
+        window.login_requested,
+        "account.access.open",
+        controller.show_account_access,
+    )
+    async_actions.connect(
+        account_status_dialog.reauthenticate_requested,
+        "account.reauthenticate",
+        controller.start_candidate_login,
+    )
+    async_actions.connect(
+        account_status_dialog.reconnect_requested,
+        "account.reconnect",
+        controller.retry_telegram_connection,
+    )
     window.content_page.dialog_selected.connect(content_dialog_selected)
     window.content_page.link_requested.connect(controller.route_content_link)
     window.content_page.cancel_search_requested.connect(controller.cancel_content_search)
@@ -1532,7 +1617,7 @@ def run(
                 NotificationRoute.SUBSCRIPTIONS: lambda: controller.window.show_page(
                     "subscriptions"
                 ),
-                NotificationRoute.LOGIN: controller.show_login,
+                NotificationRoute.LOGIN: controller.window.login_requested.emit,
                 NotificationRoute.UPDATE: controller.window.settings_requested.emit,
                 NotificationRoute.MAINTENANCE: lambda: controller.window.show_page(
                     "maintenance"
