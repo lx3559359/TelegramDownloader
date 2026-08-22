@@ -53,6 +53,7 @@ def test_manual_update_button_emits_and_reports_result(qtbot) -> None:
     ]
     assert labels == ["常规", "下载路径", "后台与通知", "关于与更新"]
     assert dialog.tabs.indexOf(dialog.about_update_tab) == 3
+    assert dialog.minimumWidth() >= 620
     assert dialog.product_name_label.text() == APP_NAME
     assert dialog.product_subtitle_label.text() == APP_SUBTITLE
     assert dialog.update_check_button.isVisibleTo(dialog.about_update_tab)

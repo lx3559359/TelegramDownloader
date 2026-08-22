@@ -63,7 +63,7 @@ class SettingsDialog(QDialog):
         self.setStyleSheet(APP_STYLESHEET)
         self.setWindowTitle("设置")
         self.setModal(True)
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(620)
         self._settings = settings
         self.default_download_root = (
             default_download_root or Path("downloads")
