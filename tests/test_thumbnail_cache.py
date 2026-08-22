@@ -47,6 +47,32 @@ def test_total_limit_evicts_least_recently_used_file(tmp_path: Path) -> None:
     assert cache.total_bytes() == 6
 
 
+def test_cache_uses_high_and_low_watermarks(tmp_path: Path) -> None:
+    cache = ThumbnailCache(
+        tmp_path / "thumbnails",
+        max_total_bytes=100,
+        target_total_bytes=90,
+    )
+    old = cache.put("old", b"1" * 40)
+    recent = cache.put("recent", b"2" * 40)
+    assert old is not None and recent is not None
+    os.utime(old, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(recent, ns=(2_000_000_000, 2_000_000_000))
+
+    newest = cache.put("newest", b"3" * 30)
+
+    assert newest is not None
+    assert old.exists() is False
+    assert cache.total_bytes() == 70
+
+
+def test_default_cache_watermarks_match_storage_policy(tmp_path: Path) -> None:
+    cache = ThumbnailCache(tmp_path / "thumbnails")
+
+    assert cache.max_total_bytes == 1024**3
+    assert cache.target_total_bytes == 900 * 1024**2
+
+
 def test_clear_returns_removed_count_and_bytes(tmp_path: Path) -> None:
     cache = ThumbnailCache(tmp_path / "thumbnails", max_total_bytes=1024)
     cache.put("a", b"12")
@@ -74,3 +100,9 @@ def test_cache_limits_must_be_positive(tmp_path: Path) -> None:
         ThumbnailCache(tmp_path / "thumbnails", max_item_bytes=0)
     with pytest.raises(ValueError, match="缩略图缓存上限必须大于零"):
         ThumbnailCache(tmp_path / "thumbnails", max_total_bytes=0)
+    with pytest.raises(ValueError, match="缩略图缓存目标"):
+        ThumbnailCache(
+            tmp_path / "thumbnails",
+            max_total_bytes=10,
+            target_total_bytes=11,
+        )

@@ -12,13 +12,19 @@ class ThumbnailCache:
         root: Path,
         *,
         max_item_bytes: int = 256 * 1024,
-        max_total_bytes: int = 512 * 1024 * 1024,
+        max_total_bytes: int = 1024**3,
+        target_total_bytes: int | None = None,
     ) -> None:
         if max_item_bytes < 1 or max_total_bytes < 1:
             raise ValueError("缩略图缓存上限必须大于零")
+        if target_total_bytes is None:
+            target_total_bytes = min(max_total_bytes, 900 * 1024**2)
+        if target_total_bytes < 1 or target_total_bytes > max_total_bytes:
+            raise ValueError("缩略图缓存目标必须在上限以内")
         self.root = root.resolve()
         self.max_item_bytes = max_item_bytes
         self.max_total_bytes = max_total_bytes
+        self.target_total_bytes = target_total_bytes
         self.root.mkdir(parents=True, exist_ok=True)
 
     def path_for(self, key: str) -> Path:
@@ -104,5 +110,5 @@ class ThumbnailCache:
             except FileNotFoundError:
                 continue
             total -= size
-            if total <= self.max_total_bytes:
+            if total <= self.target_total_bytes:
                 return
