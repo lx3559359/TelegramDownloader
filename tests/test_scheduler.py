@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from telegram_downloader.domain import ItemStatus, TaskStatus
+from telegram_downloader.domain import ItemStatus, PauseReason, TaskStatus
 from telegram_downloader.downloader import DownloadPaused, InsufficientSpaceError
 from telegram_downloader.gateway import FloodWaitError, TransientNetworkError
 from telegram_downloader.resource_control import AsyncBandwidthLimiter
@@ -31,6 +31,7 @@ class Repo:
         self.task_updates = []
         self.bulk_task_updates = []
         self.task_errors = []
+        self.task_pause_reasons = {}
         self.recovered = False
         self.list_item_calls = 0
         self.get_item_calls = []
@@ -62,13 +63,28 @@ class Repo:
         if retry_count is not None:
             selected.retry_count = retry_count
 
-    def update_task_status(self, task_id, status, error=None):
+    def update_task_status(self, task_id, status, error=None, *, pause_reason=None):
         self.task_updates.append(status)
         self.task_errors.append(error)
+        self.task_pause_reasons[task_id] = (
+            pause_reason or PauseReason.USER if status is TaskStatus.PAUSED else None
+        )
 
-    def update_task_statuses(self, task_ids, status, *, allowed, error=None):
+    def update_task_statuses(
+        self,
+        task_ids,
+        status,
+        *,
+        allowed,
+        error=None,
+        pause_reason=None,
+    ):
         ordered = tuple(dict.fromkeys(task_ids))
         self.bulk_task_updates.append((ordered, status, allowed, error))
+        for task_id in ordered:
+            self.task_pause_reasons[task_id] = (
+                pause_reason or PauseReason.USER if status is TaskStatus.PAUSED else None
+            )
         return set(ordered)
 
     def recover_interrupted(self):
@@ -102,6 +118,7 @@ class QueueRepo:
         self.order = {task_id: index for index, task_id in enumerate(task_ids)}
         self.priorities = dict.fromkeys(task_ids, 0)
         self.task_statuses = dict.fromkeys(task_ids, TaskStatus.QUEUED)
+        self.pause_reasons = dict.fromkeys(task_ids)
         self.task_updates: list[tuple[str, TaskStatus]] = []
         self.bulk_task_updates = []
         self.cleared: list[str] = []
@@ -130,11 +147,22 @@ class QueueRepo:
         if retry_count is not None:
             item.retry_count = retry_count
 
-    def update_task_status(self, task_id, status, error=None):
+    def update_task_status(self, task_id, status, error=None, *, pause_reason=None):
         self.task_statuses[task_id] = status
+        self.pause_reasons[task_id] = (
+            pause_reason or PauseReason.USER if status is TaskStatus.PAUSED else None
+        )
         self.task_updates.append((task_id, status))
 
-    def update_task_statuses(self, task_ids, status, *, allowed, error=None):
+    def update_task_statuses(
+        self,
+        task_ids,
+        status,
+        *,
+        allowed,
+        error=None,
+        pause_reason=None,
+    ):
         ordered = tuple(dict.fromkeys(task_ids))
         accepted = {
             task_id
@@ -143,8 +171,18 @@ class QueueRepo:
         }
         for task_id in accepted:
             self.task_statuses[task_id] = status
+            self.pause_reasons[task_id] = (
+                pause_reason or PauseReason.USER if status is TaskStatus.PAUSED else None
+            )
         self.bulk_task_updates.append((ordered, status, allowed, error))
         return accepted
+
+    def list_paused_by_reason(self, reason):
+        return [
+            SimpleNamespace(id=task_id)
+            for task_id, status in self.task_statuses.items()
+            if status is TaskStatus.PAUSED and self.pause_reasons[task_id] is reason
+        ]
 
     def recover_interrupted(self):
         return None
@@ -177,6 +215,101 @@ async def wait_until(predicate, attempts: int = 100) -> None:
             return
         await asyncio.sleep(0)
     raise AssertionError("condition was not reached")
+
+
+@pytest.mark.asyncio
+async def test_closed_admission_keeps_task_queued_until_opened() -> None:
+    repo = QueueRepo(("a",))
+    entered: list[str] = []
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            entered.append(item.task_id)
+
+    scheduler = DownloadScheduler(repo, Downloader())
+    scheduler.set_admission_open(False)
+    queued = asyncio.create_task(scheduler.run_task("a"))
+    await wait_until(lambda: scheduler.snapshot().queued_task_ids == ("a",))
+
+    assert scheduler.active_task_id is None
+    assert entered == []
+
+    scheduler.set_admission_open(True)
+    await queued
+
+    assert entered == ["a"]
+    assert repo.task_statuses["a"] is TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_schedule_open_resumes_only_schedule_paused_tasks() -> None:
+    repo = QueueRepo(("user", "clock"))
+    repo.task_statuses.update(
+        {"user": TaskStatus.PAUSED, "clock": TaskStatus.PAUSED}
+    )
+    repo.pause_reasons.update(
+        {"user": PauseReason.USER, "clock": PauseReason.SCHEDULE}
+    )
+    entered: list[str] = []
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            entered.append(item.task_id)
+
+    scheduler = DownloadScheduler(repo, Downloader())
+
+    resumed = await scheduler.set_schedule_open(True)
+
+    assert resumed == {"clock"}
+    assert entered == ["clock"]
+    assert repo.task_statuses["user"] is TaskStatus.PAUSED
+    assert repo.pause_reasons["user"] is PauseReason.USER
+
+
+@pytest.mark.asyncio
+async def test_schedule_close_pauses_active_task_with_schedule_reason() -> None:
+    repo = QueueRepo(("active",))
+    entered = asyncio.Event()
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            entered.set()
+            while not should_pause():
+                await asyncio.sleep(0)
+            raise DownloadPaused("paused")
+
+    scheduler = DownloadScheduler(repo, Downloader())
+    active = asyncio.create_task(scheduler.run_task("active"))
+    await entered.wait()
+
+    await scheduler.set_schedule_open(False)
+    await active
+
+    assert repo.task_statuses["active"] is TaskStatus.PAUSED
+    assert repo.pause_reasons["active"] is PauseReason.SCHEDULE
+
+
+@pytest.mark.asyncio
+async def test_schedule_reason_is_cleared_when_active_task_finishes_at_boundary() -> None:
+    repo = QueueRepo(("active",))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            entered.set()
+            await release.wait()
+
+    scheduler = DownloadScheduler(repo, Downloader())
+    active = asyncio.create_task(scheduler.run_task("active"))
+    await entered.wait()
+
+    await scheduler.set_schedule_open(False)
+    release.set()
+    await active
+
+    assert repo.task_statuses["active"] is TaskStatus.COMPLETED
+    assert "active" not in scheduler._pause_reasons
 
 
 @pytest.mark.asyncio
