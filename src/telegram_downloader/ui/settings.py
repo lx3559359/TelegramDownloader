@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from telegram_downloader import __version__
 from telegram_downloader.domain import MediaKind
 from telegram_downloader.files import DownloadNamingSettings, render_download_target
 from telegram_downloader.settings import (
@@ -41,6 +42,7 @@ class SettingsDialog(QDialog):
     # Deprecated for one release; listeners must not delete cache directly.
     thumbnail_cache_clear_requested = Signal()
     save_requested = Signal()
+    update_check_requested = Signal()
 
     def __init__(
         self,
@@ -52,6 +54,7 @@ class SettingsDialog(QDialog):
         autostart_available: bool = True,
         tray_available: bool = True,
         default_download_root: Path | None = None,
+        application_version: str = __version__,
     ) -> None:
         super().__init__(parent)
         ensure_cjk_font()
@@ -125,8 +128,18 @@ class SettingsDialog(QDialog):
             )
             selected_speed = self.speed_limit.count() - 1
         self.speed_limit.setCurrentIndex(selected_speed)
-        self.check_updates = QCheckBox("启动后自动检查正式版更新")
-        self.check_updates.setChecked(settings.check_updates_on_startup)
+        update_panel = QWidget()
+        update_layout = QVBoxLayout(update_panel)
+        update_layout.setContentsMargins(0, 0, 0, 0)
+        update_layout.setSpacing(6)
+        self.update_version_label = QLabel(f"当前版本：{application_version}")
+        self.update_status_label = QLabel("仅在点击后检查正式版更新")
+        self.update_status_label.setObjectName("muted")
+        self.update_status_label.setWordWrap(True)
+        self.update_check_button = QPushButton("检查更新")
+        update_layout.addWidget(self.update_version_label)
+        update_layout.addWidget(self.update_status_label)
+        update_layout.addWidget(self.update_check_button, 0)
         self.proxy_kind = QComboBox()
         self.proxy_kind.addItem("不使用代理", "none")
         self.proxy_kind.addItem("SOCKS5", "socks5")
@@ -143,7 +156,7 @@ class SettingsDialog(QDialog):
         self.concurrency_label = QLabel("全局媒体槽")
         form.addRow(self.concurrency_label, self.concurrency)
         form.addRow("总下载限速", self.speed_limit)
-        form.addRow("在线更新", self.check_updates)
+        form.addRow("在线更新", update_panel)
         form.addRow("代理类型", self.proxy_kind)
         form.addRow("代理地址", self.proxy_host)
         form.addRow("代理端口", self.proxy_port)
@@ -315,6 +328,7 @@ class SettingsDialog(QDialog):
         self.browse_download_root_button.clicked.connect(self._browse_download_root)
         self.reset_download_root_button.clicked.connect(self._reset_download_root)
         self.test_button.clicked.connect(self._test_proxy)
+        self.update_check_button.clicked.connect(self.update_check_requested.emit)
         self.thumbnail_cache_clear_button.clicked.connect(self._open_storage_maintenance)
         cancel_button.clicked.connect(self.reject)
         self.save_button.clicked.connect(self._save)
@@ -341,7 +355,7 @@ class SettingsDialog(QDialog):
             api_id=self.api_id.value(),
             concurrency=self.concurrency.value(),
             proxy=self.proxy_values(),
-            check_updates_on_startup=self.check_updates.isChecked(),
+            check_updates_on_startup=False,
             speed_limit_kib=int(self.speed_limit.currentData()),
             close_to_tray=self.close_to_tray.isChecked(),
             notifications_enabled=self.notifications.isChecked(),
@@ -463,6 +477,13 @@ class SettingsDialog(QDialog):
     def set_save_busy(self, busy: bool) -> None:
         self.save_button.setEnabled(not busy)
         self.save_button.setText("正在保存…" if busy else "保存")
+
+    def set_update_busy(self, busy: bool) -> None:
+        self.update_check_button.setEnabled(not busy)
+        self.update_check_button.setText("正在检查…" if busy else "检查更新")
+
+    def set_update_result(self, text: str) -> None:
+        self.update_status_label.setText(str(text))
 
     @staticmethod
     def _format_bytes(value: int) -> str:

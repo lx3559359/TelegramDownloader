@@ -299,22 +299,36 @@ async def test_newer_release_requiring_newer_updater_is_blocked(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_controller_starts_update_check_without_blocking_login(tmp_path) -> None:
-    started = asyncio.Event()
-    release = asyncio.Event()
+async def test_controller_start_never_checks_for_updates(tmp_path) -> None:
+    calls = 0
 
     class Coordinator:
-        async def startup(self, prompt, shutdown):
-            started.set()
-            await release.wait()
+        async def startup(self, _prompt, _shutdown):
+            nonlocal calls
+            calls += 1
 
     controller = AppController.for_test(update_coordinator=Coordinator())
 
-    await asyncio.wait_for(controller.start(), timeout=0.2)
-    await asyncio.wait_for(started.wait(), timeout=0.2)
-    assert controller.login_dialog is not None
-    release.set()
+    await controller.start(background=False)
+    await asyncio.sleep(0)
+
+    assert calls == 0
     await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_manual_update_check_returns_result_and_reports_no_update() -> None:
+    class Coordinator:
+        async def startup(self, _prompt, _shutdown):
+            return UpdateStartupResult.NO_UPDATE
+
+    controller = AppController.for_test(update_coordinator=Coordinator())
+
+    task = controller.check_for_updates()
+
+    assert task is not None
+    assert await task is UpdateStartupResult.NO_UPDATE
+    assert "最新正式版" in controller.window.message.last_message
 
 
 @pytest.mark.asyncio

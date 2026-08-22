@@ -51,6 +51,7 @@ ACTION_POLICIES: dict[str, ActionPolicy] = {
     "login.cancel": ActionPolicy.DEDUPLICATE,
     "settings.open": ActionPolicy.DEDUPLICATE,
     "settings.save": ActionPolicy.DEDUPLICATE,
+    "settings.update.check": ActionPolicy.DEDUPLICATE,
     "settings.thumbnail_cache.clear": ActionPolicy.DEDUPLICATE,
     "subscriptions.activate": ActionPolicy.DEDUPLICATE,
     "subscriptions.probe": ActionPolicy.DEDUPLICATE,

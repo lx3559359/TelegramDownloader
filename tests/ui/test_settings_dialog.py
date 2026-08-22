@@ -42,6 +42,27 @@ def test_round_trip_manual_proxy_form(qtbot) -> None:
     assert dialog.proxy_password.text() == "secret"
 
 
+def test_manual_update_button_emits_and_reports_result(qtbot) -> None:
+    dialog = SettingsDialog(AppSettings(), application_version="0.15.0")
+    qtbot.addWidget(dialog)
+
+    assert not hasattr(dialog, "check_updates")
+    assert "0.15.0" in dialog.update_version_label.text()
+    with qtbot.waitSignal(dialog.update_check_requested, timeout=500):
+        qtbot.mouseClick(
+            dialog.update_check_button,
+            Qt.MouseButton.LeftButton,
+        )
+    dialog.set_update_busy(True)
+    assert dialog.update_check_button.isEnabled() is False
+    assert "正在检查" in dialog.update_check_button.text()
+    dialog.set_update_result("当前已是最新正式版")
+    assert dialog.update_status_label.text() == "当前已是最新正式版"
+    dialog.set_update_busy(False)
+    assert dialog.update_check_button.isEnabled() is True
+    assert dialog.values().check_updates_on_startup is False
+
+
 def test_proxy_test_emits_without_accepting_dialog(qtbot) -> None:
     dialog = SettingsDialog(AppSettings())
     qtbot.addWidget(dialog)

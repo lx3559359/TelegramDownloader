@@ -56,6 +56,7 @@ from telegram_downloader.settings import AppSettings, ProxySettings
 from telegram_downloader.storage_maintenance import StorageMaintenanceError
 from telegram_downloader.subscriptions import SubscriptionDraft
 from telegram_downloader.ui.models import TaskItemSummary, TaskSummary
+from telegram_downloader.update import UpdateStartupResult
 
 _LOGGER = logging.getLogger("telegram_downloader.controller")
 
@@ -696,8 +697,6 @@ class AppController:
         self._background_launch = bool(background)
         self.refresh_tasks()
         await self.activate_cached_content_account()
-        if self.update_coordinator is not None and self.settings.check_updates_on_startup:
-            self.check_for_updates()
         if self.gateway is None:
             if background:
                 self._publish_event(auth_required_event())
@@ -2604,18 +2603,23 @@ class AppController:
         _LOGGER.error("background task failed (%s)", type(error).__name__)
         self._show_error(self._safe_error(error))
 
-    async def _run_update_check(self) -> None:
+    async def _run_update_check(self) -> UpdateStartupResult:
         try:
             result = await self.update_coordinator.startup(
                 self.update_prompt,
                 self.update_shutdown,
             )
-            if str(result) == "blocked":
+            if result is UpdateStartupResult.NO_UPDATE:
+                self._show_status("当前已是最新正式版")
+            elif result is UpdateStartupResult.BLOCKED:
                 self._show_status("更新检查暂不可用，已继续使用当前版本")
+            return result
         except MaintenanceBusyError as error:
             self._show_status(str(error))
+            return UpdateStartupResult.BLOCKED
         except Exception as error:
             self._show_status(f"更新检查失败（{type(error).__name__}）")
+            raise
 
     def check_for_updates(self) -> asyncio.Task[Any] | None:
         if self.update_coordinator is None or self._shutting_down:

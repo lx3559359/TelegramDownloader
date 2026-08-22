@@ -38,6 +38,7 @@ from telegram_downloader.subscription_scheduler import SubscriptionScheduler
 from telegram_downloader.subscription_service import SubscriptionService
 from telegram_downloader.subscriptions import SubscriptionRule, SubscriptionState
 from telegram_downloader.ui.async_actions import ActionPolicy
+from telegram_downloader.update import UpdateStartupResult
 
 EXPECTED_POLICIES = {
     "content.activate": ActionPolicy.REPLACE_LATEST,
@@ -50,6 +51,7 @@ EXPECTED_POLICIES = {
     "login.qr.refresh": ActionPolicy.DEDUPLICATE,
     "login.phone": ActionPolicy.DEDUPLICATE,
     "settings.save": ActionPolicy.DEDUPLICATE,
+    "settings.update.check": ActionPolicy.DEDUPLICATE,
     "settings.thumbnail_cache.clear": ActionPolicy.DEDUPLICATE,
     "maintenance.storage.activate": ActionPolicy.DEDUPLICATE,
     "maintenance.storage.scan": ActionPolicy.DEDUPLICATE,
@@ -329,6 +331,16 @@ def test_run_keeps_startup_inside_the_continuous_event_loop() -> None:
     assert source.index("await download_schedule.start()") < source.index("await controller.start(")
 
 
+def test_update_notification_opens_settings_without_starting_check() -> None:
+    source = getsource(app.run)
+
+    assert (
+        "NotificationRoute.UPDATE: controller.window.settings_requested.emit"
+        in source
+    )
+    assert "NotificationRoute.UPDATE: controller.check_for_updates" not in source
+
+
 @pytest.mark.asyncio
 async def test_download_schedule_starts_without_configured_telegram_gateway() -> None:
     controller = app.AppController.for_test(gateway=None)
@@ -520,6 +532,41 @@ def test_settings_storage_shortcut_navigates_without_direct_cache_delete(
         assert navigation == ["maintenance"]
         assert storage_tabs == [True]
         assert delete_calls == []
+    finally:
+        loop.run_until_complete(controller._async_actions.shutdown())
+        controller.window.close()
+        loop.close()
+        application.processEvents()
+
+
+def test_settings_manual_update_button_awaits_controller_result(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    application, loop, controller = app.create_application(tmp_path)
+
+    async def result() -> UpdateStartupResult:
+        await asyncio.sleep(0)
+        return UpdateStartupResult.NO_UPDATE
+
+    monkeypatch.setattr(
+        controller,
+        "check_for_updates",
+        lambda: asyncio.create_task(result()),
+    )
+
+    async def exercise() -> None:
+        controller.window.settings_requested.emit()
+        await controller._async_actions.wait_idle()
+        dialog = controller._settings_dialog
+        assert dialog is not None
+        dialog.update_check_button.click()
+        await controller._async_actions.wait_idle()
+        assert dialog.update_status_label.text() == "当前已是最新正式版"
+        assert dialog.update_check_button.isEnabled() is True
+
+    try:
+        loop.run_until_complete(exercise())
     finally:
         loop.run_until_complete(controller._async_actions.shutdown())
         controller.window.close()

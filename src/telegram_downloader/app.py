@@ -90,7 +90,11 @@ from telegram_downloader.storage_state import StorageStateStore
 from telegram_downloader.subscription_scheduler import SubscriptionScheduler
 from telegram_downloader.subscription_service import SubscriptionService
 from telegram_downloader.thumbnail_cache import ThumbnailCache
-from telegram_downloader.update import HttpBytesClient, UpdateCoordinator
+from telegram_downloader.update import (
+    HttpBytesClient,
+    UpdateCoordinator,
+    UpdateStartupResult,
+)
 from telegram_downloader.update_contract import load_trusted_keys
 from telegram_downloader.update_download import ResumableUpdateDownloader
 from telegram_downloader.update_protection import UpdateProtectionProvider
@@ -572,7 +576,10 @@ def create_application(
     diagnostic_store = DiagnosticReportStore(paths, secrets=set(secrets.values()))
 
     async def confirm_update(manifest) -> bool:
-        dialog = UpdateDialog(manifest, window)
+        dialog = UpdateDialog(
+            manifest,
+            QApplication.activeModalWidget() or window,
+        )
         loop = asyncio.get_running_loop()
         finished: asyncio.Future[bool] = loop.create_future()
 
@@ -998,6 +1005,7 @@ def create_application(
             ),
             tray_available=bool(getattr(controller, "tray_available", False)),
             default_download_root=paths.downloads,
+            application_version=__version__,
         )
         controller._settings_dialog = dialog
 
@@ -1016,8 +1024,34 @@ def create_application(
                 dialog.proxy_password.text(),
             )
 
+        async def check_updates() -> None:
+            task = controller.check_for_updates()
+            if task is None:
+                dialog.set_update_result("更新检查当前不可用")
+                return
+            result = await task
+            messages = {
+                UpdateStartupResult.NO_UPDATE: "当前已是最新正式版",
+                UpdateStartupResult.BLOCKED: "更新检查暂不可用，请稍后重试",
+                UpdateStartupResult.DECLINED: "已取消本次更新",
+                UpdateStartupResult.LAUNCHED: "正在安装更新并重新启动",
+            }
+            dialog.set_update_result(messages[result])
+
         dialog.test_proxy_requested.connect(proxy_test_requested)
         dialog.storage_maintenance_requested.connect(open_storage_maintenance)
+        async_actions.connect(
+            dialog.update_check_requested,
+            "settings.update.check",
+            check_updates,
+            hooks=ActionHooks(
+                started=lambda: dialog.set_update_busy(True),
+                failed=lambda error: dialog.set_update_result(
+                    f"更新检查失败：{controller._safe_error(error)}"
+                ),
+                finished=lambda: dialog.set_update_busy(False),
+            ),
+        )
         async_actions.connect(
             dialog.save_requested,
             "settings.save",
@@ -1030,7 +1064,12 @@ def create_application(
             ),
         )
         controller._ui_slots.extend(
-            (proxy_test_requested, open_storage_maintenance, save_settings)
+            (
+                proxy_test_requested,
+                open_storage_maintenance,
+                save_settings,
+                check_updates,
+            )
         )
         dialog.open()
 
@@ -1459,7 +1498,7 @@ def run(
                     "subscriptions"
                 ),
                 NotificationRoute.LOGIN: controller.show_login,
-                NotificationRoute.UPDATE: controller.check_for_updates,
+                NotificationRoute.UPDATE: controller.window.settings_requested.emit,
                 NotificationRoute.MAINTENANCE: lambda: controller.window.show_page(
                     "maintenance"
                 ),
