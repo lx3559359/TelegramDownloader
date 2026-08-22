@@ -55,9 +55,10 @@ def test_managed_writable_paths_are_guarded_and_include_diagnostics(tmp_path: Pa
     paths = PortablePaths(tmp_path)
     values = managed_writable_paths(paths)
 
-    assert len(values) == 15
+    assert len(values) == 16
     assert values["diagnostics"] == paths.diagnostics
     assert values["diagnosticTemp"] == paths.diagnostic_temp
+    assert values["maintenanceState"] == paths.storage_maintenance_state
     assert all(paths.guard(path) == path.resolve() for path in values.values())
 
 
@@ -95,7 +96,7 @@ def test_environment_probe_requires_non_system_volume_for_frozen_runtime(
         "frozen": True,
         "windowsX64": True,
         "nonSystemVolume": True,
-        "guardedPathCount": 15,
+        "guardedPathCount": 16,
     }
 
 

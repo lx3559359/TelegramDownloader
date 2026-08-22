@@ -13,6 +13,8 @@ class EventKind(StrEnum):
     SCHEDULE_OPENED = "schedule-opened"
     SCHEDULE_CLOSED = "schedule-closed"
     UPDATE_AVAILABLE = "update-available"
+    STORAGE_CLEANED = "storage-cleaned"
+    STORAGE_CLEANUP_FAILED = "storage-cleanup-failed"
 
 
 class NotificationRoute(StrEnum):
@@ -20,6 +22,7 @@ class NotificationRoute(StrEnum):
     SUBSCRIPTIONS = "subscriptions"
     LOGIN = "login"
     UPDATE = "update"
+    MAINTENANCE = "maintenance"
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,12 +32,19 @@ class ApplicationEvent:
     count: int
     route: NotificationRoute
     private_context: str = ""
+    byte_count: int = 0
 
     def __post_init__(self) -> None:
         if not self.identity:
             raise ValueError("通知事件标识不能为空")
         if not isinstance(self.count, int) or isinstance(self.count, bool) or self.count < 1:
             raise ValueError("通知事件数量必须是正整数")
+        if (
+            not isinstance(self.byte_count, int)
+            or isinstance(self.byte_count, bool)
+            or self.byte_count < 0
+        ):
+            raise ValueError("通知事件字节数必须是非负整数")
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +57,7 @@ class NotificationPayload:
 @dataclass(slots=True)
 class _PendingBatch:
     count: int
+    byte_count: int
     deadline: float
     sequence: int
 
@@ -60,6 +71,14 @@ _TEXT: dict[EventKind, tuple[str, str]] = {
     EventKind.SCHEDULE_OPENED: ("下载时段已开始", "时段暂停的任务正在恢复"),
     EventKind.SCHEDULE_CLOSED: ("下载时段已结束", "活动下载正在安全暂停"),
     EventKind.UPDATE_AVAILABLE: ("发现正式版更新", "打开应用可查看并确认更新"),
+    EventKind.STORAGE_CLEANED: (
+        "已释放存储空间",
+        "后台安全清理已删除 {count} 项，释放 {size}",
+    ),
+    EventKind.STORAGE_CLEANUP_FAILED: (
+        "自动清理需要处理",
+        "自动清理有 {count} 项未处理，请打开维护中心查看",
+    ),
 }
 
 _TASK_TERMINALS = frozenset(
@@ -93,11 +112,13 @@ class NotificationBatcher:
             self._sequence += 1
             self._pending[key] = _PendingBatch(
                 event.count,
+                event.byte_count,
                 float(now) + self.window_seconds,
                 self._sequence,
             )
         else:
             batch.count += event.count
+            batch.byte_count += event.byte_count
         return True
 
     def flush_due(self, *, now: float) -> list[NotificationPayload]:
@@ -116,7 +137,10 @@ class NotificationBatcher:
             payloads.append(
                 NotificationPayload(
                     title,
-                    body.format(count=batch.count),
+                    body.format(
+                        count=batch.count,
+                        size=format_size(batch.byte_count),
+                    ),
                     route,
                 )
             )
@@ -168,3 +192,42 @@ def update_available_event(version: str) -> ApplicationEvent:
         count=1,
         route=NotificationRoute.UPDATE,
     )
+
+
+def storage_cleaned_event(
+    cleanup_id: str,
+    deleted_count: int,
+    released_bytes: int,
+) -> ApplicationEvent:
+    return ApplicationEvent(
+        EventKind.STORAGE_CLEANED,
+        identity=f"storage:{cleanup_id}",
+        count=deleted_count,
+        route=NotificationRoute.MAINTENANCE,
+        byte_count=released_bytes,
+    )
+
+
+def storage_cleanup_failed_event(
+    cleanup_id: str,
+    failed_count: int,
+) -> ApplicationEvent:
+    return ApplicationEvent(
+        EventKind.STORAGE_CLEANUP_FAILED,
+        identity=f"storage:{cleanup_id}",
+        count=failed_count,
+        route=NotificationRoute.MAINTENANCE,
+    )
+
+
+def format_size(value: int) -> str:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError("字节数必须是非负整数")
+    if value < 1024:
+        return f"{value} B"
+    amount = float(value)
+    for unit in ("KiB", "MiB", "GiB"):
+        amount /= 1024
+        if amount < 1024 or unit == "GiB":
+            return f"{amount:.1f} {unit}"
+    return f"{value} B"

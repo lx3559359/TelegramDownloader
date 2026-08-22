@@ -434,6 +434,47 @@ def test_create_application_initializes_project_local_content_services(
         application.processEvents()
 
 
+def test_settings_storage_shortcut_navigates_without_direct_cache_delete(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    application, loop, controller = app.create_application(tmp_path)
+    navigation: list[str] = []
+    storage_tabs: list[bool] = []
+    delete_calls: list[bool] = []
+
+    async def forbidden_delete() -> None:
+        delete_calls.append(True)
+
+    monkeypatch.setattr(controller, "clear_thumbnail_cache", forbidden_delete)
+    monkeypatch.setattr(controller.window, "show_page", navigation.append)
+    monkeypatch.setattr(
+        controller.window.maintenance_page,
+        "show_storage",
+        lambda: storage_tabs.append(True),
+    )
+
+    async def exercise() -> None:
+        controller.window.settings_requested.emit()
+        await controller._async_actions.wait_idle()
+        dialog = controller._settings_dialog
+        assert dialog is not None
+        dialog.thumbnail_cache_clear_button.click()
+        await asyncio.sleep(0)
+        assert dialog.isVisible() is False
+
+    try:
+        loop.run_until_complete(exercise())
+        assert navigation == ["maintenance"]
+        assert storage_tabs == [True]
+        assert delete_calls == []
+    finally:
+        loop.run_until_complete(controller._async_actions.shutdown())
+        controller.window.close()
+        loop.close()
+        application.processEvents()
+
+
 def test_account_search_signal_reaches_controller_with_typed_scope(tmp_path) -> None:
     application, loop, controller = app.create_application(tmp_path)
     calls = []

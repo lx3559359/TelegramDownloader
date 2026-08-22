@@ -77,7 +77,7 @@ def test_valid_save_emits_without_closing_until_runtime_apply_succeeds(qtbot) ->
     assert dialog.result() == 0
 
 
-def test_thumbnail_cache_clear_emits_without_closing_dialog(qtbot) -> None:
+def test_thumbnail_cache_shortcut_emits_new_and_deprecated_signals(qtbot) -> None:
     dialog = SettingsDialog(
         AppSettings(),
         thumbnail_cache_bytes=3 * 1024 * 1024,
@@ -85,15 +85,20 @@ def test_thumbnail_cache_clear_emits_without_closing_dialog(qtbot) -> None:
     qtbot.addWidget(dialog)
 
     assert dialog.thumbnail_cache_size.text() == "3.0 MB"
-    with qtbot.waitSignal(
-        dialog.thumbnail_cache_clear_requested,
-        timeout=500,
-    ):
-        qtbot.mouseClick(
-            dialog.thumbnail_cache_clear_button,
-            Qt.MouseButton.LeftButton,
-        )
+    storage_requests = []
+    deprecated_requests = []
+    dialog.storage_maintenance_requested.connect(lambda: storage_requests.append(True))
+    dialog.thumbnail_cache_clear_requested.connect(
+        lambda: deprecated_requests.append(True)
+    )
+    qtbot.mouseClick(
+        dialog.thumbnail_cache_clear_button,
+        Qt.MouseButton.LeftButton,
+    )
 
+    assert dialog.thumbnail_cache_clear_button.text() == "前往存储空间"
+    assert storage_requests == [True]
+    assert deprecated_requests == [True]
     assert dialog.result() == 0
     dialog.set_thumbnail_cache_bytes(0)
     assert dialog.thumbnail_cache_size.text() == "0 B"
@@ -107,7 +112,7 @@ def test_cache_and_save_busy_states_are_immediate(qtbot) -> None:
     dialog.set_save_busy(True)
 
     assert dialog.thumbnail_cache_clear_button.isEnabled() is False
-    assert "清理" in dialog.thumbnail_cache_clear_button.text()
+    assert "打开" in dialog.thumbnail_cache_clear_button.text()
     assert dialog.save_button.isEnabled() is False
     assert "保存" in dialog.save_button.text()
 

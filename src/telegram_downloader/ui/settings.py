@@ -35,6 +35,8 @@ from telegram_downloader.ui.theme import APP_STYLESHEET, ensure_cjk_font
 
 class SettingsDialog(QDialog):
     test_proxy_requested = Signal(object, str)
+    storage_maintenance_requested = Signal()
+    # Deprecated for one release; listeners must not delete cache directly.
     thumbnail_cache_clear_requested = Signal()
     save_requested = Signal()
 
@@ -139,7 +141,7 @@ class SettingsDialog(QDialog):
             self._format_bytes(thumbnail_cache_bytes)
         )
         self.thumbnail_cache_size.setObjectName("muted")
-        self.thumbnail_cache_clear_button = QPushButton("清理缩略图缓存")
+        self.thumbnail_cache_clear_button = QPushButton("前往存储空间")
         cache_row.addWidget(self.thumbnail_cache_size)
         cache_row.addStretch()
         cache_row.addWidget(self.thumbnail_cache_clear_button)
@@ -287,9 +289,7 @@ class SettingsDialog(QDialog):
         self.directory_template.editTextChanged.connect(self._update_naming_preview)
         self.filename_template.editTextChanged.connect(self._update_naming_preview)
         self.test_button.clicked.connect(self._test_proxy)
-        self.thumbnail_cache_clear_button.clicked.connect(
-            self.thumbnail_cache_clear_requested.emit
-        )
+        self.thumbnail_cache_clear_button.clicked.connect(self._open_storage_maintenance)
         cancel_button.clicked.connect(self.reject)
         self.save_button.clicked.connect(self._save)
         self._update_proxy_fields()
@@ -402,8 +402,12 @@ class SettingsDialog(QDialog):
     def set_thumbnail_cache_busy(self, busy: bool) -> None:
         self.thumbnail_cache_clear_button.setEnabled(not busy)
         self.thumbnail_cache_clear_button.setText(
-            "正在清理…" if busy else "清理缩略图缓存"
+            "正在打开…" if busy else "前往存储空间"
         )
+
+    def _open_storage_maintenance(self) -> None:
+        self.storage_maintenance_requested.emit()
+        self.thumbnail_cache_clear_requested.emit()
 
     def set_save_busy(self, busy: bool) -> None:
         self.save_button.setEnabled(not busy)

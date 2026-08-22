@@ -24,11 +24,20 @@ def test_self_test_includes_update_storage_and_database(tmp_path: Path) -> None:
     assert "update_staging" in report["writable_paths"]
     assert "catalog_database" in report["writable_paths"]
     assert "thumbnail_cache" in report["writable_paths"]
+    assert report["writable_paths"]["maintenance_state"] == str(
+        (tmp_path / "data" / "maintenance" / "storage-state.json").resolve()
+    )
     assert (tmp_path / "data" / "database" / "tasks.sqlite3").is_file()
     assert (tmp_path / "data" / "database" / "catalog.sqlite3").is_file()
 
 
 def test_self_test_verifies_frozen_runtime_components_without_secrets(tmp_path: Path) -> None:
+    state_path = tmp_path / "data" / "maintenance" / "storage-state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        '{"privateMarker":"never-export-this-maintenance-content"}',
+        encoding="utf-8",
+    )
     report = run_self_test(tmp_path)
 
     assert report["components"] == {
@@ -46,6 +55,7 @@ def test_self_test_verifies_frozen_runtime_components_without_secrets(tmp_path: 
     assert "account_id" not in serialized
     assert "keyword" not in serialized
     assert "message_text" not in serialized
+    assert "never-export-this-maintenance-content" not in serialized
 
 
 def test_self_test_reuses_diagnostic_component_and_path_helpers(
@@ -70,4 +80,4 @@ def test_self_test_reuses_diagnostic_component_and_path_helpers(
     report = run_self_test(tmp_path)
 
     assert calls == ["paths", "components"]
-    assert len(report["writable_paths"]) == 13
+    assert len(report["writable_paths"]) == 14

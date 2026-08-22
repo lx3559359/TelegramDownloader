@@ -85,3 +85,69 @@ def test_subscription_counts_are_summed_in_their_own_route() -> None:
 
     assert payload.body == "已加入 5 个媒体到下载队列"
     assert payload.route is NotificationRoute.SUBSCRIPTIONS
+
+
+def test_storage_cleanup_events_sum_bytes_without_private_context() -> None:
+    batcher = NotificationBatcher(window_seconds=5.0)
+    private = "secret task-name D:\\private\\storage-state.json"
+    for identity, count, byte_count in (
+        ("cleanup-1", 2, 100 * 1024**2),
+        ("cleanup-2", 3, 50 * 1024**2),
+    ):
+        batcher.record(
+            ApplicationEvent(
+                EventKind.STORAGE_CLEANED,
+                identity=identity,
+                count=count,
+                route=NotificationRoute.MAINTENANCE,
+                private_context=private,
+                byte_count=byte_count,
+            ),
+            now=1.0,
+        )
+
+    payload = batcher.flush_due(now=6.0)[0]
+    serialized = f"{payload.title} {payload.body}"
+
+    assert payload.title == "已释放存储空间"
+    assert payload.body == "后台安全清理已删除 5 项，释放 150.0 MiB"
+    assert payload.route is NotificationRoute.MAINTENANCE
+    assert "secret" not in serialized
+    assert "task-name" not in serialized
+    assert "private" not in serialized
+
+
+def test_storage_cleanup_failure_uses_fixed_safe_text() -> None:
+    batcher = NotificationBatcher(window_seconds=5.0)
+    batcher.record(
+        ApplicationEvent(
+            EventKind.STORAGE_CLEANUP_FAILED,
+            identity="cleanup-failed",
+            count=2,
+            route=NotificationRoute.MAINTENANCE,
+            private_context="secret-file.part D:\\private",
+        ),
+        now=0.0,
+    )
+
+    payload = batcher.flush_due(now=5.0)[0]
+
+    assert payload.title == "自动清理需要处理"
+    assert payload.body == "自动清理有 2 项未处理，请打开维护中心查看"
+    assert "secret-file" not in payload.body
+
+
+def test_event_byte_count_is_non_negative_integer() -> None:
+    for invalid in (-1, True, 1.5):
+        try:
+            ApplicationEvent(
+                EventKind.STORAGE_CLEANED,
+                identity="cleanup",
+                count=1,
+                route=NotificationRoute.MAINTENANCE,
+                byte_count=invalid,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid byte count was accepted")

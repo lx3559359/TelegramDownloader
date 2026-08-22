@@ -15,6 +15,10 @@ from telegram_downloader.maintenance_activity import (
     ActivityKind,
     OperationActivityRegistry,
 )
+from telegram_downloader.notifications import (
+    storage_cleaned_event,
+    storage_cleanup_failed_event,
+)
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.settings import StorageMaintenanceSettings
 from telegram_downloader.storage_cleanup import (
@@ -38,6 +42,7 @@ from telegram_downloader.storage_state import StorageStateError, StorageStateSto
 
 logger = logging.getLogger(__name__)
 _CONFIRMATION_SECONDS = 300.0
+_AUTOMATIC_NOTIFICATION_BYTES = 100 * 1024**2
 _FAILED_ITEM_CODES = frozenset(
     {
         StorageResultCode.FILE_IN_USE,
@@ -563,10 +568,21 @@ class StorageMaintenanceService:
         self,
         result: StorageExecutionResult,
     ) -> StorageExecutionResult:
-        try:
-            self.publish(result)
-        except Exception:
-            logger.warning("storage cleanup notification publish failed")
+        event = None
+        if result.trigger is StorageTrigger.AUTOMATIC:
+            if result.failed_count > 0:
+                event = storage_cleanup_failed_event(result.plan_id, result.failed_count)
+            elif result.released_bytes >= _AUTOMATIC_NOTIFICATION_BYTES:
+                event = storage_cleaned_event(
+                    result.plan_id,
+                    result.deleted_count,
+                    result.released_bytes,
+                )
+        if event is not None:
+            try:
+                self.publish(event)
+            except Exception:
+                logger.warning("storage cleanup notification publish failed")
         return result
 
     def _ensure_available(self) -> None:

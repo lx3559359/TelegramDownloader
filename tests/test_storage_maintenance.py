@@ -11,6 +11,7 @@ from telegram_downloader.maintenance_activity import (
     ActivityKind,
     OperationActivityRegistry,
 )
+from telegram_downloader.notifications import EventKind, NotificationRoute
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.settings import StorageMaintenanceSettings
 from telegram_downloader.storage_cleanup import StorageCleanupPlanner
@@ -115,6 +116,7 @@ class FakeExecutor:
         self.update_protection = SnapshotProvider()
         self.calls = 0
         self.error: Exception | None = None
+        self.item_code = StorageResultCode.COMPLETED
 
     def execute(self, plan, *, cancelled):
         self.calls += 1
@@ -124,8 +126,8 @@ class FakeExecutor:
             StorageExecutionItem(
                 entry.id,
                 entry.category,
-                StorageResultCode.COMPLETED,
-                entry.size,
+                self.item_code,
+                entry.size if self.item_code is StorageResultCode.COMPLETED else 0,
             )
             for entry in plan.entries
         )
@@ -298,7 +300,7 @@ async def test_corrupt_state_blocks_automatic_cleanup_without_scan(tmp_path: Pat
     assert result.result_code is StorageResultCode.LOCAL_ERROR
     assert inventory.automatic_calls == 0
     assert executor.calls == 0
-    assert published == [result]
+    assert published == []
 
 
 @pytest.mark.asyncio
@@ -318,7 +320,7 @@ async def test_automatic_success_updates_due_and_aggregate_history(tmp_path: Pat
     assert store.state.history[-1].deleted_count == 1
     assert store.state.history[-1].released_bytes == 10
     assert "old.tmp" not in repr(store.state.history[-1])
-    assert published == [result]
+    assert published == []
 
 
 @pytest.mark.asyncio
@@ -366,7 +368,55 @@ async def test_executor_exception_is_redacted_from_logs_and_published_result(
         result = await service.execute_safe(confirmation.id)
 
     assert result.result_code is StorageResultCode.LOCAL_ERROR
-    assert published == [result]
     assert secret not in caplog.text
     assert "secret-file-name" not in caplog.text
     assert secret not in repr(result)
+    assert published == []
+
+
+@pytest.mark.asyncio
+async def test_large_automatic_cleanup_publishes_aggregate_event(tmp_path: Path) -> None:
+    service, _store, inventory, _executor, _activity, published, _clock = make_service(
+        tmp_path,
+        automatic_enabled=True,
+    )
+    size = 100 * 1024**2
+    entry = replace(inventory.automatic_result.entries[0], size=size)
+    summary = replace(
+        inventory.automatic_result.summaries[0],
+        total_bytes=size,
+        reclaimable_bytes=size,
+    )
+    inventory.automatic_result = replace(
+        inventory.automatic_result,
+        entries=(entry,),
+        summaries=(summary,),
+    )
+
+    result = await service.clean_safe(StorageTrigger.AUTOMATIC)
+
+    assert result.released_bytes == size
+    assert len(published) == 1
+    assert published[0].kind is EventKind.STORAGE_CLEANED
+    assert published[0].count == 1
+    assert published[0].byte_count == size
+    assert published[0].route is NotificationRoute.MAINTENANCE
+    assert published[0].private_context == ""
+
+
+@pytest.mark.asyncio
+async def test_automatic_item_failure_publishes_fixed_failure_event(tmp_path: Path) -> None:
+    service, _store, _inventory, executor, _activity, published, _clock = make_service(
+        tmp_path,
+        automatic_enabled=True,
+    )
+    executor.item_code = StorageResultCode.PERMISSION_DENIED
+
+    result = await service.clean_safe(StorageTrigger.AUTOMATIC)
+
+    assert result.failed_count == 1
+    assert len(published) == 1
+    assert published[0].kind is EventKind.STORAGE_CLEANUP_FAILED
+    assert published[0].count == 1
+    assert published[0].byte_count == 0
+    assert published[0].private_context == ""

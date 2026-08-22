@@ -271,6 +271,7 @@ def run_self_test(root: Path) -> dict[str, object]:
         "update_backup": "updateBackup",
         "update_helper": "updateHelper",
         "update_journal": "updateJournal",
+        "maintenance_state": "maintenanceState",
     }
     resolved = {
         public: str(paths.guard(managed[internal]))
@@ -958,8 +959,10 @@ def create_application(
         async def proxy_test_requested(proxy: object, password: str) -> None:
             await controller.test_proxy(proxy, password)
 
-        async def clear_thumbnail_cache() -> None:
-            await controller.clear_thumbnail_cache()
+        def open_storage_maintenance() -> None:
+            dialog.reject()
+            window.show_page("maintenance")
+            window.maintenance_page.show_storage()
 
         async def save_settings() -> None:
             await controller.apply_settings(
@@ -968,16 +971,7 @@ def create_application(
             )
 
         dialog.test_proxy_requested.connect(proxy_test_requested)
-        async_actions.connect(
-            dialog.thumbnail_cache_clear_requested,
-            "settings.thumbnail_cache.clear",
-            clear_thumbnail_cache,
-            hooks=ActionHooks(
-                started=lambda: dialog.set_thumbnail_cache_busy(True),
-                failed=lambda error: dialog._show_error(controller._safe_error(error)),
-                finished=lambda: dialog.set_thumbnail_cache_busy(False),
-            ),
-        )
+        dialog.storage_maintenance_requested.connect(open_storage_maintenance)
         async_actions.connect(
             dialog.save_requested,
             "settings.save",
@@ -990,7 +984,7 @@ def create_application(
             ),
         )
         controller._ui_slots.extend(
-            (proxy_test_requested, clear_thumbnail_cache, save_settings)
+            (proxy_test_requested, open_storage_maintenance, save_settings)
         )
         dialog.open()
 
@@ -1420,6 +1414,9 @@ def run(
                 ),
                 NotificationRoute.LOGIN: controller.show_login,
                 NotificationRoute.UPDATE: controller.check_for_updates,
+                NotificationRoute.MAINTENANCE: lambda: controller.window.show_page(
+                    "maintenance"
+                ),
             },
         )
         tray_adapter = QtTrayAdapter(controller.window)

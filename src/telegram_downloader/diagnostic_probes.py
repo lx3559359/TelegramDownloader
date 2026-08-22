@@ -57,6 +57,7 @@ def managed_writable_paths(paths: PortablePaths) -> dict[str, Path]:
         "updateJournal": paths.update_journal,
         "diagnostics": paths.diagnostics,
         "diagnosticTemp": paths.diagnostic_temp,
+        "maintenanceState": paths.storage_maintenance_state,
     }
 
 
