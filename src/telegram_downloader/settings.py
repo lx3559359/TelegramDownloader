@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from telegram_downloader.files import DownloadNamingSettings
 from telegram_downloader.resource_control import validate_speed_limit_kib
 
 
@@ -69,6 +70,7 @@ class AppSettings:
     autostart_enabled: bool = False
     tray_hint_shown: bool = False
     download_schedule: DownloadScheduleSettings = DownloadScheduleSettings()
+    download_naming: DownloadNamingSettings = DownloadNamingSettings()
 
     def __post_init__(self) -> None:
         if not isinstance(self.api_id, int) or isinstance(self.api_id, bool) or self.api_id < 0:
@@ -95,6 +97,8 @@ class AppSettings:
             raise SettingsError("后台设置开关必须是布尔值")
         if not isinstance(self.download_schedule, DownloadScheduleSettings):
             raise SettingsError("下载时段设置格式无效")
+        if not isinstance(self.download_naming, DownloadNamingSettings):
+            raise SettingsError("下载路径模板设置格式无效")
         try:
             validate_speed_limit_kib(self.speed_limit_kib)
         except ValueError as exc:
@@ -118,9 +122,16 @@ class SettingsStore:
             schedule_raw = raw.get("download_schedule", {})
             if not isinstance(schedule_raw, dict):
                 raise SettingsError("下载时段设置必须是对象")
+            naming_raw = raw.get("download_naming", {})
+            if not isinstance(naming_raw, dict):
+                raise SettingsError("下载路径模板设置必须是对象")
             values = dict(raw)
             values["proxy"] = ProxySettings(**proxy_raw)
             values["download_schedule"] = DownloadScheduleSettings(**schedule_raw)
+            try:
+                values["download_naming"] = DownloadNamingSettings(**naming_raw)
+            except ValueError as error:
+                raise SettingsError(str(error)) from error
             return AppSettings(**values)
         except SettingsError:
             raise
