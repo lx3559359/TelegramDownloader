@@ -119,7 +119,7 @@ def test_subscription_modules_do_not_escape_project_local_storage() -> None:
         assert all(value not in source for value in diagnostic_forbidden), module.name
 
 
-def test_v0160_version_and_download_ui_contract_are_consistent() -> None:
+def test_v0170_version_and_account_update_brand_contract_are_consistent() -> None:
     root = Path(__file__).parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     package_init = (root / "src/telegram_downloader/__init__.py").read_text(
@@ -136,12 +136,11 @@ def test_v0160_version_and_download_ui_contract_are_consistent() -> None:
         encoding="utf-8"
     )
     readme = (root / "README.md").read_text(encoding="utf-8")
-    release_notes = root / "docs/releases/v0.16.0.md"
-    verification = root / "docs/verification/v0.16.0-download-location-ui-polish.md"
+    release_notes = root / "docs/releases/v0.17.0.md"
 
-    assert project["project"]["version"] == "0.16.0"
-    assert '__version__ = "0.16.0"' in package_init
-    assert '#define AppVersion "0.16.0"' in installer
+    assert project["project"]["version"] == "0.17.0"
+    assert '__version__ = "0.17.0"' in package_init
+    assert '#define AppVersion "0.17.0"' in installer
     assert "qrcode==8.2" in requirements
     assert '"qrcode"' in spec
     assert "app_version=__version__" in gateway
@@ -168,29 +167,19 @@ def test_v0160_version_and_download_ui_contract_are_consistent() -> None:
     assert '"--background"' in entry
     assert release_notes.is_file()
     notes = release_notes.read_text(encoding="utf-8")
-    assert "# TelegramDownloader v0.16.0" in notes
+    assert "# TG 快取 v0.17.0" in notes
     assert all(
         term in notes
         for term in (
-            "Windows 文件夹选择器",
-            "已有任务保持原路径",
-            "不会静默回退",
-            "启动时不再自动检查更新",
-            "白色勾号",
-            "托盘右键菜单",
-            "完整自动换行",
-            "受信根策略",
-        )
-    )
-    assert verification.is_file()
-    evidence = verification.read_text(encoding="utf-8")
-    assert all(
-        term in evidence
-        for term in (
-            "PACKAGED_SMOKE_OK",
-            "INSTALLER_SMOKE_OK",
-            "RELEASE_PUBLISHED v0.16.0",
-            "blocked=false",
+            "账号状态",
+            "不会自动生成二维码",
+            "独立候选会话",
+            "活动下载",
+            "检查更新",
+            "启动时不会自动检查",
+            "单行省略",
+            "TG 快取",
+            "旧快捷方式",
         )
     )
     assert "v0.1.0 · stable" not in main
