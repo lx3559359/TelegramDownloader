@@ -4,7 +4,9 @@ from pathlib import Path
 
 import pytest
 
+import telegram_downloader.controller as controller_module
 from telegram_downloader.content import ContentSearchQuery
+from telegram_downloader.controller import AppController
 from telegram_downloader.domain import MediaKind, ScanFilters
 from telegram_downloader.download_paths import DownloadPathError, DownloadPathPolicy
 from telegram_downloader.downloader import MediaDownloader
@@ -12,7 +14,6 @@ from telegram_downloader.gateway import RemoteMedia
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.planner import TaskPlanner
 from telegram_downloader.settings import (
-    AppSettings,
     DownloadStorageSettings,
     SettingsStore,
 )
@@ -52,7 +53,10 @@ def remote(message_id: int, now: datetime) -> RemoteMedia:
 
 
 @pytest.mark.asyncio
-async def test_custom_root_survives_restart_and_old_tasks_keep_working(tmp_path: Path) -> None:
+async def test_custom_root_survives_restart_and_old_tasks_keep_working(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     paths = PortablePaths(tmp_path / "app")
     paths.ensure_layout()
     external = tmp_path / "external"
@@ -60,8 +64,12 @@ async def test_custom_root_survives_restart_and_old_tasks_keep_working(tmp_path:
     third = tmp_path / "unknown"
     third.mkdir()
     store = SettingsStore(paths.settings)
-    settings = AppSettings()
-    store.save(settings)
+    paths.settings.write_text(
+        '{"check_updates_on_startup": true}',
+        encoding="utf-8",
+    )
+    settings = store.load()
+    assert settings.check_updates_on_startup is False
     policy = DownloadPathPolicy(paths, settings.download_storage)
     repository = Repository()
     planner = TaskPlanner(
@@ -75,17 +83,27 @@ async def test_custom_root_survives_restart_and_old_tasks_keep_working(tmp_path:
         "测试",
         ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 10),
     )
-    old_item = planner.plan_selected("peer", "来源", query, [remote(1, now)]).items[0]
+    old_plan = planner.plan_selected("peer", "来源", query, [remote(1, now)])
+    old_item = old_plan.items[0]
 
     prepared = policy.prepare(DownloadStorageSettings(str(external)))
     settings = replace(settings, download_storage=prepared)
     store.save(settings)
     policy.apply(prepared)
     planner.configure_downloads(policy.current_root, settings.download_naming)
-    new_item = planner.plan_selected("peer", "来源", query, [remote(2, now)]).items[0]
+    new_plan = planner.plan_selected("peer", "来源", query, [remote(2, now)])
+    new_item = new_plan.items[0]
 
     reloaded = store.load()
     restarted = DownloadPathPolicy(paths, reloaded.download_storage)
+    restarted_planner = TaskPlanner(
+        Gateway(),
+        repository,
+        restarted.current_root,
+        download_root_provider=restarted.require_current_writable,
+        naming=reloaded.download_naming,
+    )
+    assert restarted_planner.downloads == external.resolve()
     media = MediaDownloader(
         Gateway(),
         repository,
@@ -102,5 +120,39 @@ async def test_custom_root_survives_restart_and_old_tasks_keep_working(tmp_path:
     assert new_item.target_path.is_relative_to(external)
     assert old_item.target_path.read_bytes() == b"abc"
     assert new_item.target_path.read_bytes() == b"abc"
+    assert reloaded.check_updates_on_startup is False
+    assert reloaded.download_storage.root == str(external.resolve())
+    assert restarted.guard(old_item.target_path) == old_item.target_path.resolve()
+    assert restarted.guard(new_item.target_path) == new_item.target_path.resolve()
+
+    class DirectoryRepository:
+        plans = {old_plan.task.id: old_plan, new_plan.task.id: new_plan}
+
+        def get_task(self, task_id):
+            return self.plans[task_id].task
+
+        def list_items(self, task_id):
+            return list(self.plans[task_id].items)
+
+    opened: list[Path] = []
+    monkeypatch.setattr(
+        controller_module.os,
+        "startfile",
+        lambda path: opened.append(Path(path)),
+        raising=False,
+    )
+    controller = AppController.for_test(
+        repository=DirectoryRepository(),
+        paths=paths,
+        download_paths=restarted,
+        settings=reloaded,
+    )
+    controller.open_task_directory(old_plan.task.id)
+    controller.open_task_directory(new_plan.task.id)
+
+    assert opened == [
+        old_item.target_path.parent.resolve(),
+        new_item.target_path.parent.resolve(),
+    ]
     with pytest.raises(DownloadPathError):
         await media.download(replace(new_item, target_path=third / "blocked.bin"))

@@ -127,5 +127,5 @@ def test_rejected_media_path_does_not_display_private_file_name(tmp_path) -> Non
 
     controller.open_media_file("item")
 
-    assert controller.window.message.last_message == "安全限制：文件路径不在应用目录内"
+    assert controller.window.message.last_message == "安全限制：文件路径不在受信下载目录内"
     assert private_name not in controller.window.message.last_message

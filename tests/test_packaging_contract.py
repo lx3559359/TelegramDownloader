@@ -67,6 +67,10 @@ def test_chinese_guide_documents_portable_data_and_security() -> None:
         "历史补抓",
         "下载路径",
         "{message_id}",
+        "浏览…选择下载根目录",
+        "已有任务保持原路径",
+        "启动时不会自动检查更新",
+        "搜索摘要完整换行",
     ):
         assert required in readme
 
@@ -277,8 +281,8 @@ def test_file_integrity_runtime_is_reachable_and_project_local() -> None:
     )
 
     assert "import FileIntegrityService" in app
-    assert "FileIntegrityService(repository, paths)" in app
-    assert "self.paths.guard" in service
+    assert "download_paths=download_paths" in app
+    assert "self.download_paths.guard" in service
     assert "asyncio.to_thread" in service
     for forbidden in ("appdata", "localappdata", "qsettings", "tempfile"):
         assert forbidden not in service.casefold()
