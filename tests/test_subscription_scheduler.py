@@ -15,6 +15,7 @@ from telegram_downloader.gateway import (
     TransientNetworkError,
 )
 from telegram_downloader.notifications import EventKind
+from telegram_downloader.subscription_matching import SubscriptionCriteria
 from telegram_downloader.subscription_scheduler import SubscriptionScheduler
 from telegram_downloader.subscriptions import (
     SubscriptionRule,
@@ -34,22 +35,25 @@ def rule(
     failure_count: int = 0,
 ) -> SubscriptionRule:
     return SubscriptionRule(
-        rule_id,
-        "a1",
-        f"peer:{rule_id}",
-        f"群-{rule_id}",
-        "美女",
-        frozenset({MediaKind.PHOTO}),
-        30,
-        True,
-        SubscriptionState.WAITING,
-        10,
-        next_run_at,
-        None,
-        None,
-        failure_count,
-        NOW,
-        NOW,
+        id=rule_id,
+        account_id="a1",
+        peer_ref=f"peer:{rule_id}",
+        dialog_title=f"群-{rule_id}",
+        criteria=SubscriptionCriteria(("美女",)),
+        media_kinds=frozenset({MediaKind.PHOTO}),
+        interval_minutes=30,
+        history_days=0,
+        enabled=True,
+        state=SubscriptionState.WAITING,
+        last_message_id=10,
+        backfill_from_utc=None,
+        backfill_through_id=None,
+        next_run_at=next_run_at,
+        last_run_at=None,
+        last_error=None,
+        failure_count=failure_count,
+        created_at=NOW,
+        updated_at=NOW,
     )
 
 
@@ -405,9 +409,7 @@ async def test_scheduler_classifies_non_network_failures(
 @pytest.mark.asyncio
 async def test_auth_failure_is_persisted_before_global_callback() -> None:
     service = Service(rule("r1"))
-    error = SessionExpiredError(
-        reason=AuthorizationFailureReason.SESSION_REVOKED
-    )
+    error = SessionExpiredError(reason=AuthorizationFailureReason.SESSION_REVOKED)
     service.outcomes = [error]
     events: list[tuple[str, object]] = []
 

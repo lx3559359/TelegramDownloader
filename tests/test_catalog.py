@@ -22,6 +22,7 @@ from telegram_downloader.content import (
     SearchStatus,
 )
 from telegram_downloader.domain import MediaKind, ScanFilters
+from telegram_downloader.subscription_matching import SubscriptionCriteria
 from telegram_downloader.subscriptions import (
     SubscriptionRule,
     SubscriptionRun,
@@ -80,22 +81,25 @@ def subscription(
     next_run_at: datetime | None = None,
 ) -> SubscriptionRule:
     return SubscriptionRule(
-        rule_id,
-        account_id,
-        peer_ref,
-        f"群-{account_id}",
-        "美女",
-        frozenset({MediaKind.PHOTO, MediaKind.VIDEO}),
-        30,
-        enabled,
-        state,
-        last_message_id,
-        next_run_at if next_run_at is not None else now,
-        None,
-        None,
-        0,
-        now,
-        now,
+        id=rule_id,
+        account_id=account_id,
+        peer_ref=peer_ref,
+        dialog_title=f"群-{account_id}",
+        criteria=SubscriptionCriteria(("美女",)),
+        media_kinds=frozenset({MediaKind.PHOTO, MediaKind.VIDEO}),
+        interval_minutes=30,
+        history_days=0,
+        enabled=enabled,
+        state=state,
+        last_message_id=last_message_id,
+        backfill_from_utc=None,
+        backfill_through_id=None,
+        next_run_at=next_run_at if next_run_at is not None else now,
+        last_run_at=None,
+        last_error=None,
+        failure_count=0,
+        created_at=now,
+        updated_at=now,
     )
 
 
@@ -164,8 +168,7 @@ def create_v3_catalog_with_search(database: Path, now: datetime) -> None:
         connection.executescript(catalog_module._SCHEMA_V2_MIGRATION)
         connection.executescript(catalog_module._SCHEMA_V3_MIGRATION)
         connection.execute(
-            "INSERT INTO accounts(account_id, display_name, last_used_at) "
-            "VALUES(?, ?, ?)",
+            "INSERT INTO accounts(account_id, display_name, last_used_at) VALUES(?, ?, ?)",
             ("a1", "旧账号", now.isoformat()),
         )
         connection.execute(
@@ -772,9 +775,7 @@ def test_thumbnail_reference_queries_follow_history_deletion(tmp_path: Path) -> 
 
     assert repo.list_thumbnail_keys("a1") == {"a1:shared"}
     assert repo.list_thumbnail_keys("a1", first.id) == {"a1:shared"}
-    assert repo.referenced_thumbnail_keys("a1", {"a1:shared", "missing"}) == {
-        "a1:shared"
-    }
+    assert repo.referenced_thumbnail_keys("a1", {"a1:shared", "missing"}) == {"a1:shared"}
 
     repo.delete_session("a1", first.id)
     assert repo.referenced_thumbnail_keys("a1", {"a1:shared"}) == {"a1:shared"}

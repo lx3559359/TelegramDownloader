@@ -10,6 +10,7 @@ import pytest
 from telegram_downloader.content import AccountProfile
 from telegram_downloader.controller import AppController
 from telegram_downloader.domain import MediaKind
+from telegram_downloader.subscription_matching import SubscriptionCriteria
 from telegram_downloader.subscriptions import SubscriptionDraft
 
 NOW = datetime(2026, 8, 15, tzinfo=UTC)
@@ -238,7 +239,7 @@ async def test_subscription_actions_restore_busy_state_and_refresh_rules() -> No
     )
     draft = SubscriptionDraft(
         "-1001",
-        "美女",
+        SubscriptionCriteria(("美女",)),
         frozenset({MediaKind.PHOTO}),
     )
 
@@ -277,7 +278,11 @@ async def test_subscription_baseline_action_has_foreground_priority() -> None:
         subscription_scheduler=SubscriptionScheduler(),
         window=Window(),
     )
-    draft = SubscriptionDraft("-1001", "美女", frozenset({MediaKind.PHOTO}))
+    draft = SubscriptionDraft(
+        "-1001",
+        SubscriptionCriteria(("美女",)),
+        frozenset({MediaKind.PHOTO}),
+    )
 
     task = asyncio.create_task(controller.create_subscription(draft))
     await entered.wait()
@@ -326,9 +331,7 @@ async def test_subscription_created_task_enters_existing_download_scheduler() ->
         started.append("refresh")
         refreshed.set()
 
-    controller.refresh_tasks = Mock(
-        side_effect=AssertionError("同步刷新不应被调用")
-    )
+    controller.refresh_tasks = Mock(side_effect=AssertionError("同步刷新不应被调用"))
     controller.refresh_tasks_async = refresh
     controller._start_task = lambda task_id: started.append(task_id)
 

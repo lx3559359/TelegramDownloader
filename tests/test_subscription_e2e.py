@@ -14,6 +14,7 @@ from telegram_downloader.paths import PortablePaths
 from telegram_downloader.planner import TaskPlanner
 from telegram_downloader.repository import TaskRepository
 from telegram_downloader.scheduler import DownloadScheduler
+from telegram_downloader.subscription_matching import SubscriptionCriteria
 from telegram_downloader.subscription_scheduler import SubscriptionScheduler
 from telegram_downloader.subscription_service import SubscriptionService
 from telegram_downloader.subscriptions import SubscriptionDraft
@@ -48,11 +49,9 @@ class Gateway:
         through_id: int,
         limit: int,
     ) -> tuple[RemoteMessage, ...]:
-        return tuple(
-            item
-            for item in self.messages
-            if after_id < item.message_id <= through_id
-        )[:limit]
+        return tuple(item for item in self.messages if after_id < item.message_id <= through_id)[
+            :limit
+        ]
 
     async def expand_album(self, *_args) -> tuple[object, ...]:
         return ()
@@ -131,7 +130,11 @@ async def test_project_local_subscription_to_completed_download_and_restart(
     service.set_account(profile)
 
     rule = await service.create_rule(
-        SubscriptionDraft("-1001", "测试关键词", frozenset({MediaKind.PHOTO}))
+        SubscriptionDraft(
+            "-1001",
+            SubscriptionCriteria(("测试关键词",)),
+            frozenset({MediaKind.PHOTO}),
+        )
     )
     assert rule.last_message_id == 10
     assert tasks.list_tasks() == []

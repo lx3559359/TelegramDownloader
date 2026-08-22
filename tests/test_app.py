@@ -29,6 +29,7 @@ from telegram_downloader.paths import PortablePaths
 from telegram_downloader.settings import AppSettings
 from telegram_downloader.subscription_scheduler import SubscriptionScheduler
 from telegram_downloader.subscription_service import SubscriptionService
+from telegram_downloader.subscription_matching import SubscriptionCriteria
 from telegram_downloader.subscriptions import SubscriptionRule, SubscriptionState
 from telegram_downloader.ui.async_actions import ActionPolicy
 
@@ -236,12 +237,8 @@ def test_run_keeps_startup_inside_the_continuous_event_loop() -> None:
 
     assert "run_until_complete(controller.start())" not in source
     assert "loop.create_task(start_application())" in source
-    assert source.index("_show_initial_window(") < source.index(
-        "await controller.start("
-    )
-    assert source.index("await download_schedule.start()") < source.index(
-        "await controller.start("
-    )
+    assert source.index("_show_initial_window(") < source.index("await controller.start(")
+    assert source.index("await download_schedule.start()") < source.index("await controller.start(")
 
 
 @pytest.mark.asyncio
@@ -380,9 +377,7 @@ def test_create_application_initializes_project_local_content_services(
         controller._handle_session_expired = record_expiry
         loop.run_until_complete(
             controller.subscription_scheduler.on_session_expired(
-                SessionExpiredError(
-                    reason=AuthorizationFailureReason.SESSION_REVOKED
-                )
+                SessionExpiredError(reason=AuthorizationFailureReason.SESSION_REVOKED)
             )
         )
         assert auth_events == [AuthorizationFailureReason.SESSION_REVOKED]
@@ -422,9 +417,7 @@ def test_account_search_signal_reaches_controller_with_typed_scope(tmp_path) -> 
 
     try:
         loop.run_until_complete(emit_and_wait())
-        assert calls == [
-            (SearchScope.ALL_DIALOGS, ALL_DIALOGS_SCOPE_REF, "安装")
-        ]
+        assert calls == [(SearchScope.ALL_DIALOGS, ALL_DIALOGS_SCOPE_REF, "安装")]
     finally:
         loop.run_until_complete(controller._async_actions.shutdown())
         controller.window.close()
@@ -436,17 +429,13 @@ def test_account_search_signal_reaches_controller_with_typed_scope(tmp_path) -> 
 async def test_telegram_health_uses_retained_authorization_reason() -> None:
     controller = SimpleNamespace(
         gateway=None,
-        last_authorization_failure_reason=(
-            AuthorizationFailureReason.AUTH_KEY_DUPLICATED
-        ),
+        last_authorization_failure_reason=(AuthorizationFailureReason.AUTH_KEY_DUPLICATED),
     )
 
     result = await app._telegram_health(controller)
 
     assert result.code == "telegram-session-expired"
-    assert result.metrics == {
-        "authorizationReason": "auth-key-duplicated"
-    }
+    assert result.metrics == {"authorizationReason": "auth-key-duplicated"}
 
 
 def test_service_builder_shares_runtime_download_resource_settings(tmp_path) -> None:
@@ -493,22 +482,25 @@ def test_create_application_recovers_interrupted_subscription(tmp_path) -> None:
     )
     catalog.save_subscription(
         SubscriptionRule(
-            "rule-1",
-            "a1",
-            "-1001",
-            "资料群",
-            "美女",
-            frozenset({MediaKind.PHOTO}),
-            30,
-            True,
-            SubscriptionState.RUNNING,
-            42,
-            None,
-            now,
-            None,
-            0,
-            now,
-            now,
+            id="rule-1",
+            account_id="a1",
+            peer_ref="-1001",
+            dialog_title="资料群",
+            criteria=SubscriptionCriteria(("美女",)),
+            media_kinds=frozenset({MediaKind.PHOTO}),
+            interval_minutes=30,
+            history_days=0,
+            enabled=True,
+            state=SubscriptionState.RUNNING,
+            last_message_id=42,
+            backfill_from_utc=None,
+            backfill_through_id=None,
+            next_run_at=None,
+            last_run_at=now,
+            last_error=None,
+            failure_count=0,
+            created_at=now,
+            updated_at=now,
         )
     )
 

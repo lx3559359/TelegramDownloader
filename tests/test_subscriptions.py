@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import pytest
 
 from telegram_downloader.domain import MediaKind
+from telegram_downloader.subscription_matching import SubscriptionCriteria
 from telegram_downloader.subscriptions import (
     SubscriptionDraft,
     SubscriptionProbeProgress,
@@ -27,12 +28,15 @@ def rule(**changes: object) -> SubscriptionRule:
         account_id="account-1",
         peer_ref="peer:1",
         dialog_title="测试频道",
-        keyword="  美 女  ",
+        criteria=SubscriptionCriteria(("  美 女  ",)),
         media_kinds=frozenset({MediaKind.PHOTO, MediaKind.VIDEO}),
         interval_minutes=30,
+        history_days=0,
         enabled=True,
         state=SubscriptionState.WAITING,
         last_message_id=42,
+        backfill_from_utc=None,
+        backfill_through_id=None,
         next_run_at=NOW,
         last_run_at=None,
         last_error=None,
@@ -43,17 +47,22 @@ def rule(**changes: object) -> SubscriptionRule:
     return replace(value, **changes)
 
 
-def test_subscription_rule_normalizes_keyword() -> None:
-    assert rule().normalized_keyword == "美 女"
+def test_subscription_rule_exposes_structured_summary_and_fingerprint() -> None:
+    saved = rule()
+
+    assert saved.keyword == "任意：美 女"
+    assert saved.normalized_keyword == saved.criteria.fingerprint
 
 
 @pytest.mark.parametrize(
     ("changes", "message"),
     [
-        ({"keyword": "   "}, "关键词"),
+        ({"criteria": "invalid"}, "订阅规则"),
         ({"media_kinds": frozenset()}, "媒体类型"),
         ({"interval_minutes": 7}, "检查间隔"),
+        ({"history_days": 2}, "历史补抓"),
         ({"last_message_id": -1}, "消息游标"),
+        ({"backfill_through_id": -1}, "补抓"),
         ({"failure_count": -1}, "失败次数"),
     ],
 )
@@ -65,19 +74,31 @@ def test_subscription_rule_rejects_invalid_values(
         rule(**changes)
 
 
-def test_subscription_draft_trims_keyword_and_validates_fields() -> None:
+def test_subscription_draft_trims_peer_and_exposes_structured_summary() -> None:
     draft = SubscriptionDraft(
-        "peer:1",
-        "  美女  ",
+        " peer:1 ",
+        SubscriptionCriteria(("AI", "模型"), ("广告",)),
         frozenset({MediaKind.PHOTO}),
         15,
+        7,
     )
 
-    assert draft.keyword == "美女"
-    assert draft.normalized_keyword == "美女"
+    assert draft.peer_ref == "peer:1"
+    assert draft.keyword == "任意：AI、模型；排除：广告"
+    assert draft.matcher_fingerprint == draft.criteria.fingerprint
 
     with pytest.raises(ValueError, match="群组"):
-        SubscriptionDraft("", "美女", frozenset({MediaKind.PHOTO}), 15)
+        SubscriptionDraft(
+            "",
+            SubscriptionCriteria(("美女",)),
+            frozenset({MediaKind.PHOTO}),
+            15,
+        )
+
+
+def test_backfill_snapshot_requires_a_persisted_start_time() -> None:
+    with pytest.raises(ValueError, match="补抓起点"):
+        rule(backfill_through_id=99, backfill_from_utc=None)
 
 
 def test_subscription_counters_reject_impossible_keyword_totals() -> None:

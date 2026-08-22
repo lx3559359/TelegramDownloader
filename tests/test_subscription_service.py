@@ -18,6 +18,7 @@ from telegram_downloader.gateway import (
 )
 from telegram_downloader.planner import TaskPlanner
 from telegram_downloader.repository import TaskRepository
+from telegram_downloader.subscription_matching import SubscriptionCriteria
 from telegram_downloader.subscription_service import SubscriptionService
 from telegram_downloader.subscriptions import (
     SubscriptionDraft,
@@ -26,6 +27,10 @@ from telegram_downloader.subscriptions import (
 )
 
 NOW = datetime(2026, 8, 15, 9, 0, tzinfo=UTC)
+
+
+def criteria(value: str) -> SubscriptionCriteria:
+    return SubscriptionCriteria((value,))
 
 
 def ids(prefix: str):
@@ -99,11 +104,9 @@ class Gateway:
         self.incremental_calls.append((after_id, through_id, limit))
         if self.incremental_error is not None:
             raise self.incremental_error
-        return tuple(
-            item
-            for item in self.messages
-            if after_id < item.message_id <= through_id
-        )[:limit]
+        return tuple(item for item in self.messages if after_id < item.message_id <= through_id)[
+            :limit
+        ]
 
     async def recent_messages(
         self,
@@ -176,7 +179,7 @@ async def test_create_rule_establishes_baseline_without_queueing(
     saved = await service.create_rule(
         SubscriptionDraft(
             "-1001",
-            "美女",
+            criteria("美女"),
             frozenset({MediaKind.PHOTO, MediaKind.VIDEO}),
             30,
         )
@@ -199,7 +202,7 @@ async def test_failed_initial_baseline_is_retryable_without_recreating_rule(
 
     with pytest.raises(TransientNetworkError):
         await service.create_rule(
-            SubscriptionDraft("-1001", "美女", frozenset({MediaKind.PHOTO}))
+            SubscriptionDraft("-1001", criteria("美女"), frozenset({MediaKind.PHOTO}))
         )
 
     [failed] = service.list_rules()
@@ -226,7 +229,7 @@ async def test_run_queues_only_matching_new_media_and_advances_cursor(
     saved = await service.create_rule(
         SubscriptionDraft(
             "-1001",
-            "美女",
+            criteria("美女"),
             frozenset({MediaKind.PHOTO, MediaKind.VIDEO}),
         )
     )
@@ -257,7 +260,7 @@ async def test_no_match_advances_but_network_failure_does_not(
 ) -> None:
     service, gateway, catalog, _tasks = build_service(tmp_path)
     saved = await service.create_rule(
-        SubscriptionDraft("-1001", "美女", frozenset({MediaKind.PHOTO}))
+        SubscriptionDraft("-1001", criteria("美女"), frozenset({MediaKind.PHOTO}))
     )
     gateway.latest_id = 43
     gateway.messages = (message(43, "普通内容", remote(43)),)
@@ -279,7 +282,7 @@ async def test_matching_album_is_expanded_and_duplicate_rerun_is_idempotent(
 ) -> None:
     service, gateway, catalog, tasks = build_service(tmp_path)
     saved = await service.create_rule(
-        SubscriptionDraft("-1001", "美女", frozenset({MediaKind.PHOTO}))
+        SubscriptionDraft("-1001", criteria("美女"), frozenset({MediaKind.PHOTO}))
     )
     trigger = remote(43)
     trigger = RemoteMedia(
@@ -318,7 +321,7 @@ async def test_matching_album_is_expanded_and_duplicate_rerun_is_idempotent(
 
     gateway.latest_id = 42
     overlapping = await service.create_rule(
-        SubscriptionDraft("-1001", "相册", frozenset({MediaKind.PHOTO}))
+        SubscriptionDraft("-1001", criteria("相册"), frozenset({MediaKind.PHOTO}))
     )
     gateway.latest_id = 44
     second_report = await service.run_rule(overlapping.id)
@@ -331,7 +334,7 @@ async def test_matching_album_is_expanded_and_duplicate_rerun_is_idempotent(
 async def test_probe_rule_reports_matches_without_side_effects(tmp_path: Path) -> None:
     service, gateway, catalog, tasks = build_service(tmp_path)
     saved = await service.create_rule(
-        SubscriptionDraft("-1001", "美女", frozenset({MediaKind.PHOTO}))
+        SubscriptionDraft("-1001", criteria("美女"), frozenset({MediaKind.PHOTO}))
     )
     gateway.recent = (
         message(40, "普通", remote(40)),
@@ -349,9 +352,7 @@ async def test_probe_rule_reports_matches_without_side_effects(tmp_path: Path) -
     assert report.duplicate == 0
     assert [sample.message_id for sample in report.samples] == [41]
     assert gateway.recent_calls == [("-1001", 100)]
-    assert [item.inspected for item in progress] == sorted(
-        item.inspected for item in progress
-    )
+    assert [item.inspected for item in progress] == sorted(item.inspected for item in progress)
     assert progress[0].inspected == 0
     assert progress[-1].phase == "测试完成"
     assert service.get_rule(saved.id) == before_rule
@@ -365,7 +366,7 @@ async def test_probe_expands_album_marks_duplicates_and_matches_formal_run(
 ) -> None:
     service, gateway, catalog, tasks = build_service(tmp_path)
     first_rule = await service.create_rule(
-        SubscriptionDraft("-1001", "美女", frozenset({MediaKind.PHOTO}))
+        SubscriptionDraft("-1001", criteria("美女"), frozenset({MediaKind.PHOTO}))
     )
     trigger = replace(remote(43), grouped_id=900)
     second = replace(remote(44), grouped_id=900)
@@ -384,7 +385,7 @@ async def test_probe_expands_album_marks_duplicates_and_matches_formal_run(
 
     gateway.latest_id = 42
     parity_rule = await service.create_rule(
-        SubscriptionDraft("-1001", "相册", frozenset({MediaKind.PHOTO}))
+        SubscriptionDraft("-1001", criteria("相册"), frozenset({MediaKind.PHOTO}))
     )
     gateway.latest_id = 45
     gateway.recent = (album_message,)
@@ -413,11 +414,10 @@ async def test_probe_expands_album_marks_duplicates_and_matches_formal_run(
 async def test_probe_limits_samples_and_excerpt_length(tmp_path: Path) -> None:
     service, gateway, _catalog, _tasks = build_service(tmp_path)
     saved = await service.create_rule(
-        SubscriptionDraft("-1001", "资料", frozenset({MediaKind.PHOTO}))
+        SubscriptionDraft("-1001", criteria("资料"), frozenset({MediaKind.PHOTO}))
     )
     gateway.recent = tuple(
-        message(value, "资料" + "长" * 100, remote(value))
-        for value in range(43, 68)
+        message(value, "资料" + "长" * 100, remote(value)) for value in range(43, 68)
     )
 
     report = await service.probe_rule(saved.id)
@@ -433,7 +433,7 @@ async def test_probe_cancellation_leaves_rule_cursor_history_and_tasks_unchanged
 ) -> None:
     service, gateway, catalog, tasks = build_service(tmp_path)
     saved = await service.create_rule(
-        SubscriptionDraft("-1001", "资料", frozenset({MediaKind.PHOTO}))
+        SubscriptionDraft("-1001", criteria("资料"), frozenset({MediaKind.PHOTO}))
     )
     gateway.recent_started = asyncio.Event()
     gateway.recent_release = asyncio.Event()
@@ -456,7 +456,7 @@ async def test_probe_cancellation_leaves_rule_cursor_history_and_tasks_unchanged
 async def test_list_runs_is_account_scoped_and_bounded(tmp_path: Path) -> None:
     service, gateway, _catalog, _tasks = build_service(tmp_path)
     saved = await service.create_rule(
-        SubscriptionDraft("-1001", "资料", frozenset({MediaKind.PHOTO}))
+        SubscriptionDraft("-1001", criteria("资料"), frozenset({MediaKind.PHOTO}))
     )
     gateway.latest_id = 43
     gateway.messages = (message(43, "资料", remote(43)),)
@@ -475,7 +475,7 @@ async def test_rule_edit_pause_resume_due_and_delete_lifecycle(
 ) -> None:
     service, gateway, _catalog, _tasks = build_service(tmp_path)
     saved = await service.create_rule(
-        SubscriptionDraft("-1001", "美女", frozenset({MediaKind.PHOTO}), 30)
+        SubscriptionDraft("-1001", criteria("美女"), frozenset({MediaKind.PHOTO}), 30)
     )
     assert service.list_rules() == [saved]
     assert service.list_due_rules(NOW) == []
@@ -484,7 +484,7 @@ async def test_rule_edit_pause_resume_due_and_delete_lifecycle(
     gateway.latest_id = 99
     changed = await service.update_rule(
         saved.id,
-        SubscriptionDraft("-1001", "视频", frozenset({MediaKind.VIDEO}), 60),
+        SubscriptionDraft("-1001", criteria("视频"), frozenset({MediaKind.VIDEO}), 60),
     )
     assert changed.last_message_id == 99
     assert changed.interval_minutes == 60
@@ -508,7 +508,7 @@ async def test_successful_reconnection_makes_blocked_rule_due_immediately(
 ) -> None:
     service, _gateway, catalog, _tasks = build_service(tmp_path)
     saved = await service.create_rule(
-        SubscriptionDraft("-1001", "美女", frozenset({MediaKind.PHOTO}))
+        SubscriptionDraft("-1001", criteria("美女"), frozenset({MediaKind.PHOTO}))
     )
     catalog.save_subscription(
         replace(
@@ -532,13 +532,13 @@ async def test_successful_reconnection_makes_blocked_rule_due_immediately(
 async def test_editing_paused_rule_does_not_resume_it(tmp_path: Path) -> None:
     service, _gateway, _catalog, _tasks = build_service(tmp_path)
     saved = await service.create_rule(
-        SubscriptionDraft("-1001", "美女", frozenset({MediaKind.PHOTO}), 30)
+        SubscriptionDraft("-1001", criteria("美女"), frozenset({MediaKind.PHOTO}), 30)
     )
     service.set_enabled(saved.id, False)
 
     changed = await service.update_rule(
         saved.id,
-        SubscriptionDraft("-1001", "美女", frozenset({MediaKind.VIDEO}), 60),
+        SubscriptionDraft("-1001", criteria("美女"), frozenset({MediaKind.VIDEO}), 60),
     )
 
     assert changed.enabled is False

@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
 
 from telegram_downloader.content import ContentDialog, DialogKind
 from telegram_downloader.domain import MediaKind
+from telegram_downloader.subscription_matching import SubscriptionCriteria
 from telegram_downloader.subscriptions import (
     SubscriptionProbeProgress,
     SubscriptionProbeReport,
@@ -47,6 +48,7 @@ def test_subscription_page_uses_major_and_nested_silver_cards(qtbot) -> None:
     assert page.diagnostic_card.isAncestorOf(page.run_history_table)
     assert page.diagnostic_card.isAncestorOf(page.probe_sample_table)
 
+
 NOW = datetime(2026, 8, 15, 9, 0, tzinfo=UTC)
 
 
@@ -65,22 +67,25 @@ def dialog() -> ContentDialog:
 
 def rule(*, enabled: bool = True) -> SubscriptionRule:
     return SubscriptionRule(
-        "rule-1",
-        "a1",
-        "-1001",
-        "资料群",
-        "美女",
-        frozenset({MediaKind.PHOTO, MediaKind.VIDEO}),
-        30,
-        enabled,
-        SubscriptionState.WAITING if enabled else SubscriptionState.PAUSED,
-        42,
-        NOW + timedelta(minutes=30) if enabled else None,
-        NOW,
-        None,
-        0,
-        NOW,
-        NOW,
+        id="rule-1",
+        account_id="a1",
+        peer_ref="-1001",
+        dialog_title="资料群",
+        criteria=SubscriptionCriteria(("美女",)),
+        media_kinds=frozenset({MediaKind.PHOTO, MediaKind.VIDEO}),
+        interval_minutes=30,
+        history_days=0,
+        enabled=enabled,
+        state=(SubscriptionState.WAITING if enabled else SubscriptionState.PAUSED),
+        last_message_id=42,
+        backfill_from_utc=None,
+        backfill_through_id=None,
+        next_run_at=NOW + timedelta(minutes=30) if enabled else None,
+        last_run_at=NOW,
+        last_error=None,
+        failure_count=0,
+        created_at=NOW,
+        updated_at=NOW,
     )
 
 
@@ -328,9 +333,7 @@ def test_probe_progress_shows_counts_and_cancel(qtbot) -> None:
     page.show()
     qtbot.waitExposed(page)
     page.set_probe_busy("rule-1", True)
-    page.set_probe_progress(
-        SubscriptionProbeProgress("rule-1", 12, 3, 2, "正在筛选")
-    )
+    page.set_probe_progress(SubscriptionProbeProgress("rule-1", 12, 3, 2, "正在筛选"))
 
     assert "已扫描 12" in page.probe_progress_label.text()
     assert "关键词 3" in page.probe_progress_label.text()
