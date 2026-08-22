@@ -8,6 +8,7 @@ import platform
 import sys
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,11 @@ from telegram_downloader.activation import (
     ACTIVATION_CHANNEL,
     LocalActivationServer,
     request_activation,
+)
+from telegram_downloader.background import (
+    BackgroundModeController,
+    QtTrayAdapter,
+    QtWindowPort,
 )
 from telegram_downloader.catalog import CatalogRepository
 from telegram_downloader.content import ContentSearchQuery, SearchScope
@@ -37,11 +43,13 @@ from telegram_downloader.diagnostic_probes import (
 )
 from telegram_downloader.diagnostic_store import DiagnosticReportStore
 from telegram_downloader.diagnostics import DiagnosticResult, DiagnosticsService
+from telegram_downloader.domain import TaskStatus
 from telegram_downloader.downloader import MediaDownloader
 from telegram_downloader.file_integrity import FileIntegrityService
 from telegram_downloader.gateway import SessionExpiredError, TelethonGateway
 from telegram_downloader.instance_guard import WindowsInstanceGuard
 from telegram_downloader.logging import configure_logging
+from telegram_downloader.notifications import NotificationRoute
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.planner import ScanPreview, TaskPlanner
 from telegram_downloader.repository import TaskRepository
@@ -123,24 +131,29 @@ class _GracefulShutdown:
             self.quit_application()
 
 
-def _install_graceful_shutdown(application: Any, controller: Any):
+def _install_graceful_shutdown(
+    application: Any,
+    controller: Any,
+    background: BackgroundModeController,
+    *,
+    shutdown: _GracefulShutdown | None = None,
+):
     from PySide6.QtCore import QEvent, QObject
 
-    shutdown = _GracefulShutdown(controller, application.quit)
+    shutdown = shutdown or _GracefulShutdown(controller, application.quit)
 
     class WindowCloseFilter(QObject):
         def eventFilter(self, watched, event):
             if event.type() == QEvent.Type.Close and not shutdown.completed:
                 event.ignore()
-                watched.hide()
-                shutdown.request()
+                background.handle_window_close()
                 return True
             return super().eventFilter(watched, event)
 
     close_filter = WindowCloseFilter(controller.window)
     controller.window.installEventFilter(close_filter)
     application.setQuitOnLastWindowClosed(False)
-    controller.update_shutdown = shutdown.request
+    controller.update_shutdown = background.request_exit
     return shutdown, close_filter
 
 
@@ -1026,14 +1039,91 @@ def run(
         return 2
 
     activation_server: LocalActivationServer | None = None
+    tray_adapter: QtTrayAdapter | None = None
     try:
         _startup_status(startup_indicator, "正在准备本地数据…")
         application, loop, controller = create_application(root)
 
+        graceful_shutdown = _GracefulShutdown(controller, application.quit)
+        window_port = QtWindowPort(
+            controller.window,
+            {
+                NotificationRoute.TASKS: lambda: controller.window.show_page("tasks"),
+                NotificationRoute.SUBSCRIPTIONS: lambda: controller.window.show_page(
+                    "subscriptions"
+                ),
+                NotificationRoute.LOGIN: controller.show_login,
+                NotificationRoute.UPDATE: lambda: controller.window.show_page("tasks"),
+            },
+        )
+        tray_adapter = QtTrayAdapter(controller.window)
+
+        def persist_tray_hint() -> None:
+            updated = replace(controller.settings, tray_hint_shown=True)
+            controller.settings_store.save(updated)
+            controller.settings = updated
+
+        background = BackgroundModeController(
+            window_port,
+            tray_adapter,
+            graceful_shutdown.request,
+            tray_hint_shown=controller.settings.tray_hint_shown,
+            persist_tray_hint=persist_tray_hint,
+        )
+        background.configure(
+            close_to_tray=controller.settings.close_to_tray,
+            notifications_enabled=controller.settings.notifications_enabled,
+        )
+        tray_adapter.show_requested.connect(background.show_window)
+        tray_adapter.hide_requested.connect(controller.window.hide)
+        tray_adapter.exit_requested.connect(background.request_exit)
+        tray_adapter.notification_activated.connect(background.show_window)
+
+        async def pause_all_downloads() -> None:
+            tasks = await asyncio.to_thread(controller.repository.list_tasks)
+            await controller.pause_tasks(
+                [
+                    task.id
+                    for task in tasks
+                    if task.status
+                    in {
+                        TaskStatus.QUEUED,
+                        TaskStatus.DOWNLOADING,
+                        TaskStatus.WAITING_RETRY,
+                    }
+                ]
+            )
+
+        async def resume_all_downloads() -> None:
+            tasks = await asyncio.to_thread(controller.repository.list_tasks)
+            await controller.resume_tasks(
+                [task.id for task in tasks if task.status is TaskStatus.PAUSED]
+            )
+
+        def open_downloads() -> None:
+            try:
+                downloads = controller.paths.guard(controller.paths.downloads)
+                downloads.mkdir(parents=True, exist_ok=True)
+                startfile = getattr(os, "startfile", None)
+                if startfile is not None:
+                    startfile(downloads)
+            except (OSError, ValueError):
+                controller._show_status("Windows 无法打开下载目录")
+
+        tray_adapter.pause_all_requested.connect(
+            lambda: controller._spawn_background(pause_all_downloads())
+        )
+        tray_adapter.resume_all_requested.connect(
+            lambda: controller._spawn_background(resume_all_downloads())
+        )
+        tray_adapter.subscriptions_requested.connect(
+            controller.subscription_scheduler.wake
+        )
+        tray_adapter.downloads_requested.connect(open_downloads)
+        tray_adapter.show()
+
         def activate_main_window() -> None:
-            controller.window.show()
-            controller.window.raise_()
-            controller.window.activateWindow()
+            background.show_window()
 
         activation_server = LocalActivationServer(
             ACTIVATION_CHANNEL,
@@ -1043,6 +1133,8 @@ def run(
         graceful_shutdown, close_filter = _install_graceful_shutdown(
             application,
             controller,
+            background,
+            shutdown=graceful_shutdown,
         )
         application.aboutToQuit.connect(loop.stop)
         with loop:
@@ -1074,5 +1166,7 @@ def run(
     finally:
         if activation_server is not None:
             activation_server.close()
+        if tray_adapter is not None:
+            tray_adapter.hide()
         _startup_close(startup_indicator)
         guard.release()

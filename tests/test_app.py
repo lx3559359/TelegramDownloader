@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtWidgets import QMessageBox, QWidget
 
 from telegram_downloader import app
 from telegram_downloader.catalog import CatalogRepository
@@ -114,6 +114,42 @@ def test_graceful_shutdown_cleans_async_work_before_quitting() -> None:
     asyncio.run(exercise())
 
     assert events == ["actions", "controller", "quit"]
+
+
+def test_window_close_filter_delegates_to_background_without_shutdown(qapp) -> None:
+    class Controller:
+        window = QWidget()
+
+        async def shutdown(self) -> None:
+            raise AssertionError("close-to-tray must not shut down")
+
+    class Background:
+        closes = 0
+
+        def handle_window_close(self) -> bool:
+            self.closes += 1
+            Controller.window.hide()
+            return True
+
+        def request_exit(self) -> None:
+            raise AssertionError("close-to-tray must not request exit")
+
+    background = Background()
+    shutdown, close_filter = app._install_graceful_shutdown(
+        qapp,
+        Controller(),
+        background,
+    )
+    Controller.window.show()
+
+    Controller.window.close()
+    qapp.processEvents()
+
+    assert background.closes == 1
+    assert Controller.window.isVisible() is False
+    assert shutdown.task is None
+    Controller.window.removeEventFilter(close_filter)
+    qapp.setQuitOnLastWindowClosed(True)
 
 
 def test_run_keeps_startup_inside_the_continuous_event_loop() -> None:
