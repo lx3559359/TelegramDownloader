@@ -10,6 +10,10 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 import telegram_downloader.controller as controller_module
+from telegram_downloader.account_access import (
+    AuthorizationState,
+    ConnectionState,
+)
 from telegram_downloader.connectivity import ConnectionRecovery
 from telegram_downloader.content import (
     ALL_DIALOGS_SCOPE_REF,
@@ -565,15 +569,14 @@ async def test_credentials_start_qr_login_instead_of_phone_flow() -> None:
 
 
 @pytest.mark.asyncio
-async def test_show_login_uses_saved_credentials_for_qr() -> None:
-    expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
-
+async def test_show_login_with_saved_credentials_never_starts_qr() -> None:
     class Gateway:
-        async def begin_qr_login(self):
-            return QrLoginInfo("tg://login?token=saved", expires)
+        def __init__(self) -> None:
+            self.begin_qr_calls = 0
 
-        async def wait_qr_login(self):
-            return AuthState.PASSWORD_REQUIRED
+        async def begin_qr_login(self):
+            self.begin_qr_calls += 1
+            raise AssertionError("manual navigation must not start QR")
 
     class Dialog:
         def __init__(self):
@@ -604,8 +607,9 @@ async def test_show_login_uses_saved_credentials_for_qr() -> None:
 
     dialog = Dialog()
     settings = AppSettings(api_id=123)
+    gateway = Gateway()
     controller = AppController.for_test(
-        gateway=Gateway(),
+        gateway=gateway,
         login_dialog=dialog,
         settings=settings,
         secrets={"api_hash": "saved-hash"},
@@ -616,8 +620,53 @@ async def test_show_login_uses_saved_credentials_for_qr() -> None:
     await asyncio.sleep(0)
 
     assert dialog.shown is True
-    assert dialog.qr == ("tg://login?token=saved", expires)
-    assert dialog.pages[-1] is LoginPage.PASSWORD
+    assert dialog.qr is None
+    assert dialog.pages[-1] is LoginPage.CREDENTIALS
+    assert gateway.begin_qr_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_show_account_access_for_authorized_account_never_starts_qr() -> None:
+    calls: list[str] = []
+
+    class Gateway:
+        def is_connected(self) -> bool:
+            return True
+
+        async def account_profile(self):
+            return AccountProfile("42", "测试账号")
+
+        async def begin_qr_login(self):
+            calls.append("qr")
+            raise AssertionError("navigation must not begin QR login")
+
+    class StatusDialog:
+        def set_snapshot(self, value):
+            self.snapshot = value
+
+        def show(self):
+            calls.append("show")
+
+        def raise_(self):
+            pass
+
+        def activateWindow(self):
+            pass
+
+    status_dialog = StatusDialog()
+    controller = AppController.for_test(
+        gateway=Gateway(),
+        account_status_dialog=status_dialog,
+        secrets={"api_hash": "saved", "session": "encrypted-session"},
+        settings=AppSettings(api_id=1),
+    )
+
+    await controller.show_account_access()
+
+    assert calls == ["show"]
+    assert status_dialog.snapshot.authorization is AuthorizationState.AUTHORIZED
+    assert status_dialog.snapshot.connection is ConnectionState.ONLINE
+    assert status_dialog.snapshot.display_name == "测试账号"
 
 
 def test_show_login_prefills_saved_credentials_before_show() -> None:
@@ -655,8 +704,8 @@ def test_show_login_prefills_saved_credentials_before_show() -> None:
         "prefill",
         (12345, "saved-hash", proxy, "saved-password"),
     )
-    assert calls[1:4] == ["show", "raise", "activate"]
-    assert calls[4] == ("page", LoginPage.CREDENTIALS)
+    assert calls[1] == ("page", LoginPage.CREDENTIALS)
+    assert calls[2:5] == ["show", "raise", "activate"]
 
 
 @pytest.mark.asyncio

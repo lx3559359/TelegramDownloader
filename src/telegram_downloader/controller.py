@@ -14,8 +14,18 @@ from threading import Event
 from time import monotonic as monotonic_clock
 from typing import Any
 
+from telegram_downloader.account_access import (
+    AccountStatusSnapshot,
+    AuthorizationState,
+    ConnectionState,
+)
 from telegram_downloader.connectivity import ConnectionRecovery
-from telegram_downloader.content import ContentSearchQuery, SearchResult, SearchScope
+from telegram_downloader.content import (
+    AccountProfile,
+    ContentSearchQuery,
+    SearchResult,
+    SearchScope,
+)
 from telegram_downloader.content_browser import NothingToQueueError
 from telegram_downloader.content_progress import (
     DialogSyncProgress,
@@ -255,6 +265,25 @@ class _NullLoginDialog:
         pass
 
 
+class _NullAccountStatusDialog:
+    snapshot: AccountStatusSnapshot | None = None
+
+    def set_snapshot(self, value: AccountStatusSnapshot) -> None:
+        self.snapshot = value
+
+    def show_error(self, _message: str) -> None:
+        pass
+
+    def show(self) -> None:
+        pass
+
+    def raise_(self) -> None:
+        pass
+
+    def activateWindow(self) -> None:
+        pass
+
+
 class _NullSubscriptionPage:
     def set_logged_in(self, _value: bool) -> None:
         pass
@@ -451,6 +480,7 @@ class AppController:
         vault: Any,
         window: Any,
         login_dialog: Any,
+        account_status_dialog: Any | None = None,
         content_browser: Any | None = None,
         subscriptions: Any | None = None,
         subscription_scheduler: Any | None = None,
@@ -496,6 +526,9 @@ class AppController:
         self.vault = vault
         self.window = window
         self.login_dialog = login_dialog
+        self.account_status_dialog = (
+            account_status_dialog or _NullAccountStatusDialog()
+        )
         self.content_browser = content_browser
         self.subscriptions = subscriptions or _NullSubscriptionService()
         self.subscription_scheduler = subscription_scheduler or _NullSubscriptionScheduler()
@@ -573,6 +606,7 @@ class AppController:
             vault=vault,
             window=dependencies.pop("window", _NullWindow()),
             login_dialog=dependencies.pop("login_dialog", _NullLoginDialog()),
+            account_status_dialog=dependencies.pop("account_status_dialog", None),
             content_browser=dependencies.pop("content_browser", None),
             subscriptions=dependencies.pop("subscriptions", None),
             subscription_scheduler=dependencies.pop("subscription_scheduler", None),
@@ -2342,21 +2376,74 @@ class AppController:
         self._next_progress_refresh = sampled_at + self._progress_refresh_interval
         await self.refresh_tasks_async(now=sampled_at)
 
-    def show_login(self) -> None:
-        self._prefill_login()
-        self.login_dialog.show()
-        self.login_dialog.raise_()
-        self.login_dialog.activateWindow()
+    async def show_account_access(self) -> None:
         if (
-            self.gateway is not None
-            and self.settings.api_id > 0
-            and self.secrets.get("api_hash", "")
+            self.gateway is None
+            or self.settings.api_id <= 0
+            or not self.secrets.get("api_hash")
         ):
-            self._spawn_background(self.begin_qr_login())
+            self.show_login_credentials()
             return
+        try:
+            profile = await self.gateway.account_profile()
+            authorization = AuthorizationState.AUTHORIZED
+            connection = (
+                ConnectionState.ONLINE
+                if self._gateway_is_connected(self.gateway)
+                else ConnectionState.DEGRADED
+            )
+        except SessionExpiredError:
+            profile = None
+            authorization = AuthorizationState.EXPIRED
+            connection = ConnectionState.OFFLINE
+        except Exception:
+            profile = None
+            authorization = AuthorizationState.UNKNOWN
+            connection = ConnectionState.DEGRADED
+        self.account_status_dialog.set_snapshot(
+            self._account_status_snapshot(
+                profile,
+                authorization,
+                connection,
+            )
+        )
+        self.account_status_dialog.show()
+        self.account_status_dialog.raise_()
+        self.account_status_dialog.activateWindow()
+
+    def _account_status_snapshot(
+        self,
+        profile: AccountProfile | None,
+        authorization: AuthorizationState,
+        connection: ConnectionState,
+    ) -> AccountStatusSnapshot:
+        scheduler_snapshot = self.scheduler.snapshot()
+        fallback_name = getattr(self.window, "account", None) or "账号信息不可用"
+        return AccountStatusSnapshot(
+            profile.account_id if profile is not None else None,
+            profile.display_name if profile is not None else fallback_name,
+            authorization,
+            connection,
+            bool(self.secrets.get("session")),
+            self.content_browser is not None,
+            not isinstance(self.subscriptions, _NullSubscriptionService),
+            scheduler_snapshot.active_count,
+        )
+
+    def show_login_credentials(self) -> None:
+        self._prefill_login()
         from telegram_downloader.ui.login import LoginPage
 
         self.login_dialog.show_page(LoginPage.CREDENTIALS)
+        self._show_login_dialog()
+
+    def show_login(self) -> None:
+        self.show_login_credentials()
+
+    def _show_login_dialog(self) -> None:
+        self.login_dialog.show()
+        self.login_dialog.raise_()
+        self.login_dialog.activateWindow()
 
     def _prefill_login(self) -> None:
         set_saved = getattr(self.login_dialog, "set_saved_credentials", None)
