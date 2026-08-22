@@ -103,9 +103,7 @@ class SubscriptionService:
     ]:
         account = self._require_account()
         rules = tuple(self.catalog.list_subscriptions(account.account_id))
-        latest_runs = tuple(
-            self.catalog.latest_subscription_runs(account.account_id).items()
-        )
+        latest_runs = tuple(self.catalog.latest_subscription_runs(account.account_id).items())
         return rules, latest_runs
 
     def list_runs(
@@ -133,7 +131,7 @@ class SubscriptionService:
 
     async def create_rule(self, draft: SubscriptionDraft) -> SubscriptionRule:
         account = self._require_account()
-        gateway, _planner = self._require_online()
+        self._require_online()
         dialog = self.catalog.get_dialog(account.account_id, draft.peer_ref)
         if not dialog.available:
             raise SubscriptionUnavailableError("该群组或频道当前不可用")
@@ -143,12 +141,15 @@ class SubscriptionService:
             account_id=account.account_id,
             peer_ref=dialog.peer_ref,
             dialog_title=dialog.title,
-            keyword=draft.keyword,
+            criteria=draft.criteria,
             media_kinds=draft.media_kinds,
             interval_minutes=draft.interval_minutes,
+            history_days=draft.history_days,
             enabled=True,
             state=SubscriptionState.BASELINING,
             last_message_id=None,
+            backfill_from_utc=self._history_cutoff(draft.history_days, now),
+            backfill_through_id=None,
             next_run_at=None,
             last_run_at=None,
             last_error=None,
@@ -158,7 +159,7 @@ class SubscriptionService:
         )
         self.catalog.save_subscription(rule)
         try:
-            baseline = await gateway.latest_message_id(dialog.peer_ref)
+            return await self._establish_baseline(rule)
         except Exception as error:
             failed_at = self.clock()
             self.catalog.save_subscription(
@@ -172,15 +173,6 @@ class SubscriptionService:
                 )
             )
             raise
-        ready = replace(
-            rule,
-            state=SubscriptionState.WAITING,
-            last_message_id=baseline,
-            next_run_at=now + timedelta(minutes=draft.interval_minutes),
-            updated_at=self.clock(),
-        )
-        self.catalog.save_subscription(ready)
-        return ready
 
     async def update_rule(
         self,
@@ -188,41 +180,129 @@ class SubscriptionService:
         draft: SubscriptionDraft,
     ) -> SubscriptionRule:
         account = self._require_account()
-        gateway, _planner = self._require_online()
+        self._require_online()
         current = self.catalog.get_subscription(account.account_id, rule_id)
         dialog = self.catalog.get_dialog(account.account_id, draft.peer_ref)
         if not dialog.available:
             raise SubscriptionUnavailableError("该群组或频道当前不可用")
-        reset = (
-            current.peer_ref != draft.peer_ref
-            or current.normalized_keyword != draft.normalized_keyword
-        )
-        baseline = (
-            await gateway.latest_message_id(draft.peer_ref)
-            if reset
-            else current.last_message_id
-        )
         now = self.clock()
         enabled = current.enabled
-        updated = replace(
+        reset = self._requires_rebaseline(current, draft)
+        pending = replace(
             current,
             peer_ref=draft.peer_ref,
             dialog_title=dialog.title,
-            keyword=draft.keyword,
+            criteria=draft.criteria,
             media_kinds=draft.media_kinds,
             interval_minutes=draft.interval_minutes,
+            history_days=draft.history_days,
             enabled=enabled,
-            state=(SubscriptionState.WAITING if enabled else SubscriptionState.PAUSED),
-            last_message_id=baseline,
+            state=(SubscriptionState.BASELINING if reset else current.state),
+            last_message_id=(None if reset else current.last_message_id),
+            backfill_from_utc=(
+                self._history_cutoff(draft.history_days, now)
+                if reset
+                else current.backfill_from_utc
+            ),
+            backfill_through_id=(None if reset else current.backfill_through_id),
             next_run_at=(
-                now + timedelta(minutes=draft.interval_minutes) if enabled else None
+                None if reset or not enabled else now + timedelta(minutes=draft.interval_minutes)
             ),
             last_error=None,
             failure_count=0,
             updated_at=now,
         )
-        self.catalog.save_subscription(updated)
-        return updated
+        if not reset:
+            stable = replace(
+                pending,
+                state=(SubscriptionState.WAITING if enabled else SubscriptionState.PAUSED),
+            )
+            self.catalog.save_subscription(stable)
+            return stable
+        self.catalog.save_subscription(pending)
+        try:
+            return await self._establish_baseline(pending)
+        except Exception:
+            failed_at = self.clock()
+            self.catalog.save_subscription(
+                replace(
+                    pending,
+                    state=(SubscriptionState.FAILED if enabled else SubscriptionState.PAUSED),
+                    next_run_at=failed_at if enabled else None,
+                    last_error="自动建立基线失败",
+                    failure_count=pending.failure_count + 1,
+                    updated_at=failed_at,
+                )
+            )
+            raise
+
+    async def _establish_baseline(
+        self,
+        rule: SubscriptionRule,
+        *,
+        running: bool = False,
+    ) -> SubscriptionRule:
+        gateway, _planner = self._require_online()
+        snapshot_id = await gateway.latest_message_id(rule.peer_ref)
+        now = self.clock()
+        backfill_from = rule.backfill_from_utc
+        backfill_through: int | None = None
+        baseline = snapshot_id
+        if rule.history_days > 0:
+            backfill_from = backfill_from or self._history_cutoff(
+                rule.history_days,
+                now,
+            )
+            assert backfill_from is not None
+            boundary_id = await gateway.message_id_before(
+                rule.peer_ref,
+                backfill_from,
+            )
+            baseline = min(boundary_id, snapshot_id)
+            if baseline < snapshot_id:
+                backfill_through = snapshot_id
+            else:
+                backfill_from = None
+        state = (
+            SubscriptionState.RUNNING
+            if running
+            else (SubscriptionState.WAITING if rule.enabled else SubscriptionState.PAUSED)
+        )
+        next_run_at = None
+        if not running and rule.enabled:
+            next_run_at = (
+                now
+                if backfill_through is not None
+                else now + timedelta(minutes=rule.interval_minutes)
+            )
+        ready = replace(
+            rule,
+            state=state,
+            last_message_id=baseline,
+            backfill_from_utc=backfill_from,
+            backfill_through_id=backfill_through,
+            next_run_at=next_run_at,
+            last_error=None,
+            updated_at=now,
+        )
+        self.catalog.save_subscription(ready)
+        return ready
+
+    @staticmethod
+    def _history_cutoff(history_days: int, now: datetime) -> datetime | None:
+        return now - timedelta(days=history_days) if history_days else None
+
+    @staticmethod
+    def _requires_rebaseline(
+        current: SubscriptionRule,
+        draft: SubscriptionDraft,
+    ) -> bool:
+        return (
+            current.peer_ref != draft.peer_ref
+            or current.normalized_keyword != draft.matcher_fingerprint
+            or current.media_kinds != draft.media_kinds
+            or current.history_days != draft.history_days
+        )
 
     def set_enabled(self, rule_id: str, enabled: bool) -> SubscriptionRule:
         current = self.get_rule(rule_id)
@@ -356,34 +436,41 @@ class SubscriptionService:
         )
         self._progress(on_progress, rule_id, 0, 0, 0, 0, 0, "正在读取新消息")
         try:
-            snapshot_id = await gateway.latest_message_id(rule.peer_ref)
             if rule.last_message_id is None:
-                last_processed_id = snapshot_id
-                report = self._complete_run(
-                    rule,
-                    started_at,
-                    last_processed_id,
-                    inspected,
-                    keyword_hits,
-                    matched,
-                    queued,
-                    duplicate,
-                    task_ids,
-                    False,
-                )
-                self._progress(
-                    on_progress,
-                    rule_id,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    "基线建立完成",
-                )
-                return report
+                rule = await self._establish_baseline(rule, running=True)
+                last_processed_id = rule.last_message_id or 0
+                if rule.backfill_through_id is None:
+                    report = self._complete_run(
+                        rule,
+                        started_at,
+                        last_processed_id,
+                        inspected,
+                        keyword_hits,
+                        matched,
+                        queued,
+                        duplicate,
+                        task_ids,
+                        False,
+                    )
+                    self._progress(
+                        on_progress,
+                        rule_id,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        "基线建立完成",
+                    )
+                    return report
 
+            snapshot_id = (
+                rule.backfill_through_id
+                if rule.backfill_through_id is not None
+                else await gateway.latest_message_id(rule.peer_ref)
+            )
             after_id = rule.last_message_id
+            assert after_id is not None
             messages = await gateway.incremental_messages(
                 rule.peer_ref,
                 after_id=after_id,

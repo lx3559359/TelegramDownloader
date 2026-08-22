@@ -206,6 +206,59 @@ async def test_create_rule_establishes_baseline_without_queueing(
 
 
 @pytest.mark.asyncio
+async def test_create_historical_rule_locks_cutoff_and_snapshot(
+    tmp_path: Path,
+) -> None:
+    service, gateway, catalog, tasks = build_service(tmp_path)
+    gateway.latest_id = 900
+    gateway.boundary_id = 300
+
+    saved = await service.create_rule(
+        SubscriptionDraft(
+            "-1001",
+            SubscriptionCriteria(("AI",)),
+            frozenset({MediaKind.PHOTO}),
+            history_days=7,
+        )
+    )
+
+    assert gateway.boundary_calls == [("-1001", NOW - timedelta(days=7))]
+    assert saved.last_message_id == 300
+    assert saved.backfill_from_utc == NOW - timedelta(days=7)
+    assert saved.backfill_through_id == 900
+    assert saved.next_run_at == NOW
+    assert tasks.list_tasks() == []
+    assert catalog.get_subscription("a1", saved.id) == saved
+
+
+@pytest.mark.asyncio
+async def test_failed_history_baseline_retries_original_cutoff(
+    tmp_path: Path,
+) -> None:
+    service, gateway, _catalog, _tasks = build_service(tmp_path)
+    gateway.latest_error = TransientNetworkError("offline")
+    draft = SubscriptionDraft(
+        "-1001",
+        SubscriptionCriteria(("AI",)),
+        frozenset({MediaKind.PHOTO}),
+        history_days=3,
+    )
+
+    with pytest.raises(TransientNetworkError):
+        await service.create_rule(draft)
+
+    failed = service.list_rules()[0]
+    assert failed.backfill_from_utc == NOW - timedelta(days=3)
+    gateway.latest_error = None
+    gateway.latest_id = 500
+    gateway.boundary_id = 100
+
+    await service.run_rule(failed.id)
+
+    assert gateway.boundary_calls[-1] == ("-1001", NOW - timedelta(days=3))
+
+
+@pytest.mark.asyncio
 async def test_failed_initial_baseline_is_retryable_without_recreating_rule(
     tmp_path: Path,
 ) -> None:
@@ -512,6 +565,44 @@ async def test_rule_edit_pause_resume_due_and_delete_lifecycle(
 
     service.delete_rule(saved.id)
     assert service.list_rules() == []
+
+
+@pytest.mark.asyncio
+async def test_only_semantic_edits_reestablish_history_baseline(tmp_path: Path) -> None:
+    service, gateway, _catalog, _tasks = build_service(tmp_path)
+    original_draft = SubscriptionDraft(
+        "-1001",
+        SubscriptionCriteria(("AI",)),
+        frozenset({MediaKind.PHOTO}),
+        30,
+        0,
+    )
+    saved = await service.create_rule(original_draft)
+    assert gateway.latest_calls == 1
+
+    interval_only = await service.update_rule(
+        saved.id,
+        replace(original_draft, interval_minutes=60),
+    )
+
+    assert interval_only.last_message_id == saved.last_message_id
+    assert gateway.latest_calls == 1
+
+    gateway.latest_id = 900
+    gateway.boundary_id = 300
+    changed = await service.update_rule(
+        saved.id,
+        replace(
+            original_draft,
+            criteria=SubscriptionCriteria(("模型",)),
+            history_days=7,
+        ),
+    )
+
+    assert gateway.latest_calls == 2
+    assert changed.last_message_id == 300
+    assert changed.backfill_through_id == 900
+    assert changed.next_run_at == NOW
 
 
 @pytest.mark.asyncio
