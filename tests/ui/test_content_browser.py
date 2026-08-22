@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QGraphicsDropShadowEffect,
     QHeaderView,
+    QTableView,
 )
 
 from telegram_downloader.content import (
@@ -106,11 +107,13 @@ def test_page_contains_content_browser_controls(qtbot) -> None:
         page.result_table.horizontalScrollBarPolicy()
         == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
     )
-    assert page.result_table.wordWrap() is True
+    assert page.result_table.wordWrap() is False
     assert (
         page.result_table.textElideMode()
-        == Qt.TextElideMode.ElideNone
+        == Qt.TextElideMode.ElideRight
     )
+    assert not hasattr(page, "summary_delegate")
+    assert not hasattr(page, "_row_resize_timer")
     header = page.result_table.horizontalHeader()
     fixed_widths = {
         0: 52,
@@ -149,78 +152,38 @@ def test_account_content_card_structure_keeps_filter_minimums(qtbot) -> None:
     assert page.dialog_list.textElideMode() == Qt.TextElideMode.ElideRight
 
 
-def test_result_summary_wraps_without_squeezing_fixed_columns(qtbot) -> None:
+def test_result_summary_is_single_line_with_full_tooltip(qtbot) -> None:
     now = datetime(2026, 8, 15, tzinfo=UTC)
     page = ContentBrowserPage()
     page.resize(996, 650)
     qtbot.addWidget(page)
     page.show()
+    excerpt = "这是一段很长的搜索结果摘要。" * 30
     page.set_results(
         [
             replace(
                 result(now, "long-summary", 1),
-                excerpt=(
-                    "这是一段很长的摘要，需要在摘要列内完整换行，"
-                    "不能挤压日期、类型、大小或状态列。"
-                )
-                * 4,
+                excerpt=excerpt,
             )
         ]
     )
-    qtbot.wait(80)
+    qtbot.wait(20)
 
+    index = page.result_model.index(0, 4)
+    assert page.result_model.data(index, Qt.ItemDataRole.DisplayRole) == excerpt
+    assert page.result_model.data(index, Qt.ItemDataRole.ToolTipRole) == excerpt
     assert (
         page.result_table.horizontalScrollBarPolicy()
         == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
     )
     assert page.result_table.columnWidth(4) > 0
-    assert page.result_table.rowHeight(0) > 78
-    assert page.summary_delegate.measurement_count == 1
+    assert page.result_table.rowHeight(0) == 78
 
 
-def test_result_summary_resize_is_debounced_and_invalidates_cache(qtbot) -> None:
-    now = datetime(2026, 8, 15, tzinfo=UTC)
-    page = ContentBrowserPage()
-    page.resize(1100, 650)
-    qtbot.addWidget(page)
-    page.show()
-    page.set_results(
-        [replace(result(now, "long-summary", 1), excerpt="换行摘要 " * 80)]
-    )
-    qtbot.wait(80)
-    initial = page.summary_delegate.measurement_count
-
-    page.result_table.setColumnWidth(4, 280)
-    page.result_table.setColumnWidth(4, 260)
-    page.result_table.setColumnWidth(4, 240)
-    assert page._row_resize_timer.isActive()
-    qtbot.wait(80)
-
-    assert page.summary_delegate.measurement_count == initial + 1
-
-
-def test_result_summary_font_change_invalidates_cached_height(qtbot) -> None:
-    now = datetime(2026, 8, 15, tzinfo=UTC)
-    page = ContentBrowserPage()
-    page.resize(1000, 620)
-    qtbot.addWidget(page)
-    page.show()
-    page.set_results(
-        [replace(result(now, "long-summary", 1), excerpt="字体变化摘要 " * 40)]
-    )
-    qtbot.wait(80)
-    initial = page.summary_delegate.measurement_count
-
-    font = page.font()
-    font.setPointSize(font.pointSize() + 2)
-    page.setFont(font)
-    assert page._row_resize_timer.isActive()
-    qtbot.wait(80)
-
-    assert page.summary_delegate.measurement_count == initial + 1
-
-
-def test_large_result_set_only_measures_visible_summary_rows(qtbot) -> None:
+def test_large_result_set_keeps_fixed_rows_without_scroll_resize(
+    qtbot,
+    monkeypatch,
+) -> None:
     now = datetime(2026, 8, 15, tzinfo=UTC)
     page = ContentBrowserPage()
     page.resize(1000, 620)
@@ -238,13 +201,23 @@ def test_large_result_set_only_measures_visible_summary_rows(qtbot) -> None:
     )
     qtbot.wait(100)
 
-    initial = page.summary_delegate.measurement_count
-    assert 0 < initial < 100
+    resize_calls: list[tuple[int, int]] = []
+    original_set_row_height = QTableView.setRowHeight
 
-    page.result_table.verticalScrollBar().setValue(5_000)
+    def track_row_height(table: QTableView, row: int, height: int) -> None:
+        resize_calls.append((row, height))
+        original_set_row_height(table, row, height)
+
+    monkeypatch.setattr(QTableView, "setRowHeight", track_row_height)
+
+    page.result_table.verticalScrollBar().setValue(
+        page.result_table.verticalScrollBar().maximum()
+    )
     qtbot.wait(100)
 
-    assert initial < page.summary_delegate.measurement_count < 200
+    assert resize_calls == []
+    for row in (0, 1, 5_000, 9_998, 9_999):
+        assert page.result_table.rowHeight(row) == 78
 
 
 def test_account_content_cards_use_shared_major_elevation(qtbot) -> None:
