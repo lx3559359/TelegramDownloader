@@ -101,6 +101,19 @@ QLabel#diagnosticStatus[status="warning"] {
 QLabel#diagnosticStatus[status="failed"] {
     border-color: #E7A8B3; background: #FFF0F3; color: #A33C50;
 }
+QLabel#updateStatus {
+    padding: 8px 11px; border: 1px solid #C5D0DC; border-radius: 7px;
+    background: #F1F4F8; color: #475569;
+}
+QLabel#updateStatus[updateState="success"] {
+    border-color: #9DD9C7; background: #EAF8F2; color: #176B55;
+}
+QLabel#updateStatus[updateState="warning"] {
+    border-color: #E7C878; background: #FFF8E5; color: #8A6418;
+}
+QLabel#updateStatus[updateState="error"] {
+    border-color: #E7A8B3; background: #FFF0F3; color: #A33C50;
+}
 QLabel#errorText, QLabel#errorBanner {
     padding: 8px 11px; border: 1px solid #E7A8B3; border-radius: 7px;
     background: #FFF0F3; color: #A33C50;

@@ -67,6 +67,9 @@ def test_manual_update_button_emits_and_reports_result(qtbot) -> None:
     dialog.set_update_result("当前已是最新正式版", state="success")
     assert dialog.update_status_label.text() == "当前已是最新正式版"
     assert dialog.update_status_label.property("updateState") == "success"
+    assert 'QLabel#updateStatus[updateState="success"]' in APP_STYLESHEET
+    assert 'QLabel#updateStatus[updateState="warning"]' in APP_STYLESHEET
+    assert 'QLabel#updateStatus[updateState="error"]' in APP_STYLESHEET
     dialog.set_last_successful_update_check("2026-08-23T02:20:00Z")
     assert "2026-08-23" in dialog.update_last_checked_label.text()
     dialog.set_update_busy(False)

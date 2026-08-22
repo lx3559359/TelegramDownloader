@@ -301,7 +301,11 @@ async def test_newer_release_requiring_newer_updater_is_blocked(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_controller_start_never_checks_for_updates(tmp_path) -> None:
+@pytest.mark.parametrize("background", [False, True])
+async def test_controller_start_never_checks_for_updates(
+    tmp_path,
+    background: bool,
+) -> None:
     calls = 0
 
     class Coordinator:
@@ -311,7 +315,7 @@ async def test_controller_start_never_checks_for_updates(tmp_path) -> None:
 
     controller = AppController.for_test(update_coordinator=Coordinator())
 
-    await controller.start(background=False)
+    await controller.start(background=background)
     await asyncio.sleep(0)
 
     assert calls == 0
