@@ -108,7 +108,7 @@ def test_subscription_modules_do_not_escape_project_local_storage() -> None:
         assert all(value not in source for value in diagnostic_forbidden), module.name
 
 
-def test_v0140_version_and_p1_experience_contract_are_consistent() -> None:
+def test_v0150_version_and_storage_maintenance_contract_are_consistent() -> None:
     root = Path(__file__).parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     package_init = (root / "src/telegram_downloader/__init__.py").read_text(
@@ -125,12 +125,12 @@ def test_v0140_version_and_p1_experience_contract_are_consistent() -> None:
         encoding="utf-8"
     )
     readme = (root / "README.md").read_text(encoding="utf-8")
-    release_notes = root / "docs/releases/v0.14.0.md"
-    verification = root / "docs/verification/v0.14.0-p1-experience-upgrades.md"
+    release_notes = root / "docs/releases/v0.15.0.md"
+    verification = root / "docs/verification/v0.15.0-storage-maintenance.md"
 
-    assert project["project"]["version"] == "0.14.0"
-    assert '__version__ = "0.14.0"' in package_init
-    assert '#define AppVersion "0.14.0"' in installer
+    assert project["project"]["version"] == "0.15.0"
+    assert '__version__ = "0.15.0"' in package_init
+    assert '#define AppVersion "0.15.0"' in installer
     assert "qrcode==8.2" in requirements
     assert '"qrcode"' in spec
     assert "app_version=__version__" in gateway
@@ -157,14 +157,19 @@ def test_v0140_version_and_p1_experience_contract_are_consistent() -> None:
     assert '"--background"' in entry
     assert release_notes.is_file()
     notes = release_notes.read_text(encoding="utf-8")
-    assert "# TelegramDownloader v0.14.0" in notes
+    assert "# TelegramDownloader v0.15.0" in notes
     assert all(
         term in notes
         for term in (
-            "高级订阅",
-            "批量导入",
-            "全局媒体槽",
-            "下载路径",
+            "默认关闭",
+            "7 天",
+            "30 天",
+            "1 GiB",
+            "900 MiB",
+            "最新 1 份",
+            "不会自动扫描 `downloads`",
+            "两次确认",
+            "来源不明",
         )
     )
     assert verification.is_file()
@@ -180,9 +185,52 @@ def test_v0140_version_and_p1_experience_contract_are_consistent() -> None:
         "FileIntegrityService",
         "DiagnosticsService",
         "DiagnosticReportStore",
+        "StorageMaintenanceService",
+        "StorageMaintenanceScheduler",
     ):
         assert component in app
         assert f"{component}(" in app
+
+    for term in (
+        "维护中心与存储空间",
+        "默认关闭",
+        "7 天",
+        "30 天",
+        "1 GiB",
+        "900 MiB",
+        "最新 1 份",
+        "不会自动扫描 `downloads`",
+        "两次确认",
+        "来源不明",
+        "永久删除",
+        "退出",
+    ):
+        assert term in readme
+
+
+def test_portable_zip_has_private_runtime_entry_gate() -> None:
+    root = Path(__file__).parents[1]
+    build = (root / "scripts/build.ps1").read_text(encoding="utf-8")
+    forbidden = (
+        "storage-state.json",
+        ".part",
+        ".corrupt",
+        "app.log",
+        "tasks.sqlite3",
+        "catalog.sqlite3",
+        "secrets.dat",
+    )
+
+    assert all(value in build for value in forbidden)
+    for fragment in (
+        "System.IO.Compression.ZipFile",
+        "OpenRead($zip)",
+        "Entry.FullName",
+        "ToLowerInvariant",
+        "Dispose()",
+        "Portable ZIP contains private runtime entry",
+    ):
+        assert fragment in build
 
 
 def test_build_preserves_existing_project_local_runtime_data() -> None:

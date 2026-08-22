@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -48,3 +49,30 @@ def test_background_argument_is_propagated_to_gui_runner(
 
     assert main_module.main() == 0
     assert calls == [(tmp_path, True)]
+
+
+def test_self_test_json_forces_utf8_stdout(monkeypatch) -> None:
+    class Output:
+        def __init__(self) -> None:
+            self.encoding = "cp936"
+            self.reconfigured: list[tuple[str, str]] = []
+            self.parts: list[str] = []
+
+        def reconfigure(self, *, encoding: str, errors: str) -> None:
+            self.encoding = encoding
+            self.reconfigured.append((encoding, errors))
+
+        def write(self, value: str) -> int:
+            self.parts.append(value)
+            return len(value)
+
+        def flush(self) -> None:
+            pass
+
+    output = Output()
+    monkeypatch.setattr(sys, "stdout", output)
+
+    main_module._print_self_test_report({"runtime_root": "D:/Telegram下载器"})
+
+    assert output.reconfigured == [("utf-8", "strict")]
+    assert json.loads("".join(output.parts))["runtime_root"].endswith("下载器")

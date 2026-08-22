@@ -117,6 +117,37 @@ try {
         Remove-Item -LiteralPath $zip -Force
     }
     Compress-Archive -Path (Join-Path $appDir '*') -DestinationPath $zip -CompressionLevel Optimal
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $privateArchive = $null
+    try {
+        $privateArchive = [System.IO.Compression.ZipFile]::OpenRead($zip)
+        foreach ($archiveEntry in $privateArchive.Entries) {
+            $normalizedEntry = $archiveEntry.FullName.Replace('\', '/').Trim('/').ToLowerInvariant()
+            $entryName = [IO.Path]::GetFileName($normalizedEntry)
+            $privateRoot = (
+                $normalizedEntry -eq 'data' -or
+                $normalizedEntry.StartsWith('data/') -or
+                $normalizedEntry -eq 'downloads' -or
+                $normalizedEntry.StartsWith('downloads/')
+            )
+            $privateName = (
+                $entryName -eq 'storage-state.json' -or
+                $entryName -eq 'app.log' -or
+                $entryName -eq 'tasks.sqlite3' -or
+                $entryName -eq 'catalog.sqlite3' -or
+                $entryName -eq 'secrets.dat' -or
+                $entryName.EndsWith('.part') -or
+                $entryName.Contains('.corrupt')
+            )
+            if ($privateRoot -or $privateName) {
+                throw 'Portable ZIP contains private runtime entry'
+            }
+        }
+    } finally {
+        if ($null -ne $privateArchive) {
+            $privateArchive.Dispose()
+        }
+    }
     $zipValidation = Assert-ProjectChild (Join-Path $buildTemp 'portable-zip-validation')
     if (Test-Path -LiteralPath $zipValidation) {
         Remove-Item -LiteralPath $zipValidation -Recurse -Force

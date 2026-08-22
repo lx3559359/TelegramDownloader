@@ -3,9 +3,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
 from telegram_downloader.bootstrap import configure_process, runtime_root
+
+
+def _print_self_test_report(report: dict[str, object]) -> None:
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if callable(reconfigure):
+        reconfigure(encoding="utf-8", errors="strict")
+    print(json.dumps(report, ensure_ascii=False, separators=(",", ":")))
 
 
 def _default_startup_factory():
@@ -62,7 +70,7 @@ def main() -> int:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, confirmation)
-        print(json.dumps(report, ensure_ascii=False, separators=(",", ":")))
+        _print_self_test_report(report)
         return 0 if report.get("ok") is True else 1
 
     return _run_gui(root, background=arguments.background)
