@@ -827,6 +827,35 @@ async def test_repeated_candidate_login_focuses_existing_attempt() -> None:
 
 
 @pytest.mark.asyncio
+async def test_candidate_credentials_edit_cannot_fall_back_to_active_replacement() -> None:
+    class Gateway:
+        def __init__(self) -> None:
+            self.disconnect_calls = 0
+
+        async def disconnect(self):
+            self.disconnect_calls += 1
+
+    class Dialog:
+        def __init__(self) -> None:
+            self.error = ""
+
+        def show_error(self, text):
+            self.error = text
+
+    active = Gateway()
+    candidate = Gateway()
+    controller = AppController.for_test(gateway=active, login_dialog=Dialog())
+    controller._candidate_login = CandidateLoginSession(candidate)
+
+    await controller.edit_credentials()
+
+    assert controller._candidate_login is not None
+    assert active.disconnect_calls == 0
+    assert candidate.disconnect_calls == 0
+    assert "设置" in controller.login_dialog.error
+
+
+@pytest.mark.asyncio
 async def test_candidate_commit_same_account_skips_switch_confirmation() -> None:
     class Gateway:
         def __init__(self, account_id: str, name: str, session: str) -> None:

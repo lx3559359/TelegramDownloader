@@ -954,11 +954,12 @@ class AppController:
         self.login_dialog.show_page(LoginPage.PHONE)
 
     async def edit_credentials(self) -> None:
-        await self._cancel_qr_wait()
         if self._candidate_login is not None:
-            await self._discard_candidate_login()
-            self.show_login_credentials()
+            self.login_dialog.show_error(
+                "重新登录期间不能修改 API/代理；请先取消，并在设置中保存后重试"
+            )
             return
+        await self._cancel_qr_wait()
         await self._cancel_subscription_probe()
         await self.connection_recovery.cancel()
         if self.gateway is not None:
@@ -2644,10 +2645,6 @@ class AppController:
         )
         old_services = OnlineServices(self.gateway, self.planner, self.scheduler)
         old_secrets = dict(self.secrets)
-        new_secrets = {
-            **old_secrets,
-            "session": candidate.gateway.export_session(),
-        }
         committed = False
         vault_changed = False
         self.scheduler.set_admission_open(False)
@@ -2655,6 +2652,10 @@ class AppController:
             await self._cancel_subscription_probe()
             await self._cancel_content_operations()
             self.bind_online_services(services)
+            new_secrets = {
+                **old_secrets,
+                "session": candidate.gateway.export_session(),
+            }
             self.vault.save(new_secrets)
             vault_changed = True
             self.gateway = services.gateway
