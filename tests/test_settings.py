@@ -9,6 +9,7 @@ from telegram_downloader.settings import (
     ProxySettings,
     SettingsError,
     SettingsStore,
+    StorageMaintenanceSettings,
 )
 
 
@@ -41,6 +42,62 @@ def test_background_settings_have_safe_compatible_defaults(tmp_path) -> None:
     assert loaded.tray_hint_shown is False
     assert loaded.download_schedule == DownloadScheduleSettings()
     assert loaded.download_naming == DownloadNamingSettings()
+
+
+def test_storage_maintenance_defaults_are_fixed_and_opt_in() -> None:
+    value = StorageMaintenanceSettings()
+
+    assert value.automatic_enabled is False
+    assert value.temp_retention_days == 7
+    assert value.log_retention_days == 30
+    assert value.thumbnail_limit_bytes == 1024**3
+    assert value.thumbnail_target_bytes == 900 * 1024**2
+    assert value.update_staging_retention_days == 7
+    assert value.update_backup_keep_count == 1
+    assert value.check_interval_seconds == 86400
+    assert value.startup_delay_seconds == 300
+    assert value.idle_required_seconds == 60
+    assert value.busy_retry_seconds == 900
+
+
+def test_old_settings_default_storage_maintenance_to_disabled(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text('{"api_id":7,"concurrency":2}', encoding="utf-8")
+
+    loaded = SettingsStore(path).load()
+
+    assert loaded.api_id == 7
+    assert loaded.concurrency == 2
+    assert loaded.storage_maintenance == StorageMaintenanceSettings()
+
+
+def test_storage_maintenance_enabled_round_trips_as_nested_json(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    store = SettingsStore(path)
+    settings = AppSettings(
+        storage_maintenance=StorageMaintenanceSettings(automatic_enabled=True)
+    )
+
+    store.save(settings)
+
+    assert store.load() == settings
+    assert json.loads(path.read_text(encoding="utf-8"))["storage_maintenance"][
+        "automatic_enabled"
+    ] is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"automatic_enabled": 1},
+        {"temp_retention_days": 8},
+        {"temp_retention_days": 7.0},
+        {"thumbnail_target_bytes": 1},
+    ],
+)
+def test_storage_maintenance_rejects_unsupported_values(value) -> None:
+    with pytest.raises(SettingsError):
+        StorageMaintenanceSettings(**value)
 
 
 def test_download_naming_settings_round_trip_as_nested_json(tmp_path) -> None:

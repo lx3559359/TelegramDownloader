@@ -23,6 +23,11 @@ def test_ensure_layout_creates_every_managed_directory(tmp_path: Path) -> None:
     assert paths.diagnostics.is_dir()
     assert paths.diagnostic_temp == tmp_path / "data" / "temp" / "diagnostics"
     assert paths.diagnostic_temp.is_dir()
+    assert paths.maintenance == tmp_path / "data" / "maintenance"
+    assert paths.maintenance.is_dir()
+    assert paths.storage_maintenance_state == (
+        tmp_path / "data" / "maintenance" / "storage-state.json"
+    )
     assert paths.update_staging.is_dir()
     assert paths.update_backup.is_dir()
     assert paths.update_helper.is_dir()

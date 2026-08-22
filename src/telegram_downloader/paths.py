@@ -60,6 +60,14 @@ class PortablePaths:
         return self.temp / "diagnostics"
 
     @property
+    def maintenance(self) -> Path:
+        return self.data / "maintenance"
+
+    @property
+    def storage_maintenance_state(self) -> Path:
+        return self.maintenance / "storage-state.json"
+
+    @property
     def update(self) -> Path:
         return self.data / "update"
 
@@ -106,6 +114,7 @@ class PortablePaths:
             self.temp,
             self.diagnostics,
             self.diagnostic_temp,
+            self.maintenance,
             self.update_staging,
             self.update_backup,
             self.update_helper,

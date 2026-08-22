@@ -41,6 +41,44 @@ class DownloadScheduleSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class StorageMaintenanceSettings:
+    automatic_enabled: bool = False
+    temp_retention_days: int = 7
+    log_retention_days: int = 30
+    thumbnail_limit_bytes: int = 1024**3
+    thumbnail_target_bytes: int = 900 * 1024**2
+    update_staging_retention_days: int = 7
+    update_backup_keep_count: int = 1
+    check_interval_seconds: int = 86400
+    startup_delay_seconds: int = 300
+    idle_required_seconds: int = 60
+    busy_retry_seconds: int = 900
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.automatic_enabled, bool):
+            raise SettingsError("自动清理开关必须是布尔值")
+        expected = {
+            "temp_retention_days": 7,
+            "log_retention_days": 30,
+            "thumbnail_limit_bytes": 1024**3,
+            "thumbnail_target_bytes": 900 * 1024**2,
+            "update_staging_retention_days": 7,
+            "update_backup_keep_count": 1,
+            "check_interval_seconds": 86400,
+            "startup_delay_seconds": 300,
+            "idle_required_seconds": 60,
+            "busy_retry_seconds": 900,
+        }
+        if any(
+            not isinstance(getattr(self, name), int)
+            or isinstance(getattr(self, name), bool)
+            or getattr(self, name) != value
+            for name, value in expected.items()
+        ):
+            raise SettingsError("存储维护策略不是受支持的固定策略")
+
+
+@dataclass(frozen=True, slots=True)
 class ProxySettings:
     kind: str = "none"
     host: str = ""
@@ -71,6 +109,7 @@ class AppSettings:
     tray_hint_shown: bool = False
     download_schedule: DownloadScheduleSettings = DownloadScheduleSettings()
     download_naming: DownloadNamingSettings = DownloadNamingSettings()
+    storage_maintenance: StorageMaintenanceSettings = StorageMaintenanceSettings()
 
     def __post_init__(self) -> None:
         if not isinstance(self.api_id, int) or isinstance(self.api_id, bool) or self.api_id < 0:
@@ -99,6 +138,8 @@ class AppSettings:
             raise SettingsError("下载时段设置格式无效")
         if not isinstance(self.download_naming, DownloadNamingSettings):
             raise SettingsError("下载路径模板设置格式无效")
+        if not isinstance(self.storage_maintenance, StorageMaintenanceSettings):
+            raise SettingsError("存储维护设置格式无效")
         try:
             validate_speed_limit_kib(self.speed_limit_kib)
         except ValueError as exc:
@@ -125,9 +166,15 @@ class SettingsStore:
             naming_raw = raw.get("download_naming", {})
             if not isinstance(naming_raw, dict):
                 raise SettingsError("下载路径模板设置必须是对象")
+            maintenance_raw = raw.get("storage_maintenance", {})
+            if not isinstance(maintenance_raw, dict):
+                raise SettingsError("存储维护设置必须是对象")
             values = dict(raw)
             values["proxy"] = ProxySettings(**proxy_raw)
             values["download_schedule"] = DownloadScheduleSettings(**schedule_raw)
+            values["storage_maintenance"] = StorageMaintenanceSettings(
+                **maintenance_raw
+            )
             try:
                 values["download_naming"] = DownloadNamingSettings(**naming_raw)
             except ValueError as error:
