@@ -23,12 +23,12 @@ class DownloadScheduleSettings:
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
             raise SettingsError("下载时段开关必须是布尔值")
-        normalized = tuple(dict.fromkeys(self.weekdays))
-        if not normalized or any(
+        if not isinstance(self.weekdays, (tuple, list)) or not self.weekdays or any(
             not isinstance(day, int) or isinstance(day, bool) or not 0 <= day <= 6
-            for day in normalized
+            for day in self.weekdays
         ):
             raise SettingsError("下载星期必须是周一到周日的非空集合")
+        normalized = tuple(dict.fromkeys(self.weekdays))
         if any(
             not isinstance(value, int)
             or isinstance(value, bool)

@@ -45,6 +45,7 @@ def test_background_settings_have_safe_compatible_defaults(tmp_path) -> None:
     "value",
     [
         {"weekdays": []},
+        {"weekdays": None},
         {"weekdays": [0, 7]},
         {"start_minute": -1},
         {"end_minute": 1440},
