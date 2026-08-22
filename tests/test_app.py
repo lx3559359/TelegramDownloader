@@ -8,6 +8,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QMessageBox, QWidget
 
 from telegram_downloader import app
+from telegram_downloader.account_access import OnlineServices
 from telegram_downloader.catalog import CatalogRepository
 from telegram_downloader.connectivity import ConnectionRecovery
 from telegram_downloader.content import (
@@ -63,6 +64,44 @@ EXPECTED_POLICIES = {
     "maintenance.storage.automatic": ActionPolicy.DEDUPLICATE,
     "maintenance.storage.cancel": ActionPolicy.DEDUPLICATE,
 }
+
+
+def test_online_service_bundle_build_is_side_effect_free(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    application, loop, controller = app.create_application(tmp_path)
+    content_bindings = []
+    subscription_bindings = []
+    monkeypatch.setattr(
+        controller.content_browser,
+        "bind_online",
+        lambda gateway, planner: content_bindings.append((gateway, planner)),
+    )
+    monkeypatch.setattr(
+        controller.subscriptions,
+        "bind_online",
+        lambda gateway, planner: subscription_bindings.append((gateway, planner)),
+    )
+    gateway = SimpleNamespace()
+
+    try:
+        services = controller.build_online_services(gateway, controller.settings)
+
+        assert isinstance(services, OnlineServices)
+        assert services.gateway is gateway
+        assert content_bindings == []
+        assert subscription_bindings == []
+
+        controller.bind_online_services(services)
+
+        assert content_bindings == [(gateway, services.planner)]
+        assert subscription_bindings == [(gateway, services.planner)]
+    finally:
+        loop.run_until_complete(controller._async_actions.shutdown())
+        controller.window.close()
+        loop.close()
+        application.processEvents()
 
 
 def close_created_application(application, loop, controller) -> None:
@@ -646,10 +685,12 @@ def test_service_builder_shares_runtime_download_resource_settings(tmp_path) -> 
     )
 
     try:
-        planner, scheduler, content = controller.service_builder(object(), settings)
+        services = controller.build_online_services(object(), settings)
+        planner = services.planner
+        scheduler = services.scheduler
 
         assert planner is not None
-        assert content is controller.content_browser
+        assert services.gateway is not None
         assert scheduler.snapshot().concurrency == 4
         assert scheduler.snapshot().speed_limit_kib == 2048
         assert scheduler.downloader.bandwidth is scheduler._bandwidth

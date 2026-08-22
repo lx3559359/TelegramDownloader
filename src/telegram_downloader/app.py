@@ -18,6 +18,7 @@ from time import monotonic
 from typing import Any
 
 from telegram_downloader import __version__
+from telegram_downloader.account_access import OnlineServices
 from telegram_downloader.activation import (
     ACTIVATION_CHANNEL,
     LocalActivationServer,
@@ -488,7 +489,10 @@ def create_application(
     ) -> TelethonGateway:
         return TelethonGateway(api_id, api_hash, session, proxy, proxy_password)
 
-    def build_services(gateway: TelethonGateway, resource_settings: AppSettings):
+    def build_online_services(
+        gateway: TelethonGateway,
+        resource_settings: AppSettings,
+    ) -> OnlineServices:
         planner = TaskPlanner(
             gateway,
             repository,
@@ -517,9 +521,15 @@ def create_application(
             datetime.now().astimezone(),
         )
         scheduler.set_admission_open(schedule_state.allowed)
-        content_browser.bind_online(gateway, planner)
-        subscriptions.bind_online(gateway, planner)
-        return planner, scheduler, content_browser
+        return OnlineServices(gateway, planner, scheduler)
+
+    def bind_online_services(services: OnlineServices) -> None:
+        content_browser.bind_online(services.gateway, services.planner)
+        subscriptions.bind_online(services.gateway, services.planner)
+
+    def unbind_online_services() -> None:
+        content_browser.go_offline()
+        subscriptions.go_offline()
 
     gateway = None
     planner = None
@@ -533,10 +543,13 @@ def create_application(
             settings.proxy,
             secrets.get("proxy_password", ""),
         )
-        planner, scheduler, content_browser = build_services(
+        services = build_online_services(
             gateway,
             settings,
         )
+        bind_online_services(services)
+        planner = services.planner
+        scheduler = services.scheduler
 
     async def confirm_preview(preview: ScanPreview) -> bool:
         dialog = QMessageBox(window)
@@ -743,7 +756,9 @@ def create_application(
         paths=paths,
         download_paths=download_paths,
         gateway_factory=gateway_factory,
-        service_builder=build_services,
+        build_online_services=build_online_services,
+        bind_online_services=bind_online_services,
+        unbind_online_services=unbind_online_services,
         confirm_preview=confirm_preview,
         update_coordinator=update_coordinator,
         update_prompt=update_prompt,

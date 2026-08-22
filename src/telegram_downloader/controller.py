@@ -19,6 +19,7 @@ from telegram_downloader.account_access import (
     AuthorizationState,
     CandidateLoginSession,
     ConnectionState,
+    OnlineServices,
 )
 from telegram_downloader.connectivity import ConnectionRecovery
 from telegram_downloader.content import (
@@ -493,9 +494,12 @@ class AppController:
         gateway_factory: Callable[..., TelegramGateway] | None = None,
         service_builder: Callable[
             [TelegramGateway, AppSettings],
-            tuple[Any, Any, Any],
+            Any,
         ]
         | None = None,
+        build_online_services: Callable[[Any, AppSettings], OnlineServices] | None = None,
+        bind_online_services: Callable[[OnlineServices], None] | None = None,
+        unbind_online_services: Callable[[], None] | None = None,
         confirm_preview: Callable[[Any], bool | Awaitable[bool]] | None = None,
         confirm_reauthentication: Callable[[], bool | Awaitable[bool]] | None = None,
         confirm_account_switch: (
@@ -543,7 +547,10 @@ class AppController:
         self._diagnostic_report: Any | None = None
         self.paths = paths
         self.gateway_factory = gateway_factory
-        self.service_builder = service_builder
+        self.build_online_services = build_online_services or service_builder
+        self.service_builder = self.build_online_services
+        self.bind_online_services = bind_online_services or (lambda _services: None)
+        self.unbind_online_services = unbind_online_services or (lambda: None)
         self.confirm_preview = confirm_preview or (lambda _preview: True)
         self.confirm_reauthentication = confirm_reauthentication or (lambda: False)
         self.confirm_account_switch = confirm_account_switch or (
@@ -627,6 +634,9 @@ class AppController:
             download_paths=dependencies.pop("download_paths", None),
             gateway_factory=dependencies.pop("gateway_factory", None),
             service_builder=dependencies.pop("service_builder", None),
+            build_online_services=dependencies.pop("build_online_services", None),
+            bind_online_services=dependencies.pop("bind_online_services", None),
+            unbind_online_services=dependencies.pop("unbind_online_services", None),
             confirm_preview=dependencies.pop("confirm_preview", None),
             confirm_reauthentication=dependencies.pop(
                 "confirm_reauthentication",
@@ -844,15 +854,16 @@ class AppController:
             self.settings = updated_settings
             self.secrets = updated_secrets
             self.gateway = gateway
-            if self.service_builder is not None:
-                services = self.service_builder(
+            if self.build_online_services is not None:
+                services = self.build_online_services(
                     gateway,
                     updated_settings,
                 )
-                if len(services) == 3:
-                    self.planner, self.scheduler, self.content_browser = services
-                else:
-                    self.planner, self.scheduler = services
+                if not isinstance(services, OnlineServices):
+                    services = OnlineServices(gateway, services[0], services[1])
+                self.bind_online_services(services)
+                self.planner = services.planner
+                self.scheduler = services.scheduler
             await self.begin_qr_login()
         except Exception as error:
             self.login_dialog.show_error(self._safe_error(error))
@@ -2639,15 +2650,20 @@ class AppController:
                         "fresh Telegram connection failed (%s)",
                         type(reconnect_error).__name__,
                     )
-                if self.service_builder is not None:
-                    services = self.service_builder(
+                if self.build_online_services is not None:
+                    services = self.build_online_services(
                         fresh_gateway,
                         self.settings,
                     )
-                    if len(services) == 3:
-                        self.planner, self.scheduler, self.content_browser = services
-                    else:
-                        self.planner, self.scheduler = services
+                    if not isinstance(services, OnlineServices):
+                        services = OnlineServices(
+                            fresh_gateway,
+                            services[0],
+                            services[1],
+                        )
+                    self.bind_online_services(services)
+                    self.planner = services.planner
+                    self.scheduler = services.scheduler
 
             self._request_login(publish=False)
 
