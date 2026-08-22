@@ -61,6 +61,21 @@ def test_policy_rejects_root_itself_unless_explicitly_allowed(tmp_path) -> None:
     assert policy.guard(paths.downloads, allow_root=True) == paths.downloads.resolve()
 
 
+def test_policy_rejects_symlink_escape_from_trusted_root(tmp_path) -> None:
+    paths = make_paths(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = paths.downloads / "escape"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"当前 Windows 环境不能创建测试符号链接: {error}")
+    policy = DownloadPathPolicy(paths, DownloadStorageSettings())
+
+    with pytest.raises(DownloadPathError, match="超出受信"):
+        policy.guard(link / "blocked.bin")
+
+
 def test_prepare_rejects_application_data_and_filesystem_root(tmp_path) -> None:
     paths = make_paths(tmp_path)
     policy = DownloadPathPolicy(paths, DownloadStorageSettings())
@@ -112,6 +127,18 @@ def test_prepare_surfaces_probe_failure_without_changing_policy(tmp_path) -> Non
     with pytest.raises(DownloadPathError, match="当前不可写"):
         policy.prepare(DownloadStorageSettings(str(external)))
     assert policy.current_root == paths.downloads.resolve()
+
+
+def test_saved_offline_root_is_kept_until_writability_is_required(tmp_path) -> None:
+    paths = make_paths(tmp_path)
+    missing = tmp_path / "offline-drive" / "media"
+    settings = DownloadStorageSettings(str(missing.resolve()))
+
+    policy = DownloadPathPolicy(paths, settings)
+
+    assert policy.current_root == missing.resolve()
+    with pytest.raises(DownloadPathError, match="不存在"):
+        policy.require_current_writable()
 
 
 def test_default_probe_creates_and_removes_exclusive_file(tmp_path) -> None:

@@ -37,6 +37,7 @@ from telegram_downloader.domain import (
     TaskRecord,
     TaskStatus,
 )
+from telegram_downloader.download_paths import DownloadPathPolicy
 from telegram_downloader.file_integrity import (
     IntegrityProgress,
     IntegritySummary,
@@ -59,7 +60,7 @@ from telegram_downloader.maintenance_activity import (
 from telegram_downloader.notifications import EventKind
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.scheduler import SchedulerSnapshot
-from telegram_downloader.settings import AppSettings, ProxySettings
+from telegram_downloader.settings import AppSettings, DownloadStorageSettings, ProxySettings
 from telegram_downloader.ui.login import LoginPage
 
 
@@ -2174,6 +2175,58 @@ def test_open_media_file_requires_completed_local_existing_file(
     assert "安全" in controller.window.message.last_message
 
 
+def test_open_media_and_task_directory_accept_external_trusted_root(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    paths = PortablePaths(tmp_path / "app")
+    paths.ensure_layout()
+    external = tmp_path / "external"
+    target = external / "channel" / "video.mp4"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"media")
+    policy = DownloadPathPolicy(paths, DownloadStorageSettings())
+    prepared = policy.prepare(DownloadStorageSettings(str(external)))
+    policy.apply(prepared)
+    task = SimpleNamespace(id="task")
+    item = SimpleNamespace(
+        id="item",
+        status=ItemStatus.COMPLETED,
+        target_path=target,
+    )
+
+    class Repository:
+        def get_item(self, item_id):
+            assert item_id == item.id
+            return item
+
+        def get_task(self, task_id):
+            assert task_id == task.id
+            return task
+
+        def list_items(self, task_id):
+            assert task_id == task.id
+            return [item]
+
+    opened = []
+    monkeypatch.setattr(
+        controller_module.os,
+        "startfile",
+        lambda path: opened.append(path),
+        raising=False,
+    )
+    controller = AppController.for_test(
+        repository=Repository(),
+        paths=paths,
+        download_paths=policy,
+    )
+
+    controller.open_media_file(item.id)
+    controller.open_task_directory(task.id)
+
+    assert opened == [target.resolve(), target.parent.resolve()]
+
+
 @pytest.mark.asyncio
 async def test_progress_refresh_is_throttled_across_concurrent_callers() -> None:
     controller = AppController.for_test(progress_refresh_interval=0.5)
@@ -3900,6 +3953,82 @@ async def test_apply_settings_rolls_back_runtime_effects_when_vault_save_fails()
 
     assert observed == [(previous, current), (current, previous)]
     assert controller.settings == previous
+
+
+@pytest.mark.asyncio
+async def test_apply_settings_normalizes_and_applies_download_root(tmp_path) -> None:
+    paths = PortablePaths(tmp_path / "app")
+    paths.ensure_layout()
+    external = tmp_path / "external"
+    external.mkdir()
+    previous = AppSettings()
+    requested = replace(
+        previous,
+        download_storage=DownloadStorageSettings(str(external / ".")),
+    )
+    policy = DownloadPathPolicy(paths, previous.download_storage)
+    effects = AsyncMock()
+    vault = Vault()
+    planner = SimpleNamespace(configure_downloads=Mock())
+    controller = AppController.for_test(
+        paths=paths,
+        download_paths=policy,
+        settings=previous,
+        planner=planner,
+        vault=vault,
+        runtime_settings_effects=SimpleNamespace(apply=effects),
+    )
+
+    await controller.apply_settings(requested, "")
+
+    saved = controller.settings
+    assert saved.download_storage.root == str(external.resolve())
+    assert str(paths.downloads.resolve()) in saved.download_storage.trusted_roots
+    effects.assert_awaited_once_with(previous, saved)
+    assert policy.current_root == external.resolve()
+    planner.configure_downloads.assert_called_once_with(
+        external.resolve(),
+        saved.download_naming,
+    )
+
+
+@pytest.mark.asyncio
+async def test_vault_failure_does_not_apply_prepared_download_root(tmp_path) -> None:
+    paths = PortablePaths(tmp_path / "app")
+    paths.ensure_layout()
+    external = tmp_path / "external"
+    external.mkdir()
+    previous = AppSettings()
+    policy = DownloadPathPolicy(paths, previous.download_storage)
+    effects = AsyncMock()
+
+    class FailingVault:
+        def load(self):
+            return {}
+
+        def save(self, _value) -> None:
+            raise OSError("private vault path")
+
+    controller = AppController.for_test(
+        paths=paths,
+        download_paths=policy,
+        settings=previous,
+        vault=FailingVault(),
+        runtime_settings_effects=SimpleNamespace(apply=effects),
+    )
+
+    with pytest.raises(OSError, match="private vault path"):
+        await controller.apply_settings(
+            replace(
+                previous,
+                download_storage=DownloadStorageSettings(str(external)),
+            ),
+            "",
+        )
+
+    assert policy.current_root == paths.downloads.resolve()
+    assert controller.settings == previous
+    assert effects.await_count == 2
 
 
 @pytest.mark.asyncio

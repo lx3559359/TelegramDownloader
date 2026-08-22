@@ -110,6 +110,7 @@ class TaskPlanner:
         uuid_factory: Callable[[], str] | None = None,
         clock: Callable[[], datetime] | None = None,
         naming: DownloadNamingSettings | None = None,
+        download_root_provider: Callable[[], Path] | None = None,
     ) -> None:
         self.gateway = gateway
         self.repository = repository
@@ -117,11 +118,31 @@ class TaskPlanner:
         self.uuid_factory = uuid_factory or (lambda: str(uuid4()))
         self.clock = clock or (lambda: datetime.now(UTC))
         self.naming = naming or DownloadNamingSettings()
+        self._download_root_provider = download_root_provider
 
-    def configure_naming(self, naming: DownloadNamingSettings) -> None:
+    def configure_downloads(
+        self,
+        downloads: Path,
+        naming: DownloadNamingSettings,
+    ) -> None:
         if not isinstance(naming, DownloadNamingSettings):
             raise ValueError("下载命名设置无效")
+        self.downloads = downloads.resolve()
         self.naming = naming
+
+    def configure_naming(self, naming: DownloadNamingSettings) -> None:
+        self.configure_downloads(self.downloads, naming)
+
+    def _available_download_root(self) -> Path:
+        root = (
+            self._download_root_provider()
+            if self._download_root_provider is not None
+            else self.downloads
+        )
+        resolved = root.resolve()
+        if resolved != self.downloads:
+            raise ValueError("下载根目录设置与运行时策略不一致")
+        return resolved
 
     async def scan(self, source: ParsedLink, filters: ScanFilters) -> ScanPreview:
         remote = [item async for item in self.gateway.scan(source, filters)]
@@ -308,6 +329,7 @@ class TaskPlanner:
             ]
         if not remote:
             raise EmptyScanError(empty_message)
+        downloads = self._available_download_root()
 
         task = TaskRecord(
             task_id,
@@ -325,7 +347,7 @@ class TaskPlanner:
         used: set[Path] = set()
         for item in remote:
             target = render_download_target(
-                self.downloads,
+                downloads,
                 self.naming,
                 item.source_title,
                 item.message_date_utc,

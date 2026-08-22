@@ -19,9 +19,11 @@ from telegram_downloader.domain import (
     TaskRecord,
     TaskStatus,
 )
+from telegram_downloader.download_paths import DownloadPathPolicy
 from telegram_downloader.file_integrity import FileIntegrityService
 from telegram_downloader.paths import PathOutsideRootError, PortablePaths
 from telegram_downloader.repository import TaskRepository
+from telegram_downloader.settings import DownloadStorageSettings
 
 
 def integrity_fixture(
@@ -164,6 +166,28 @@ async def test_path_escape_is_rejected_before_file_access(tmp_path: Path) -> Non
         await service.verify([escaped.id])
 
     assert outside.read_bytes() == b"good"
+
+
+@pytest.mark.asyncio
+async def test_integrity_accepts_current_external_media_root(tmp_path: Path) -> None:
+    _service, repository, paths, items = integrity_fixture(tmp_path)
+    external = tmp_path / "external"
+    external.mkdir()
+    target = external / "file.bin"
+    target.write_bytes(b"good")
+    policy = DownloadPathPolicy(paths, DownloadStorageSettings())
+    prepared = policy.prepare(DownloadStorageSettings(str(external)))
+    policy.apply(prepared)
+    with sqlite3.connect(repository.database) as connection:
+        connection.execute(
+            "UPDATE media_items SET target_path = ? WHERE id = ?",
+            (str(target), items[0].id),
+        )
+    service = FileIntegrityService(repository, paths, download_paths=policy)
+
+    summary = await service.verify([items[0].id])
+
+    assert summary.baselined == 1
 
 
 @pytest.mark.asyncio

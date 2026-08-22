@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -132,6 +133,75 @@ async def test_planner_uses_and_reconfigures_download_naming_for_new_previews(
         tmp_path / "资料群" / "2026-08-13" / "42_clip.mp4"
     )
     assert first.items[0].target_path != second.items[0].target_path
+
+
+def test_planner_configure_downloads_changes_only_future_targets(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    now = datetime(2026, 8, 22, tzinfo=UTC)
+    base = RemoteMedia(
+        "peer",
+        "来源",
+        1,
+        None,
+        "media-1",
+        MediaKind.VIDEO,
+        "clip.mp4",
+        3,
+        now,
+    )
+    planner = TaskPlanner(FakeGateway([]), FakeRepository(), first)
+    query = ContentSearchQuery(
+        "测试",
+        ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 10),
+    )
+
+    old = planner.plan_selected("peer", "来源", query, [base]).items[0].target_path
+    planner.configure_downloads(second, DownloadNamingSettings())
+    new = planner.plan_selected(
+        "peer",
+        "来源",
+        query,
+        [replace(base, message_id=2, media_id="media-2")],
+    ).items[0].target_path
+
+    assert old.is_relative_to(first)
+    assert new.is_relative_to(second)
+
+
+def test_planner_probes_current_root_once_per_preview(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 22, tzinfo=UTC)
+    calls: list[Path] = []
+    planner = TaskPlanner(
+        FakeGateway([]),
+        FakeRepository(),
+        tmp_path,
+        download_root_provider=lambda: calls.append(tmp_path.resolve()) or tmp_path,
+    )
+    query = ContentSearchQuery(
+        "测试",
+        ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 10),
+    )
+    selected = [
+        RemoteMedia(
+            "peer",
+            "来源",
+            index,
+            None,
+            f"media-{index}",
+            MediaKind.VIDEO,
+            f"clip-{index}.mp4",
+            3,
+            now,
+        )
+        for index in (1, 2)
+    ]
+
+    planner.plan_selected("peer", "来源", query, selected)
+
+    assert calls == [tmp_path.resolve()]
 
 
 @pytest.mark.asyncio

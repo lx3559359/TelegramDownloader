@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from telegram_downloader.domain import ItemStatus, MediaItem, MediaKind
+from telegram_downloader.download_paths import DownloadPathError, DownloadPathPolicy
 from telegram_downloader.downloader import (
     DownloadPaused,
     InsufficientSpaceError,
@@ -13,6 +14,7 @@ from telegram_downloader.downloader import (
     SizeMismatchError,
 )
 from telegram_downloader.paths import PathOutsideRootError, PortablePaths
+from telegram_downloader.settings import DownloadStorageSettings
 
 
 class FakeGateway:
@@ -347,6 +349,31 @@ async def test_rejects_target_outside_portable_root(tmp_path: Path) -> None:
         await downloader(paths, FakeGateway([]), FakeRepository()).download(
             item(tmp_path / "outside.mp4")
         )
+
+
+@pytest.mark.asyncio
+async def test_downloader_accepts_old_and_current_trusted_roots(tmp_path: Path) -> None:
+    paths = PortablePaths(tmp_path / "app")
+    paths.ensure_layout()
+    external = tmp_path / "external"
+    external.mkdir()
+    policy = DownloadPathPolicy(paths, DownloadStorageSettings())
+    prepared = policy.prepare(DownloadStorageSettings(str(external)))
+    policy.apply(prepared)
+    media = downloader(
+        paths,
+        FakeGateway([b"abc"]),
+        FakeRepository(),
+        download_paths=policy,
+    )
+
+    await media.download(item(paths.downloads / "old.bin", size=3))
+    await media.download(item(external / "new.bin", size=3))
+
+    assert (paths.downloads / "old.bin").read_bytes() == b"abc"
+    assert (external / "new.bin").read_bytes() == b"abc"
+    with pytest.raises(DownloadPathError):
+        await media.download(item(tmp_path / "unknown" / "blocked.bin", size=3))
 
 
 @pytest.mark.asyncio

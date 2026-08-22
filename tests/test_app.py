@@ -28,7 +28,11 @@ from telegram_downloader.gateway import (
 )
 from telegram_downloader.maintenance_activity import OperationActivityRegistry
 from telegram_downloader.paths import PortablePaths
-from telegram_downloader.settings import AppSettings
+from telegram_downloader.settings import (
+    AppSettings,
+    DownloadStorageSettings,
+    SettingsStore,
+)
 from telegram_downloader.subscription_matching import SubscriptionCriteria
 from telegram_downloader.subscription_scheduler import SubscriptionScheduler
 from telegram_downloader.subscription_service import SubscriptionService
@@ -57,6 +61,54 @@ EXPECTED_POLICIES = {
     "maintenance.storage.automatic": ActionPolicy.DEDUPLICATE,
     "maintenance.storage.cancel": ActionPolicy.DEDUPLICATE,
 }
+
+
+def close_created_application(application, loop, controller) -> None:
+    loop.run_until_complete(controller._async_actions.shutdown())
+    controller.window.close()
+    loop.close()
+    application.processEvents()
+
+
+def test_create_application_recovers_only_unsafe_download_setting(tmp_path) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    unsafe = AppSettings(
+        api_id=17,
+        concurrency=4,
+        download_storage=DownloadStorageSettings(str(paths.data / "media")),
+    )
+    SettingsStore(paths.settings).save(unsafe)
+
+    application, loop, controller = app.create_application(tmp_path)
+
+    try:
+        assert controller.settings.api_id == 17
+        assert controller.settings.concurrency == 4
+        assert controller.settings.download_storage == DownloadStorageSettings()
+        assert controller.download_paths.current_root == paths.downloads.resolve()
+        assert "下载目录设置不安全" in controller.window.statusBar().currentMessage()
+        assert SettingsStore(paths.settings).load().download_storage == DownloadStorageSettings()
+    finally:
+        close_created_application(application, loop, controller)
+
+
+def test_create_application_keeps_structurally_safe_offline_download_root(tmp_path) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    missing = tmp_path / "offline" / "media"
+    expected = AppSettings(download_storage=DownloadStorageSettings(str(missing.resolve())))
+    SettingsStore(paths.settings).save(expected)
+
+    application, loop, controller = app.create_application(tmp_path)
+
+    try:
+        assert controller.settings.download_storage == expected.download_storage
+        assert controller.download_paths.current_root == missing.resolve()
+        with pytest.raises(ValueError, match="不存在"):
+            controller.download_paths.require_current_writable()
+    finally:
+        close_created_application(application, loop, controller)
 
 
 def test_responsive_action_policy_map_is_complete() -> None:

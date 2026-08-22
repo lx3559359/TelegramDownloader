@@ -16,6 +16,7 @@ from telegram_downloader.download_io import (
     BufferedPartWriter,
     submit_batch,
 )
+from telegram_downloader.download_paths import DownloadPathPolicy
 from telegram_downloader.gateway import TelegramGateway
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.resource_control import AsyncBandwidthLimiter
@@ -91,6 +92,7 @@ class MediaDownloader:
         write_batch_bytes: int = 1024 * 1024,
         write_batch_interval: float = 0.5,
         batch_submit: BatchSubmit | None = None,
+        download_paths: DownloadPathPolicy | PortablePaths | None = None,
     ) -> None:
         if reserve_bytes < 0 or progress_interval < 0:
             raise ValueError("磁盘预留和进度间隔不能为负数")
@@ -99,6 +101,7 @@ class MediaDownloader:
         self.gateway = gateway
         self.repository = repository
         self.paths = paths
+        self.download_paths = download_paths or paths
         self.free_bytes = free_bytes or (lambda path: shutil.disk_usage(path).free)
         self.reserve_bytes = reserve_bytes
         self.progress_interval = progress_interval
@@ -113,7 +116,7 @@ class MediaDownloader:
         should_pause: Callable[[], bool] | None = None,
     ) -> Path:
         pause_requested = should_pause or (lambda: False)
-        target = self.paths.guard(item.target_path)
+        target = self.download_paths.guard(item.target_path)
         target.parent.mkdir(parents=True, exist_ok=True)
 
         if target.exists():
@@ -131,7 +134,7 @@ class MediaDownloader:
                 f"目标文件已存在但大小不符: 期望 {item.expected_size}，实际 {actual_size}"
             )
 
-        part = self.paths.guard(target.with_suffix(target.suffix + ".part"))
+        part = self.download_paths.guard(target.with_suffix(target.suffix + ".part"))
         offset = part.stat().st_size if part.exists() else 0
         if item.expected_size is not None and offset > item.expected_size:
             corrupt = self._next_corrupt_path(part)
@@ -307,10 +310,10 @@ class MediaDownloader:
             )
 
     def _next_corrupt_path(self, part: Path) -> Path:
-        candidate = self.paths.guard(part.with_suffix(part.suffix + ".corrupt"))
+        candidate = self.download_paths.guard(part.with_suffix(part.suffix + ".corrupt"))
         sequence = 2
         while candidate.exists():
-            candidate = self.paths.guard(
+            candidate = self.download_paths.guard(
                 part.with_suffix(part.suffix + f".corrupt.{sequence}")
             )
             sequence += 1

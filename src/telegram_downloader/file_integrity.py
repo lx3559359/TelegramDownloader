@@ -11,6 +11,7 @@ from threading import Event
 from typing import Protocol
 
 from telegram_downloader.domain import IntegrityStatus, ItemStatus, MediaItem
+from telegram_downloader.download_paths import DownloadPathPolicy
 from telegram_downloader.paths import PortablePaths
 
 _VERIFYABLE_FAILURES = frozenset(
@@ -98,9 +99,12 @@ class FileIntegrityService:
         self,
         repository: IntegrityRepository,
         paths: PortablePaths,
+        *,
+        download_paths: DownloadPathPolicy | PortablePaths | None = None,
     ) -> None:
         self.repository = repository
         self.paths = paths
+        self.download_paths = download_paths or paths
 
     async def verify(
         self,
@@ -123,7 +127,7 @@ class FileIntegrityService:
                 self._report(progress, index, total, item, item.integrity_status)
                 continue
 
-            target = self.paths.guard(Path(item.target_path))
+            target = self.download_paths.guard(Path(item.target_path))
             try:
                 if not target.exists():
                     status = IntegrityStatus.MISSING
@@ -219,8 +223,8 @@ class FileIntegrityService:
             ):
                 skipped += 1
                 continue
-            target = self.paths.guard(Path(item.target_path))
-            part = self.paths.guard(target.with_suffix(target.suffix + ".part"))
+            target = self.download_paths.guard(Path(item.target_path))
+            part = self.download_paths.guard(target.with_suffix(target.suffix + ".part"))
             moves: list[tuple[Path, Path]] = []
             try:
                 for source in (target, part):
@@ -269,10 +273,10 @@ class FileIntegrityService:
             )
 
     def _next_corrupt_path(self, source: Path) -> Path:
-        candidate = self.paths.guard(source.with_suffix(source.suffix + ".corrupt"))
+        candidate = self.download_paths.guard(source.with_suffix(source.suffix + ".corrupt"))
         sequence = 2
         while candidate.exists():
-            candidate = self.paths.guard(
+            candidate = self.download_paths.guard(
                 source.with_suffix(source.suffix + f".corrupt.{sequence}")
             )
             sequence += 1

@@ -29,6 +29,7 @@ from telegram_downloader.domain import (
     ScanFilters,
     TaskStatus,
 )
+from telegram_downloader.download_paths import DownloadPathPolicy
 from telegram_downloader.file_integrity import (
     IntegrityProgress,
     IntegritySummary,
@@ -456,6 +457,7 @@ class AppController:
         diagnostics: Any | None = None,
         diagnostic_store: Any | None = None,
         paths: PortablePaths | None = None,
+        download_paths: DownloadPathPolicy | None = None,
         gateway_factory: Callable[..., TelegramGateway] | None = None,
         service_builder: Callable[
             [TelegramGateway, AppSettings],
@@ -516,6 +518,11 @@ class AppController:
         self.update_protection = update_protection
         self.storage_state = storage_state
         self.settings = settings or settings_store.load()
+        self.download_paths = download_paths or (
+            DownloadPathPolicy(paths, self.settings.download_storage)
+            if paths is not None
+            else None
+        )
         self.secrets = dict(secrets if secrets is not None else vault.load())
         self.connection_recovery = connection_recovery or ConnectionRecovery()
         self._connection_monitor_interval = connection_monitor_interval
@@ -570,6 +577,7 @@ class AppController:
             diagnostics=dependencies.pop("diagnostics", None),
             diagnostic_store=dependencies.pop("diagnostic_store", None),
             paths=dependencies.pop("paths", None),
+            download_paths=dependencies.pop("download_paths", None),
             gateway_factory=dependencies.pop("gateway_factory", None),
             service_builder=dependencies.pop("service_builder", None),
             confirm_preview=dependencies.pop("confirm_preview", None),
@@ -1764,6 +1772,12 @@ class AppController:
 
     async def apply_settings(self, settings: AppSettings, proxy_password: str) -> None:
         previous_settings = self.settings
+        if self.download_paths is not None:
+            prepared_storage = await asyncio.to_thread(
+                self.download_paths.prepare,
+                settings.download_storage,
+            )
+            settings = replace(settings, download_storage=prepared_storage)
         connection_changed = (
             settings.api_id != previous_settings.api_id or settings.proxy != previous_settings.proxy
         )
@@ -1779,14 +1793,23 @@ class AppController:
             with suppress(Exception):
                 await self.runtime_settings_effects.apply(settings, previous_settings)
             raise
+        if self.download_paths is not None:
+            self.download_paths.apply(settings.download_storage)
         self.settings = settings
         self.secrets = updated_secrets
         configure = getattr(self.scheduler, "configure_resources", None)
         if callable(configure):
             configure(settings.concurrency, settings.speed_limit_kib)
-        configure_naming = getattr(self.planner, "configure_naming", None)
-        if callable(configure_naming):
-            configure_naming(settings.download_naming)
+        configure_downloads = getattr(self.planner, "configure_downloads", None)
+        if callable(configure_downloads) and self.download_paths is not None:
+            configure_downloads(
+                self.download_paths.current_root,
+                settings.download_naming,
+            )
+        else:
+            configure_naming = getattr(self.planner, "configure_naming", None)
+            if callable(configure_naming):
+                configure_naming(settings.download_naming)
         message = "设置已保存；下载资源与路径模板已即时应用"
         if connection_changed:
             message += "，API/代理变更将在下次连接时生效"
@@ -2045,7 +2068,7 @@ class AppController:
         )
 
     def open_media_file(self, item_id: str) -> None:
-        if self.paths is None:
+        if self.download_paths is None:
             return
         try:
             item = self.repository.get_item(item_id)
@@ -2060,7 +2083,7 @@ class AppController:
             }:
                 self._show_status("媒体完整性异常，请先校验或重新下载")
                 return
-            target = self.paths.guard(Path(item.target_path))
+            target = self.download_paths.guard(Path(item.target_path))
             if not target.is_file():
                 self._show_status("本地文件不存在；当前操作不会修改任务记录")
                 return
@@ -2072,7 +2095,7 @@ class AppController:
             if startfile is not None:
                 startfile(target)
         except ValueError:
-            self._show_status("安全限制：文件路径不在应用目录内")
+            self._show_status("安全限制：文件路径不在受信下载目录内")
         except KeyError:
             self._show_status("媒体记录不存在，任务列表已刷新")
             self._schedule_task_refresh()
@@ -2084,29 +2107,27 @@ class AppController:
         return list(dict.fromkeys(str(value) for value in task_ids if value))
 
     def open_task_directory(self, task_id: str) -> None:
-        if self.paths is None:
+        if self.download_paths is None:
             return
         try:
             self.repository.get_task(task_id)
             items = self.repository.list_items(task_id)
-            downloads = self.paths.downloads.resolve()
             parents: list[Path] = []
             for item in items:
                 parent = Path(item.target_path).resolve().parent
-                parent.relative_to(downloads)
-                parents.append(self.paths.guard(parent))
+                parents.append(self.download_paths.guard(parent, allow_root=True))
             directory = (
                 Path(os.path.commonpath([str(path) for path in parents]))
                 if parents
-                else downloads
+                else self.download_paths.current_root
             )
-            directory = self.paths.guard(directory)
+            directory = self.download_paths.guard(directory, allow_root=True)
             directory.mkdir(parents=True, exist_ok=True)
             startfile = getattr(os, "startfile", None)
             if startfile is not None:
                 startfile(directory)
         except ValueError:
-            self._show_status("安全限制：下载目录不在应用下载目录内")
+            self._show_status("安全限制：下载目录不在受信下载目录内")
         except KeyError:
             self._show_status("任务不存在，任务列表已刷新")
             self._schedule_task_refresh()

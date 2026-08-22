@@ -49,6 +49,10 @@ from telegram_downloader.diagnostic_probes import (
 from telegram_downloader.diagnostic_store import DiagnosticReportStore
 from telegram_downloader.diagnostics import DiagnosticResult, DiagnosticsService
 from telegram_downloader.domain import TaskStatus
+from telegram_downloader.download_paths import (
+    DownloadPathError,
+    DownloadPathPolicy,
+)
 from telegram_downloader.download_schedule import (
     DownloadScheduleController,
     evaluate_download_schedule,
@@ -72,7 +76,12 @@ from telegram_downloader.resource_control import AsyncBandwidthLimiter
 from telegram_downloader.runtime_settings import RuntimeSettingsCoordinator
 from telegram_downloader.scheduler import DownloadScheduler
 from telegram_downloader.security import SecretsError, SecretsVault
-from telegram_downloader.settings import AppSettings, SettingsError, SettingsStore
+from telegram_downloader.settings import (
+    AppSettings,
+    DownloadStorageSettings,
+    SettingsError,
+    SettingsStore,
+)
 from telegram_downloader.storage_cleanup import StorageCleanupExecutor, StorageCleanupPlanner
 from telegram_downloader.storage_inventory import StorageInventoryService
 from telegram_downloader.storage_maintenance import StorageMaintenanceService
@@ -388,6 +397,18 @@ def create_application(
         settings = settings_store.load()
     except SettingsError:
         settings = AppSettings()
+    download_storage_warning = ""
+    try:
+        download_paths = DownloadPathPolicy(paths, settings.download_storage)
+    except DownloadPathError:
+        download_storage_warning = "下载目录设置不安全，已恢复默认"
+        settings = replace(
+            settings,
+            download_storage=DownloadStorageSettings(),
+        )
+        download_paths = DownloadPathPolicy(paths, settings.download_storage)
+        with suppress(OSError):
+            settings_store.save(settings)
     vault = SecretsVault(paths.secrets)
     try:
         secrets = vault.load()
@@ -423,7 +444,11 @@ def create_application(
             else settings.storage_maintenance
         ),
     )
-    integrity_service = FileIntegrityService(repository, paths)
+    integrity_service = FileIntegrityService(
+        repository,
+        paths,
+        download_paths=download_paths,
+    )
     catalog = CatalogRepository(paths.catalog_database)
     catalog_error: Exception | None = None
     try:
@@ -452,11 +477,18 @@ def create_application(
         planner = TaskPlanner(
             gateway,
             repository,
-            paths.downloads,
+            download_paths.current_root,
             naming=resource_settings.download_naming,
+            download_root_provider=download_paths.require_current_writable,
         )
         bandwidth = AsyncBandwidthLimiter(resource_settings.speed_limit_kib)
-        downloader = MediaDownloader(gateway, repository, paths, bandwidth=bandwidth)
+        downloader = MediaDownloader(
+            gateway,
+            repository,
+            paths,
+            bandwidth=bandwidth,
+            download_paths=download_paths,
+        )
         scheduler = DownloadScheduler(
             repository,
             downloader,
@@ -690,6 +722,7 @@ def create_application(
         diagnostics=diagnostics,
         diagnostic_store=diagnostic_store,
         paths=paths,
+        download_paths=download_paths,
         gateway_factory=gateway_factory,
         service_builder=build_services,
         confirm_preview=confirm_preview,
@@ -706,6 +739,8 @@ def create_application(
         secrets=secrets,
     )
     controller_ref["controller"] = controller
+    if download_storage_warning:
+        controller._show_status(download_storage_warning)
     async_actions = AsyncActionBridge()
     controller._async_actions = async_actions
 
@@ -1504,7 +1539,10 @@ def run(
 
         def open_downloads() -> None:
             try:
-                downloads = controller.paths.guard(controller.paths.downloads)
+                downloads = controller.download_paths.guard(
+                    controller.download_paths.current_root,
+                    allow_root=True,
+                )
                 downloads.mkdir(parents=True, exist_ok=True)
                 startfile = getattr(os, "startfile", None)
                 if startfile is not None:
