@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -23,11 +24,27 @@ from telegram_downloader.scheduler import DownloadScheduler
 
 async def wait_until(predicate, timeout: float = 1.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
-    while asyncio.get_running_loop().time() < deadline:
+    while True:
         if predicate():
             return
-        await asyncio.sleep(0.005)
-    raise AssertionError("condition was not reached")
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise AssertionError("condition was not reached")
+        await asyncio.sleep(min(0.005, remaining))
+
+
+@pytest.mark.asyncio
+async def test_wait_until_rechecks_condition_after_a_delayed_wakeup() -> None:
+    reached = False
+
+    async def block_then_reach() -> None:
+        nonlocal reached
+        time.sleep(0.02)
+        reached = True
+
+    operation = asyncio.create_task(block_then_reach())
+    await wait_until(lambda: reached, timeout=0.005)
+    await operation
 
 
 class ControlledGateway:
