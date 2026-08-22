@@ -19,7 +19,7 @@ _MEDIA_LABELS = {
 
 
 class SubscriptionRunHistoryModel(QAbstractTableModel):
-    HEADERS = ("时间", "结果", "扫描", "关键词", "媒体", "新增", "重复")
+    HEADERS = ("时间", "结果", "扫描", "规则", "媒体", "新增", "重复")
 
     def __init__(self) -> None:
         super().__init__()
@@ -133,8 +133,7 @@ class SubscriptionProbeSampleModel(QAbstractTableModel):
 
     def set_samples(
         self,
-        samples: list[SubscriptionProbeSample]
-        | tuple[SubscriptionProbeSample, ...],
+        samples: list[SubscriptionProbeSample] | tuple[SubscriptionProbeSample, ...],
     ) -> None:
         self.beginResetModel()
         self._samples = tuple(samples[:20])

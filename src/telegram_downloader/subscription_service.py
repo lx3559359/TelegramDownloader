@@ -664,10 +664,6 @@ class SubscriptionService:
         return self.gateway, self.planner
 
     @staticmethod
-    def _normalize(value: str) -> str:
-        return " ".join(value.casefold().split())
-
-    @staticmethod
     def _media_key(item: RemoteMedia) -> tuple[str, int, str]:
         return item.peer_ref, item.message_id, item.media_id
 
@@ -695,7 +691,7 @@ class SubscriptionService:
             )
 
         for index, item in enumerate(messages, start=1):
-            if rule.normalized_keyword in self._normalize(item.text):
+            if rule.criteria.matches(item.text):
                 keyword_hits += 1
                 if item.media is not None and item.grouped_id is not None:
                     if item.grouped_id not in expanded_groups:

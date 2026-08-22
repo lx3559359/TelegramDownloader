@@ -54,15 +54,14 @@ def test_run_history_model_formats_explanations_and_counts(qtbot) -> None:
     model.set_runs([run()])
 
     assert model.headerData(1, Qt.Orientation.Horizontal) == "结果"
+    assert model.headerData(3, Qt.Orientation.Horizontal) == "规则"
     assert "新增 1 项" in model.data(model.index(0, 1))
     assert model.data(model.index(0, 2)) == "5"
     assert model.data(model.index(0, 3)) == "2"
     assert model.data(model.index(0, 4)) == "1"
     assert model.data(model.index(0, 5)) == "1"
     assert model.data(model.index(0, 6)) == "0"
-    assert model.data(model.index(0, 0)) == NOW.astimezone().strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
+    assert model.data(model.index(0, 0)) == NOW.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def test_run_history_is_newest_first_limited_and_hides_raw_errors(qtbot) -> None:

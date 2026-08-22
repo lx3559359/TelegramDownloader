@@ -18,7 +18,10 @@ from telegram_downloader.gateway import (
 )
 from telegram_downloader.planner import TaskPlanner
 from telegram_downloader.repository import TaskRepository
-from telegram_downloader.subscription_matching import SubscriptionCriteria
+from telegram_downloader.subscription_matching import (
+    SubscriptionCriteria,
+    SubscriptionMatchMode,
+)
 from telegram_downloader.subscription_service import SubscriptionService
 from telegram_downloader.subscriptions import (
     SubscriptionDraft,
@@ -533,6 +536,36 @@ async def test_probe_rule_reports_matches_without_side_effects(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_probe_and_scheduled_run_share_advanced_matcher(tmp_path: Path) -> None:
+    service, gateway, _catalog, _tasks = build_service(tmp_path)
+    saved = await service.create_rule(
+        SubscriptionDraft(
+            "-1001",
+            SubscriptionCriteria(
+                ("AI", "模型"),
+                ("广告",),
+                SubscriptionMatchMode.ALL,
+            ),
+            frozenset({MediaKind.PHOTO}),
+        )
+    )
+    messages = (
+        message(43, "AI 模型", remote(43)),
+        message(44, "AI 模型 广告", remote(44)),
+        message(45, "只有 AI", remote(45)),
+    )
+    gateway.recent = messages
+    gateway.messages = messages
+    gateway.latest_id = 45
+
+    probe = await service.probe_rule(saved.id)
+    run = await service.run_rule(saved.id)
+
+    assert (probe.inspected, probe.keyword_hits, probe.matched) == (3, 1, 1)
+    assert (run.run.inspected, run.run.keyword_hits, run.run.matched) == (3, 1, 1)
+
+
+@pytest.mark.asyncio
 async def test_probe_expands_album_marks_duplicates_and_matches_formal_run(
     tmp_path: Path,
 ) -> None:
@@ -710,6 +743,38 @@ async def test_only_semantic_edits_reestablish_history_baseline(tmp_path: Path) 
     assert changed.last_message_id == 300
     assert changed.backfill_through_id == 900
     assert changed.next_run_at == NOW
+
+
+@pytest.mark.asyncio
+async def test_rebaselined_rule_does_not_duplicate_existing_media(tmp_path: Path) -> None:
+    service, gateway, _catalog, tasks = build_service(tmp_path)
+    saved = await service.create_rule(
+        SubscriptionDraft(
+            "-1001",
+            SubscriptionCriteria(("AI",)),
+            frozenset({MediaKind.PHOTO}),
+        )
+    )
+    gateway.latest_id = 43
+    gateway.messages = (message(43, "AI 模型", remote(43)),)
+    first = await service.run_rule(saved.id)
+    assert first.run.queued == 1
+
+    gateway.boundary_id = 42
+    changed = await service.update_rule(
+        saved.id,
+        SubscriptionDraft(
+            "-1001",
+            SubscriptionCriteria(("AI", "模型")),
+            frozenset({MediaKind.PHOTO}),
+            history_days=7,
+        ),
+    )
+    second = await service.run_rule(changed.id)
+
+    assert second.run.queued == 0
+    assert second.run.duplicate == 1
+    assert len(tasks.list_tasks()) == 1
 
 
 @pytest.mark.asyncio

@@ -131,7 +131,7 @@ class TaskPlanner:
         self,
         source_ref: str,
         source_title: str,
-        keyword: str,
+        rule_summary: str,
         selected: list[RemoteMedia],
     ) -> ScanPreview:
         if not selected:
@@ -150,7 +150,7 @@ class TaskPlanner:
             source_url=f"telegram://peer/{source_ref}",
             filters=filters,
             remote=selected,
-            display_title=f"{source_title}（自动订阅：{keyword}）",
+            display_title=f"{source_title}（自动订阅：{rule_summary}）",
             empty_message="订阅匹配媒体已全部存在于下载队列",
             skip_existing=True,
         )
@@ -178,9 +178,7 @@ class TaskPlanner:
         now = self.clock()
         remote = self._deduplicate(remote)
         if skip_existing:
-            keys = {
-                (item.peer_ref, item.message_id, item.media_id) for item in remote
-            }
+            keys = {(item.peer_ref, item.message_id, item.media_id) for item in remote}
             existing = self.repository.existing_media_keys(keys)
             remote = [
                 item
