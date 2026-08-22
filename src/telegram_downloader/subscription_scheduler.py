@@ -14,6 +14,10 @@ from telegram_downloader.gateway import (
     SessionExpiredError,
     TransientNetworkError,
 )
+from telegram_downloader.notifications import (
+    ApplicationEvent,
+    subscription_match_event,
+)
 from telegram_downloader.subscription_service import SubscriptionUnavailableError
 from telegram_downloader.subscriptions import (
     SubscriptionProgress,
@@ -44,6 +48,7 @@ class SubscriptionScheduler:
             [SessionExpiredError], Awaitable[None]
         ]
         | None = None,
+        publish: Callable[[ApplicationEvent], None] | None = None,
         idle_delay: float = 1.0,
     ) -> None:
         if idle_delay <= 0:
@@ -55,6 +60,7 @@ class SubscriptionScheduler:
         self.on_task_created = on_task_created or (lambda _task_id: None)
         self.on_progress = on_progress or (lambda _progress: None)
         self.on_session_expired = on_session_expired or _ignore_session_expired
+        self.publish = publish or (lambda _event: None)
         self.idle_delay = idle_delay
         self.account_id: str | None = None
         self._wake_event = asyncio.Event()
@@ -220,6 +226,10 @@ class SubscriptionScheduler:
         else:
             for task_id in report.task_ids:
                 self.on_task_created(task_id)
+            if report.run.queued > 0:
+                self._publish(
+                    subscription_match_event(report.run.id, report.run.queued)
+                )
             self.on_progress(None)
             self._notify_rules_changed()
 
@@ -251,3 +261,9 @@ class SubscriptionScheduler:
 
     def _notify_rules_changed(self) -> None:
         self.on_rules_changed()
+
+    def _publish(self, event: ApplicationEvent) -> None:
+        try:
+            self.publish(event)
+        except Exception:
+            _LOGGER.error("notification event callback failed")

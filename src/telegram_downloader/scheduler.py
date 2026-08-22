@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -22,10 +23,18 @@ from telegram_downloader.gateway import (
     MediaReferenceExpired,
     TransientNetworkError,
 )
+from telegram_downloader.notifications import (
+    ApplicationEvent,
+    EventKind,
+    disk_full_event,
+    download_event,
+)
 from telegram_downloader.resource_control import (
     AdjustableConcurrencyLimiter,
     AsyncBandwidthLimiter,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +133,7 @@ class DownloadScheduler:
         sleep: Callable[[float], Awaitable[None]] | None = None,
         shutdown_grace_seconds: float = 30.0,
         bandwidth: AsyncBandwidthLimiter | None = None,
+        publish: Callable[[ApplicationEvent], None] | None = None,
     ) -> None:
         if shutdown_grace_seconds <= 0:
             raise ValueError("关闭等待时间必须大于零")
@@ -135,8 +145,12 @@ class DownloadScheduler:
         self._permits = AdjustableConcurrencyLimiter(min(5, max(1, concurrency)))
         downloader_bandwidth = getattr(downloader, "bandwidth", None)
         self._bandwidth = bandwidth or downloader_bandwidth or AsyncBandwidthLimiter()
+        self.publish = publish or (lambda _event: None)
         self._pause_flags: dict[str, asyncio.Event] = {}
         self._pause_reasons: dict[str, PauseReason] = {}
+        self._disk_full_tasks: set[str] = set()
+        self._disk_notified: set[str] = set()
+        self._terminal_notified: set[str] = set()
         self._pending: list[_QueuedOperation] = []
         self._operations: dict[str, _QueuedOperation] = {}
         self._active_operation: _QueuedOperation | None = None
@@ -421,6 +435,7 @@ class DownloadScheduler:
                 TaskStatus.PAUSED,
                 pause_reason=reason,
             )
+            self._publish_disk_full(task_id)
         elif any(status is ItemStatus.FAILED for status in results):
             failed = self.repository.list_items(task_id, {ItemStatus.FAILED})
             reason = next(
@@ -432,8 +447,10 @@ class DownloadScheduler:
                 TaskStatus.PARTIAL_FAILURE,
                 reason,
             )
+            self._publish_terminal(EventKind.DOWNLOAD_FAILED, task_id)
         else:
             self.repository.update_task_status(task_id, TaskStatus.COMPLETED)
+            self._publish_terminal(EventKind.DOWNLOAD_COMPLETED, task_id)
 
     async def _execute_items(
         self,
@@ -459,8 +476,13 @@ class DownloadScheduler:
                 TaskStatus.PAUSED,
                 pause_reason=reason,
             )
+            self._publish_disk_full(task_id)
         else:
-            self.repository.recompute_task_status(task_id)
+            terminal = self.repository.recompute_task_status(task_id)
+            if terminal is TaskStatus.COMPLETED:
+                self._publish_terminal(EventKind.DOWNLOAD_COMPLETED, task_id)
+            elif terminal is TaskStatus.PARTIAL_FAILURE:
+                self._publish_terminal(EventKind.DOWNLOAD_FAILED, task_id)
 
     async def _guarded_item(
         self,
@@ -535,6 +557,7 @@ class DownloadScheduler:
                     self.repository.update_task_status(task_id, TaskStatus.DOWNLOADING)
             except InsufficientSpaceError as error:
                 self._pause_reasons[task_id] = PauseReason.USER
+                self._disk_full_tasks.add(task_id)
                 self._set_item_state(
                     task_id,
                     item.id,
@@ -583,3 +606,22 @@ class DownloadScheduler:
 
     def _pause_flag(self, task_id: str) -> asyncio.Event:
         return self._pause_flags.setdefault(task_id, asyncio.Event())
+
+    def _publish_terminal(self, kind: EventKind, task_id: str) -> None:
+        if task_id in self._terminal_notified:
+            return
+        self._terminal_notified.add(task_id)
+        self._publish(download_event(kind, task_id))
+
+    def _publish_disk_full(self, task_id: str) -> None:
+        if task_id not in self._disk_full_tasks or task_id in self._disk_notified:
+            return
+        self._disk_notified.add(task_id)
+        self._disk_full_tasks.discard(task_id)
+        self._publish(disk_full_event(task_id))
+
+    def _publish(self, event: ApplicationEvent) -> None:
+        try:
+            self.publish(event)
+        except Exception:
+            _LOGGER.error("notification event callback failed")

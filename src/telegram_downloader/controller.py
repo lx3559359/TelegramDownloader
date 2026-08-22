@@ -43,6 +43,7 @@ from telegram_downloader.gateway import (
     TransientNetworkError,
 )
 from telegram_downloader.links import InvalidTelegramLink, parse_telegram_link
+from telegram_downloader.notifications import ApplicationEvent, auth_required_event
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.scheduler import SchedulerSnapshot
 from telegram_downloader.settings import AppSettings, ProxySettings
@@ -422,6 +423,7 @@ class AppController:
         update_coordinator: Any | None = None,
         update_prompt: Callable[[Any], bool] | None = None,
         update_shutdown: Callable[[], None] | None = None,
+        publish: Callable[[ApplicationEvent], None] | None = None,
         settings: AppSettings | None = None,
         secrets: dict[str, str] | None = None,
         connection_recovery: ConnectionRecovery | None = None,
@@ -455,6 +457,7 @@ class AppController:
         self.update_coordinator = update_coordinator
         self.update_prompt = update_prompt or (lambda _manifest: False)
         self.update_shutdown = update_shutdown or (lambda: None)
+        self.publish = publish or (lambda _event: None)
         self.settings = settings or settings_store.load()
         self.secrets = dict(secrets if secrets is not None else vault.load())
         self.connection_recovery = connection_recovery or ConnectionRecovery()
@@ -2225,6 +2228,7 @@ class AppController:
             if self._session_expiry_handled:
                 return
             self._session_expiry_handled = True
+            self._publish_event(auth_required_event())
             _LOGGER.warning(
                 "Telegram authorization expired (reason=%s)",
                 error.reason.value,
@@ -2295,6 +2299,12 @@ class AppController:
                         self.planner, self.scheduler = services
 
             self.show_login()
+
+    def _publish_event(self, event: ApplicationEvent) -> None:
+        try:
+            self.publish(event)
+        except Exception:
+            _LOGGER.error("notification event callback failed")
 
     @property
     def last_authorization_failure_reason(

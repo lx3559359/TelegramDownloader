@@ -10,7 +10,9 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime
+from math import ceil
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 from telegram_downloader import __version__
@@ -53,7 +55,11 @@ from telegram_downloader.file_integrity import FileIntegrityService
 from telegram_downloader.gateway import SessionExpiredError, TelethonGateway
 from telegram_downloader.instance_guard import WindowsInstanceGuard
 from telegram_downloader.logging import configure_logging
-from telegram_downloader.notifications import NotificationRoute
+from telegram_downloader.notifications import (
+    ApplicationEvent,
+    NotificationBatcher,
+    NotificationRoute,
+)
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.planner import ScanPreview, TaskPlanner
 from telegram_downloader.repository import TaskRepository
@@ -259,7 +265,11 @@ def _startup_close(indicator: object | None) -> None:
         method()
 
 
-def create_application(root: Path):
+def create_application(
+    root: Path,
+    *,
+    publish_event: Callable[[ApplicationEvent], None] | None = None,
+):
     import qasync
     from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -273,6 +283,7 @@ def create_application(root: Path):
     from telegram_downloader.ui.update_dialog import UpdateDialog
 
     paths = PortablePaths(root)
+    publish_event = publish_event or (lambda _event: None)
     paths.ensure_layout()
     application = QApplication.instance() or QApplication(sys.argv[:1])
     application.setApplicationName("TelegramDownloader")
@@ -331,6 +342,7 @@ def create_application(root: Path):
             downloader,
             concurrency=resource_settings.concurrency,
             bandwidth=bandwidth,
+            publish=publish_event,
         )
         schedule_state = evaluate_download_schedule(
             resource_settings.download_schedule,
@@ -520,6 +532,7 @@ def create_application(root: Path):
         ),
         on_progress=window.subscriptions_page.set_progress,
         on_session_expired=subscription_session_expired,
+        publish=publish_event,
     )
 
     controller = AppController(
@@ -544,6 +557,7 @@ def create_application(root: Path):
         update_coordinator=update_coordinator,
         update_prompt=confirm_update,
         update_shutdown=application.quit,
+        publish=publish_event,
         settings=settings,
         secrets=secrets,
     )
@@ -1058,13 +1072,24 @@ def run(
 
     activation_server: LocalActivationServer | None = None
     tray_adapter: QtTrayAdapter | None = None
+    notification_batcher = NotificationBatcher(window_seconds=5.0)
+    notification_arm: Callable[[], None] | None = None
+
+    def publish_event(event: ApplicationEvent) -> None:
+        if notification_batcher.record(event, now=monotonic()) and notification_arm:
+            notification_arm()
+
     try:
         _startup_status(startup_indicator, "正在准备本地数据…")
-        application, loop, controller = create_application(root)
+        application, loop, controller = create_application(
+            root,
+            publish_event=publish_event,
+        )
 
         download_schedule = DownloadScheduleController(
             lambda: controller.scheduler,
             controller.settings.download_schedule,
+            publish=publish_event,
         )
         controller.download_schedule = download_schedule
         graceful_shutdown = _GracefulShutdown(
@@ -1101,6 +1126,27 @@ def run(
             close_to_tray=controller.settings.close_to_tray,
             notifications_enabled=controller.settings.notifications_enabled,
         )
+
+        from PySide6.QtCore import QTimer
+
+        notification_timer = QTimer(controller.window)
+        notification_timer.setSingleShot(True)
+
+        def arm_notification_timer() -> None:
+            deadline = notification_batcher.next_deadline
+            if deadline is None or notification_timer.isActive():
+                return
+            delay_ms = max(1, ceil((deadline - monotonic()) * 1000))
+            notification_timer.start(delay_ms)
+
+        def flush_notifications() -> None:
+            for payload in notification_batcher.flush_due(now=monotonic()):
+                background.show_notification(payload)
+            arm_notification_timer()
+
+        notification_timer.timeout.connect(flush_notifications)
+        notification_arm = arm_notification_timer
+        arm_notification_timer()
         tray_adapter.show_requested.connect(background.show_window)
         tray_adapter.hide_requested.connect(controller.window.hide)
         tray_adapter.exit_requested.connect(background.request_exit)

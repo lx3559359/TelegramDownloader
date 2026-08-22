@@ -6,6 +6,7 @@ import pytest
 from telegram_downloader.domain import ItemStatus, PauseReason, TaskStatus
 from telegram_downloader.downloader import DownloadPaused, InsufficientSpaceError
 from telegram_downloader.gateway import FloodWaitError, TransientNetworkError
+from telegram_downloader.notifications import EventKind
 from telegram_downloader.resource_control import AsyncBandwidthLimiter
 from telegram_downloader.scheduler import (
     DownloadScheduler,
@@ -344,6 +345,44 @@ async def test_flood_wait_sleeps_exact_seconds_then_retries() -> None:
 
 
 @pytest.mark.asyncio
+async def test_scheduler_emits_one_terminal_event_after_completed_status() -> None:
+    events = []
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            return None
+
+    scheduler = DownloadScheduler(Repo(), Downloader(), publish=events.append)
+
+    await scheduler.run_task("t")
+
+    assert [(event.kind, event.identity) for event in events] == [
+        (EventKind.DOWNLOAD_COMPLETED, "t")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_disk_full_emits_once_for_multi_item_task_without_terminal_event() -> None:
+    events = []
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            raise InsufficientSpaceError("private disk path")
+
+    scheduler = DownloadScheduler(
+        Repo(count=3),
+        Downloader(),
+        publish=events.append,
+    )
+
+    await scheduler.run_task("t")
+
+    assert [event.kind for event in events] == [EventKind.DISK_FULL]
+    assert events[0].identity == "t"
+    assert events[0].private_context == ""
+
+
+@pytest.mark.asyncio
 async def test_successful_item_state_updates_use_direct_item_lookup() -> None:
     class Downloader:
         async def download(self, item, should_pause):
@@ -502,6 +541,8 @@ async def test_unknown_download_error_does_not_persist_exception_text() -> None:
 
 @pytest.mark.asyncio
 async def test_partial_failure_preserves_safe_item_error_on_task() -> None:
+    events = []
+
     class Downloader:
         async def download(self, item, should_pause):
             raise TransientNetworkError("Telegram 网络连接失败")
@@ -511,12 +552,31 @@ async def test_partial_failure_preserves_safe_item_error_on_task() -> None:
         repo,
         Downloader(),
         retry=RetryPolicy(attempts=1, base_delay=0),
+        publish=events.append,
     )
 
     await scheduler.run_task("t")
 
     assert repo.task_updates[-1] is TaskStatus.PARTIAL_FAILURE
     assert repo.task_errors[-1] == "Telegram 网络连接失败"
+    assert [event.kind for event in events] == [EventKind.DOWNLOAD_FAILED]
+
+
+@pytest.mark.asyncio
+async def test_notification_callback_failure_does_not_change_download_outcome() -> None:
+    class Downloader:
+        async def download(self, item, should_pause):
+            return None
+
+    def reject_event(_event) -> None:
+        raise RuntimeError("private notification failure")
+
+    repo = Repo()
+    scheduler = DownloadScheduler(repo, Downloader(), publish=reject_event)
+
+    await scheduler.run_task("t")
+
+    assert repo.task_updates[-1] is TaskStatus.COMPLETED
 
 
 @pytest.mark.asyncio

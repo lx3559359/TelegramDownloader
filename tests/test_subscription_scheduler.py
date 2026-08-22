@@ -14,6 +14,7 @@ from telegram_downloader.gateway import (
     SessionExpiredError,
     TransientNetworkError,
 )
+from telegram_downloader.notifications import EventKind
 from telegram_downloader.subscription_scheduler import SubscriptionScheduler
 from telegram_downloader.subscriptions import (
     SubscriptionRule,
@@ -179,6 +180,42 @@ async def test_scheduler_runs_due_rules_serially_and_starts_created_tasks() -> N
     assert service.run_calls == ["r1", "r2"]
     assert service.max_active == 1
     assert started_tasks == ["task-r1", "task-r2"]
+
+
+@pytest.mark.asyncio
+async def test_subscription_event_reports_queued_count_without_private_context() -> None:
+    selected = rule("r1")
+    outcome = report(selected)
+    outcome = replace(
+        outcome,
+        run=replace(
+            outcome.run,
+            inspected=3,
+            keyword_hits=3,
+            matched=3,
+            queued=3,
+        ),
+    )
+    service = Service(selected)
+    service.outcomes = [outcome]
+    events = []
+    scheduler = SubscriptionScheduler(
+        service,
+        clock=lambda: NOW,
+        foreground_busy=lambda: False,
+        publish=events.append,
+        idle_delay=0.01,
+    )
+    scheduler.set_account("a1")
+    scheduler.start()
+
+    await wait_until(lambda: len(service.run_calls) == 1)
+    await scheduler.shutdown()
+
+    assert len(events) == 1
+    assert events[0].kind is EventKind.SUBSCRIPTION_MATCH
+    assert events[0].count == 3
+    assert events[0].private_context == ""
 
 
 @pytest.mark.asyncio

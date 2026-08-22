@@ -50,6 +50,7 @@ from telegram_downloader.gateway import (
     SessionExpiredError,
     TransientNetworkError,
 )
+from telegram_downloader.notifications import EventKind
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.scheduler import SchedulerSnapshot
 from telegram_downloader.settings import AppSettings, ProxySettings
@@ -356,11 +357,13 @@ async def test_concurrent_session_expiry_runs_one_relogin_flow(monkeypatch) -> N
     window.subscriptions_page = SimpleNamespace(
         set_logged_in=subscription_login_states.append
     )
+    events = []
     controller = AppController.for_test(
         gateway=gateway,
         vault=vault,
         secrets=vault.load(),
         window=window,
+        publish=events.append,
     )
     shown: list[str] = []
     controller.show_login = lambda: shown.append("login")
@@ -384,6 +387,7 @@ async def test_concurrent_session_expiry_runs_one_relogin_flow(monkeypatch) -> N
     assert "auth-key-duplicated" in serialized
     assert "private server text" not in serialized
     assert "private server text" not in repr(window.content_page.errors)
+    assert [event.kind for event in events] == [EventKind.AUTH_REQUIRED]
 
 
 @pytest.mark.asyncio

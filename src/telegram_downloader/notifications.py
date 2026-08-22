@@ -121,3 +121,41 @@ class NotificationBatcher:
                 )
             )
         return payloads
+
+
+def download_event(kind: EventKind, task_id: str) -> ApplicationEvent:
+    if kind not in _TASK_TERMINALS:
+        raise ValueError("下载终态事件类型无效")
+    return ApplicationEvent(
+        kind,
+        identity=task_id,
+        count=1,
+        route=NotificationRoute.TASKS,
+    )
+
+
+def disk_full_event(task_id: str) -> ApplicationEvent:
+    return ApplicationEvent(
+        EventKind.DISK_FULL,
+        identity=task_id,
+        count=1,
+        route=NotificationRoute.TASKS,
+    )
+
+
+def subscription_match_event(run_id: str, queued: int) -> ApplicationEvent:
+    return ApplicationEvent(
+        EventKind.SUBSCRIPTION_MATCH,
+        identity=run_id,
+        count=queued,
+        route=NotificationRoute.SUBSCRIPTIONS,
+    )
+
+
+def auth_required_event() -> ApplicationEvent:
+    return ApplicationEvent(
+        EventKind.AUTH_REQUIRED,
+        identity="telegram-session-expired",
+        count=1,
+        route=NotificationRoute.LOGIN,
+    )
