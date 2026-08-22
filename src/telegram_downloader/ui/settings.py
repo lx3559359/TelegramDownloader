@@ -118,7 +118,7 @@ class SettingsDialog(QDialog):
         self.proxy_password = QLineEdit(proxy_password)
         self.proxy_password.setEchoMode(QLineEdit.EchoMode.Password)
         form.addRow("API ID", self.api_id)
-        self.concurrency_label = QLabel("文件并发")
+        self.concurrency_label = QLabel("全局媒体槽")
         form.addRow(self.concurrency_label, self.concurrency)
         form.addRow("总下载限速", self.speed_limit)
         form.addRow("在线更新", self.check_updates)

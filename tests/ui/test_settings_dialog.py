@@ -29,7 +29,7 @@ def test_round_trip_manual_proxy_form(qtbot) -> None:
     assert dialog.values() == settings
     assert dialog.concurrency.minimum() == 1
     assert dialog.concurrency.maximum() == 5
-    assert dialog.concurrency_label.text() == "文件并发"
+    assert dialog.concurrency_label.text() == "全局媒体槽"
     assert tuple(
         dialog.speed_limit.itemData(index)
         for index in range(dialog.speed_limit.count())

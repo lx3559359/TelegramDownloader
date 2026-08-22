@@ -487,7 +487,7 @@ class MainWindow(QMainWindow):
         current_layout.setContentsMargins(13, 13, 13, 14)
         current_layout.setSpacing(9)
         current_layout.addWidget(self._section_label("当前任务"))
-        self.scheduler_summary = QLabel("调度：空闲 · 文件并发 3 · 不限速")
+        self.scheduler_summary = QLabel("调度：空闲 · 全局媒体槽 3 · 不限速")
         self.scheduler_summary.setObjectName("muted")
         self.scheduler_summary.setWordWrap(True)
         current_layout.addWidget(self.scheduler_summary)
@@ -735,7 +735,7 @@ class MainWindow(QMainWindow):
         speed_limit_kib: int,
     ) -> None:
         activity = (
-            f"{active} 个下载中 · {queued} 个等待"
+            f"{active} 个活动任务 · {queued} 个等待"
             if active > 0
             else "空闲"
         )
@@ -745,7 +745,7 @@ class MainWindow(QMainWindow):
             else f"限速 {self._format_rate(speed_limit_kib * 1024)}"
         )
         self.scheduler_summary.setText(
-            f"调度：{activity} · 文件并发 {concurrency} · {speed}"
+            f"调度：{activity} · 全局媒体槽 {concurrency} · {speed}"
         )
 
     def set_task_items(
