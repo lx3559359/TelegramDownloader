@@ -29,6 +29,8 @@ from PySide6.QtWidgets import (
 from telegram_downloader import __version__
 from telegram_downloader.domain import IntegrityStatus, ItemStatus, MediaKind, TaskStatus
 from telegram_downloader.file_integrity import IntegrityProgress
+from telegram_downloader.planner import BatchScanProgress
+from telegram_downloader.ui.batch_import import BatchImportDialog
 from telegram_downloader.ui.content_browser import ContentBrowserPage
 from telegram_downloader.ui.diagnostics import DiagnosticsPage
 from telegram_downloader.ui.effects import ElevationLevel, apply_elevation
@@ -72,6 +74,7 @@ _INTEGRITY_FAILURES = frozenset(
 
 class MainWindow(QMainWindow):
     scan_requested = Signal(str)
+    batch_scan_requested = Signal(object)
     content_activated = Signal()
     subscriptions_activated = Signal()
     diagnostics_activated = Signal()
@@ -99,6 +102,8 @@ class MainWindow(QMainWindow):
         self._restoring_task_selection = False
         self._detail_task_id: str | None = None
         self._integrity_busy = False
+        self._batch_dialogs: set[BatchImportDialog] = set()
+        self._pending_batch_dialog: BatchImportDialog | None = None
         self.setWindowTitle("Telegram 下载器")
         self.setMinimumSize(1180, 720)
         self.resize(1280, 780)
@@ -129,6 +134,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("准备就绪")
 
         self.scan_button.clicked.connect(self._emit_scan)
+        self.batch_button.clicked.connect(self._open_batch_import)
         self.pause_button.clicked.connect(
             lambda: self._emit_task_batch(
                 self.pause_tasks_requested.emit,
@@ -411,8 +417,11 @@ class MainWindow(QMainWindow):
         self.scan_button = QPushButton("扫描预览")
         self.scan_button.setObjectName("primaryButton")
         self.scan_button.setMinimumWidth(112)
+        self.batch_button = QPushButton("批量导入")
+        self.batch_button.setMinimumWidth(100)
         source_row.addWidget(self.link_input, 1)
         source_row.addWidget(self.scan_button)
+        source_row.addWidget(self.batch_button)
         layout.addLayout(source_row)
 
         filters = QHBoxLayout()
@@ -545,7 +554,46 @@ class MainWindow(QMainWindow):
     def set_scan_busy(self, busy: bool) -> None:
         self.link_input.setEnabled(not busy)
         self.scan_button.setEnabled(not busy)
+        self.batch_button.setEnabled(not busy)
         self.scan_button.setText("扫描中…" if busy else "扫描预览")
+        self.batch_button.setText("批量预检中…" if busy else "批量导入")
+
+    def set_batch_scan_progress(self, progress: BatchScanProgress) -> None:
+        self.batch_button.setText(f"预检 {progress.completed}/{progress.total}")
+
+    def finish_batch_preflight(self, success: bool, error: str = "") -> None:
+        dialog = self._pending_batch_dialog
+        if dialog is None:
+            return
+        if success:
+            self._pending_batch_dialog = None
+        dialog.finish_preflight(success, error)
+
+    def _open_batch_import(self) -> None:
+        dialog = BatchImportDialog(self)
+        self._batch_dialogs.add(dialog)
+        dialog.submitted.connect(
+            lambda lines, retained=dialog: self._emit_batch_scan(retained, lines)
+        )
+        dialog.finished.connect(
+            lambda _result, retained=dialog: self._release_batch_dialog(retained)
+        )
+        dialog.open()
+
+    def _emit_batch_scan(
+        self,
+        dialog: BatchImportDialog,
+        lines: tuple[str, ...],
+    ) -> None:
+        if self._pending_batch_dialog not in (None, dialog):
+            return
+        self._pending_batch_dialog = dialog
+        self.batch_scan_requested.emit(lines)
+
+    def _release_batch_dialog(self, dialog: BatchImportDialog) -> None:
+        self._batch_dialogs.discard(dialog)
+        if self._pending_batch_dialog is dialog:
+            self._pending_batch_dialog = None
 
     def _emit_for_selected(self, callback: Callable[[str], None]) -> None:
         task_id = self.selected_task_id()

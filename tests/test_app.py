@@ -27,9 +27,9 @@ from telegram_downloader.gateway import (
 )
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.settings import AppSettings
+from telegram_downloader.subscription_matching import SubscriptionCriteria
 from telegram_downloader.subscription_scheduler import SubscriptionScheduler
 from telegram_downloader.subscription_service import SubscriptionService
-from telegram_downloader.subscription_matching import SubscriptionCriteria
 from telegram_downloader.subscriptions import SubscriptionRule, SubscriptionState
 from telegram_downloader.ui.async_actions import ActionPolicy
 
@@ -85,6 +85,31 @@ def test_download_confirmation_is_nonblocking_and_awaitable(tmp_path) -> None:
         controller.window.close()
         loop.close()
         application.processEvents()
+
+
+def test_batch_download_confirmation_summarizes_preflight_duplicates() -> None:
+    preview = SimpleNamespace(
+        items=(1, 2, 3),
+        known_bytes=1024,
+        unknown_size_count=1,
+        input_count=5,
+        unique_link_count=3,
+        invalid_link_count=1,
+        duplicate_link_count=1,
+        scanned_media_count=8,
+        internal_duplicate_count=2,
+        existing_media_count=3,
+    )
+
+    text = app._download_confirmation_text(preview)
+
+    assert "输入 5 条" in text
+    assert "有效唯一 3 条" in text
+    assert "无效 1 条" in text
+    assert "输入重复 1 条" in text
+    assert "跨链接重复 2 项" in text
+    assert "队列既有 3 项" in text
+    assert "最终新增 3 项" in text
 
 
 def test_graceful_shutdown_cleans_async_work_before_quitting() -> None:

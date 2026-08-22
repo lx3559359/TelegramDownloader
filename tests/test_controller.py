@@ -1291,6 +1291,80 @@ async def test_confirmed_scan_awaits_async_task_refresh_before_start() -> None:
 
 
 @pytest.mark.asyncio
+async def test_confirmed_batch_scan_previews_and_commits_one_task() -> None:
+    batch = SimpleNamespace(
+        preview="combined-preview",
+        unique_link_count=2,
+    )
+
+    class Planner:
+        def __init__(self):
+            self.commits = []
+
+        async def scan_batch(self, links, filters, *, on_progress):
+            assert links == ("https://t.me/first", "https://t.me/second")
+            on_progress(SimpleNamespace(completed=1, total=2))
+            return batch
+
+        def commit(self, preview):
+            self.commits.append(preview)
+            return SimpleNamespace(
+                task=SimpleNamespace(id="batch-task"),
+                accepted_keys=frozenset({("peer", 1, "media")}),
+                skipped_count=2,
+            )
+
+    planner = Planner()
+    confirmed = []
+    controller = AppController.for_test(
+        gateway=ConnectedGateway(),
+        planner=planner,
+        confirm_preview=lambda preview: confirmed.append(preview) or True,
+    )
+    controller.window.finish_batch_preflight = Mock()
+    controller.window.set_batch_scan_progress = Mock()
+    controller.refresh_tasks_async = AsyncMock()
+    controller._start_task = Mock()
+
+    await controller.scan_links(
+        ("https://t.me/first", "https://t.me/second"),
+        controller.default_filters(datetime(2026, 8, 13, tzinfo=UTC)),
+    )
+
+    assert confirmed == [batch]
+    assert planner.commits == ["combined-preview"]
+    controller.window.finish_batch_preflight.assert_called_once_with(True)
+    controller.window.set_batch_scan_progress.assert_called_once()
+    controller._start_task.assert_called_once_with("batch-task")
+    assert controller.window.message.last_message == (
+        "批量加入 1 项，确认时另跳过重复 2 项；任务已开始下载"
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_batch_preflight_keeps_input_dialog_open() -> None:
+    class Planner:
+        async def scan_batch(self, _links, _filters, *, on_progress):
+            raise ValueError("批量链接没有新媒体")
+
+    controller = AppController.for_test(
+        gateway=ConnectedGateway(),
+        planner=Planner(),
+    )
+    controller.window.finish_batch_preflight = Mock()
+
+    await controller.scan_links(
+        ("https://t.me/first",),
+        controller.default_filters(datetime(2026, 8, 13, tzinfo=UTC)),
+    )
+
+    controller.window.finish_batch_preflight.assert_called_once_with(
+        False,
+        "批量链接没有新媒体",
+    )
+
+
+@pytest.mark.asyncio
 async def test_running_task_refreshes_window_before_download_finishes() -> None:
     release = asyncio.Event()
     started = asyncio.Event()

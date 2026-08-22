@@ -293,6 +293,26 @@ def _standard_button_selected(answer: object, expected: object) -> bool:
     return answer == expected
 
 
+def _download_confirmation_text(preview: object) -> str:
+    known = AppController._format_bytes(int(getattr(preview, "known_bytes", 0)))
+    unknown_count = int(getattr(preview, "unknown_size_count", 0))
+    unknown = f"，另有 {unknown_count} 项大小未知" if unknown_count else ""
+    if hasattr(preview, "unique_link_count"):
+        return (
+            f"输入 {preview.input_count} 条 · 有效唯一 {preview.unique_link_count} 条 · "
+            f"无效 {preview.invalid_link_count} 条 · 输入重复 {preview.duplicate_link_count} 条\n"
+            f"扫描媒体 {preview.scanned_media_count} 项 · "
+            f"跨链接重复 {preview.internal_duplicate_count} 项 · "
+            f"队列既有 {preview.existing_media_count} 项\n"
+            f"最终新增 {len(preview.items)} 项，已知大小 {known}{unknown}。"
+            "\n\n创建一个批量下载任务？"
+        )
+    return (
+        f"扫描到 {len(preview.items)} 项媒体，已知大小 {known}{unknown}。"
+        "\n\n加入下载队列？"
+    )
+
+
 def _startup_status(indicator: object | None, text: str) -> None:
     method = getattr(indicator, "set_status", None)
     if not callable(method):
@@ -423,15 +443,9 @@ def create_application(
         )
 
     async def confirm_preview(preview: ScanPreview) -> bool:
-        known = AppController._format_bytes(preview.known_bytes)
-        unknown = (
-            f"，另有 {preview.unknown_size_count} 项大小未知" if preview.unknown_size_count else ""
-        )
         dialog = QMessageBox(window)
         dialog.setWindowTitle("确认下载任务")
-        dialog.setText(
-            f"扫描到 {len(preview.items)} 项媒体，已知大小 {known}{unknown}。\n\n加入下载队列？"
-        )
+        dialog.setText(_download_confirmation_text(preview))
         dialog.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         dialog.setDefaultButton(QMessageBox.StandardButton.Yes)
         loop = asyncio.get_running_loop()
@@ -653,6 +667,19 @@ def create_application(
         )
         await controller.scan_link(link, filters)
 
+    @qasync.asyncSlot(object)
+    async def batch_scan_requested(value: object) -> None:
+        links = tuple(str(item) for item in value) if isinstance(value, (list, tuple)) else ()
+        local_timezone = datetime_now_timezone()
+        filters = AppController.filters_from_dates(
+            window.date_from.date().toPython(),
+            window.date_to.date().toPython(),
+            window.selected_media_kinds(),
+            window.limit_input.value(),
+            local_timezone,
+        )
+        await controller.scan_links(links, filters)
+
     @qasync.asyncSlot(int, str, object, str)
     async def credentials_submitted(
         api_id: int,
@@ -847,6 +874,7 @@ def create_application(
         dialog.open()
 
     window.scan_requested.connect(scan_requested)
+    window.batch_scan_requested.connect(batch_scan_requested)
     window.task_selection_changed.connect(task_selection_changed)
     window.open_media_requested.connect(open_media_requested)
     window.integrity_cancel_requested.connect(integrity_cancel_requested)
@@ -1097,6 +1125,7 @@ def create_application(
     controller._ui_slots.extend(
         (
             scan_requested,
+            batch_scan_requested,
             credentials_submitted,
             phone_submitted,
             code_submitted,

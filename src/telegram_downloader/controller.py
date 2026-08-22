@@ -121,6 +121,12 @@ class _NullWindow:
     def set_scan_busy(self, _busy: bool) -> None:
         pass
 
+    def set_batch_scan_progress(self, _progress: object) -> None:
+        pass
+
+    def finish_batch_preflight(self, _success: bool, _error: str = "") -> None:
+        pass
+
     def set_integrity_busy(self, _busy: bool) -> None:
         pass
 
@@ -937,6 +943,70 @@ class AppController:
         except Exception as error:
             _LOGGER.error("scan failed (%s)", type(error).__name__)
             self._show_error(self._safe_error(error))
+        finally:
+            self.window.set_scan_busy(False)
+
+    async def scan_links(
+        self,
+        links: tuple[str, ...],
+        filters: ScanFilters,
+    ) -> None:
+        self.window.set_scan_busy(True)
+        preflight_finished = False
+        try:
+            if not await self.ensure_telegram_online():
+                self.window.finish_batch_preflight(False, "请先登录 Telegram 账号")
+                return
+            if self.planner is None:
+                self.window.finish_batch_preflight(False, "请先登录 Telegram 账号")
+                return
+            batch = await self.planner.scan_batch(
+                links,
+                filters,
+                on_progress=self.window.set_batch_scan_progress,
+            )
+            self.window.finish_batch_preflight(True)
+            preflight_finished = True
+            if not await self._confirm_download_preview(batch):
+                self._show_status("已取消批量创建任务")
+                return
+            committed = self.planner.commit(batch.preview)
+            await self.refresh_tasks_async()
+            self._start_task(committed.task.id)
+            self._show_status(
+                f"批量加入 {len(committed.accepted_keys)} 项，"
+                f"确认时另跳过重复 {committed.skipped_count} 项；任务已开始下载"
+            )
+        except asyncio.CancelledError:
+            if not preflight_finished:
+                self.window.finish_batch_preflight(False, "批量预检已取消")
+            raise
+        except SessionExpiredError as error:
+            if not preflight_finished:
+                self.window.finish_batch_preflight(False, self._safe_error(error))
+            await self._handle_session_expired(error)
+        except (InvalidTelegramLink, ValueError, GatewayError) as error:
+            safe = self._safe_error(error)
+            _LOGGER.warning(
+                "batch scan rejected (%s); input_count=%s",
+                type(error).__name__,
+                len(links),
+            )
+            if preflight_finished:
+                self._show_error(safe)
+            else:
+                self.window.finish_batch_preflight(False, safe)
+        except Exception as error:
+            _LOGGER.error(
+                "batch scan failed (%s); input_count=%s",
+                type(error).__name__,
+                len(links),
+            )
+            safe = self._safe_error(error)
+            if preflight_finished:
+                self._show_error(safe)
+            else:
+                self.window.finish_batch_preflight(False, safe)
         finally:
             self.window.set_scan_busy(False)
 
