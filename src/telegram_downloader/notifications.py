@@ -159,3 +159,12 @@ def auth_required_event() -> ApplicationEvent:
         count=1,
         route=NotificationRoute.LOGIN,
     )
+
+
+def update_available_event(version: str) -> ApplicationEvent:
+    return ApplicationEvent(
+        EventKind.UPDATE_AVAILABLE,
+        identity=f"update:{version}",
+        count=1,
+        route=NotificationRoute.UPDATE,
+    )

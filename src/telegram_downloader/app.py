@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import json
 import logging
 import os
@@ -61,6 +62,7 @@ from telegram_downloader.notifications import (
     ApplicationEvent,
     NotificationBatcher,
     NotificationRoute,
+    update_available_event,
 )
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.planner import ScanPreview, TaskPlanner
@@ -78,6 +80,27 @@ from telegram_downloader.update_contract import load_trusted_keys
 from telegram_downloader.update_download import ResumableUpdateDownloader
 
 _LOGGER = logging.getLogger("telegram_downloader.app")
+
+
+class BackgroundUpdatePrompt:
+    def __init__(
+        self,
+        *,
+        window_visible: Callable[[], bool],
+        show_dialog: Callable[[object], bool | Awaitable[bool]],
+        publish: Callable[[ApplicationEvent], None],
+    ) -> None:
+        self.window_visible = window_visible
+        self.show_dialog = show_dialog
+        self.publish = publish
+
+    async def __call__(self, manifest: object) -> bool:
+        if not self.window_visible():
+            version = str(getattr(manifest, "version", "unknown"))
+            self.publish(update_available_event(version))
+            return False
+        decision = self.show_dialog(manifest)
+        return bool(await decision if inspect.isawaitable(decision) else decision)
 
 
 class _FunctionDiagnosticProbe:
@@ -179,6 +202,30 @@ def _install_graceful_shutdown(
     application.setQuitOnLastWindowClosed(False)
     controller.update_shutdown = background.request_exit
     return shutdown, close_filter
+
+
+def _install_session_shutdown(
+    application: Any,
+    background: BackgroundModeController,
+) -> Callable[[object], None]:
+    def commit_data_requested(_manager: object) -> None:
+        background.request_exit()
+
+    application.commitDataRequest.connect(commit_data_requested)
+    return commit_data_requested
+
+
+def _show_initial_window(
+    controller: Any,
+    *,
+    background: bool,
+    tray_available: bool,
+) -> None:
+    if background and tray_available:
+        return
+    controller.window.show()
+    if background:
+        controller._show_status("系统托盘不可用，已显示主窗口")
 
 
 def run_self_test(root: Path) -> dict[str, object]:
@@ -419,8 +466,32 @@ def create_application(
     )
     diagnostic_store = DiagnosticReportStore(paths, secrets=set(secrets.values()))
 
-    def confirm_update(manifest) -> bool:
-        return UpdateDialog(manifest, window).exec() == UpdateDialog.DialogCode.Accepted
+    async def confirm_update(manifest) -> bool:
+        dialog = UpdateDialog(manifest, window)
+        loop = asyncio.get_running_loop()
+        finished: asyncio.Future[bool] = loop.create_future()
+
+        def resolve(answer: int) -> None:
+            if not finished.done():
+                finished.set_result(
+                    answer == UpdateDialog.DialogCode.Accepted.value
+                )
+
+        dialog.finished.connect(resolve)
+        dialog.open()
+        try:
+            return await finished
+        except asyncio.CancelledError:
+            dialog.reject()
+            raise
+        finally:
+            dialog.deleteLater()
+
+    update_prompt = BackgroundUpdatePrompt(
+        window_visible=window.isVisible,
+        show_dialog=confirm_update,
+        publish=publish_event,
+    )
 
     controller_ref: dict[str, AppController] = {}
 
@@ -560,7 +631,7 @@ def create_application(
         service_builder=build_services,
         confirm_preview=confirm_preview,
         update_coordinator=update_coordinator,
-        update_prompt=confirm_update,
+        update_prompt=update_prompt,
         update_shutdown=application.quit,
         publish=publish_event,
         settings=settings,
@@ -1072,7 +1143,9 @@ def run(
     instance_guard: WindowsInstanceGuard | None = None,
     *,
     startup_indicator: object | None = None,
+    background: bool = False,
 ) -> int:
+    launch_in_background = bool(background)
     guard = instance_guard or WindowsInstanceGuard()
     if not guard.acquire():
         if not request_activation(ACTIVATION_CHANNEL, timeout_ms=1000):
@@ -1115,7 +1188,7 @@ def run(
                     "subscriptions"
                 ),
                 NotificationRoute.LOGIN: controller.show_login,
-                NotificationRoute.UPDATE: lambda: controller.window.show_page("tasks"),
+                NotificationRoute.UPDATE: controller.check_for_updates,
             },
         )
         tray_adapter = QtTrayAdapter(controller.window)
@@ -1237,15 +1310,22 @@ def run(
             background,
             shutdown=graceful_shutdown,
         )
+        session_shutdown = _install_session_shutdown(application, background)
         application.aboutToQuit.connect(loop.stop)
         with loop:
 
             async def start_application() -> None:
                 _startup_status(startup_indicator, "正在恢复任务与账号…")
-                controller.window.show()
+                _show_initial_window(
+                    controller,
+                    background=launch_in_background,
+                    tray_available=tray_adapter.available,
+                )
                 _startup_finish(startup_indicator, controller.window)
                 await download_schedule.start()
-                await controller.start()
+                await controller.start(
+                    background=launch_in_background and tray_adapter.available
+                )
 
             startup_task = loop.create_task(start_application())
 
@@ -1264,6 +1344,7 @@ def run(
             if not startup_task.cancelled():
                 startup_task.result()
         del close_filter
+        del session_shutdown
         return 0
     finally:
         if activation_server is not None:

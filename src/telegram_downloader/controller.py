@@ -479,6 +479,7 @@ class AppController:
         self.phone_code_hash = ""
         self._background: set[asyncio.Task[Any]] = set()
         self._connection_monitor_task: asyncio.Task[None] | None = None
+        self._update_check_task: asyncio.Task[Any] | None = None
         self._session_restore_task: asyncio.Task[None] | None = None
         self._qr_wait_task: asyncio.Task[None] | None = None
         self._qr_generation = 0
@@ -501,6 +502,7 @@ class AppController:
         self._progress_samples: dict[str, tuple[float, int]] = {}
         self._session_expiry_lock = asyncio.Lock()
         self._session_expiry_handled = False
+        self._background_launch = False
         self._last_authorization_failure_reason: (
             AuthorizationFailureReason | None
         ) = None
@@ -634,13 +636,17 @@ class AppController:
         method = getattr(gateway, "is_connected", None)
         return bool(method()) if callable(method) else False
 
-    async def start(self) -> None:
+    async def start(self, *, background: bool = False) -> None:
+        self._background_launch = bool(background)
         self.refresh_tasks()
         await self.activate_cached_content_account()
         if self.update_coordinator is not None and self.settings.check_updates_on_startup:
-            self._spawn_background(self._run_update_check())
+            self.check_for_updates()
         if self.gateway is None:
-            self.show_login()
+            if background:
+                self._publish_event(auth_required_event())
+            else:
+                self.show_login()
             return
         self._ensure_connection_monitor()
         self._session_restore_task = self._spawn_background(self._restore_saved_session())
@@ -657,7 +663,7 @@ class AppController:
         try:
             name = await self._account_name()
             if name is None:
-                self.show_login()
+                self._request_login()
                 return
             self.window.set_account(name)
             await self.activate_content_account()
@@ -2313,13 +2319,24 @@ class AppController:
                     else:
                         self.planner, self.scheduler = services
 
-            self.show_login()
+            self._request_login(publish=False)
 
     def _publish_event(self, event: ApplicationEvent) -> None:
         try:
             self.publish(event)
         except Exception:
             _LOGGER.error("notification event callback failed")
+
+    def _request_login(self, *, publish: bool = True) -> None:
+        if publish:
+            self._publish_event(auth_required_event())
+        visible = getattr(self.window, "isVisible", None)
+        if callable(visible):
+            if not visible():
+                return
+        elif self._background_launch:
+            return
+        self.show_login()
 
     @property
     def last_authorization_failure_reason(
@@ -2452,6 +2469,15 @@ class AppController:
                 self._show_status("更新检查暂不可用，已继续使用当前版本")
         except Exception as error:
             self._show_status(f"更新检查失败（{type(error).__name__}）")
+
+    def check_for_updates(self) -> asyncio.Task[Any] | None:
+        if self.update_coordinator is None or self._shutting_down:
+            return None
+        current = self._update_check_task
+        if current is not None and not current.done():
+            return current
+        self._update_check_task = self._spawn_background(self._run_update_check())
+        return self._update_check_task
 
     async def _run_and_refresh(self, task_id: str) -> None:
         operation = asyncio.create_task(self.scheduler.run_task(task_id))

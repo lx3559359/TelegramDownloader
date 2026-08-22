@@ -1,5 +1,7 @@
+import sys
 from pathlib import Path
 
+from telegram_downloader import __main__ as main_module
 from telegram_downloader.bootstrap import configure_process, resolve_runtime_root
 
 
@@ -28,3 +30,21 @@ def test_configure_process_redirects_temp_and_user_data(
     assert Path(environ["LOCALAPPDATA"]) == tmp_path / "data" / "user-profile" / "Local"
     assert (tmp_path / "data" / "temp").is_dir()
     assert (tmp_path / "downloads").is_dir()
+
+
+def test_background_argument_is_propagated_to_gui_runner(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls: list[tuple[Path, bool]] = []
+    monkeypatch.setattr(main_module, "runtime_root", lambda: tmp_path)
+    monkeypatch.setattr(main_module, "configure_process", lambda root: root)
+    monkeypatch.setattr(
+        main_module,
+        "_run_gui",
+        lambda root, *, background: calls.append((root, background)) or 0,
+    )
+    monkeypatch.setattr(sys, "argv", ["TelegramDownloader", "--background"])
+
+    assert main_module.main() == 0
+    assert calls == [(tmp_path, True)]

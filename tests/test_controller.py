@@ -3734,6 +3734,29 @@ async def test_apply_settings_rolls_back_runtime_effects_when_vault_save_fails()
 
 
 @pytest.mark.asyncio
+async def test_background_start_requests_login_without_showing_dialog() -> None:
+    events = []
+
+    class LoginDialog:
+        shows = 0
+
+        def show(self) -> None:
+            self.shows += 1
+
+    login = LoginDialog()
+    controller = AppController.for_test(
+        gateway=None,
+        login_dialog=login,
+        publish=events.append,
+    )
+
+    await controller.start(background=True)
+
+    assert login.shows == 0
+    assert events[-1].kind is EventKind.AUTH_REQUIRED
+
+
+@pytest.mark.asyncio
 async def test_restore_uses_persistent_dispatch_order() -> None:
     ordered = [SimpleNamespace(id="priority"), SimpleNamespace(id="oldest")]
 

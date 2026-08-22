@@ -3,11 +3,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+from types import SimpleNamespace
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from telegram_downloader.app import BackgroundUpdatePrompt
 from telegram_downloader.controller import AppController
+from telegram_downloader.notifications import EventKind, NotificationRoute
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.update import (
     HelperLaunchRequest,
@@ -97,6 +100,39 @@ class Downloader:
         self.calls.append((urls, destination, size, digest))
         destination.write_bytes(self.content)
         return destination
+
+
+@pytest.mark.asyncio
+async def test_hidden_update_check_notifies_then_defers_dialog() -> None:
+    events = []
+    dialog_calls = []
+    prompt = BackgroundUpdatePrompt(
+        window_visible=lambda: False,
+        show_dialog=lambda manifest: dialog_calls.append(manifest) or True,
+        publish=events.append,
+    )
+
+    accepted = await prompt(SimpleNamespace(version="0.13.0"))
+
+    assert accepted is False
+    assert dialog_calls == []
+    assert events[-1].kind is EventKind.UPDATE_AVAILABLE
+    assert events[-1].route is NotificationRoute.UPDATE
+
+
+@pytest.mark.asyncio
+async def test_visible_update_check_awaits_existing_dialog() -> None:
+    async def show_dialog(_manifest) -> bool:
+        await asyncio.sleep(0)
+        return True
+
+    prompt = BackgroundUpdatePrompt(
+        window_visible=lambda: True,
+        show_dialog=show_dialog,
+        publish=lambda _event: None,
+    )
+
+    assert await prompt(SimpleNamespace(version="0.13.0")) is True
 
 
 @pytest.mark.asyncio
@@ -245,3 +281,29 @@ async def test_controller_starts_update_check_without_blocking_login(tmp_path) -
     assert controller.login_dialog is not None
     release.set()
     await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_controller_deduplicates_manual_update_checks() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    class Coordinator:
+        async def startup(self, _prompt, _shutdown):
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+
+    controller = AppController.for_test(update_coordinator=Coordinator())
+
+    first = controller.check_for_updates()
+    second = controller.check_for_updates()
+    await started.wait()
+
+    assert first is second
+    assert calls == 1
+    release.set()
+    assert first is not None
+    await first

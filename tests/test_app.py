@@ -183,16 +183,63 @@ def test_window_close_filter_delegates_to_background_without_shutdown(qapp) -> N
     qapp.setQuitOnLastWindowClosed(True)
 
 
+def test_session_shutdown_requests_true_background_exit() -> None:
+    callbacks = []
+
+    class Signal:
+        def connect(self, callback) -> None:
+            callbacks.append(callback)
+
+    class Application:
+        commitDataRequest = Signal()
+
+    class Background:
+        exit_requests = 0
+
+        def request_exit(self) -> None:
+            self.exit_requests += 1
+
+    background = Background()
+    retained = app._install_session_shutdown(Application(), background)
+
+    callbacks[0](object())
+
+    assert retained is callbacks[0]
+    assert background.exit_requests == 1
+
+
+def test_background_launch_falls_back_to_visible_window_without_tray() -> None:
+    class Window:
+        visible = False
+
+        def show(self) -> None:
+            self.visible = True
+
+    class Controller:
+        window = Window()
+        messages = []
+
+        def _show_status(self, text: str) -> None:
+            self.messages.append(text)
+
+    controller = Controller()
+
+    app._show_initial_window(controller, background=True, tray_available=False)
+
+    assert controller.window.visible is True
+    assert controller.messages == ["系统托盘不可用，已显示主窗口"]
+
+
 def test_run_keeps_startup_inside_the_continuous_event_loop() -> None:
     source = getsource(app.run)
 
     assert "run_until_complete(controller.start())" not in source
     assert "loop.create_task(start_application())" in source
-    assert source.index("controller.window.show()") < source.index(
-        "await controller.start()"
+    assert source.index("_show_initial_window(") < source.index(
+        "await controller.start("
     )
     assert source.index("await download_schedule.start()") < source.index(
-        "await controller.start()"
+        "await controller.start("
     )
 
 

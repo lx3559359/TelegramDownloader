@@ -49,8 +49,8 @@ def test_gui_bootstrap_closes_indicator_after_runner_returns(tmp_path) -> None:
 
     indicator = Indicator()
 
-    def runner(root, *, startup_indicator) -> int:
-        events.append(("run", root, startup_indicator))
+    def runner(root, *, startup_indicator, background) -> int:
+        events.append(("run", root, startup_indicator, background))
         return 7
 
     result = entry._run_gui(
@@ -62,7 +62,7 @@ def test_gui_bootstrap_closes_indicator_after_runner_returns(tmp_path) -> None:
     assert result == 7
     assert events == [
         ("status", "正在加载运行组件…"),
-        ("run", tmp_path, indicator),
+        ("run", tmp_path, indicator, False),
         "close",
     ]
 
@@ -77,8 +77,9 @@ def test_gui_bootstrap_closes_indicator_when_runner_fails(tmp_path) -> None:
         def close(self) -> None:
             closed.append(True)
 
-    def runner(_root, *, startup_indicator) -> int:
+    def runner(_root, *, startup_indicator, background) -> int:
         del startup_indicator
+        assert background is False
         raise RuntimeError("synthetic startup failure")
 
     try:
@@ -93,3 +94,25 @@ def test_gui_bootstrap_closes_indicator_when_runner_fails(tmp_path) -> None:
         raise AssertionError("startup failure was not propagated")
 
     assert closed == [True]
+
+
+def test_background_gui_bootstrap_does_not_create_startup_indicator(tmp_path) -> None:
+    calls: list[tuple[object, bool]] = []
+
+    def unexpected_indicator():
+        raise AssertionError("background launch must not create a startup window")
+
+    def runner(_root, *, startup_indicator, background) -> int:
+        calls.append((startup_indicator, background))
+        return 0
+
+    assert (
+        entry._run_gui(
+            tmp_path,
+            background=True,
+            startup_factory=unexpected_indicator,
+            runner=runner,
+        )
+        == 0
+    )
+    assert calls == [(None, True)]

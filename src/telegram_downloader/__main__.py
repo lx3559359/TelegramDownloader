@@ -14,15 +14,29 @@ def _default_startup_factory():
     return create_startup_indicator()
 
 
-def _run_gui(root: Path, *, startup_factory=None, runner=None) -> int:
-    indicator = (startup_factory or _default_startup_factory)()
+def _run_gui(
+    root: Path,
+    *,
+    background: bool = False,
+    startup_factory=None,
+    runner=None,
+) -> int:
+    indicator = None
+    if not background:
+        indicator = (startup_factory or _default_startup_factory)()
     try:
-        indicator.set_status("正在加载运行组件…")
+        if indicator is not None:
+            indicator.set_status("正在加载运行组件…")
         if runner is None:
             from telegram_downloader.app import run as runner
-        return runner(root, startup_indicator=indicator)
+        return runner(
+            root,
+            startup_indicator=indicator,
+            background=background,
+        )
     finally:
-        indicator.close()
+        if indicator is not None:
+            indicator.close()
 
 
 def main() -> int:
@@ -30,6 +44,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="TelegramDownloader")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--update-health-check", type=Path)
+    parser.add_argument("--background", action="store_true")
     arguments = parser.parse_args()
 
     if arguments.self_test or arguments.update_health_check is not None:
@@ -50,7 +65,7 @@ def main() -> int:
         print(json.dumps(report, ensure_ascii=False, separators=(",", ":")))
         return 0 if report.get("ok") is True else 1
 
-    return _run_gui(root)
+    return _run_gui(root, background=arguments.background)
 
 
 if __name__ == "__main__":
