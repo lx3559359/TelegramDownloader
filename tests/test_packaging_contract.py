@@ -112,7 +112,7 @@ def test_subscription_modules_do_not_escape_project_local_storage() -> None:
         assert all(value not in source for value in diagnostic_forbidden), module.name
 
 
-def test_v0150_version_and_storage_maintenance_contract_are_consistent() -> None:
+def test_v0160_version_and_download_ui_contract_are_consistent() -> None:
     root = Path(__file__).parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     package_init = (root / "src/telegram_downloader/__init__.py").read_text(
@@ -129,12 +129,12 @@ def test_v0150_version_and_storage_maintenance_contract_are_consistent() -> None
         encoding="utf-8"
     )
     readme = (root / "README.md").read_text(encoding="utf-8")
-    release_notes = root / "docs/releases/v0.15.0.md"
-    verification = root / "docs/verification/v0.15.0-storage-maintenance.md"
+    release_notes = root / "docs/releases/v0.16.0.md"
+    verification = root / "docs/verification/2026-08-22-download-location-ui-polish.md"
 
-    assert project["project"]["version"] == "0.15.0"
-    assert '__version__ = "0.15.0"' in package_init
-    assert '#define AppVersion "0.15.0"' in installer
+    assert project["project"]["version"] == "0.16.0"
+    assert '__version__ = "0.16.0"' in package_init
+    assert '#define AppVersion "0.16.0"' in installer
     assert "qrcode==8.2" in requirements
     assert '"qrcode"' in spec
     assert "app_version=__version__" in gateway
@@ -161,19 +161,18 @@ def test_v0150_version_and_storage_maintenance_contract_are_consistent() -> None
     assert '"--background"' in entry
     assert release_notes.is_file()
     notes = release_notes.read_text(encoding="utf-8")
-    assert "# TelegramDownloader v0.15.0" in notes
+    assert "# TelegramDownloader v0.16.0" in notes
     assert all(
         term in notes
         for term in (
-            "默认关闭",
-            "7 天",
-            "30 天",
-            "1 GiB",
-            "900 MiB",
-            "最新 1 份",
-            "不会自动扫描 `downloads`",
-            "两次确认",
-            "来源不明",
+            "Windows 文件夹选择器",
+            "已有任务保持原路径",
+            "不会静默回退",
+            "启动时不再自动检查更新",
+            "白色勾号",
+            "托盘右键菜单",
+            "完整自动换行",
+            "受信根策略",
         )
     )
     assert verification.is_file()
