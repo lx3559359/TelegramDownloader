@@ -5,12 +5,42 @@ from collections.abc import Callable, Mapping
 from typing import Any, Protocol
 
 from PySide6.QtCore import QObject, Signal
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtGui import QAction, QColor, QIcon, QPalette
 from PySide6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon
 
 from telegram_downloader.notifications import NotificationPayload, NotificationRoute
 
 _LOGGER = logging.getLogger(__name__)
+
+TRAY_MENU_STYLESHEET = """
+QMenu {
+    background: #FFFFFF;
+    color: #22394A;
+    border: 1px solid #D5DEE7;
+    border-radius: 7px;
+    padding: 6px;
+}
+QMenu::item {
+    min-height: 28px;
+    padding: 3px 24px 3px 10px;
+    border-radius: 5px;
+    background: transparent;
+    color: #22394A;
+}
+QMenu::item:selected {
+    background: #E8F9FC;
+    color: #087F96;
+}
+QMenu::item:disabled {
+    background: transparent;
+    color: #A8B5BD;
+}
+QMenu::separator {
+    height: 1px;
+    margin: 5px 8px;
+    background: #E2E8F0;
+}
+"""
 
 
 class WindowPort(Protocol):
@@ -160,6 +190,25 @@ class QtTrayAdapter(QObject):
         self.icon = QSystemTrayIcon(QIcon(icon), window)
         self.icon.setToolTip("Telegram 下载器")
         self.menu = QMenu(window)
+        self.menu.setObjectName("trayMenu")
+        palette = self.menu.palette()
+        palette.setColor(QPalette.ColorRole.Window, QColor("#FFFFFF"))
+        palette.setColor(QPalette.ColorRole.Base, QColor("#FFFFFF"))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor("#22394A"))
+        palette.setColor(QPalette.ColorRole.Text, QColor("#22394A"))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor("#22394A"))
+        palette.setColor(
+            QPalette.ColorGroup.Disabled,
+            QPalette.ColorRole.Text,
+            QColor("#A8B5BD"),
+        )
+        palette.setColor(
+            QPalette.ColorGroup.Disabled,
+            QPalette.ColorRole.WindowText,
+            QColor("#A8B5BD"),
+        )
+        self.menu.setPalette(palette)
+        self.menu.setStyleSheet(TRAY_MENU_STYLESHEET)
         self.show_action = QAction("显示主窗口", self.menu)
         self.hide_action = QAction("隐藏主窗口", self.menu)
         self.pause_action = QAction("暂停全部下载", self.menu)

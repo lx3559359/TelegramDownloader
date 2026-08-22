@@ -1,6 +1,9 @@
 import logging
 
-from telegram_downloader.background import BackgroundModeController
+from PySide6.QtGui import QColor, QPalette
+from PySide6.QtWidgets import QSystemTrayIcon, QWidget
+
+from telegram_downloader.background import BackgroundModeController, QtTrayAdapter
 from telegram_downloader.notifications import NotificationPayload, NotificationRoute
 
 
@@ -143,3 +146,33 @@ def test_disabled_notifications_are_not_forwarded() -> None:
     )
 
     assert controller.tray.notifications == []
+
+
+def test_tray_menu_uses_explicit_readable_palette(qapp, qtbot, monkeypatch) -> None:
+    original = qapp.palette()
+    dark = QPalette(original)
+    dark.setColor(QPalette.ColorRole.Window, QColor("#111827"))
+    dark.setColor(QPalette.ColorRole.WindowText, QColor("#111827"))
+    qapp.setPalette(dark)
+    window = QWidget()
+    qtbot.addWidget(window)
+    monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", lambda: True)
+
+    try:
+        adapter = QtTrayAdapter(window)
+        palette = adapter.menu.palette()
+
+        assert palette.color(QPalette.ColorRole.Window).name().lower() == "#ffffff"
+        assert palette.color(QPalette.ColorRole.WindowText).name().lower() == "#22394a"
+        assert palette.color(QPalette.ColorRole.Text).name().lower() == "#22394a"
+        assert "QMenu::item:selected" in adapter.menu.styleSheet()
+        assert "#E8F9FC" in adapter.menu.styleSheet()
+        assert "QMenu::item:disabled" in adapter.menu.styleSheet()
+        assert "QMenu::separator" in adapter.menu.styleSheet()
+        assert adapter.menu.objectName() == "trayMenu"
+        assert (
+            qapp.palette().color(QPalette.ColorRole.Window).name().lower()
+            == "#111827"
+        )
+    finally:
+        qapp.setPalette(original)
