@@ -4,6 +4,7 @@ import pytest
 
 from telegram_downloader.settings import (
     AppSettings,
+    DownloadScheduleSettings,
     ProxySettings,
     SettingsError,
     SettingsStore,
@@ -28,6 +29,40 @@ def test_settings_round_trip_is_atomic(tmp_path) -> None:
 
 def test_missing_settings_use_safe_defaults(tmp_path) -> None:
     assert SettingsStore(tmp_path / "missing.json").load() == AppSettings()
+
+
+def test_background_settings_have_safe_compatible_defaults(tmp_path) -> None:
+    loaded = SettingsStore(tmp_path / "missing.json").load()
+
+    assert loaded.close_to_tray is True
+    assert loaded.notifications_enabled is True
+    assert loaded.autostart_enabled is False
+    assert loaded.tray_hint_shown is False
+    assert loaded.download_schedule == DownloadScheduleSettings()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"weekdays": []},
+        {"weekdays": [0, 7]},
+        {"start_minute": -1},
+        {"end_minute": 1440},
+    ],
+)
+def test_download_schedule_rejects_invalid_values(value) -> None:
+    with pytest.raises(SettingsError):
+        DownloadScheduleSettings(**value)
+
+
+def test_old_settings_json_loads_with_new_defaults(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text('{"api_id":123,"concurrency":3}', encoding="utf-8")
+
+    loaded = SettingsStore(path).load()
+
+    assert loaded.api_id == 123
+    assert loaded.download_schedule.enabled is False
 
 
 def test_old_settings_default_to_unlimited_speed(tmp_path) -> None:
