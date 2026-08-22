@@ -213,35 +213,7 @@ class UpdateTransaction:
         _atomic_write(self.paths.update_journal, canonical_json(value))
 
     def _read_journal(self) -> dict[str, Any]:
-        try:
-            value = json.loads(self.paths.update_journal.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise UpdateTransactionError("更新恢复日志损坏") from exc
-        expected = {
-            "schemaVersion",
-            "transactionId",
-            "state",
-            "oldVersion",
-            "targetVersion",
-            "backup",
-            "extraction",
-            "oldFiles",
-            "newFiles",
-            "backedUp",
-            "installed",
-        }
-        if not isinstance(value, dict) or set(value) != expected or value["schemaVersion"] != 1:
-            raise UpdateTransactionError("更新恢复日志格式无效")
-        for key in ("oldFiles", "newFiles", "backedUp", "installed"):
-            if not isinstance(value[key], list):
-                raise UpdateTransactionError("更新恢复日志文件列表无效")
-            for relative in value[key]:
-                _validate_relative_path(relative)
-        for key in ("backup", "extraction"):
-            _validate_update_relative_path(value[key])
-        if value["state"] not in {"prepared", "backing-up", "installing", "committed"}:
-            raise UpdateTransactionError("更新恢复日志状态无效")
-        return value
+        return load_update_journal(self.paths)
 
     def _record_result(self, status: str, old_version: str, target_version: str) -> None:
         result = self.paths.guard(self.paths.update / "result.json")
@@ -260,6 +232,58 @@ class UpdateTransaction:
         guarded = self.paths.guard(path)
         if guarded.exists():
             shutil.rmtree(guarded)
+
+
+def load_update_journal(paths: PortablePaths) -> dict[str, Any]:
+    try:
+        value = json.loads(
+            paths.update_journal.read_text(encoding="utf-8"),
+            object_pairs_hook=_pairs_without_duplicates,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, RuntimePackageError) as exc:
+        raise UpdateTransactionError("更新恢复日志损坏") from exc
+    expected = {
+        "schemaVersion",
+        "transactionId",
+        "state",
+        "oldVersion",
+        "targetVersion",
+        "backup",
+        "extraction",
+        "oldFiles",
+        "newFiles",
+        "backedUp",
+        "installed",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or not isinstance(value["schemaVersion"], int)
+        or isinstance(value["schemaVersion"], bool)
+        or value["schemaVersion"] != 1
+    ):
+        raise UpdateTransactionError("更新恢复日志格式无效")
+    transaction_id = value["transactionId"]
+    if not isinstance(transaction_id, str) or re.fullmatch(
+        r"[a-f0-9]{32}", transaction_id
+    ) is None:
+        raise UpdateTransactionError("更新恢复日志事务标识无效")
+    try:
+        parse_version(value["oldVersion"])
+        parse_version(value["targetVersion"])
+        for key in ("oldFiles", "newFiles", "backedUp", "installed"):
+            files = value[key]
+            if not isinstance(files, list) or len(files) != len(set(files)):
+                raise UpdateTransactionError("更新恢复日志文件列表无效")
+            for relative in files:
+                _validate_relative_path(relative)
+        for key in ("backup", "extraction"):
+            _validate_update_relative_path(value[key])
+    except (RuntimePackageError, TypeError, ValueError) as exc:
+        raise UpdateTransactionError("更新恢复日志格式无效") from exc
+    if value["state"] not in {"prepared", "backing-up", "installing", "committed"}:
+        raise UpdateTransactionError("更新恢复日志状态无效")
+    return value
 
 
 def read_installed_inventory(root: Path) -> RuntimeInventory:

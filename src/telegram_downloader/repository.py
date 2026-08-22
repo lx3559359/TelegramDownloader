@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -114,6 +114,17 @@ class TaskSnapshot:
     known_size: int
     unknown_size_count: int
     item_error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class MaintenanceMediaRecord:
+    item_id: str
+    task_id: str
+    task_title: str
+    target_path: Path
+    task_status: TaskStatus
+    item_status: ItemStatus
+    integrity_status: IntegrityStatus
 
 
 class TaskRepository:
@@ -280,6 +291,48 @@ class TaskRepository:
         if row is None:
             raise KeyError(item_id)
         return self._item_from_row(row)
+
+    def maintenance_media_by_targets(
+        self,
+        targets: Sequence[Path],
+    ) -> dict[Path, MaintenanceMediaRecord]:
+        normalized = tuple(dict.fromkeys(Path(target).resolve() for target in targets))
+        if not normalized:
+            return {}
+        found: dict[Path, MaintenanceMediaRecord] = {}
+        with self._connection() as connection:
+            for batch in batched(normalized, 400):
+                marks = ",".join("?" for _ in batch)
+                rows = connection.execute(
+                    f"""
+                    SELECT media_items.id AS item_id,
+                           media_items.task_id AS task_id,
+                           COALESCE(tasks.display_title, tasks.source_title)
+                               AS task_title,
+                           media_items.target_path AS target_path,
+                           tasks.status AS task_status,
+                           media_items.status AS item_status,
+                           media_items.integrity_status AS integrity_status
+                    FROM media_items
+                    JOIN tasks ON tasks.id = media_items.task_id
+                    WHERE media_items.target_path IN ({marks})
+                    """,
+                    tuple(str(target) for target in batch),
+                ).fetchall()
+                for row in rows:
+                    target = Path(row["target_path"]).resolve()
+                    if target in found:
+                        raise ValueError("维护目标关联多个媒体")
+                    found[target] = MaintenanceMediaRecord(
+                        item_id=str(row["item_id"]),
+                        task_id=str(row["task_id"]),
+                        task_title=str(row["task_title"]),
+                        target_path=target,
+                        task_status=TaskStatus(row["task_status"]),
+                        item_status=ItemStatus(row["item_status"]),
+                        integrity_status=IntegrityStatus(row["integrity_status"]),
+                    )
+        return {target: found[target] for target in normalized if target in found}
 
     def list_tasks(self, *, include_archived: bool = False) -> list[TaskRecord]:
         where = "" if include_archived else "WHERE archived_at IS NULL"

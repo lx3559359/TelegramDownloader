@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -746,3 +747,57 @@ def test_get_tasks_and_update_statuses_use_bulk_contract(tmp_path: Path) -> None
         repository.get_task(task_id).status is TaskStatus.PAUSED
         for task_id in updated
     )
+
+
+def test_maintenance_media_by_targets_uses_one_join_query(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository = TaskRepository(tmp_path / "tasks.sqlite3")
+    repository.initialize()
+    task, item = records(tmp_path)
+    target = item.target_path.resolve()
+    repository.create_task(
+        replace(task, status=TaskStatus.COMPLETED, display_title="资料群"),
+        [
+            replace(
+                item,
+                status=ItemStatus.COMPLETED,
+                integrity_status=IntegrityStatus.VERIFIED,
+            )
+        ],
+    )
+    statements: list[str] = []
+    original_connection = repository._connection
+
+    @contextmanager
+    def traced_connection():
+        with original_connection() as connection:
+            connection.set_trace_callback(statements.append)
+            yield connection
+
+    monkeypatch.setattr(repository, "_connection", traced_connection)
+
+    found = repository.maintenance_media_by_targets(
+        [target, target, tmp_path / "missing.mp4"]
+    )
+
+    assert list(found) == [target]
+    record = found[target]
+    assert record.item_id == item.id
+    assert record.task_id == task.id
+    assert record.task_title == "资料群"
+    assert record.target_path == target
+    assert record.task_status is TaskStatus.COMPLETED
+    assert record.item_status is ItemStatus.COMPLETED
+    assert record.integrity_status is IntegrityStatus.VERIFIED
+    join_queries = [
+        statement
+        for statement in statements
+        if "FROM media_items" in statement and "JOIN tasks" in statement
+    ]
+    assert len(join_queries) == 1
+
+    statements.clear()
+    assert repository.maintenance_media_by_targets([]) == {}
+    assert statements == []
