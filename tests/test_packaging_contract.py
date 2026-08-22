@@ -103,7 +103,7 @@ def test_subscription_modules_do_not_escape_project_local_storage() -> None:
         assert all(value not in source for value in diagnostic_forbidden), module.name
 
 
-def test_v0122_version_and_responsiveness_contract_are_consistent() -> None:
+def test_v0130_version_and_background_runtime_contract_are_consistent() -> None:
     root = Path(__file__).parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     package_init = (root / "src/telegram_downloader/__init__.py").read_text(
@@ -115,12 +115,16 @@ def test_v0122_version_and_responsiveness_contract_are_consistent() -> None:
     requirements = (root / "requirements.txt").read_text(encoding="utf-8")
     spec = (root / "TelegramDownloader.spec").read_text(encoding="utf-8")
     app = (root / "src/telegram_downloader/app.py").read_text(encoding="utf-8")
+    entry = (root / "src/telegram_downloader/__main__.py").read_text(encoding="utf-8")
+    repository = (root / "src/telegram_downloader/repository.py").read_text(
+        encoding="utf-8"
+    )
     readme = (root / "README.md").read_text(encoding="utf-8")
-    release_notes = root / "docs/releases/v0.12.2.md"
+    release_notes = root / "docs/releases/v0.13.0.md"
 
-    assert project["project"]["version"] == "0.12.2"
-    assert '__version__ = "0.12.2"' in package_init
-    assert '#define AppVersion "0.12.2"' in installer
+    assert project["project"]["version"] == "0.13.0"
+    assert '__version__ = "0.13.0"' in package_init
+    assert '#define AppVersion "0.13.0"' in installer
     assert "qrcode==8.2" in requirements
     assert '"qrcode"' in spec
     assert "app_version=__version__" in gateway
@@ -140,10 +144,15 @@ def test_v0122_version_and_responsiveness_contract_are_consistent() -> None:
     assert "每条结果的真实来源" in readme
     assert "继续搜索" in readme
     assert "120 秒" in readme
+    assert "关闭到托盘" in readme
+    assert "系统通知" in readme
+    assert "下载时段" in readme
+    assert "pause_reason" in repository
+    assert '"--background"' in entry
     assert release_notes.is_file()
     notes = release_notes.read_text(encoding="utf-8")
-    assert "# TelegramDownloader v0.12.2" in notes
-    assert all(term in notes for term in ("批量写盘", "渐进", "异步"))
+    assert "# TelegramDownloader v0.13.0" in notes
+    assert all(term in notes for term in ("托盘", "系统通知", "下载时段"))
     assert "v0.1.0 · stable" not in main
     for component in (
         "ContentBrowserService",
