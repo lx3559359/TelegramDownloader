@@ -159,13 +159,6 @@ QComboBox:focus, QCheckBox:focus, QTableView:focus, QListView:focus {
     border: 1px solid #17A8C2;
 }
 QCheckBox { spacing: 7px; color: #334155; }
-QCheckBox::indicator {
-    width: 16px; height: 16px; border: 1px solid #9FB1C4;
-    border-radius: 4px; background: #FFFFFF;
-}
-QCheckBox::indicator:checked {
-    border-color: #17A8C2; background: #17A8C2;
-}
 
 QTableView, QListView, QTextBrowser, QScrollArea {
     border: 1px solid #D5DEE7; border-radius: 8px; background: #FFFFFF;

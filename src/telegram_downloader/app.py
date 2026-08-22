@@ -380,6 +380,7 @@ def create_application(
         ActionHooks,
         AsyncActionBridge,
     )
+    from telegram_downloader.ui.checkmark_style import install_checkmark_style
     from telegram_downloader.ui.login import LoginDialog
     from telegram_downloader.ui.main import MainWindow
     from telegram_downloader.ui.settings import SettingsDialog
@@ -389,6 +390,7 @@ def create_application(
     publish_event = publish_event or (lambda _event: None)
     paths.ensure_layout()
     application = QApplication.instance() or QApplication(sys.argv[:1])
+    install_checkmark_style(application)
     application.setApplicationName("TelegramDownloader")
     application.setApplicationVersion(__version__)
     application.setQuitOnLastWindowClosed(True)
