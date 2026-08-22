@@ -3618,7 +3618,7 @@ def test_refresh_tasks_exposes_queue_positions_and_scheduler_summary() -> None:
 
     class Scheduler:
         def snapshot(self):
-            return SchedulerSnapshot("active", ("queued",), 4, 2048)
+            return SchedulerSnapshot(("active", "active-2"), ("queued",), 4, 2048)
 
         def queue_positions(self):
             return {"queued": 1}
@@ -3646,7 +3646,7 @@ def test_refresh_tasks_exposes_queue_positions_and_scheduler_summary() -> None:
     assert window.tasks[0].queue_position == 1
     assert window.tasks[1].queue_position is None
     assert window.scheduler_summary == {
-        "active": 1,
+        "active": 2,
         "queued": 1,
         "concurrency": 4,
         "speed_limit_kib": 2048,

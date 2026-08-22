@@ -340,7 +340,7 @@ class _NullScheduler:
         return set()
 
     def snapshot(self) -> SchedulerSnapshot:
-        return SchedulerSnapshot(None, (), 3, 0)
+        return SchedulerSnapshot((), (), 3, 0)
 
     def queue_positions(self) -> dict[str, int]:
         return {}
@@ -2150,7 +2150,7 @@ class AppController:
             snapshot_method()
             if callable(snapshot_method)
             else SchedulerSnapshot(
-                None,
+                (),
                 (),
                 self.settings.concurrency,
                 self.settings.speed_limit_kib,
@@ -2224,7 +2224,7 @@ class AppController:
         set_scheduler_summary = getattr(self.window, "set_scheduler_summary", None)
         if callable(set_scheduler_summary):
             set_scheduler_summary(
-                active=1 if scheduler_state.active_task_id is not None else 0,
+                active=scheduler_state.active_count,
                 queued=scheduler_state.queued_count,
                 concurrency=scheduler_state.concurrency,
                 speed_limit_kib=scheduler_state.speed_limit_kib,

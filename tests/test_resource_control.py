@@ -199,6 +199,33 @@ async def test_increasing_limit_wakes_waiters_in_fifo_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_keyed_waiters_rotate_tasks_before_same_task_backlog() -> None:
+    limiter = AdjustableConcurrencyLimiter(2)
+    await limiter.acquire("large")
+    await limiter.acquire("large")
+    entered: list[str] = []
+
+    async def wait_for_permit(task_id: str) -> None:
+        await limiter.acquire(task_id)
+        entered.append(task_id)
+
+    same_task = asyncio.create_task(wait_for_permit("large"))
+    small_task = asyncio.create_task(wait_for_permit("small"))
+    await asyncio.sleep(0)
+
+    limiter.release()
+    await small_task
+    assert entered == ["small"]
+    assert same_task.done() is False
+
+    limiter.release()
+    await same_task
+    assert entered == ["small", "large"]
+    limiter.release()
+    limiter.release()
+
+
+@pytest.mark.asyncio
 async def test_reducing_limit_does_not_cancel_active_holders() -> None:
     limiter = AdjustableConcurrencyLimiter(2)
     await limiter.acquire()

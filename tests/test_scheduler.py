@@ -210,6 +210,45 @@ class QueueRepo:
         return True
 
 
+class MultiQueueRepo(QueueRepo):
+    def __init__(self, counts: dict[str, int]) -> None:
+        super().__init__(tuple(counts))
+        self.items = {
+            f"{task_id}-item-{index}": SimpleNamespace(
+                id=f"{task_id}-item-{index}",
+                task_id=task_id,
+                retry_count=0,
+                downloaded_bytes=0,
+                status=ItemStatus.QUEUED,
+                last_error=None,
+            )
+            for task_id, count in counts.items()
+            for index in range(count)
+        }
+
+    def list_items(self, task_id, statuses=None):
+        selected = [item for item in self.items.values() if item.task_id == task_id]
+        if statuses is None:
+            return selected
+        return [item for item in selected if item.status in statuses]
+
+    def get_item(self, item_id):
+        return self.items[item_id]
+
+    def recompute_task_status(self, task_id):
+        statuses = {item.status for item in self.list_items(task_id)}
+        if ItemStatus.FAILED in statuses:
+            result = TaskStatus.PARTIAL_FAILURE
+        elif ItemStatus.PAUSED in statuses:
+            result = TaskStatus.PAUSED
+        elif statuses == {ItemStatus.COMPLETED}:
+            result = TaskStatus.COMPLETED
+        else:
+            result = TaskStatus.QUEUED
+        self.task_statuses[task_id] = result
+        return result
+
+
 async def wait_until(predicate, attempts: int = 100) -> None:
     for _ in range(attempts):
         if predicate():
@@ -227,7 +266,7 @@ async def test_closed_admission_keeps_task_queued_until_opened() -> None:
         async def download(self, item, should_pause):
             entered.append(item.task_id)
 
-    scheduler = DownloadScheduler(repo, Downloader())
+    scheduler = DownloadScheduler(repo, Downloader(), concurrency=1)
     scheduler.set_admission_open(False)
     queued = asyncio.create_task(scheduler.run_task("a"))
     await wait_until(lambda: scheduler.snapshot().queued_task_ids == ("a",))
@@ -288,6 +327,38 @@ async def test_schedule_close_pauses_active_task_with_schedule_reason() -> None:
 
     assert repo.task_statuses["active"] is TaskStatus.PAUSED
     assert repo.pause_reasons["active"] is PauseReason.SCHEDULE
+
+
+@pytest.mark.asyncio
+async def test_schedule_close_pauses_every_active_task() -> None:
+    repo = QueueRepo(("first", "second"))
+    entered: set[str] = set()
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            entered.add(item.task_id)
+            while not should_pause():
+                await asyncio.sleep(0)
+            raise DownloadPaused("paused")
+
+    scheduler = DownloadScheduler(repo, Downloader(), concurrency=2)
+    runs = [
+        asyncio.create_task(scheduler.run_task(task_id))
+        for task_id in ("first", "second")
+    ]
+    await wait_until(lambda: entered == {"first", "second"})
+
+    await scheduler.set_schedule_open(False)
+    await asyncio.gather(*runs)
+
+    assert repo.task_statuses == {
+        "first": TaskStatus.PAUSED,
+        "second": TaskStatus.PAUSED,
+    }
+    assert repo.pause_reasons == {
+        "first": PauseReason.SCHEDULE,
+        "second": PauseReason.SCHEDULE,
+    }
 
 
 @pytest.mark.asyncio
@@ -701,30 +772,92 @@ async def test_scheduler_runs_one_task_and_prioritizes_waiting_work() -> None:
     await wait_until(lambda: entered == ["oldest"])
     middle = asyncio.create_task(scheduler.run_task("middle"))
     newest = asyncio.create_task(scheduler.run_task("newest"))
-    await wait_until(lambda: scheduler.queue_positions() == {"middle": 1, "newest": 2})
+    await wait_until(lambda: scheduler.queue_positions() == {"newest": 1})
 
     assert scheduler.active_task_id == "oldest"
     assert scheduler.snapshot() == SchedulerSnapshot(
-        "oldest",
-        ("middle", "newest"),
+        ("oldest", "middle"),
+        ("newest",),
         2,
         0,
     )
     repo.priorities["newest"] = 1
     assert scheduler.prioritize_task("newest") is True
-    assert scheduler.queue_positions() == {"newest": 1, "middle": 2}
+    assert scheduler.queue_positions() == {"newest": 1}
 
     gates["oldest"].set()
-    await wait_until(lambda: entered == ["oldest", "newest"])
-    assert scheduler.active_task_id == "newest"
+    await wait_until(lambda: entered == ["oldest", "middle", "newest"])
+    assert scheduler.active_task_ids == ("middle", "newest")
     gates["newest"].set()
-    await wait_until(lambda: entered == ["oldest", "newest", "middle"])
     gates["middle"].set()
     await asyncio.gather(oldest, middle, newest)
 
-    assert repo.cleared == ["oldest", "newest", "middle"]
+    assert repo.cleared == ["oldest", "middle", "newest"]
     assert scheduler.snapshot().active_task_id is None
     assert scheduler.queue_positions() == {}
+
+
+@pytest.mark.asyncio
+async def test_global_slots_run_multiple_tasks_without_exceeding_limit() -> None:
+    task_ids = ("first", "second", "third", "fourth")
+    repo = QueueRepo(task_ids)
+    release = {task_id: asyncio.Event() for task_id in task_ids}
+    entered: list[str] = []
+    active = 0
+    maximum = 0
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            nonlocal active, maximum
+            entered.append(item.task_id)
+            active += 1
+            maximum = max(maximum, active)
+            await release[item.task_id].wait()
+            active -= 1
+
+    scheduler = DownloadScheduler(repo, Downloader(), concurrency=3)
+    runs = [asyncio.create_task(scheduler.run_task(task_id)) for task_id in task_ids]
+    await wait_until(lambda: len(entered) == 3)
+
+    assert scheduler.active_task_ids == ("first", "second", "third")
+    assert scheduler.queue_positions() == {"fourth": 1}
+    assert maximum == 3
+
+    release["first"].set()
+    await wait_until(lambda: "fourth" in entered)
+    for event in release.values():
+        event.set()
+    await asyncio.gather(*runs)
+
+    assert maximum == 3
+    assert set(entered) == set(task_ids)
+
+
+@pytest.mark.asyncio
+async def test_new_single_file_task_rotates_ahead_of_large_task_backlog() -> None:
+    repo = MultiQueueRepo({"large": 4, "small": 1})
+    gates = {item_id: asyncio.Event() for item_id in repo.items}
+    entered: list[str] = []
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            entered.append(item.id)
+            await gates[item.id].wait()
+
+    scheduler = DownloadScheduler(repo, Downloader(), concurrency=2)
+    large = asyncio.create_task(scheduler.run_task("large"))
+    await wait_until(lambda: entered == ["large-item-0", "large-item-1"])
+    small = asyncio.create_task(scheduler.run_task("small"))
+    await wait_until(lambda: scheduler.active_task_ids == ("large", "small"))
+    await wait_until(lambda: scheduler._permits.waiting == 3)
+
+    gates["large-item-0"].set()
+    await wait_until(lambda: "small-item-0" in entered)
+
+    assert entered[:3] == ["large-item-0", "large-item-1", "small-item-0"]
+    for gate in gates.values():
+        gate.set()
+    await asyncio.gather(large, small)
 
 
 @pytest.mark.asyncio
@@ -763,7 +896,7 @@ async def test_pausing_waiting_task_removes_it_without_downloading() -> None:
             if item.task_id == "active":
                 await active_release.wait()
 
-    scheduler = DownloadScheduler(repo, Downloader())
+    scheduler = DownloadScheduler(repo, Downloader(), concurrency=1)
     active = asyncio.create_task(scheduler.run_task("active"))
     await wait_until(lambda: entered == ["active"])
     waiting = asyncio.create_task(scheduler.run_task("waiting"))
@@ -792,7 +925,12 @@ async def test_shutdown_resolves_waiting_callers_and_settles_active_task() -> No
                     await asyncio.sleep(0)
                 raise DownloadPaused("paused")
 
-    scheduler = DownloadScheduler(repo, Downloader(), shutdown_grace_seconds=0.1)
+    scheduler = DownloadScheduler(
+        repo,
+        Downloader(),
+        concurrency=1,
+        shutdown_grace_seconds=0.1,
+    )
     active = asyncio.create_task(scheduler.run_task("active"))
     await entered.wait()
     waiting = asyncio.create_task(scheduler.run_task("waiting"))
@@ -804,6 +942,40 @@ async def test_shutdown_resolves_waiting_callers_and_settles_active_task() -> No
     assert repo.task_statuses["active"] is TaskStatus.PAUSED
     assert entered.is_set()
     assert scheduler.snapshot().queued_task_ids == ()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_settles_all_active_task_callers() -> None:
+    repo = QueueRepo(("first", "second"))
+    entered: set[str] = set()
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            entered.add(item.task_id)
+            while not should_pause():
+                await asyncio.sleep(0)
+            raise DownloadPaused("paused")
+
+    scheduler = DownloadScheduler(
+        repo,
+        Downloader(),
+        concurrency=2,
+        shutdown_grace_seconds=0.1,
+    )
+    runs = [
+        asyncio.create_task(scheduler.run_task(task_id))
+        for task_id in ("first", "second")
+    ]
+    await wait_until(lambda: entered == {"first", "second"})
+
+    await scheduler.shutdown()
+    await asyncio.gather(*runs)
+
+    assert repo.task_statuses == {
+        "first": TaskStatus.PAUSED,
+        "second": TaskStatus.PAUSED,
+    }
+    assert scheduler.active_task_ids == ()
 
 
 def test_runtime_resource_configuration_is_visible_in_snapshot() -> None:
@@ -818,7 +990,7 @@ def test_runtime_resource_configuration_is_visible_in_snapshot() -> None:
 
     scheduler.configure_resources(5, 2048)
 
-    assert scheduler.snapshot() == SchedulerSnapshot(None, (), 5, 2048)
+    assert scheduler.snapshot() == SchedulerSnapshot((), (), 5, 2048)
     assert bandwidth.speed_limit_kib == 2048
 
 
@@ -834,7 +1006,7 @@ async def test_pause_tasks_deduplicates_flags_queue_and_persistence() -> None:
                 await asyncio.sleep(0)
             raise DownloadPaused("paused")
 
-    scheduler = DownloadScheduler(repo, Downloader())
+    scheduler = DownloadScheduler(repo, Downloader(), concurrency=1)
     active = asyncio.create_task(scheduler.run_task("active"))
     await entered.wait()
     waiting = asyncio.create_task(scheduler.run_task("waiting"))

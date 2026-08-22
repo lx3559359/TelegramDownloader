@@ -49,10 +49,18 @@ class RetryPolicy:
 
 @dataclass(frozen=True, slots=True)
 class SchedulerSnapshot:
-    active_task_id: str | None
+    active_task_ids: tuple[str, ...]
     queued_task_ids: tuple[str, ...]
     concurrency: int
     speed_limit_kib: int
+
+    @property
+    def active_task_id(self) -> str | None:
+        return self.active_task_ids[0] if self.active_task_ids else None
+
+    @property
+    def active_count(self) -> int:
+        return len(self.active_task_ids)
 
     @property
     def queued_count(self) -> int:
@@ -153,7 +161,7 @@ class DownloadScheduler:
         self._terminal_notified: set[str] = set()
         self._pending: list[_QueuedOperation] = []
         self._operations: dict[str, _QueuedOperation] = {}
-        self._active_operation: _QueuedOperation | None = None
+        self._active_operations: dict[str, _QueuedOperation] = {}
         self._sequence = 0
         self._shutting_down = False
         self._admission_open = True
@@ -164,21 +172,29 @@ class DownloadScheduler:
 
     @property
     def active_task_id(self) -> str | None:
-        operation = self._active_operation
-        return operation.task_id if operation is not None else None
+        return self.active_task_ids[0] if self.active_task_ids else None
+
+    @property
+    def active_task_ids(self) -> tuple[str, ...]:
+        return tuple(
+            operation.task_id
+            for operation in sorted(
+                self._active_operations.values(),
+                key=lambda item: item.sequence,
+            )
+        )
 
     def set_admission_open(self, opened: bool) -> None:
         self._admission_open = bool(opened)
         if self._admission_open:
-            self._admit_next()
+            self._admit_available()
 
     async def set_schedule_open(self, opened: bool) -> set[str]:
         self.set_admission_open(opened)
         if not opened:
-            active = self.active_task_id
-            if active is not None:
-                self._pause_reasons.setdefault(active, PauseReason.SCHEDULE)
-                self._pause_flag(active).set()
+            for task_id in self.active_task_ids:
+                self._pause_reasons.setdefault(task_id, PauseReason.SCHEDULE)
+                self._pause_flag(task_id).set()
             return set()
         tasks = self.repository.list_paused_by_reason(PauseReason.SCHEDULE)
         return await self.resume_tasks([task.id for task in tasks])
@@ -194,9 +210,9 @@ class DownloadScheduler:
         for task_id in ordered:
             self._pause_flag(task_id).set()
             operation = self._operations.get(task_id)
-            if operation is self._active_operation:
+            if task_id in self._active_operations:
                 self._pause_reasons[task_id] = PauseReason.USER
-            if operation is None or operation is self._active_operation:
+            if operation is None or task_id in self._active_operations:
                 continue
             if operation in self._pending:
                 self._pending.remove(operation)
@@ -275,7 +291,7 @@ class DownloadScheduler:
 
     def snapshot(self) -> SchedulerSnapshot:
         return SchedulerSnapshot(
-            self.active_task_id,
+            self.active_task_ids,
             tuple(operation.task_id for operation in self._sorted_pending()),
             self._permits.limit,
             self._bandwidth.speed_limit_kib,
@@ -288,13 +304,13 @@ class DownloadScheduler:
         }
 
     def is_active(self, task_id: str) -> bool:
-        return self.active_task_id == task_id
+        return task_id in self._active_operations
 
     def prioritize_task(self, task_id: str) -> bool:
         operation = self._operations.get(task_id)
         if (
             operation is None
-            or operation is self._active_operation
+            or task_id in self._active_operations
             or operation not in self._pending
         ):
             return False
@@ -305,6 +321,7 @@ class DownloadScheduler:
     def configure_resources(self, concurrency: int, speed_limit_kib: int) -> None:
         self._permits.set_limit(concurrency)
         self._bandwidth.set_speed_limit_kib(speed_limit_kib)
+        self._admit_available()
 
     async def shutdown(self) -> None:
         self._shutting_down = True
@@ -315,18 +332,23 @@ class DownloadScheduler:
             if not operation.completion.done():
                 operation.completion.set_result(None)
 
-        active = self._active_operation
-        if active is None or active.runner is None:
+        active = tuple(self._active_operations.values())
+        runners = tuple(
+            operation.runner for operation in active if operation.runner is not None
+        )
+        if not runners:
             return
-        self._pause_flag(active.task_id).set()
+        for operation in active:
+            self._pause_flag(operation.task_id).set()
         try:
             await asyncio.wait_for(
-                asyncio.gather(active.runner, return_exceptions=True),
+                asyncio.gather(*runners, return_exceptions=True),
                 timeout=self.shutdown_grace_seconds,
             )
         except TimeoutError:
-            active.runner.cancel()
-            await asyncio.gather(active.runner, return_exceptions=True)
+            for runner in runners:
+                runner.cancel()
+            await asyncio.gather(*runners, return_exceptions=True)
         await asyncio.sleep(0)
 
     async def _queue_operation(
@@ -346,24 +368,26 @@ class DownloadScheduler:
         self._operations[task_id] = operation
         self._pending.append(operation)
         self._pending.sort(key=self._operation_sort_key)
-        self._admit_next()
+        self._admit_available()
         await asyncio.shield(operation.completion)
 
-    def _admit_next(self) -> None:
-        if (
-            self._shutting_down
-            or not self._admission_open
-            or self._active_operation is not None
-            or not self._pending
+    def _admit_available(self) -> None:
+        while (
+            not self._shutting_down
+            and self._admission_open
+            and len(self._active_operations) < self._permits.limit
+            and self._pending
         ):
-            return
-        self._pending.sort(key=self._operation_sort_key)
-        operation = self._pending.pop(0)
-        self._active_operation = operation
-        operation.runner = asyncio.create_task(self._perform(operation))
-        operation.runner.add_done_callback(
-            lambda runner, selected=operation: self._finish_operation(selected, runner)
-        )
+            self._pending.sort(key=self._operation_sort_key)
+            operation = self._pending.pop(0)
+            self._active_operations[operation.task_id] = operation
+            operation.runner = asyncio.create_task(self._perform(operation))
+            operation.runner.add_done_callback(
+                lambda runner, selected=operation: self._finish_operation(
+                    selected,
+                    runner,
+                )
+            )
 
     async def _perform(self, operation: _QueuedOperation) -> None:
         clear_priority = getattr(self.repository, "clear_task_priority", None)
@@ -382,8 +406,8 @@ class DownloadScheduler:
         operation: _QueuedOperation,
         runner: asyncio.Task[None],
     ) -> None:
-        if self._active_operation is operation:
-            self._active_operation = None
+        if self._active_operations.get(operation.task_id) is operation:
+            self._active_operations.pop(operation.task_id, None)
         if self._operations.get(operation.task_id) is operation:
             self._operations.pop(operation.task_id, None)
 
@@ -400,7 +424,7 @@ class DownloadScheduler:
                 operation.completion.set_result(None)
             else:
                 operation.completion.set_exception(error)
-        self._admit_next()
+        self._admit_available()
 
     def _sorted_pending(self) -> list[_QueuedOperation]:
         return sorted(self._pending, key=self._operation_sort_key)
@@ -490,8 +514,11 @@ class DownloadScheduler:
         item: MediaItem,
         pause_flag: asyncio.Event,
     ) -> ItemStatus:
-        async with self._permits:
+        await self._permits.acquire(task_id)
+        try:
             return await self._run_item(task_id, item, pause_flag)
+        finally:
+            self._permits.release()
 
     async def _run_item(
         self,
