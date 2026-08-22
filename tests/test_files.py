@@ -113,9 +113,13 @@ def test_custom_naming_template_renders_all_requested_fields(tmp_path: Path) -> 
     ("directory", "filename"),
     [
         ("../{source}", "{original_name}"),
+        ("/{source}", "{original_name}"),
         ("C:/{source}", "{original_name}"),
         ("{source}\\{year}", "{original_name}"),
+        ("{source}//{year}", "{original_name}"),
+        ("{source}/a/b/c/d/e/f/g/h", "{original_name}"),
         ("{unknown}", "{original_name}"),
+        ("{source.__class__}", "{original_name}"),
         ("{source}/{year:>5}", "{original_name}"),
         ("{source}", "../{original_name}"),
         ("{source}", "{message_id}"),
@@ -142,3 +146,25 @@ def test_rendered_placeholder_values_cannot_escape_download_root(tmp_path: Path)
 
     assert target.resolve().is_relative_to(tmp_path.resolve())
     assert ".." not in target.relative_to(tmp_path).parts
+
+
+def test_naming_templates_reject_overlong_template_and_rendered_path(tmp_path) -> None:
+    with pytest.raises(ValueError, match="500"):
+        DownloadNamingSettings("a" * 501, "{original_name}")
+    with pytest.raises(ValueError, match="200"):
+        DownloadNamingSettings("{source}", "x" * 197 + "{extension}")
+
+    naming = DownloadNamingSettings(
+        "/".join("x" * 40 for _ in range(6)),
+        "{original_name}",
+    )
+    with pytest.raises(ValueError, match="220"):
+        render_download_target(
+            tmp_path,
+            naming,
+            "source",
+            datetime(2026, 8, 13, tzinfo=UTC),
+            MediaKind.DOCUMENT,
+            7,
+            "document.pdf",
+        )

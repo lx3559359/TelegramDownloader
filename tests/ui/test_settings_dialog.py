@@ -155,6 +155,23 @@ def test_download_naming_tab_round_trips_and_previews_custom_templates(qtbot) ->
     assert dialog.values().download_naming == naming
     assert "2026/08/示例频道/video/2026-08-22_12345_video.mp4" in dialog.naming_preview.text()
 
+    assert [
+        dialog.directory_template.itemText(index)
+        for index in range(dialog.directory_template.count())
+    ] == [
+        "{source}/{year_month}/{media_type}",
+        "{year}/{month}/{source}/{media_type}",
+        "{source}/{message_date}",
+    ]
+    assert [
+        dialog.filename_template.itemText(index)
+        for index in range(dialog.filename_template.count())
+    ] == [
+        "{original_name}",
+        "{stem}_{message_id}{extension}",
+        "{message_date}_{message_id}_{original_name}",
+    ]
+
 
 def test_download_naming_tab_rejects_unsafe_template_before_save(qtbot) -> None:
     dialog = SettingsDialog(AppSettings())
