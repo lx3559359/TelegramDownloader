@@ -591,6 +591,7 @@ class SubscriptionService:
             rule.id,
             last_processed_id,
             finished_at,
+            complete_backfill=(rule.backfill_through_id is not None and not has_more),
         )
         run = SubscriptionRun(
             self.uuid_factory(),

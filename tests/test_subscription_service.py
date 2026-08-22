@@ -86,6 +86,8 @@ class Gateway:
         self.incremental_error: Exception | None = None
         self.albums: dict[int, tuple[RemoteSearchHit, ...]] = {}
         self.incremental_calls: list[tuple[int, int, int]] = []
+        self.incremental_started: asyncio.Event | None = None
+        self.incremental_release: asyncio.Event | None = None
         self.recent: tuple[RemoteMessage, ...] = ()
         self.recent_calls: list[tuple[str, int]] = []
         self.recent_started: asyncio.Event | None = None
@@ -114,6 +116,10 @@ class Gateway:
         limit: int,
     ) -> tuple[RemoteMessage, ...]:
         self.incremental_calls.append((after_id, through_id, limit))
+        if self.incremental_started is not None:
+            self.incremental_started.set()
+        if self.incremental_release is not None:
+            await self.incremental_release.wait()
         if self.incremental_error is not None:
             raise self.incremental_error
         return tuple(item for item in self.messages if after_id < item.message_id <= through_id)[
@@ -256,6 +262,107 @@ async def test_failed_history_baseline_retries_original_cutoff(
     await service.run_rule(failed.id)
 
     assert gateway.boundary_calls[-1] == ("-1001", NOW - timedelta(days=3))
+
+
+@pytest.mark.asyncio
+async def test_history_catchup_uses_fixed_snapshot_and_clears_last_page(
+    tmp_path: Path,
+) -> None:
+    service, gateway, catalog, _tasks = build_service(tmp_path)
+    gateway.latest_id = 1200
+    gateway.boundary_id = 0
+    saved = await service.create_rule(
+        SubscriptionDraft(
+            "-1001",
+            SubscriptionCriteria(("AI",)),
+            frozenset({MediaKind.PHOTO}),
+            history_days=7,
+        )
+    )
+    gateway.latest_id = 1300
+    gateway.messages = tuple(message(number, "AI", remote(number)) for number in range(1, 1301))
+
+    first = await service.run_rule(saved.id)
+    second = await service.run_rule(saved.id)
+    third = await service.run_rule(saved.id)
+
+    assert gateway.incremental_calls == [
+        (0, 1200, 500),
+        (500, 1200, 500),
+        (1000, 1200, 500),
+    ]
+    assert first.has_more is True
+    assert second.has_more is True
+    assert third.has_more is False
+    completed = catalog.get_subscription("a1", saved.id)
+    assert completed.last_message_id == 1200
+    assert completed.backfill_from_utc is None
+    assert completed.backfill_through_id is None
+
+    await service.run_rule(saved.id)
+    assert gateway.incremental_calls[-1] == (1200, 1300, 500)
+
+
+@pytest.mark.asyncio
+async def test_history_catchup_failure_cancel_and_restart_preserve_cursor(
+    tmp_path: Path,
+) -> None:
+    service, gateway, catalog, tasks = build_service(tmp_path)
+    gateway.latest_id = 1200
+    gateway.boundary_id = 0
+    saved = await service.create_rule(
+        SubscriptionDraft(
+            "-1001",
+            SubscriptionCriteria(("AI",)),
+            frozenset({MediaKind.PHOTO}),
+            history_days=7,
+        )
+    )
+    gateway.messages = tuple(message(number, "AI", remote(number)) for number in range(1, 1201))
+    await service.run_rule(saved.id)
+    assert catalog.get_subscription("a1", saved.id).last_message_id == 500
+
+    gateway.incremental_error = TransientNetworkError("offline")
+    with pytest.raises(TransientNetworkError):
+        await service.run_rule(saved.id)
+    failed = catalog.get_subscription("a1", saved.id)
+    assert failed.last_message_id == 500
+    assert failed.backfill_through_id == 1200
+
+    gateway.incremental_error = None
+    gateway.incremental_started = asyncio.Event()
+    gateway.incremental_release = asyncio.Event()
+    running = asyncio.create_task(service.run_rule(saved.id))
+    await gateway.incremental_started.wait()
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    cancelled = catalog.get_subscription("a1", saved.id)
+    assert cancelled.last_message_id == 500
+    assert cancelled.backfill_through_id == 1200
+
+    gateway.incremental_started = None
+    gateway.incremental_release = None
+    reopened_catalog = CatalogRepository(catalog.database)
+    reopened_catalog.initialize()
+    reopened_planner = TaskPlanner(
+        gateway,
+        tasks,
+        tmp_path / "downloads",
+        uuid_factory=ids("reopened-task"),
+        clock=lambda: NOW,
+    )
+    reopened = SubscriptionService(
+        reopened_catalog,
+        uuid_factory=ids("reopened-subscription"),
+        clock=lambda: NOW,
+    )
+    reopened.bind_online(gateway, reopened_planner)
+    reopened.set_account(AccountProfile("a1", "账号"))
+
+    assert reopened.get_rule(saved.id).last_message_id == 500
+    await reopened.run_rule(saved.id)
+    assert gateway.incremental_calls[-1] == (500, 1200, 500)
 
 
 @pytest.mark.asyncio
