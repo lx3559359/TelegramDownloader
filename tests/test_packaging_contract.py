@@ -126,6 +126,7 @@ def test_v0140_version_and_p1_experience_contract_are_consistent() -> None:
     )
     readme = (root / "README.md").read_text(encoding="utf-8")
     release_notes = root / "docs/releases/v0.14.0.md"
+    verification = root / "docs/verification/v0.14.0-p1-experience-upgrades.md"
 
     assert project["project"]["version"] == "0.14.0"
     assert '__version__ = "0.14.0"' in package_init
@@ -166,6 +167,9 @@ def test_v0140_version_and_p1_experience_contract_are_consistent() -> None:
             "下载路径",
         )
     )
+    assert verification.is_file()
+    evidence = verification.read_text(encoding="utf-8")
+    assert all(term in evidence for term in ("第一轮", "第二轮", "第三轮"))
     assert "v0.1.0 · stable" not in main
     for component in (
         "ContentBrowserService",
