@@ -94,10 +94,10 @@ def test_page_contains_content_browser_controls(qtbot) -> None:
     assert page.queue_button.text() == "加入下载队列"
     assert page.result_table.iconSize() == QSize(88, 60)
     assert page.result_table.verticalHeader().defaultSectionSize() == 78
-    assert page.result_table.wordWrap() is False
+    assert page.result_table.wordWrap() is True
     assert (
         page.result_table.textElideMode()
-        == Qt.TextElideMode.ElideRight
+        == Qt.TextElideMode.ElideNone
     )
     header = page.result_table.horizontalHeader()
     fixed_widths = {
@@ -137,7 +137,7 @@ def test_account_content_card_structure_keeps_filter_minimums(qtbot) -> None:
     assert page.dialog_list.textElideMode() == Qt.TextElideMode.ElideRight
 
 
-def test_result_columns_do_not_squeeze_fixed_text_at_minimum_size(qtbot) -> None:
+def test_result_summary_wraps_without_squeezing_fixed_columns(qtbot) -> None:
     now = datetime(2026, 8, 15, tzinfo=UTC)
     page = ContentBrowserPage()
     page.resize(996, 650)
@@ -148,17 +148,88 @@ def test_result_columns_do_not_squeeze_fixed_text_at_minimum_size(qtbot) -> None
             replace(
                 result(now, "long-summary", 1),
                 excerpt=(
-                    "这是一段很长的摘要，只允许在摘要列内省略，"
+                    "这是一段很长的摘要，需要在摘要列内完整换行，"
                     "不能挤压日期、类型、大小或状态列。"
                 )
                 * 4,
             )
         ]
     )
-    qtbot.wait(20)
+    qtbot.wait(80)
 
     assert page.result_table.horizontalScrollBar().maximum() == 0
     assert page.result_table.columnWidth(4) > 0
+    assert page.result_table.rowHeight(0) > 78
+    assert page.summary_delegate.measurement_count == 1
+
+
+def test_result_summary_resize_is_debounced_and_invalidates_cache(qtbot) -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    page = ContentBrowserPage()
+    page.resize(1100, 650)
+    qtbot.addWidget(page)
+    page.show()
+    page.set_results(
+        [replace(result(now, "long-summary", 1), excerpt="换行摘要 " * 80)]
+    )
+    qtbot.wait(80)
+    initial = page.summary_delegate.measurement_count
+
+    page.result_table.setColumnWidth(4, 280)
+    page.result_table.setColumnWidth(4, 260)
+    page.result_table.setColumnWidth(4, 240)
+    assert page._row_resize_timer.isActive()
+    qtbot.wait(80)
+
+    assert page.summary_delegate.measurement_count == initial + 1
+
+
+def test_result_summary_font_change_invalidates_cached_height(qtbot) -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    page = ContentBrowserPage()
+    page.resize(1000, 620)
+    qtbot.addWidget(page)
+    page.show()
+    page.set_results(
+        [replace(result(now, "long-summary", 1), excerpt="字体变化摘要 " * 40)]
+    )
+    qtbot.wait(80)
+    initial = page.summary_delegate.measurement_count
+
+    font = page.font()
+    font.setPointSize(font.pointSize() + 2)
+    page.setFont(font)
+    assert page._row_resize_timer.isActive()
+    qtbot.wait(80)
+
+    assert page.summary_delegate.measurement_count == initial + 1
+
+
+def test_large_result_set_only_measures_visible_summary_rows(qtbot) -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    page = ContentBrowserPage()
+    page.resize(1000, 620)
+    qtbot.addWidget(page)
+    page.show()
+    page.result_table.setFixedHeight(220)
+    page.set_results(
+        [
+            replace(
+                result(now, f"result-{index}", 10_000 - index),
+                excerpt=f"第 {index} 行摘要 " * 16,
+            )
+            for index in range(10_000)
+        ]
+    )
+    qtbot.wait(100)
+
+    initial = page.summary_delegate.measurement_count
+    assert 0 < initial < 100
+
+    page.result_table.verticalScrollBar().setValue(5_000)
+    qtbot.wait(100)
+
+    assert initial < page.summary_delegate.measurement_count < 200
 
 
 def test_account_content_cards_use_shared_major_elevation(qtbot) -> None:

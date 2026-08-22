@@ -3,7 +3,16 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QModelIndex, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QDate,
+    QEvent,
+    QModelIndex,
+    QRect,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -19,6 +28,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QSplitter,
+    QStyleOptionViewItem,
     QTableView,
     QTabWidget,
     QVBoxLayout,
@@ -44,6 +54,7 @@ from telegram_downloader.ui.content_models import (
 )
 from telegram_downloader.ui.effects import ElevationLevel, apply_elevation
 from telegram_downloader.ui.media_preview import MediaPreviewDialog
+from telegram_downloader.ui.wrapped_text import WrappedSummaryDelegate
 
 _MEDIA_LABELS = {
     MediaKind.PHOTO: "图片",
@@ -296,8 +307,14 @@ class ContentBrowserPage(QWidget):
         )
         self.result_table.setIconSize(QSize(88, 60))
         self.result_table.verticalHeader().setDefaultSectionSize(78)
-        self.result_table.setWordWrap(False)
-        self.result_table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.result_table.setWordWrap(True)
+        self.result_table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.summary_delegate = WrappedSummaryDelegate(self.result_table)
+        self.result_table.setItemDelegateForColumn(4, self.summary_delegate)
+        self._row_resize_timer = QTimer(self)
+        self._row_resize_timer.setSingleShot(True)
+        self._row_resize_timer.setInterval(40)
+        self._row_resize_timer.timeout.connect(self._resize_visible_result_rows)
         result_header = self.result_table.horizontalHeader()
         result_header.setMinimumSectionSize(40)
         for column, width in {
@@ -398,9 +415,18 @@ class ContentBrowserPage(QWidget):
         self.history_table.selectionModel().selectionChanged.connect(
             self._refresh_actions
         )
+        # Keep the bridge: a direct PySide slot binding can abort while a
+        # child preview dialog closes and updates scrollbar geometry.
         self.result_table.verticalScrollBar().valueChanged.connect(
-            lambda _value: self.request_visible_thumbnails()
+            lambda value: self._result_view_scrolled(value)
         )
+        self.result_table.horizontalHeader().sectionResized.connect(
+            self._result_section_resized
+        )
+        self.result_model.modelReset.connect(self._summary_model_reset)
+        self.result_model.rowsInserted.connect(self._summary_rows_changed)
+        self.result_model.rowsRemoved.connect(self._summary_rows_changed)
+        self.result_model.dataChanged.connect(self._summary_data_changed)
         self.result_table.doubleClicked.connect(self._request_preview)
 
     def set_logged_in(self, logged_in: bool) -> None:
@@ -547,7 +573,7 @@ class ContentBrowserPage(QWidget):
 
     def request_visible_thumbnails(self) -> None:
         viewport = self.result_table.viewport().rect()
-        for row in range(self.result_model.rowCount()):
+        for row in self._visible_result_rows():
             index = self.result_model.index(row, 1)
             if not self.result_table.visualRect(index).intersects(viewport):
                 continue
@@ -558,6 +584,79 @@ class ContentBrowserPage(QWidget):
                 continue
             self._thumbnail_requested_ids.add(result_id)
             self.thumbnail_requested.emit(result_id)
+
+    def _visible_result_rows(self) -> range:
+        row_count = self.result_model.rowCount()
+        if row_count == 0:
+            return range(0)
+        first = self.result_table.rowAt(0)
+        if first < 0:
+            first = 0
+        viewport_bottom = max(0, self.result_table.viewport().height() - 1)
+        last = self.result_table.rowAt(viewport_bottom)
+        if last < 0:
+            last = min(row_count - 1, first + 20)
+        return range(first, min(row_count - 1, last) + 1)
+
+    def _schedule_summary_resize(self) -> None:
+        self._row_resize_timer.start()
+
+    def _resize_visible_result_rows(self) -> None:
+        width = self.result_table.columnWidth(4)
+        if width <= 0:
+            return
+        for row in self._visible_result_rows():
+            index = self.result_model.index(row, 4)
+            option = QStyleOptionViewItem()
+            self.result_table.initViewItemOption(option)
+            option.rect = QRect(0, 0, width, self.result_table.rowHeight(row))
+            height = self.summary_delegate.sizeHint(option, index).height()
+            if self.result_table.rowHeight(row) != height:
+                self.result_table.setRowHeight(row, height)
+
+    def _result_view_scrolled(self, _value: int) -> None:
+        self.request_visible_thumbnails()
+        self._schedule_summary_resize()
+
+    def _result_section_resized(
+        self,
+        logical_index: int,
+        _old_size: int,
+        _new_size: int,
+    ) -> None:
+        if logical_index != 4:
+            return
+        self.summary_delegate.clear_cache()
+        self._schedule_summary_resize()
+
+    def _summary_model_reset(self) -> None:
+        self.summary_delegate.clear_cache()
+        self._schedule_summary_resize()
+
+    def _summary_rows_changed(self, *_args: object) -> None:
+        self._schedule_summary_resize()
+
+    def _summary_data_changed(
+        self,
+        top_left: QModelIndex,
+        bottom_right: QModelIndex,
+        _roles: object = None,
+    ) -> None:
+        if top_left.column() <= 4 <= bottom_right.column():
+            self._schedule_summary_resize()
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        layout_change_types = {
+            QEvent.Type.FontChange,
+            QEvent.Type.ApplicationFontChange,
+        }
+        screen_change = getattr(QEvent.Type, "ScreenChangeInternal", None)
+        if screen_change is not None:
+            layout_change_types.add(screen_change)
+        if event.type() in layout_change_types and hasattr(self, "summary_delegate"):
+            self.summary_delegate.clear_cache()
+            self._schedule_summary_resize()
 
     def _request_preview(self, index: QModelIndex) -> None:
         if not index.isValid() or index.column() != 1:
