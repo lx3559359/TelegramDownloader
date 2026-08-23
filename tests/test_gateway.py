@@ -90,8 +90,9 @@ def test_gateway_connection_state_comes_from_client() -> None:
 
 
 @pytest.mark.asyncio
-async def test_qr_login_begin_wait_and_refresh() -> None:
-    expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
+async def test_qr_login_info_carries_relative_validity_from_response_time() -> None:
+    now = datetime(2026, 8, 23, 5, tzinfo=UTC)
+    expires = now + timedelta(seconds=29.5)
 
     class FakeQr:
         def __init__(self):
@@ -101,6 +102,7 @@ async def test_qr_login_begin_wait_and_refresh() -> None:
 
         async def recreate(self):
             self.url = "tg://login?token=refreshed"
+            self.expires = expires + timedelta(seconds=1)
 
         async def wait(self):
             self.waited = True
@@ -111,16 +113,49 @@ async def test_qr_login_begin_wait_and_refresh() -> None:
         async def qr_login(self):
             return qr
 
-    gateway = TelethonGateway.from_client_for_test(Client())
+    gateway = TelethonGateway.from_client_for_test(
+        Client(),
+        utc_now=lambda: now,
+    )
 
     info = await gateway.begin_qr_login()
     refreshed = await gateway.refresh_qr_login()
     state = await gateway.wait_qr_login()
 
-    assert info == gateway_module.QrLoginInfo("tg://login?token=first", expires)
+    assert info == gateway_module.QrLoginInfo(
+        "tg://login?token=first",
+        expires,
+        29.5,
+    )
     assert state is AuthState.READY
     assert qr.waited is True
-    assert refreshed == gateway_module.QrLoginInfo("tg://login?token=refreshed", expires)
+    assert refreshed == gateway_module.QrLoginInfo(
+        "tg://login?token=refreshed",
+        expires + timedelta(seconds=1),
+        30.5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_qr_login_info_preserves_non_positive_validity_for_controller() -> None:
+    now = datetime(2026, 8, 23, 5, tzinfo=UTC)
+
+    class FakeQr:
+        url = "tg://login?token=expired"
+        expires = now - timedelta(seconds=2)
+
+    class Client:
+        async def qr_login(self):
+            return FakeQr()
+
+    gateway = TelethonGateway.from_client_for_test(
+        Client(),
+        utc_now=lambda: now,
+    )
+
+    info = await gateway.begin_qr_login()
+
+    assert info.valid_for_seconds == -2
 
 
 @pytest.mark.asyncio

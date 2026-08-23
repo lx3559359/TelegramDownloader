@@ -70,6 +70,7 @@ class RemoteMessage:
 class QrLoginInfo:
     url: str
     expires_at: datetime
+    valid_for_seconds: float
 
 
 class GatewayError(RuntimeError):
@@ -252,6 +253,8 @@ class TelethonGateway:
         session: str = "",
         proxy: ProxySettings | None = None,
         proxy_password: str = "",
+        *,
+        utc_now: Callable[[], datetime] | None = None,
     ) -> None:
         from telethon import TelegramClient, errors, functions, types, utils
         from telethon.sessions import StringSession
@@ -301,6 +304,7 @@ class TelethonGateway:
         self._qr_login: object | None = None
         self._connected = False
         self._entity_cache: dict[str, object] = {}
+        self._utc_now = utc_now or (lambda: datetime.now(UTC))
 
     @classmethod
     def from_client_for_test(
@@ -323,6 +327,7 @@ class TelethonGateway:
         search_global_request_factory=None,
         input_peer_empty_factory=None,
         input_messages_filter_empty_factory=None,
+        utc_now: Callable[[], datetime] | None = None,
         connected: bool = True,
     ) -> TelethonGateway:
         gateway = cls.__new__(cls)
@@ -348,6 +353,7 @@ class TelethonGateway:
         gateway._qr_login = None
         gateway._connected = connected
         gateway._entity_cache = {}
+        gateway._utc_now = utc_now or (lambda: datetime.now(UTC))
         return gateway
 
     async def connect(self) -> None:
@@ -440,7 +446,14 @@ class TelethonGateway:
             raise GatewayError("Telegram 未返回有效二维码")
         if expires_at is None:
             raise GatewayError("Telegram 未返回二维码过期时间")
-        return QrLoginInfo(url, expires_at)
+        now = self._utc_datetime(self._utc_now())
+        if now is None:
+            raise GatewayError("本机时间无效，无法生成二维码")
+        return QrLoginInfo(
+            url,
+            expires_at,
+            (expires_at - now).total_seconds(),
+        )
 
     def export_session(self) -> str:
         session = getattr(self._client, "session", None)

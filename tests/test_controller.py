@@ -533,7 +533,7 @@ async def test_credentials_start_qr_login_instead_of_phone_flow() -> None:
             return None
 
         async def begin_qr_login(self):
-            return QrLoginInfo("tg://login?token=first", expires)
+            return QrLoginInfo("tg://login?token=first", expires, 60.0)
 
         async def wait_qr_login(self):
             return AuthState.PASSWORD_REQUIRED
@@ -697,7 +697,7 @@ async def test_candidate_login_uses_isolated_gateway_and_cancel_keeps_active() -
 
         async def begin_qr_login(self):
             self.begin_qr_calls += 1
-            return QrLoginInfo("tg://login?token=candidate", expires)
+            return QrLoginInfo("tg://login?token=candidate", expires, 60.0)
 
         async def wait_qr_login(self):
             await asyncio.Event().wait()
@@ -770,7 +770,7 @@ async def test_repeated_candidate_login_focuses_existing_attempt() -> None:
             pass
 
         async def begin_qr_login(self):
-            return QrLoginInfo("tg://login?token=candidate", expires)
+            return QrLoginInfo("tg://login?token=candidate", expires, 60.0)
 
         async def wait_qr_login(self):
             await asyncio.Event().wait()
@@ -1142,10 +1142,10 @@ async def test_manual_qr_refresh_cancels_old_wait_before_starting_new() -> None:
             self.cancelled = 0
 
         async def begin_qr_login(self):
-            return QrLoginInfo("tg://login?token=first", expires)
+            return QrLoginInfo("tg://login?token=first", expires, 60.0)
 
         async def refresh_qr_login(self):
-            return QrLoginInfo("tg://login?token=second", expires)
+            return QrLoginInfo("tg://login?token=second", expires, 60.0)
 
         async def wait_qr_login(self):
             self.wait_calls += 1
@@ -1205,11 +1205,11 @@ async def test_expired_qr_refreshes_in_same_wait_task() -> None:
             self.refresh_calls = 0
 
         async def begin_qr_login(self):
-            return QrLoginInfo("tg://login?token=first", expires)
+            return QrLoginInfo("tg://login?token=first", expires, 60.0)
 
         async def refresh_qr_login(self):
             self.refresh_calls += 1
-            return QrLoginInfo("tg://login?token=second", expires)
+            return QrLoginInfo("tg://login?token=second", expires, 60.0)
 
         async def wait_qr_login(self):
             self.wait_calls += 1
@@ -1258,7 +1258,7 @@ async def test_successful_qr_login_saves_session_through_common_finish_path() ->
 
     class Gateway:
         async def begin_qr_login(self):
-            return QrLoginInfo("tg://login?token=first", expires)
+            return QrLoginInfo("tg://login?token=first", expires, 60.0)
 
         async def wait_qr_login(self):
             return AuthState.READY
@@ -1317,7 +1317,7 @@ async def test_phone_fallback_cancels_qr_wait_before_switching_page() -> None:
             self.cancelled = False
 
         async def begin_qr_login(self):
-            return QrLoginInfo("tg://login?token=first", expires)
+            return QrLoginInfo("tg://login?token=first", expires, 60.0)
 
         async def wait_qr_login(self):
             try:
@@ -1365,7 +1365,7 @@ async def test_edit_credentials_cancels_qr_and_disconnects_old_gateway() -> None
             self.disconnected = 0
 
         async def begin_qr_login(self):
-            return QrLoginInfo("tg://login?token=first", expires)
+            return QrLoginInfo("tg://login?token=first", expires, 60.0)
 
         async def wait_qr_login(self):
             try:
@@ -1413,7 +1413,7 @@ async def test_new_credentials_replace_old_gateway_in_safe_order() -> None:
 
     class OldGateway:
         async def begin_qr_login(self):
-            return QrLoginInfo("tg://login?token=old", expires)
+            return QrLoginInfo("tg://login?token=old", expires, 60.0)
 
         async def wait_qr_login(self):
             try:
@@ -1430,7 +1430,7 @@ async def test_new_credentials_replace_old_gateway_in_safe_order() -> None:
             order.append("new-connected")
 
         async def begin_qr_login(self):
-            return QrLoginInfo("tg://login?token=new", expires)
+            return QrLoginInfo("tg://login?token=new", expires, 60.0)
 
         async def wait_qr_login(self):
             return AuthState.PASSWORD_REQUIRED
@@ -1473,7 +1473,7 @@ async def test_cancel_login_stops_qr_wait_and_disconnects_client() -> None:
             self.disconnected = 0
 
         async def begin_qr_login(self):
-            return QrLoginInfo("tg://login?token=first", expires)
+            return QrLoginInfo("tg://login?token=first", expires, 60.0)
 
         async def wait_qr_login(self):
             try:
@@ -1504,7 +1504,7 @@ async def test_shutdown_cancels_qr_wait_before_disconnecting_gateway() -> None:
 
     class Gateway:
         async def begin_qr_login(self):
-            return QrLoginInfo("tg://login?token=first", expires)
+            return QrLoginInfo("tg://login?token=first", expires, 60.0)
 
         async def wait_qr_login(self):
             try:
@@ -1536,7 +1536,7 @@ async def test_qr_wait_failure_is_consumed_and_shown_safely() -> None:
 
     class Gateway:
         async def begin_qr_login(self):
-            return QrLoginInfo("tg://login?token=first", expires)
+            return QrLoginInfo("tg://login?token=first", expires, 60.0)
 
         async def wait_qr_login(self):
             raise GatewayError("Telegram 网络连接失败")
