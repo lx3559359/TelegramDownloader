@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QStackedWidget,
     QVBoxLayout,
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
 
 from telegram_downloader.branding import APP_NAME
 from telegram_downloader.settings import ProxySettings, SettingsError
+from telegram_downloader.ui.api_guide import ApiCredentialGuide
 from telegram_downloader.ui.effects import ElevationLevel, apply_elevation
 from telegram_downloader.ui.qr import render_qr_image
 from telegram_downloader.ui.theme import APP_STYLESHEET, ensure_cjk_font
@@ -56,7 +58,7 @@ class LoginDialog(QDialog):
         self.setStyleSheet(APP_STYLESHEET)
         self.setWindowTitle(f"登录 {APP_NAME}")
         self.setModal(True)
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(600)
         self._qr_expires_at: datetime | None = None
         self._busy_action: str | None = None
         self.qr_countdown_timer = QTimer(self)
@@ -107,10 +109,24 @@ class LoginDialog(QDialog):
 
     def _build_credentials_page(self) -> QWidget:
         page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 8, 0, 0)
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        self.credentials_scroll = QScrollArea(page)
+        self.credentials_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.credentials_scroll.setWidgetResizable(True)
+        self.credentials_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.credentials_scroll.setMinimumHeight(360)
+        self.credentials_scroll.setMaximumHeight(500)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 8, 8, 0)
         layout.setSpacing(12)
         layout.addWidget(self._step_label("步骤 1 / 4 · API 凭据与网络"))
+        self.api_guide = ApiCredentialGuide(content)
+        layout.addWidget(self.api_guide)
 
         form = QFormLayout()
         form.setHorizontalSpacing(14)
@@ -144,10 +160,13 @@ class LoginDialog(QDialog):
 
         self.credentials_next = QPushButton("保存并生成二维码")
         self.credentials_next.setObjectName("primaryButton")
+        self.credentials_next.setDefault(True)
         self.credentials_next.clicked.connect(self._submit_credentials)
         layout.addWidget(self.credentials_next, 0, Qt.AlignmentFlag.AlignRight)
         self.proxy_kind.currentIndexChanged.connect(self._update_proxy_fields)
         self._update_proxy_fields()
+        self.credentials_scroll.setWidget(content)
+        page_layout.addWidget(self.credentials_scroll)
         return page
 
     def _build_qr_page(self) -> QWidget:
@@ -317,6 +336,7 @@ class LoginDialog(QDialog):
         self.proxy_username.setText(proxy.username)
         self.proxy_password.setText(proxy_password)
         self._update_proxy_fields()
+        self.api_guide.set_credentials_present(api_id > 0 and bool(api_hash.strip()))
 
     def show_qr(self, url: str, expires_at: datetime) -> None:
         image = render_qr_image(url)

@@ -1,11 +1,13 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtWidgets import (
     QApplication,
     QGraphicsDropShadowEffect,
     QLabel,
     QLineEdit,
+    QScrollArea,
 )
 
 from telegram_downloader.branding import APP_NAME
@@ -182,3 +184,76 @@ def test_qr_state_is_cleared_on_page_switch_and_reject(qtbot) -> None:
 
     assert dialog.qr_countdown_timer.isActive() is False
     assert dialog.qr_image.pixmap().isNull() is True
+
+
+@pytest.mark.parametrize(
+    ("api_id", "api_hash", "expanded"),
+    ((0, "", True), (12345, "", True), (0, "saved-hash", True), (12345, "saved-hash", False)),
+)
+def test_api_guide_initial_state_requires_complete_credentials(
+    qtbot, api_id: int, api_hash: str, expanded: bool
+) -> None:
+    dialog = LoginDialog()
+    qtbot.addWidget(dialog)
+
+    dialog.set_saved_credentials(api_id, api_hash, ProxySettings(), "")
+
+    assert dialog.api_guide.is_expanded() is expanded
+
+
+def test_user_guide_choice_and_values_survive_repeated_prefill(qtbot) -> None:
+    dialog = LoginDialog()
+    qtbot.addWidget(dialog)
+    dialog.set_saved_credentials(12345, "saved-hash", ProxySettings(), "")
+    qtbot.mouseClick(dialog.api_guide.toggle_button, Qt.MouseButton.LeftButton)
+    dialog.set_saved_credentials(67890, "edited-hash", ProxySettings(), "")
+
+    assert dialog.api_guide.is_expanded() is True
+    assert dialog.api_id.value() == 67890
+    assert dialog.api_hash.text() == "edited-hash"
+
+
+def test_credentials_page_uses_vertical_only_scroll_area(qtbot) -> None:
+    dialog = LoginDialog()
+    qtbot.addWidget(dialog)
+    dialog.show()
+    QApplication.processEvents()
+
+    assert isinstance(dialog.credentials_scroll, QScrollArea)
+    assert dialog.credentials_scroll.widgetResizable() is True
+    assert dialog.credentials_scroll.maximumHeight() == 500
+    assert dialog.minimumWidth() == 600
+    assert (
+        dialog.credentials_scroll.horizontalScrollBarPolicy()
+        == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    )
+    assert dialog.credentials_scroll.horizontalScrollBar().maximum() == 0
+
+
+def test_enter_still_submits_credentials_after_guide_integration(qtbot) -> None:
+    dialog = LoginDialog()
+    qtbot.addWidget(dialog)
+    dialog.show()
+    QApplication.processEvents()
+    dialog.api_id.setValue(12345)
+    dialog.api_hash.setText("secret-hash")
+    dialog.api_hash.setFocus()
+
+    with qtbot.waitSignal(dialog.credentials_submitted, timeout=500) as signal:
+        qtbot.keyPress(dialog.api_hash, Qt.Key.Key_Return)
+
+    assert signal.args[0:2] == [12345, "secret-hash"]
+
+
+def test_expanded_guide_dialog_fits_screen_and_submit_is_reachable(qtbot) -> None:
+    dialog = LoginDialog()
+    qtbot.addWidget(dialog)
+    dialog.show()
+    QApplication.processEvents()
+    available = dialog.screen().availableGeometry()
+
+    assert dialog.frameGeometry().width() <= available.width()
+    assert dialog.frameGeometry().height() <= available.height()
+    dialog.credentials_scroll.ensureWidgetVisible(dialog.credentials_next)
+    QApplication.processEvents()
+    assert dialog.credentials_next.isVisible() is True
