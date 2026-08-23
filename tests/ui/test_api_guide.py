@@ -7,6 +7,8 @@ import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFrame, QLabel
 
+from telegram_downloader.ui.theme import APP_STYLESHEET
+
 
 def test_api_guide_module_exposes_only_official_portal_url() -> None:
     spec = importlib.util.find_spec("telegram_downloader.ui.api_guide")
@@ -149,3 +151,15 @@ def test_guide_exposes_theme_object_names(qtbot) -> None:
     assert len(guide.findChildren(QFrame, "apiGuideStep")) == 5
     assert len(guide.findChildren(QLabel, "apiGuideNumber")) == 5
     assert len(guide.findChildren(QLabel, "apiGuideWarning")) == 1
+
+
+def test_theme_styles_api_guide_objects() -> None:
+    for selector in (
+        "QFrame#apiGuide",
+        "QFrame#apiGuideStep",
+        "QLabel#apiGuideNumber",
+        "QLabel#apiGuideHint",
+        "QLabel#apiGuideWarning",
+        "QLabel#apiGuideError",
+    ):
+        assert selector in APP_STYLESHEET

@@ -56,6 +56,28 @@ QFrame#elevatedSubCard {
         stop: 0 #FFFFFF, stop: 1 #F1F4F8
     );
 }
+QFrame#apiGuide {
+    border: 1px solid #A9D9E4; border-radius: 11px; background: #F2FAFC;
+}
+QFrame#apiGuideStep {
+    border: 1px solid #D8E7ED; border-radius: 8px; background: #FFFFFF;
+}
+QLabel#apiGuideNumber {
+    border: none; border-radius: 12px; background: #17A8C2;
+    color: #FFFFFF; font-weight: 750;
+}
+QLabel#apiGuideHint {
+    padding: 8px 10px; border: 1px solid #C7DDE7; border-radius: 7px;
+    background: #EDF8FB; color: #376578;
+}
+QLabel#apiGuideWarning {
+    padding: 8px 10px; border: 1px solid #E7C878; border-radius: 7px;
+    background: #FFF8E5; color: #76551A;
+}
+QLabel#apiGuideError {
+    padding: 8px 10px; border: 1px solid #E7A8B3; border-radius: 7px;
+    background: #FFF0F3; color: #A33C50;
+}
 
 QLabel#brandMark {
     min-width: 34px;
