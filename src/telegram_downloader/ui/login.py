@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+from collections.abc import Callable
 from enum import IntEnum
-from math import ceil
+from math import ceil, isfinite
+from time import monotonic
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QPixmap
@@ -45,6 +46,7 @@ class LoginPage(IntEnum):
 class LoginDialog(QDialog):
     credentials_submitted = Signal(int, str, object, str)
     qr_refresh_requested = Signal()
+    qr_expired = Signal(int)
     phone_fallback_requested = Signal()
     credentials_edit_requested = Signal()
     login_cancelled = Signal()
@@ -52,14 +54,22 @@ class LoginDialog(QDialog):
     code_submitted = Signal(str)
     password_submitted = Signal(str)
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        monotonic_now: Callable[[], float] = monotonic,
+    ) -> None:
         super().__init__(parent)
         ensure_cjk_font()
         self.setStyleSheet(APP_STYLESHEET)
         self.setWindowTitle(f"登录 {APP_NAME}")
         self.setModal(True)
         self.setMinimumWidth(600)
-        self._qr_expires_at: datetime | None = None
+        self._monotonic_now = monotonic_now
+        self._qr_deadline: float | None = None
+        self._qr_generation: int | None = None
+        self._qr_expiry_emitted = False
         self._busy_action: str | None = None
         self.qr_countdown_timer = QTimer(self)
         self.qr_countdown_timer.setInterval(1000)
@@ -338,14 +348,14 @@ class LoginDialog(QDialog):
         self._update_proxy_fields()
         self.api_guide.set_credentials_present(api_id > 0 and bool(api_hash.strip()))
 
-    def show_qr(self, url: str, expires_at: datetime) -> None:
+    def show_qr(self, url: str, valid_for_seconds: float, generation: int) -> None:
+        if not isfinite(valid_for_seconds) or valid_for_seconds <= 0:
+            raise ValueError("二维码有效期必须为正数")
         image = render_qr_image(url)
         self.qr_image.setPixmap(QPixmap.fromImage(image))
-        self._qr_expires_at = (
-            expires_at.replace(tzinfo=UTC)
-            if expires_at.tzinfo is None
-            else expires_at.astimezone(UTC)
-        )
+        self._qr_deadline = self._monotonic_now() + valid_for_seconds
+        self._qr_generation = generation
+        self._qr_expiry_emitted = False
         self.show_page(LoginPage.QR)
         self._tick_qr_countdown()
         self.qr_countdown_timer.start()
@@ -355,20 +365,27 @@ class LoginDialog(QDialog):
         if seconds > 0:
             self.qr_countdown.setText(f"二维码将在 {seconds} 秒后刷新")
         else:
-            self.qr_countdown.setText("二维码已过期，正在刷新…")
+            self.qr_countdown.setText("二维码已过期，正在生成新二维码…")
 
     def show_qr_status(self, text: str) -> None:
         self.qr_status.setText(text)
 
     def _tick_qr_countdown(self) -> None:
-        if self._qr_expires_at is None:
+        if self._qr_deadline is None or self._qr_generation is None:
             return
-        seconds = max(0, ceil((self._qr_expires_at - datetime.now(UTC)).total_seconds()))
+        seconds = max(0, ceil(self._qr_deadline - self._monotonic_now()))
         self.update_qr_countdown(seconds)
+        if seconds > 0 or self._qr_expiry_emitted:
+            return
+        self._qr_expiry_emitted = True
+        self.qr_countdown_timer.stop()
+        self.qr_expired.emit(self._qr_generation)
 
     def _clear_qr(self) -> None:
         self.qr_countdown_timer.stop()
-        self._qr_expires_at = None
+        self._qr_deadline = None
+        self._qr_generation = None
+        self._qr_expiry_emitted = False
         self.qr_image.clear()
         self.qr_countdown.setText("正在生成二维码…")
         self.qr_status.setText("等待手机扫码确认")

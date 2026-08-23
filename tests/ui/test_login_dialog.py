@@ -1,5 +1,3 @@
-from datetime import UTC, datetime, timedelta
-
 import pytest
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtWidgets import (
@@ -15,6 +13,17 @@ from telegram_downloader.settings import ProxySettings
 from telegram_downloader.ui.effects import ElevationLevel
 from telegram_downloader.ui.login import LoginDialog, LoginPage
 from telegram_downloader.ui.theme import APP_STYLESHEET
+
+
+class MonotonicClock:
+    def __init__(self) -> None:
+        self.value = 100.0
+
+    def now(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
 
 
 def test_login_pages_mask_sensitive_fields(qtbot) -> None:
@@ -114,9 +123,8 @@ def test_reset_authentication_clears_attempt_fields(qtbot) -> None:
 def test_qr_page_renders_in_memory_and_exposes_login_choices(qtbot) -> None:
     dialog = LoginDialog()
     qtbot.addWidget(dialog)
-    expires_at = datetime.now(UTC) + timedelta(seconds=60)
 
-    dialog.show_qr("tg://login?token=abc_123", expires_at)
+    dialog.show_qr("tg://login?token=abc_123", 60.0, 1)
 
     assert dialog.stack.currentWidget() is dialog.qr_page
     assert dialog.qr_image.pixmap().isNull() is False
@@ -155,9 +163,7 @@ def test_qr_page_uses_fixed_viewport_and_preserves_complete_pixmap(qtbot) -> Non
     dialog = LoginDialog()
     qtbot.addWidget(dialog)
     dialog.show()
-    expires_at = datetime.now(UTC) + timedelta(seconds=60)
-
-    dialog.show_qr(f"tg://login?token={'a' * 43}", expires_at)
+    dialog.show_qr(f"tg://login?token={'a' * 43}", 60.0, 1)
     QApplication.processEvents()
 
     pixmap = dialog.qr_image.pixmap()
@@ -170,20 +176,50 @@ def test_qr_page_uses_fixed_viewport_and_preserves_complete_pixmap(qtbot) -> Non
 def test_qr_state_is_cleared_on_page_switch_and_reject(qtbot) -> None:
     dialog = LoginDialog()
     qtbot.addWidget(dialog)
-    expires_at = datetime.now(UTC) + timedelta(seconds=60)
-    dialog.show_qr("tg://login?token=abc_123", expires_at)
+    dialog.show_qr("tg://login?token=abc_123", 60.0, 1)
 
     dialog.show_page(LoginPage.PHONE)
 
     assert dialog.qr_countdown_timer.isActive() is False
     assert dialog.qr_image.pixmap().isNull() is True
 
-    dialog.show_qr("tg://login?token=xyz_789", expires_at)
+    dialog.show_qr("tg://login?token=xyz_789", 60.0, 2)
     with qtbot.waitSignal(dialog.login_cancelled, timeout=500):
         dialog.reject()
 
     assert dialog.qr_countdown_timer.isActive() is False
     assert dialog.qr_image.pixmap().isNull() is True
+
+
+def test_qr_countdown_uses_relative_monotonic_deadline(qtbot) -> None:
+    clock = MonotonicClock()
+    dialog = LoginDialog(monotonic_now=clock.now)
+    qtbot.addWidget(dialog)
+
+    dialog.show_qr("tg://login?token=abc_123", 10.2, 7)
+    assert dialog.qr_countdown.text() == "二维码将在 11 秒后刷新"
+
+    clock.advance(2.5)
+    dialog._tick_qr_countdown()
+
+    assert dialog.qr_countdown.text() == "二维码将在 8 秒后刷新"
+
+
+def test_qr_expiry_emits_once_for_each_generation(qtbot) -> None:
+    clock = MonotonicClock()
+    dialog = LoginDialog(monotonic_now=clock.now)
+    qtbot.addWidget(dialog)
+    expired_generations: list[int] = []
+    dialog.qr_expired.connect(expired_generations.append)
+    dialog.show_qr("tg://login?token=abc_123", 1.0, 42)
+
+    clock.advance(1.1)
+    dialog._tick_qr_countdown()
+    dialog._tick_qr_countdown()
+
+    assert expired_generations == [42]
+    assert dialog.qr_countdown_timer.isActive() is False
+    assert dialog.qr_countdown.text() == "二维码已过期，正在生成新二维码…"
 
 
 @pytest.mark.parametrize(
