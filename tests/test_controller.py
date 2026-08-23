@@ -1262,6 +1262,108 @@ async def test_qr_login_rebuilds_non_finite_validity(invalid_ttl: float) -> None
 
 
 @pytest.mark.asyncio
+async def test_qr_lifecycle_logs_metadata_without_token(caplog) -> None:
+    expires = datetime(2026, 8, 23, 5, tzinfo=UTC)
+    private_url = "tg://login?token=private_qr_token"
+
+    class Gateway:
+        async def begin_qr_login(self):
+            return QrLoginInfo(private_url, expires, 1.0)
+
+        async def refresh_qr_login(self):
+            return QrLoginInfo(private_url, expires, 1.0)
+
+    controller = AppController.for_test(gateway=Gateway())
+
+    with caplog.at_level(logging.INFO, logger="telegram_downloader.controller"):
+        await controller.begin_qr_login()
+
+    assert "qr-rejected-short-ttl" in caplog.text
+    assert "ttl_seconds=" in caplog.text
+    assert private_url not in caplog.text
+    assert "private_qr_token" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_candidate_qr_expiry_failure_preserves_active_account_services() -> None:
+    expires = datetime(2026, 8, 23, 5, tzinfo=UTC)
+
+    class ActiveGateway:
+        def __init__(self) -> None:
+            self.disconnect_calls = 0
+
+        async def disconnect(self):
+            self.disconnect_calls += 1
+
+    class CandidateGateway:
+        def __init__(self) -> None:
+            self.refresh_calls = 0
+            self.disconnect_calls = 0
+
+        async def begin_qr_login(self):
+            return QrLoginInfo("tg://login?token=candidate", expires, 29.0)
+
+        async def refresh_qr_login(self):
+            self.refresh_calls += 1
+            raise GatewayError("候选登录二维码刷新失败")
+
+        async def wait_qr_login(self):
+            await asyncio.Event().wait()
+
+        async def disconnect(self):
+            self.disconnect_calls += 1
+
+    class Dialog:
+        def __init__(self) -> None:
+            self.generation = 0
+            self.error = ""
+
+        def show_qr(self, _url, _ttl, generation):
+            self.generation = generation
+
+        def show_qr_status(self, _text):
+            pass
+
+        def show_error(self, text):
+            self.error = text
+
+    active_gateway = ActiveGateway()
+    candidate_gateway = CandidateGateway()
+    active_planner = object()
+    active_scheduler = object()
+    active_content_browser = object()
+    dialog = Dialog()
+    controller = AppController.for_test(
+        gateway=active_gateway,
+        planner=active_planner,
+        scheduler=active_scheduler,
+        content_browser=active_content_browser,
+        login_dialog=dialog,
+        secrets={"api_hash": "saved-hash", "session": "active-session"},
+    )
+    controller._candidate_login = CandidateLoginSession(candidate_gateway)
+    secrets_before = dict(controller.secrets)
+
+    await controller.begin_qr_login()
+    await controller.refresh_expired_qr(dialog.generation)
+
+    assert controller.gateway is active_gateway
+    assert controller.planner is active_planner
+    assert controller.scheduler is active_scheduler
+    assert controller.content_browser is active_content_browser
+    assert controller.secrets == secrets_before
+    assert active_gateway.disconnect_calls == 0
+    assert candidate_gateway.refresh_calls == 1
+    assert candidate_gateway.disconnect_calls == 0
+    assert dialog.error == "候选登录二维码刷新失败"
+
+    await controller.cancel_login()
+
+    assert active_gateway.disconnect_calls == 0
+    assert candidate_gateway.disconnect_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_ui_expiry_refresh_is_generation_scoped_and_deduplicated() -> None:
     expires = datetime(2026, 8, 23, 5, tzinfo=UTC)
     refresh_started = asyncio.Event()
