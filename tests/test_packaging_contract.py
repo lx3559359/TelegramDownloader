@@ -126,7 +126,7 @@ def test_subscription_modules_do_not_escape_project_local_storage() -> None:
         assert all(value not in source for value in diagnostic_forbidden), module.name
 
 
-def test_v0170_version_and_account_update_brand_contract_are_consistent() -> None:
+def test_v0180_version_and_api_onboarding_contract_are_consistent() -> None:
     root = Path(__file__).parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     package_init = (root / "src/telegram_downloader/__init__.py").read_text(
@@ -143,11 +143,11 @@ def test_v0170_version_and_account_update_brand_contract_are_consistent() -> Non
         encoding="utf-8"
     )
     readme = (root / "README.md").read_text(encoding="utf-8")
-    release_notes = root / "docs/releases/v0.17.0.md"
+    release_notes = root / "docs/releases/v0.18.0.md"
 
-    assert project["project"]["version"] == "0.17.0"
-    assert '__version__ = "0.17.0"' in package_init
-    assert '#define AppVersion "0.17.0"' in installer
+    assert project["project"]["version"] == "0.18.0"
+    assert '__version__ = "0.18.0"' in package_init
+    assert '#define AppVersion "0.18.0"' in installer
     assert "qrcode==8.2" in requirements
     assert '"qrcode"' in spec
     assert "app_version=__version__" in gateway
@@ -174,19 +174,19 @@ def test_v0170_version_and_account_update_brand_contract_are_consistent() -> Non
     assert '"--background"' in entry
     assert release_notes.is_file()
     notes = release_notes.read_text(encoding="utf-8")
-    assert "# TG 快取 v0.17.0" in notes
+    assert "# TG 快取 v0.18.0" in notes
     assert all(
         term in notes
         for term in (
-            "账号状态",
-            "不会自动生成二维码",
-            "独立候选会话",
-            "活动下载",
-            "检查更新",
-            "启动时不会自动检查",
-            "单行省略",
-            "TG 快取",
-            "旧快捷方式",
+            "首次登录",
+            "my.telegram.org/apps",
+            "系统默认浏览器",
+            "API development tools",
+            "确认码",
+            "每个手机号",
+            "API Hash 与密码类似",
+            "纵向滚动",
+            "二维码",
         )
     )
     assert "v0.1.0 · stable" not in main
