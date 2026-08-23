@@ -596,6 +596,7 @@ class AppController:
         self._session_restore_task: asyncio.Task[None] | None = None
         self._qr_wait_task: asyncio.Task[None] | None = None
         self._qr_generation = 0
+        self._qr_refresh_lock = asyncio.Lock()
         self._candidate_login: CandidateLoginSession | None = None
         self._ui_slots: list[object] = []
         self._shutting_down = False
@@ -940,23 +941,44 @@ class AppController:
             self.login_dialog.show_error(self._safe_error(error))
 
     async def refresh_qr_login(self) -> None:
-        gateway = self._login_gateway()
-        if gateway is None:
-            self.login_dialog.show_error("请先填写 API 凭据")
-            return
-        try:
-            await self._cancel_qr_wait()
-            info = await gateway.refresh_qr_login()
-            info = await self._displayable_qr_info(gateway, info)
-            await self._show_qr_and_wait(gateway, info)
-        except TransientNetworkError as error:
-            from telegram_downloader.ui.login import LoginPage
+        requested_generation = self._qr_generation
+        await self._refresh_qr(expected_generation=requested_generation)
 
-            self._prefill_login()
-            self.login_dialog.show_page(LoginPage.CREDENTIALS)
-            self.login_dialog.show_error(self._safe_error(error))
-        except Exception as error:
-            self.login_dialog.show_error(self._safe_error(error))
+    async def refresh_expired_qr(self, generation: int) -> None:
+        await self._refresh_qr(expected_generation=generation)
+
+    async def _refresh_qr(self, *, expected_generation: int) -> None:
+        async with self._qr_refresh_lock:
+            if expected_generation != self._qr_generation:
+                _LOGGER.info(
+                    "qr-refresh-deduplicated (generation=%s current_generation=%s)",
+                    expected_generation,
+                    self._qr_generation,
+                )
+                return
+            gateway = self._login_gateway()
+            if gateway is None:
+                self.login_dialog.show_error("请先填写 API 凭据")
+                return
+            try:
+                await self._cancel_qr_wait()
+                _LOGGER.info(
+                    "qr-refresh-started (generation=%s context=%s)",
+                    self._qr_generation,
+                    self._qr_login_context(),
+                )
+                info = await gateway.refresh_qr_login()
+                info = await self._displayable_qr_info(gateway, info)
+                await self._show_qr_and_wait(gateway, info)
+            except TransientNetworkError as error:
+                if self._candidate_login is None:
+                    from telegram_downloader.ui.login import LoginPage
+
+                    self._prefill_login()
+                    self.login_dialog.show_page(LoginPage.CREDENTIALS)
+                self.login_dialog.show_error(self._safe_error(error))
+            except Exception as error:
+                self.login_dialog.show_error(self._safe_error(error))
 
     async def use_phone_fallback(self) -> None:
         await self._cancel_qr_wait()
@@ -1003,7 +1025,10 @@ class AppController:
     def _qr_ttl_metric(info: QrLoginInfo) -> int:
         if not isfinite(info.valid_for_seconds):
             return -1
-        return round(info.valid_for_seconds)
+        return max(0, int(info.valid_for_seconds))
+
+    def _qr_login_context(self) -> str:
+        return "candidate" if self._candidate_login is not None else "initial"
 
     async def _displayable_qr_info(
         self,
@@ -1012,16 +1037,18 @@ class AppController:
     ) -> QrLoginInfo:
         if self._qr_lifetime_is_usable(info):
             return info
-        _LOGGER.warning(
-            "QR code rejected before display (ttl_seconds=%s)",
+        _LOGGER.info(
+            "qr-rejected-short-ttl (ttl_seconds=%s context=%s)",
             self._qr_ttl_metric(info),
+            self._qr_login_context(),
         )
         refreshed = await gateway.refresh_qr_login()
         if self._qr_lifetime_is_usable(refreshed):
             return refreshed
-        _LOGGER.warning(
-            "Refreshed QR code rejected before display (ttl_seconds=%s)",
+        _LOGGER.info(
+            "qr-rejected-short-ttl (ttl_seconds=%s context=%s)",
             self._qr_ttl_metric(refreshed),
+            self._qr_login_context(),
         )
         raise GatewayError(_QR_VALIDITY_ERROR)
 
@@ -1038,12 +1065,21 @@ class AppController:
             self._candidate_login.qr_wait_task = task
         await asyncio.sleep(0)
         if generation != self._qr_generation or task.done():
+            if task.done():
+                with suppress(asyncio.CancelledError):
+                    await task
             return
         self._display_qr(info, generation)
 
     def _display_qr(self, info: QrLoginInfo, generation: int) -> None:
         self.login_dialog.show_qr(info.url, info.valid_for_seconds, generation)
         self.login_dialog.show_qr_status("等待手机扫码确认")
+        _LOGGER.info(
+            "qr-created (generation=%s ttl_seconds=%s context=%s)",
+            generation,
+            self._qr_ttl_metric(info),
+            self._qr_login_context(),
+        )
 
     async def _cancel_qr_wait(self) -> None:
         task = self._qr_wait_task
@@ -1068,12 +1104,8 @@ class AppController:
                 try:
                     state = await gateway.wait_qr_login()
                 except TimeoutError:
-                    info = await gateway.refresh_qr_login()
-                    info = await self._displayable_qr_info(gateway, info)
-                    if generation != self._qr_generation:
-                        return
-                    self._display_qr(info, generation)
-                    continue
+                    await self._refresh_qr(expected_generation=generation)
+                    return
                 if generation != self._qr_generation:
                     return
                 if state is AuthState.PASSWORD_REQUIRED:

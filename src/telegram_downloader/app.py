@@ -1498,6 +1498,12 @@ def create_application(
         lambda: controller.refresh_qr_login(),
         hooks=login_hooks("qr.refresh"),
     )
+    async_actions.connect_payload(
+        login_dialog.qr_expired,
+        "login.qr.expired",
+        lambda generation: controller.refresh_expired_qr(generation),
+        hooks=login_hooks("qr.refresh"),
+    )
     async_actions.connect(
         login_dialog.phone_fallback_requested,
         "login.phone",

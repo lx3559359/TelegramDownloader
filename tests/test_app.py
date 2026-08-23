@@ -55,6 +55,7 @@ EXPECTED_POLICIES = {
     "diagnostics.run": ActionPolicy.DEDUPLICATE,
     "diagnostics.export": ActionPolicy.DEDUPLICATE,
     "login.qr.refresh": ActionPolicy.DEDUPLICATE,
+    "login.qr.expired": ActionPolicy.DEDUPLICATE,
     "login.phone": ActionPolicy.DEDUPLICATE,
     "settings.save": ActionPolicy.DEDUPLICATE,
     "settings.update.check": ActionPolicy.DEDUPLICATE,
@@ -551,7 +552,7 @@ def test_create_application_initializes_project_local_content_services(
         assert "content_preview_requested" in slot_names
         assert "subscription_probe_requested" in slot_names
         assert controller._async_actions.active_keys == frozenset()
-        assert len(controller._async_actions._slots) == 41
+        assert len(controller._async_actions._slots) == 42
         assert controller.diagnostics is not None
         assert controller.diagnostic_store.paths.root == tmp_path.resolve()
         controller.window.content_page.link_requested.emit("https://t.me/example/1#fragment")
@@ -880,12 +881,18 @@ def test_zero_argument_ui_signals_schedule_each_controller_action_once(
             lambda name=action_name: record(name),
         )
 
+    async def record_expiry(generation: int) -> None:
+        calls.append(f"login.qr.expired:{generation}")
+
+    monkeypatch.setattr(controller, "refresh_expired_qr", record_expiry)
+
     async def emit_actions() -> None:
         controller.window.content_activated.emit()
         controller.window.subscriptions_activated.emit()
         controller.window.content_page.refresh_requested.emit()
         controller.window.content_page.connection_retry_requested.emit()
         controller.login_dialog.qr_refresh_requested.emit()
+        controller.login_dialog.qr_expired.emit(42)
         controller.login_dialog.phone_fallback_requested.emit()
         controller.login_dialog.credentials_edit_requested.emit()
         controller.login_dialog.login_cancelled.emit()
@@ -896,7 +903,11 @@ def test_zero_argument_ui_signals_schedule_each_controller_action_once(
         assert bridge is not None
         loop.run_until_complete(emit_actions())
 
-        assert calls == list(actions.values())
+        assert calls == [
+            *list(actions.values())[:5],
+            "login.qr.expired:42",
+            *list(actions.values())[5:],
+        ]
         assert bridge.active_keys == frozenset()
     finally:
         bridge = getattr(controller, "_async_actions", None)

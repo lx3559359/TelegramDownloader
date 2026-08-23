@@ -49,6 +49,7 @@ ACTION_POLICIES: dict[str, ActionPolicy] = {
     "diagnostics.cancel": ActionPolicy.DEDUPLICATE,
     "diagnostics.export": ActionPolicy.DEDUPLICATE,
     "login.qr.refresh": ActionPolicy.DEDUPLICATE,
+    "login.qr.expired": ActionPolicy.DEDUPLICATE,
     "login.phone": ActionPolicy.DEDUPLICATE,
     "login.credentials": ActionPolicy.DEDUPLICATE,
     "login.cancel": ActionPolicy.DEDUPLICATE,

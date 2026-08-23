@@ -1262,6 +1262,62 @@ async def test_qr_login_rebuilds_non_finite_validity(invalid_ttl: float) -> None
 
 
 @pytest.mark.asyncio
+async def test_ui_expiry_refresh_is_generation_scoped_and_deduplicated() -> None:
+    expires = datetime(2026, 8, 23, 5, tzinfo=UTC)
+    refresh_started = asyncio.Event()
+    release_refresh = asyncio.Event()
+
+    class Gateway:
+        def __init__(self) -> None:
+            self.refresh_calls = 0
+
+        async def begin_qr_login(self):
+            return QrLoginInfo("tg://login?token=first", expires, 29.0)
+
+        async def refresh_qr_login(self):
+            self.refresh_calls += 1
+            refresh_started.set()
+            await release_refresh.wait()
+            return QrLoginInfo("tg://login?token=second", expires, 29.0)
+
+        async def wait_qr_login(self):
+            await asyncio.Event().wait()
+
+    class Dialog:
+        def __init__(self) -> None:
+            self.generations: list[int] = []
+
+        def show_qr(self, _url, _ttl, generation):
+            self.generations.append(generation)
+
+        def show_qr_status(self, _text):
+            pass
+
+        def show_error(self, _text):
+            pass
+
+    gateway = Gateway()
+    dialog = Dialog()
+    controller = AppController.for_test(gateway=gateway, login_dialog=dialog)
+
+    await controller.begin_qr_login()
+    generation = dialog.generations[-1]
+    first = asyncio.create_task(controller.refresh_expired_qr(generation))
+    await refresh_started.wait()
+    second = asyncio.create_task(controller.refresh_expired_qr(generation))
+    release_refresh.set()
+    await asyncio.gather(first, second)
+
+    try:
+        assert gateway.refresh_calls == 1
+        assert len(dialog.generations) == 2
+        assert dialog.generations[0] == generation
+        assert dialog.generations[1] > generation
+    finally:
+        await controller._cancel_qr_wait()
+
+
+@pytest.mark.asyncio
 async def test_manual_qr_refresh_cancels_old_wait_before_starting_new() -> None:
     expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
 
@@ -1327,7 +1383,7 @@ async def test_manual_qr_refresh_cancels_old_wait_before_starting_new() -> None:
 
 
 @pytest.mark.asyncio
-async def test_expired_qr_refreshes_in_same_wait_task() -> None:
+async def test_gateway_timeout_refreshes_through_new_generation() -> None:
     expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
 
     class Gateway:
@@ -1346,7 +1402,7 @@ async def test_expired_qr_refreshes_in_same_wait_task() -> None:
             self.wait_calls += 1
             if self.wait_calls == 1:
                 raise TimeoutError
-            return AuthState.PASSWORD_REQUIRED
+            await asyncio.Event().wait()
 
     class Dialog:
         def __init__(self):
@@ -1370,12 +1426,16 @@ async def test_expired_qr_refreshes_in_same_wait_task() -> None:
     controller = AppController.for_test(gateway=gateway, login_dialog=dialog)
 
     await controller.begin_qr_login()
+    for _attempt in range(5):
+        if len(dialog.urls) == 1:
+            break
+        await asyncio.sleep(0)
 
     assert gateway.wait_calls == 2
     assert gateway.refresh_calls == 1
     assert dialog.urls == ["tg://login?token=second"]
-    assert dialog.pages[-1] is LoginPage.PASSWORD
-    assert controller._qr_wait_task is None
+    assert controller._qr_wait_task is not None
+    await controller._cancel_qr_wait()
 
 
 @pytest.mark.asyncio
