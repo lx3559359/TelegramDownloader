@@ -1485,6 +1485,112 @@ async def test_manual_qr_refresh_cancels_old_wait_before_starting_new() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancel_during_qr_refresh_does_not_restore_cancelled_login() -> None:
+    expires = datetime(2026, 8, 23, 5, tzinfo=UTC)
+    refresh_started = asyncio.Event()
+    release_refresh = asyncio.Event()
+
+    class Gateway:
+        def __init__(self) -> None:
+            self.disconnect_calls = 0
+
+        async def begin_qr_login(self):
+            return QrLoginInfo("tg://login?token=first", expires, 29.0)
+
+        async def refresh_qr_login(self):
+            refresh_started.set()
+            await release_refresh.wait()
+            return QrLoginInfo("tg://login?token=second", expires, 29.0)
+
+        async def wait_qr_login(self):
+            await asyncio.Event().wait()
+
+        async def disconnect(self):
+            self.disconnect_calls += 1
+
+    class Dialog:
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+
+        def show_qr(self, url, _ttl, _generation):
+            self.urls.append(url)
+
+        def show_qr_status(self, _text):
+            pass
+
+        def show_error(self, _text):
+            pass
+
+    gateway = Gateway()
+    dialog = Dialog()
+    controller = AppController.for_test(gateway=gateway, login_dialog=dialog)
+    await controller.begin_qr_login()
+    generation = controller._qr_generation
+    refresh = asyncio.create_task(controller.refresh_expired_qr(generation))
+    await refresh_started.wait()
+
+    await controller.cancel_login()
+    release_refresh.set()
+    await refresh
+
+    assert dialog.urls == ["tg://login?token=first"]
+    assert controller._qr_wait_task is None
+    assert gateway.disconnect_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_qr_begin_does_not_display_late_result() -> None:
+    expires = datetime(2026, 8, 23, 5, tzinfo=UTC)
+    begin_started = asyncio.Event()
+    release_begin = asyncio.Event()
+
+    class Gateway:
+        def __init__(self) -> None:
+            self.disconnect_calls = 0
+            self.wait_calls = 0
+
+        async def begin_qr_login(self):
+            begin_started.set()
+            await release_begin.wait()
+            return QrLoginInfo("tg://login?token=late", expires, 29.0)
+
+        async def wait_qr_login(self):
+            self.wait_calls += 1
+            await asyncio.Event().wait()
+
+        async def disconnect(self):
+            self.disconnect_calls += 1
+
+    class Dialog:
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+
+        def show_qr(self, url, _ttl, _generation):
+            self.urls.append(url)
+
+        def show_qr_status(self, _text):
+            pass
+
+        def show_error(self, _text):
+            pass
+
+    gateway = Gateway()
+    dialog = Dialog()
+    controller = AppController.for_test(gateway=gateway, login_dialog=dialog)
+    begin = asyncio.create_task(controller.begin_qr_login())
+    await begin_started.wait()
+
+    await controller.cancel_login()
+    release_begin.set()
+    await begin
+
+    assert dialog.urls == []
+    assert gateway.wait_calls == 0
+    assert gateway.disconnect_calls == 1
+    assert controller._qr_wait_task is None
+
+
+@pytest.mark.asyncio
 async def test_gateway_timeout_refreshes_through_new_generation() -> None:
     expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
 
@@ -1846,6 +1952,38 @@ async def test_qr_wait_failure_is_consumed_and_shown_safely() -> None:
 
     assert dialog.error == "Telegram 网络连接失败"
     assert controller._qr_wait_task is None
+
+
+@pytest.mark.asyncio
+async def test_qr_wait_failure_log_never_contains_token(caplog) -> None:
+    expires = datetime(2026, 8, 23, 5, tzinfo=UTC)
+    private_url = "tg://login?token=private_wait_token"
+
+    class Gateway:
+        async def begin_qr_login(self):
+            return QrLoginInfo(private_url, expires, 29.0)
+
+        async def wait_qr_login(self):
+            raise GatewayError(private_url)
+
+    class Dialog:
+        def __init__(self) -> None:
+            self.error = ""
+
+        def show_error(self, text):
+            self.error = text
+
+    dialog = Dialog()
+    with caplog.at_level(logging.INFO, logger="telegram_downloader.controller"):
+        await AppController.for_test(
+            gateway=Gateway(),
+            login_dialog=dialog,
+        ).begin_qr_login()
+
+    assert "qr-wait-failed" in caplog.text
+    assert private_url not in caplog.text
+    assert "private_wait_token" not in caplog.text
+    assert dialog.error == "二维码登录失败，请刷新后重试"
 
 
 def test_show_login_without_credentials_returns_to_credentials_page() -> None:

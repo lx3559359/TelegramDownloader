@@ -75,6 +75,7 @@ from telegram_downloader.update import UpdateStartupResult
 _LOGGER = logging.getLogger("telegram_downloader.controller")
 _MIN_QR_VALIDITY_SECONDS = 5.0
 _QR_VALIDITY_ERROR = "二维码有效期异常，请检查系统时间或网络后重试"
+_QR_LOGIN_ERROR = "二维码登录失败，请刷新后重试"
 
 
 def _tracked_activity(kind: ActivityKind):
@@ -925,20 +926,34 @@ class AppController:
         if gateway is None:
             self.login_dialog.show_error("请先填写 API 凭据")
             return
+        request_generation: int | None = None
         try:
             await self._cancel_qr_wait()
+            request_generation = self._qr_generation
             info = await gateway.begin_qr_login()
             info = await self._displayable_qr_info(gateway, info)
+            if request_generation != self._qr_generation:
+                return
             await self._show_qr_and_wait(gateway, info)
         except TransientNetworkError as error:
+            if (
+                request_generation is not None
+                and request_generation != self._qr_generation
+            ):
+                return
             if self._candidate_login is None:
                 from telegram_downloader.ui.login import LoginPage
 
                 self._prefill_login()
                 self.login_dialog.show_page(LoginPage.CREDENTIALS)
-            self.login_dialog.show_error(self._safe_error(error))
+            self.login_dialog.show_error(self._safe_qr_error(error))
         except Exception as error:
-            self.login_dialog.show_error(self._safe_error(error))
+            if (
+                request_generation is not None
+                and request_generation != self._qr_generation
+            ):
+                return
+            self.login_dialog.show_error(self._safe_qr_error(error))
 
     async def refresh_qr_login(self) -> None:
         requested_generation = self._qr_generation
@@ -960,8 +975,10 @@ class AppController:
             if gateway is None:
                 self.login_dialog.show_error("请先填写 API 凭据")
                 return
+            refresh_generation: int | None = None
             try:
                 await self._cancel_qr_wait()
+                refresh_generation = self._qr_generation
                 _LOGGER.info(
                     "qr-refresh-started (generation=%s context=%s)",
                     self._qr_generation,
@@ -969,16 +986,28 @@ class AppController:
                 )
                 info = await gateway.refresh_qr_login()
                 info = await self._displayable_qr_info(gateway, info)
+                if refresh_generation != self._qr_generation:
+                    return
                 await self._show_qr_and_wait(gateway, info)
             except TransientNetworkError as error:
+                if (
+                    refresh_generation is not None
+                    and refresh_generation != self._qr_generation
+                ):
+                    return
                 if self._candidate_login is None:
                     from telegram_downloader.ui.login import LoginPage
 
                     self._prefill_login()
                     self.login_dialog.show_page(LoginPage.CREDENTIALS)
-                self.login_dialog.show_error(self._safe_error(error))
+                self.login_dialog.show_error(self._safe_qr_error(error))
             except Exception as error:
-                self.login_dialog.show_error(self._safe_error(error))
+                if (
+                    refresh_generation is not None
+                    and refresh_generation != self._qr_generation
+                ):
+                    return
+                self.login_dialog.show_error(self._safe_qr_error(error))
 
     async def use_phone_fallback(self) -> None:
         await self._cancel_qr_wait()
@@ -1029,6 +1058,13 @@ class AppController:
 
     def _qr_login_context(self) -> str:
         return "candidate" if self._candidate_login is not None else "initial"
+
+    @staticmethod
+    def _safe_qr_error(error: Exception) -> str:
+        safe = AppController._safe_error(error)
+        if "tg://login?token=" in safe.casefold():
+            return _QR_LOGIN_ERROR
+        return safe
 
     async def _displayable_qr_info(
         self,
@@ -1118,11 +1154,12 @@ class AppController:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            safe = self._safe_error(error)
-            if isinstance(error, (GatewayError, ValueError)):
-                _LOGGER.warning("QR login failed (%s): %s", type(error).__name__, safe)
-            else:
-                _LOGGER.error("QR login failed (%s)", type(error).__name__)
+            safe = self._safe_qr_error(error)
+            _LOGGER.warning(
+                "qr-wait-failed (type=%s context=%s)",
+                type(error).__name__,
+                self._qr_login_context(),
+            )
             self.login_dialog.show_error(safe)
         finally:
             if self._qr_wait_task is asyncio.current_task():
