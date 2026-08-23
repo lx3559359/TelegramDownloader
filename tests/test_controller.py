@@ -536,6 +536,7 @@ async def test_credentials_start_qr_login_instead_of_phone_flow() -> None:
             return QrLoginInfo("tg://login?token=first", expires, 60.0)
 
         async def wait_qr_login(self):
+            await asyncio.sleep(0)
             return AuthState.PASSWORD_REQUIRED
 
     class Dialog:
@@ -543,8 +544,8 @@ async def test_credentials_start_qr_login_instead_of_phone_flow() -> None:
             self.pages = []
             self.qr = None
 
-        def show_qr(self, url, expires_at):
-            self.qr = (url, expires_at)
+        def show_qr(self, url, valid_for_seconds, generation):
+            self.qr = (url, valid_for_seconds, generation)
 
         def show_qr_status(self, _text):
             pass
@@ -564,7 +565,7 @@ async def test_credentials_start_qr_login_instead_of_phone_flow() -> None:
     await controller.submit_credentials(123, "api-secret", ProxySettings(), "")
     await asyncio.sleep(0)
 
-    assert dialog.qr == ("tg://login?token=first", expires)
+    assert dialog.qr[:2] == ("tg://login?token=first", 60.0)
     assert LoginPage.PHONE not in dialog.pages
     assert dialog.pages[-1] is LoginPage.PASSWORD
     assert controller._qr_wait_task is None
@@ -595,8 +596,8 @@ async def test_show_login_with_saved_credentials_never_starts_qr() -> None:
         def activateWindow(self):
             pass
 
-        def show_qr(self, url, expires_at):
-            self.qr = (url, expires_at)
+        def show_qr(self, url, valid_for_seconds, generation):
+            self.qr = (url, valid_for_seconds, generation)
 
         def show_qr_status(self, _text):
             pass
@@ -722,7 +723,7 @@ async def test_candidate_login_uses_isolated_gateway_and_cancel_keeps_active() -
         def activateWindow(self):
             pass
 
-        def show_qr(self, _url, _expires_at):
+        def show_qr(self, _url, _valid_for_seconds, _generation):
             pass
 
         def show_qr_status(self, _text):
@@ -794,7 +795,7 @@ async def test_repeated_candidate_login_focuses_existing_attempt() -> None:
         def activateWindow(self):
             pass
 
-        def show_qr(self, _url, _expires_at):
+        def show_qr(self, _url, _valid_for_seconds, _generation):
             pass
 
         def show_qr_status(self, _text):
@@ -1131,6 +1132,136 @@ async def test_qr_network_failure_keeps_prefill_and_returns_to_credentials() -> 
 
 
 @pytest.mark.asyncio
+async def test_qr_login_rebuilds_short_lived_code_before_display() -> None:
+    expires = datetime(2026, 8, 23, 5, tzinfo=UTC)
+    wait_started = asyncio.Event()
+
+    class Gateway:
+        def __init__(self) -> None:
+            self.refresh_calls = 0
+
+        async def begin_qr_login(self):
+            return QrLoginInfo("tg://login?token=stale", expires, 1.0)
+
+        async def refresh_qr_login(self):
+            self.refresh_calls += 1
+            return QrLoginInfo("tg://login?token=fresh", expires, 29.0)
+
+        async def wait_qr_login(self):
+            wait_started.set()
+            await asyncio.Event().wait()
+
+    class Dialog:
+        def __init__(self) -> None:
+            self.qr = []
+
+        def show_qr(self, url, valid_for_seconds, generation):
+            assert wait_started.is_set() is True
+            self.qr.append((url, valid_for_seconds, generation))
+
+        def show_qr_status(self, _text):
+            pass
+
+        def show_error(self, _text):
+            pass
+
+    gateway = Gateway()
+    dialog = Dialog()
+    controller = AppController.for_test(gateway=gateway, login_dialog=dialog)
+
+    await controller.begin_qr_login()
+
+    assert gateway.refresh_calls == 1
+    assert [(url, ttl) for url, ttl, _generation in dialog.qr] == [
+        ("tg://login?token=fresh", 29.0)
+    ]
+    await controller._cancel_qr_wait()
+
+
+@pytest.mark.asyncio
+async def test_qr_login_rejects_second_short_lived_code_without_display() -> None:
+    expires = datetime(2026, 8, 23, 5, tzinfo=UTC)
+
+    class Gateway:
+        def __init__(self) -> None:
+            self.refresh_calls = 0
+            self.wait_calls = 0
+
+        async def begin_qr_login(self):
+            return QrLoginInfo("tg://login?token=stale", expires, 1.0)
+
+        async def refresh_qr_login(self):
+            self.refresh_calls += 1
+            return QrLoginInfo("tg://login?token=still-stale", expires, 2.0)
+
+        async def wait_qr_login(self):
+            self.wait_calls += 1
+            raise AssertionError("unusable QR code must not start a listener")
+
+    class Dialog:
+        def __init__(self) -> None:
+            self.qr = []
+            self.error = ""
+
+        def show_qr(self, *values):
+            self.qr.append(values)
+
+        def show_qr_status(self, _text):
+            pass
+
+        def show_error(self, text):
+            self.error = text
+
+    gateway = Gateway()
+    dialog = Dialog()
+    controller = AppController.for_test(gateway=gateway, login_dialog=dialog)
+
+    await controller.begin_qr_login()
+
+    assert gateway.refresh_calls == 1
+    assert gateway.wait_calls == 0
+    assert dialog.qr == []
+    assert dialog.error == "二维码有效期异常，请检查系统时间或网络后重试"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_ttl", [float("nan"), float("inf")])
+async def test_qr_login_rebuilds_non_finite_validity(invalid_ttl: float) -> None:
+    expires = datetime(2026, 8, 23, 5, tzinfo=UTC)
+
+    class Gateway:
+        async def begin_qr_login(self):
+            return QrLoginInfo("tg://login?token=invalid", expires, invalid_ttl)
+
+        async def refresh_qr_login(self):
+            return QrLoginInfo("tg://login?token=fresh", expires, 29.0)
+
+        async def wait_qr_login(self):
+            await asyncio.Event().wait()
+
+    class Dialog:
+        def __init__(self) -> None:
+            self.ttls = []
+
+        def show_qr(self, _url, valid_for_seconds, _generation):
+            self.ttls.append(valid_for_seconds)
+
+        def show_qr_status(self, _text):
+            pass
+
+        def show_error(self, _text):
+            pass
+
+    dialog = Dialog()
+    controller = AppController.for_test(gateway=Gateway(), login_dialog=dialog)
+
+    await controller.begin_qr_login()
+
+    assert dialog.ttls == [29.0]
+    await controller._cancel_qr_wait()
+
+
+@pytest.mark.asyncio
 async def test_manual_qr_refresh_cancels_old_wait_before_starting_new() -> None:
     expires = datetime(2026, 8, 14, 1, tzinfo=UTC)
 
@@ -1163,7 +1294,7 @@ async def test_manual_qr_refresh_cancels_old_wait_before_starting_new() -> None:
         def __init__(self):
             self.urls = []
 
-        def show_qr(self, url, _expires_at):
+        def show_qr(self, url, _valid_for_seconds, _generation):
             self.urls.append(url)
 
         def show_qr_status(self, _text):
@@ -1222,7 +1353,7 @@ async def test_expired_qr_refreshes_in_same_wait_task() -> None:
             self.urls = []
             self.pages = []
 
-        def show_qr(self, url, _expires_at):
+        def show_qr(self, url, _valid_for_seconds, _generation):
             self.urls.append(url)
 
         def show_qr_status(self, _text):
@@ -1239,17 +1370,12 @@ async def test_expired_qr_refreshes_in_same_wait_task() -> None:
     controller = AppController.for_test(gateway=gateway, login_dialog=dialog)
 
     await controller.begin_qr_login()
-    task = controller._qr_wait_task
-    assert task is not None
-    await task
 
     assert gateway.wait_calls == 2
     assert gateway.refresh_calls == 1
-    assert dialog.urls == [
-        "tg://login?token=first",
-        "tg://login?token=second",
-    ]
+    assert dialog.urls == ["tg://login?token=second"]
     assert dialog.pages[-1] is LoginPage.PASSWORD
+    assert controller._qr_wait_task is None
 
 
 @pytest.mark.asyncio
@@ -1274,7 +1400,7 @@ async def test_successful_qr_login_saves_session_through_common_finish_path() ->
             self.ready = None
             self.accepted = False
 
-        def show_qr(self, _url, _expires_at):
+        def show_qr(self, _url, _valid_for_seconds, _generation):
             pass
 
         def show_qr_status(self, _text):
@@ -1298,9 +1424,6 @@ async def test_successful_qr_login_saves_session_through_common_finish_path() ->
     )
 
     await controller.begin_qr_login()
-    task = controller._qr_wait_task
-    assert task is not None
-    await task
 
     assert vault.value["session"] == "qr-portable-session"
     assert controller.window.account == "QR User"
@@ -1330,7 +1453,7 @@ async def test_phone_fallback_cancels_qr_wait_before_switching_page() -> None:
         def __init__(self):
             self.page = None
 
-        def show_qr(self, _url, _expires_at):
+        def show_qr(self, _url, _valid_for_seconds, _generation):
             pass
 
         def show_qr_status(self, _text):
@@ -1381,7 +1504,7 @@ async def test_edit_credentials_cancels_qr_and_disconnects_old_gateway() -> None
         def __init__(self):
             self.page = None
 
-        def show_qr(self, _url, _expires_at):
+        def show_qr(self, _url, _valid_for_seconds, _generation):
             pass
 
         def show_qr_status(self, _text):
@@ -1436,7 +1559,7 @@ async def test_new_credentials_replace_old_gateway_in_safe_order() -> None:
             return AuthState.PASSWORD_REQUIRED
 
     class Dialog:
-        def show_qr(self, _url, _expires_at):
+        def show_qr(self, _url, _valid_for_seconds, _generation):
             pass
 
         def show_qr_status(self, _text):
@@ -1545,7 +1668,7 @@ async def test_qr_wait_failure_is_consumed_and_shown_safely() -> None:
         def __init__(self):
             self.error = None
 
-        def show_qr(self, _url, _expires_at):
+        def show_qr(self, _url, _valid_for_seconds, _generation):
             pass
 
         def show_qr_status(self, _text):
@@ -1558,11 +1681,9 @@ async def test_qr_wait_failure_is_consumed_and_shown_safely() -> None:
     controller = AppController.for_test(gateway=Gateway(), login_dialog=dialog)
 
     await controller.begin_qr_login()
-    task = controller._qr_wait_task
-    assert task is not None
-    await task
 
     assert dialog.error == "Telegram 网络连接失败"
+    assert controller._qr_wait_task is None
 
 
 def test_show_login_without_credentials_returns_to_credentials_page() -> None:
