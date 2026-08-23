@@ -85,12 +85,17 @@ TelegramDownloader/
 
 第三方 Telegram 客户端必须使用用户自己的 API ID 和 API Hash：
 
-1. 在浏览器打开 [my.telegram.org](https://my.telegram.org)。
-2. 使用手机号登录，进入 **API development tools**。
-3. 创建应用并复制 API ID、API Hash。
-4. 首次在本程序填写 API 凭据，点击“保存并生成二维码”。
-5. 打开 Telegram App，进入 **设置 → 设备 → 连接桌面设备**，扫描程序显示的二维码并在手机端确认。
-6. 如果账号启用了两步验证，再输入 Telegram 云密码。二维码过期会自动刷新，也可以手动刷新。
+首次登录窗口会默认展开完整指南；已有凭据时默认折叠，但始终可以点击“如何获取 API ID / Hash”重新查看。申请页面只通过系统默认浏览器打开，本程序不内嵌网页，也不会读取官网中的手机号或确认码。
+
+1. 先在官方 Telegram App 注册并保持登录，准备当前有效手机号。
+2. 点击登录窗口中的按钮，或在浏览器打开 [my.telegram.org/apps](https://my.telegram.org/apps)。
+3. 手机号使用国际格式登录，例如中国大陆号码以 `+86` 开头。确认码会发送到 Telegram 消息，而不是短信。
+4. 登录后进入 **API development tools**。如果账号已创建过应用，直接查看现有凭据；Telegram 当前说明每个手机号只能关联一个 API ID。
+5. 首次创建时可以参考：App title 填 `TG Quick Fetch Personal`，Short name 填 `tgquickfetch`，Platform 选择 `Desktop`，Description 填 `Personal media download manager`。官网若显示其他字段，以网页当前要求为准。
+6. 复制纯数字 `api_id` 和较长字符串 `api_hash`，分别粘贴到程序的 API ID、API Hash 输入框。
+7. 点击“保存并生成二维码”，再打开 Telegram App，进入 **设置 → 设备 → 连接桌面设备** 扫码确认；启用两步验证的账号还需输入 Telegram 云密码。
+
+常见问题：收不到官网确认码时检查 Telegram 服务消息，不要只等待短信；页面打不开时检查网络或代理；已经创建过 API 时不要反复创建，返回 **API development tools** 查看即可。API Hash 与密码类似，请勿截图、分享或提交到公开网站。请遵守 Telegram API 条款，不得用于刷量、垃圾消息或其他滥用行为。
 
 以后有效会话会自动恢复；前台操作或后台订阅发现会话失效时都会立即进入同一重新登录流程并显示新二维码。“连接正常”只有在网络可用且账号授权有效时才会显示。诊断记录只保留固定的脱敏授权原因类型，不保存 Telegram 返回的原始错误文本。二维码页始终可以切换到“改用手机号登录”，继续使用手机号、验证码和可选两步验证流程。
 
