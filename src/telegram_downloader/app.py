@@ -1059,10 +1059,6 @@ def create_application(
         await controller.load_more_content(search_id)
 
     @qasync.asyncSlot(str)
-    async def content_queue_requested(search_id: str) -> None:
-        await controller.queue_content_selection(search_id)
-
-    @qasync.asyncSlot(str)
     async def content_preview_requested(result_id: str) -> None:
         await controller.open_content_preview(result_id)
 
@@ -1207,11 +1203,11 @@ def create_application(
     window.content_page.dialog_selected.connect(content_dialog_selected)
     window.content_page.link_requested.connect(controller.route_content_link)
     window.content_page.cancel_search_requested.connect(controller.cancel_content_search)
-    window.content_page.selection_changed.connect(controller.set_content_selected)
-    window.content_page.queue_requested.connect(content_queue_requested)
+    window.content_page.selection_intent_requested.connect(
+        controller.submit_content_selection
+    )
     window.content_page.thumbnail_requested.connect(controller.request_thumbnail)
     window.content_page.preview_requested.connect(content_preview_requested)
-    window.content_page.history_open_requested.connect(controller._reload_content_search)
     window.subscriptions_page.create_requested.connect(subscription_create_requested)
     window.subscriptions_page.update_requested.connect(subscription_update_requested)
     window.subscriptions_page.rule_selected.connect(controller.show_subscription_details)
@@ -1227,6 +1223,23 @@ def create_application(
 
     def content_failure(error: Exception) -> None:
         window.content_page.show_error(controller._safe_error(error))
+
+    async_actions.connect_payload(
+        window.content_page.history_open_requested,
+        "content.history.open",
+        controller.open_content_history,
+        hooks=ActionHooks(failed=content_failure),
+    )
+    async_actions.connect_payload(
+        window.content_page.queue_requested,
+        "content.queue",
+        controller.queue_content_selection,
+        hooks=ActionHooks(
+            started=lambda: window.content_page.set_queue_busy(True),
+            failed=content_failure,
+            finished=lambda: window.content_page.set_queue_busy(False),
+        ),
+    )
 
     def storage_failure(error: Exception) -> None:
         window.storage_page.show_error(controller._safe_error(error))
@@ -1549,7 +1562,6 @@ def create_application(
             content_dialog_selected,
             content_search_requested,
             content_load_more_requested,
-            content_queue_requested,
             content_preview_requested,
             subscription_create_requested,
             subscription_update_requested,

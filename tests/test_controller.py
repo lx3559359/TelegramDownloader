@@ -4274,7 +4274,7 @@ async def test_content_search_selection_and_queue_flow() -> None:
     assert ("commit", "preview") in calls
     assert ("finalize", "search-1", 2) in calls
     assert window.message == "选择 4 项，加入 2 项，跳过重复 1 项，不可用 1 项"
-    assert window.content_page.queue_busy == [True, False]
+    assert window.content_page.queue_busy == []
 
 
 @pytest.mark.asyncio
@@ -4331,7 +4331,7 @@ async def test_cancelled_queue_confirmation_restores_action_state() -> None:
 
     await controller.queue_content_selection("search-1")
 
-    assert window.content_page.queue_busy == [True, False]
+    assert window.content_page.queue_busy == []
     assert window.message == "已取消创建任务"
 
 
@@ -4428,12 +4428,12 @@ async def test_queue_selection_waits_for_async_user_confirmation() -> None:
     await asyncio.wait_for(entered.wait(), timeout=1)
 
     assert queue.done() is False
-    assert window.content_page.queue_busy == [True]
+    assert window.content_page.queue_busy == []
 
     release.set()
     await queue
 
-    assert window.content_page.queue_busy == [True, False]
+    assert window.content_page.queue_busy == []
     assert window.message == "已取消创建任务"
 
 

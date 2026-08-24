@@ -479,8 +479,8 @@ def test_selection_summary_and_queue_signal_skip_unavailable_and_queued(
     with qtbot.waitSignal(page.queue_requested, timeout=500) as caught:
         qtbot.mouseClick(page.queue_button, Qt.MouseButton.LeftButton)
     assert caught.args == ["search-1"]
-    assert page.queue_button.text() == "正在准备已选 2 项…"
-    assert page.queue_button.isEnabled() is False
+    assert page.queue_button.text() == "加入下载队列"
+    assert page.queue_button.isEnabled() is True
 
 
 def test_bulk_selection_explains_when_every_result_is_excluded(qtbot) -> None:

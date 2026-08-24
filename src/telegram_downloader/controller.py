@@ -1757,7 +1757,6 @@ class AppController:
     async def queue_content_selection(self, search_id: str) -> None:
         page = self._content_page()
         page.show_error("")
-        page.set_queue_busy(True)
         try:
             if self.content_browser is None or self.planner is None:
                 self._show_error("请先连接 Telegram 账号")
@@ -1819,8 +1818,6 @@ class AppController:
             )
         except Exception as error:
             page.show_error(self._safe_error(error))
-        finally:
-            page.set_queue_busy(False)
 
     async def _confirm_download_preview(self, preview: Any) -> bool:
         confirmation = self.confirm_preview(preview)

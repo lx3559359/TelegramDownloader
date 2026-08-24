@@ -19,6 +19,9 @@ from telegram_downloader.content import (
     ContentDialog,
     DialogKind,
     SearchScope,
+    SearchSelectionIntent,
+    SelectionCommit,
+    SelectionMode,
 )
 from telegram_downloader.content_browser import ContentBrowserService
 from telegram_downloader.domain import MediaKind
@@ -48,8 +51,10 @@ EXPECTED_POLICIES = {
     "account.reauthenticate": ActionPolicy.DEDUPLICATE,
     "account.reconnect": ActionPolicy.DEDUPLICATE,
     "content.activate": ActionPolicy.REPLACE_LATEST,
+    "content.history.open": ActionPolicy.REPLACE_LATEST,
     "content.search": ActionPolicy.REPLACE_LATEST,
     "content.load_more": ActionPolicy.REPLACE_LATEST,
+    "content.queue": ActionPolicy.DEDUPLICATE,
     "dialogs.refresh": ActionPolicy.DEDUPLICATE,
     "telegram.retry": ActionPolicy.DEDUPLICATE,
     "diagnostics.run": ActionPolicy.DEDUPLICATE,
@@ -217,6 +222,18 @@ def test_responsive_action_policy_map_is_complete() -> None:
     assert {
         key: async_actions.ACTION_POLICIES[key] for key in EXPECTED_POLICIES
     } == EXPECTED_POLICIES
+
+
+def test_content_history_queue_and_selection_use_responsive_wiring() -> None:
+    source = getsource(app.create_application)
+    assert '"content.history.open"' in source
+    assert '"content.queue"' in source
+    assert (
+        "selection_intent_requested.connect("
+        "controller.submit_content_selection)"
+    ) in source.replace("\n", "").replace(" ", "")
+    assert "history_open_requested.connect(controller._reload_content_search)" not in source
+    assert "selection_changed.connect(controller.set_content_selected)" not in source
 
 
 def test_standard_button_selection_accepts_pyside_integer_result() -> None:
@@ -552,7 +569,7 @@ def test_create_application_initializes_project_local_content_services(
         assert "content_preview_requested" in slot_names
         assert "subscription_probe_requested" in slot_names
         assert controller._async_actions.active_keys == frozenset()
-        assert len(controller._async_actions._slots) == 42
+        assert len(controller._async_actions._slots) == 44
         assert controller.diagnostics is not None
         assert controller.diagnostic_store.paths.root == tmp_path.resolve()
         controller.window.content_page.link_requested.emit("https://t.me/example/1#fragment")
@@ -823,30 +840,44 @@ def test_create_application_recovers_interrupted_subscription(tmp_path) -> None:
 
 def test_content_selection_signal_includes_active_search_id(tmp_path) -> None:
     application, loop, controller = app.create_application(tmp_path)
-    calls: list[tuple[str, str, bool]] = []
+    calls: list[SearchSelectionIntent] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
 
     class ContentBrowser:
-        def set_selected(
-            self,
-            search_id: str,
-            result_id: str,
-            selected: bool,
-        ) -> list[object]:
-            calls.append((search_id, result_id, selected))
-            return []
-
-        def list_results(self, _search_id: str) -> list[object]:
-            return []
+        async def persist_selection(self, intent):
+            calls.append(intent)
+            started.set()
+            await release.wait()
+            return SelectionCommit(
+                intent.search_id,
+                intent.generation,
+                intent.revision,
+                1,
+            )
 
     try:
         controller.content_browser = ContentBrowser()
         page = controller.window.content_page
-        page.active_search_id = "search-1"
+        intent = SearchSelectionIntent(
+            "search-1",
+            1,
+            1,
+            SelectionMode.PATCH,
+            (("result-1", True),),
+        )
 
-        page._selection_changed("result-1", True)
-        application.processEvents()
+        async def exercise() -> None:
+            page.selection_intent_requested.emit(intent)
+            await started.wait()
+            assert controller._selection_persist_task is not None
+            task = controller._selection_persist_task
+            release.set()
+            await task
 
-        assert calls == [("search-1", "result-1", True)]
+        loop.run_until_complete(exercise())
+
+        assert calls == [intent]
     finally:
         loop.run_until_complete(controller._async_actions.shutdown())
         controller.window.close()

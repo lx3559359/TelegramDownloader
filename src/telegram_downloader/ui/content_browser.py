@@ -825,7 +825,6 @@ class ContentBrowserPage(QWidget):
 
     def _emit_queue(self) -> None:
         if self.active_search_id is not None:
-            self.set_queue_busy(True)
             self.queue_requested.emit(self.active_search_id)
 
     def _emit_load_more(self) -> None:
