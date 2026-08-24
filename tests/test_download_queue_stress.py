@@ -19,12 +19,14 @@ from telegram_downloader.resource_control import AsyncBandwidthLimiter
 from telegram_downloader.scheduler import DownloadScheduler
 
 
-async def wait_until(predicate, attempts: int = 500) -> None:
-    for _ in range(attempts):
+async def wait_until(predicate, timeout: float = 2.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
         if predicate():
             return
-        await asyncio.sleep(0)
-    raise AssertionError("condition was not reached")
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(f"condition was not reached within {timeout:.1f}s")
+        await asyncio.sleep(0.005)
 
 
 def seed_queue(repository: TaskRepository, paths: PortablePaths) -> list[str]:
@@ -140,11 +142,11 @@ async def test_fifty_task_queue_survives_priority_duplicates_pauses_and_live_lim
     prioritized = task_ids[-10:]
     for task_id in prioritized:
         assert repository.prioritize_task(task_id) is True
-        assert scheduler.prioritize_task(task_id) is True
+        assert await scheduler.prioritize_task(task_id) is True
     assert scheduler.snapshot().queued_task_ids[0] == prioritized[-1]
     queued_paused = task_ids[20]
-    scheduler.pause_task(queued_paused)
-    scheduler.pause_task(task_ids[0])
+    await scheduler.pause_task(queued_paused)
+    await scheduler.pause_task(task_ids[0])
     scheduler.configure_resources(5, 0)
     first_release.set()
 

@@ -1,9 +1,11 @@
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
 
 from telegram_downloader.domain import ItemStatus, PauseReason, TaskStatus
+from telegram_downloader.download_persistence import DownloadPersistenceCoordinator
 from telegram_downloader.downloader import DownloadPaused, InsufficientSpaceError
 from telegram_downloader.gateway import FloodWaitError, TransientNetworkError
 from telegram_downloader.maintenance_activity import (
@@ -215,6 +217,94 @@ class QueueRepo:
         return True
 
 
+class SlowQueueRepo(QueueRepo):
+    def __init__(self, task_ids: tuple[str, ...], delay: float = 0.05) -> None:
+        super().__init__(task_ids)
+        self.delay = delay
+
+    def _wait(self) -> None:
+        time.sleep(self.delay)
+
+    def list_items(self, task_id, statuses=None):
+        self._wait()
+        return super().list_items(task_id, statuses)
+
+    def get_item(self, item_id):
+        self._wait()
+        return super().get_item(item_id)
+
+    def update_item_progress(
+        self,
+        item_id,
+        downloaded_bytes,
+        status,
+        error=None,
+        retry_count=None,
+    ):
+        self._wait()
+        return super().update_item_progress(
+            item_id,
+            downloaded_bytes,
+            status,
+            error,
+            retry_count,
+        )
+
+    def update_item_progresses(self, updates):
+        self._wait()
+        for update in updates:
+            QueueRepo.update_item_progress(
+                self,
+                update.item_id,
+                update.downloaded_bytes,
+                update.status,
+                update.error,
+                update.retry_count,
+            )
+
+    def update_task_status(self, task_id, status, error=None, *, pause_reason=None):
+        self._wait()
+        return super().update_task_status(
+            task_id,
+            status,
+            error,
+            pause_reason=pause_reason,
+        )
+
+    def recompute_task_status(self, task_id):
+        self._wait()
+        return super().recompute_task_status(task_id)
+
+    def task_dispatch_key(self, task_id):
+        self._wait()
+        return super().task_dispatch_key(task_id)
+
+    def clear_task_priority(self, task_id):
+        self._wait()
+        return super().clear_task_priority(task_id)
+
+
+class RecordingPersistence:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+        self.fault_handler = None
+
+    def set_fault_handler(self, handler) -> None:
+        self.fault_handler = handler
+
+    async def record_progress(self, update) -> None:
+        raise AssertionError(f"unexpected progress: {update}")
+
+    async def execute(self, operation, **_kwargs):
+        return operation()
+
+    async def drain(self) -> None:
+        self.events.append("drain")
+
+    async def close(self) -> None:
+        self.events.append("close")
+
+
 class MultiQueueRepo(QueueRepo):
     def __init__(self, counts: dict[str, int]) -> None:
         super().__init__(tuple(counts))
@@ -254,12 +344,14 @@ class MultiQueueRepo(QueueRepo):
         return result
 
 
-async def wait_until(predicate, attempts: int = 100) -> None:
-    for _ in range(attempts):
+async def wait_until(predicate, timeout: float = 1.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
         if predicate():
             return
-        await asyncio.sleep(0)
-    raise AssertionError("condition was not reached")
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(f"condition was not reached within {timeout:.1f}s")
+        await asyncio.sleep(0.005)
 
 
 @pytest.mark.asyncio
@@ -446,6 +538,77 @@ async def test_flood_wait_sleeps_exact_seconds_then_retries() -> None:
 
 
 @pytest.mark.asyncio
+async def test_retry_state_is_durable_before_sleep_and_resume() -> None:
+    events: list[str] = []
+
+    class RecordingRepo(Repo):
+        def update_item_progress(
+            self,
+            item_id,
+            downloaded_bytes,
+            status,
+            error=None,
+            retry_count=None,
+        ):
+            super().update_item_progress(
+                item_id,
+                downloaded_bytes,
+                status,
+                error,
+                retry_count,
+            )
+            events.append(f"item:{status.value}")
+
+        def update_task_status(
+            self,
+            task_id,
+            status,
+            error=None,
+            *,
+            pause_reason=None,
+        ):
+            super().update_task_status(
+                task_id,
+                status,
+                error,
+                pause_reason=pause_reason,
+            )
+            events.append(f"task:{status.value}")
+
+    attempts = 0
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise TransientNetworkError("offline")
+
+    async def record_sleep(_seconds):
+        events.append("sleep")
+
+    scheduler = DownloadScheduler(
+        RecordingRepo(),
+        Downloader(),
+        concurrency=1,
+        retry=RetryPolicy(2, 1),
+        sleep=record_sleep,
+    )
+
+    await scheduler.run_task("t")
+
+    assert events == [
+        "task:downloading",
+        "item:waiting_retry",
+        "task:waiting_retry",
+        "sleep",
+        "task:downloading",
+        "item:completed",
+        "task:completed",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_scheduler_emits_one_terminal_event_after_completed_status() -> None:
     events = []
 
@@ -544,10 +707,7 @@ async def test_scheduler_never_exceeds_configured_concurrency() -> None:
     repo = Repo(count=4)
     scheduler = DownloadScheduler(repo, Downloader(), concurrency=2)
     task = asyncio.create_task(scheduler.run_task("t"))
-    for _ in range(20):
-        if peak == 2:
-            break
-        await asyncio.sleep(0)
+    await wait_until(lambda: peak == 2)
     assert peak == 2
     release.set()
     await task
@@ -573,11 +733,12 @@ async def test_pause_conditions_do_not_retry(error) -> None:
     assert repo.task_updates[-1] is TaskStatus.PAUSED
 
 
-def test_recover_delegates_to_repository() -> None:
+@pytest.mark.asyncio
+async def test_recover_delegates_to_repository() -> None:
     repo = Repo()
     scheduler = DownloadScheduler(repo, object())
 
-    scheduler.recover()
+    await scheduler.recover()
 
     assert repo.recovered is True
 
@@ -812,7 +973,7 @@ async def test_scheduler_runs_one_task_and_prioritizes_waiting_work() -> None:
         0,
     )
     repo.priorities["newest"] = 1
-    assert scheduler.prioritize_task("newest") is True
+    assert await scheduler.prioritize_task("newest") is True
     assert scheduler.queue_positions() == {"newest": 1}
 
     gates["oldest"].set()
@@ -932,7 +1093,7 @@ async def test_pausing_waiting_task_removes_it_without_downloading() -> None:
     waiting = asyncio.create_task(scheduler.run_task("waiting"))
     await wait_until(lambda: scheduler.queue_positions() == {"waiting": 1})
 
-    scheduler.pause_task("waiting")
+    await scheduler.pause_task("waiting")
     await waiting
 
     assert entered == ["active"]
@@ -1042,7 +1203,7 @@ async def test_pause_tasks_deduplicates_flags_queue_and_persistence() -> None:
     waiting = asyncio.create_task(scheduler.run_task("waiting"))
     await wait_until(lambda: scheduler.queue_positions() == {"waiting": 1})
 
-    accepted = scheduler.pause_tasks(["active", "waiting", "active"])
+    accepted = await scheduler.pause_tasks(["active", "waiting", "active"])
     await asyncio.gather(active, waiting)
 
     assert accepted == {"active", "waiting"}
@@ -1074,3 +1235,113 @@ async def test_resume_tasks_bulk_updates_and_schedules_each_once() -> None:
     assert scheduler._pause_flags["b"].is_set() is False
     assert len(repo.bulk_task_updates) == 1
     assert repo.bulk_task_updates[0][1] is TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_slow_scheduler_repository_keeps_event_loop_responsive() -> None:
+    repo = SlowQueueRepo(("task",))
+    persistence = DownloadPersistenceCoordinator(repo)
+
+    class Downloader:
+        async def download(self, _item, _should_pause):
+            return None
+
+    scheduler = DownloadScheduler(repo, Downloader(), persistence=persistence)
+    gaps: list[float] = []
+    running = True
+
+    async def heartbeat() -> None:
+        previous = asyncio.get_running_loop().time()
+        while running:
+            await asyncio.sleep(0)
+            current = asyncio.get_running_loop().time()
+            gaps.append((current - previous) * 1000)
+            previous = current
+
+    pulse = asyncio.create_task(heartbeat())
+    try:
+        await scheduler.run_task("task")
+    finally:
+        running = False
+        await pulse
+        await scheduler.shutdown()
+
+    assert max(gaps) <= 20.0
+
+
+@pytest.mark.asyncio
+async def test_scheduler_skips_duplicate_completed_item_write() -> None:
+    repo = QueueRepo(("task",))
+    item_writes = 0
+    original_update = repo.update_item_progress
+
+    def record_update(*args, **kwargs):
+        nonlocal item_writes
+        item_writes += 1
+        return original_update(*args, **kwargs)
+
+    repo.update_item_progress = record_update
+
+    class Downloader:
+        async def download(self, item, should_pause):
+            del should_pause
+            item.status = ItemStatus.COMPLETED
+
+    scheduler = DownloadScheduler(repo, Downloader())
+
+    await scheduler.run_task("task")
+
+    assert item_writes == 0
+    await scheduler.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_persistence_fault_stops_admission_and_pauses_active_tasks() -> None:
+    repo = QueueRepo(("active", "waiting"))
+    persistence = RecordingPersistence()
+    entered = asyncio.Event()
+
+    class Downloader:
+        async def download(self, _item, should_pause):
+            entered.set()
+            while not should_pause():
+                await asyncio.sleep(0)
+            raise DownloadPaused("paused")
+
+    scheduler = DownloadScheduler(
+        repo,
+        Downloader(),
+        concurrency=1,
+        persistence=persistence,
+    )
+    operation = asyncio.create_task(scheduler.run_task("active"))
+    await entered.wait()
+    waiting = asyncio.create_task(scheduler.run_task("waiting"))
+    await wait_until(lambda: scheduler.queue_positions() == {"waiting": 1})
+    assert persistence.fault_handler is not None
+    failure = RuntimeError("synthetic storage failure")
+
+    persistence.fault_handler(failure)
+
+    assert scheduler._admission_open is False
+    assert scheduler._pause_flags["active"].is_set()
+    with pytest.raises(RuntimeError) as queued_failure:
+        await asyncio.wait_for(waiting, timeout=0.1)
+    assert queued_failure.value is failure
+    assert scheduler.queue_positions() == {}
+    await operation
+    await scheduler.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drains_and_closes_persistence_without_active_tasks() -> None:
+    persistence = RecordingPersistence()
+    scheduler = DownloadScheduler(
+        QueueRepo(("task",)),
+        object(),
+        persistence=persistence,
+    )
+
+    await scheduler.shutdown()
+
+    assert persistence.events == ["drain", "close"]

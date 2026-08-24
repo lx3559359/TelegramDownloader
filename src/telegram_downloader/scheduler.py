@@ -13,6 +13,10 @@ from telegram_downloader.domain import (
     TaskRecord,
     TaskStatus,
 )
+from telegram_downloader.download_persistence import (
+    DownloadPersistence,
+    ThreadedDownloadPersistence,
+)
 from telegram_downloader.downloader import (
     DownloadPaused,
     InsufficientSpaceError,
@@ -77,6 +81,7 @@ class _QueuedOperation:
     item_ids: tuple[str, ...] | None
     dispatch_key: tuple[Any, ...]
     sequence: int
+    ready: asyncio.Future[None]
     completion: asyncio.Future[None]
     runner: asyncio.Task[None] | None = None
 
@@ -147,6 +152,7 @@ class DownloadScheduler:
         bandwidth: AsyncBandwidthLimiter | None = None,
         publish: Callable[[ApplicationEvent], None] | None = None,
         activity: OperationActivityRegistry | None = None,
+        persistence: DownloadPersistence | None = None,
     ) -> None:
         if shutdown_grace_seconds <= 0:
             raise ValueError("关闭等待时间必须大于零")
@@ -160,6 +166,7 @@ class DownloadScheduler:
         self._bandwidth = bandwidth or downloader_bandwidth or AsyncBandwidthLimiter()
         self.publish = publish or (lambda _event: None)
         self.activity = activity
+        self.persistence = persistence or ThreadedDownloadPersistence(repository)
         self._pause_flags: dict[str, asyncio.Event] = {}
         self._pause_reasons: dict[str, PauseReason] = {}
         self._disk_full_tasks: set[str] = set()
@@ -169,8 +176,13 @@ class DownloadScheduler:
         self._operations: dict[str, _QueuedOperation] = {}
         self._active_operations: dict[str, _QueuedOperation] = {}
         self._sequence = 0
+        self._enqueue_lock = asyncio.Lock()
         self._shutting_down = False
+        self._shutdown_complete = False
         self._admission_open = True
+        set_fault_handler = getattr(self.persistence, "set_fault_handler", None)
+        if callable(set_fault_handler):
+            set_fault_handler(self._handle_persistence_fault)
 
     @property
     def concurrency(self) -> int:
@@ -202,16 +214,18 @@ class DownloadScheduler:
                 self._pause_reasons.setdefault(task_id, PauseReason.SCHEDULE)
                 self._pause_flag(task_id).set()
             return set()
-        tasks = self.repository.list_paused_by_reason(PauseReason.SCHEDULE)
+        tasks = await self.persistence.execute(
+            lambda: self.repository.list_paused_by_reason(PauseReason.SCHEDULE)
+        )
         return await self.resume_tasks([task.id for task in tasks])
 
-    def recover(self) -> None:
-        self.repository.recover_interrupted()
+    async def recover(self) -> None:
+        await self.persistence.execute(self.repository.recover_interrupted)
 
-    def pause_task(self, task_id: str) -> None:
-        self.pause_tasks([task_id])
+    async def pause_task(self, task_id: str) -> None:
+        await self.pause_tasks([task_id])
 
-    def pause_tasks(self, task_ids: list[str]) -> set[str]:
+    async def pause_tasks(self, task_ids: list[str]) -> set[str]:
         ordered = tuple(dict.fromkeys(task_ids))
         for task_id in ordered:
             self._pause_flag(task_id).set()
@@ -223,17 +237,21 @@ class DownloadScheduler:
             if operation in self._pending:
                 self._pending.remove(operation)
             self._operations.pop(task_id, None)
+            if not operation.ready.done():
+                operation.ready.set_result(None)
             if not operation.completion.done():
                 operation.completion.set_result(None)
-        return self.repository.update_task_statuses(
-            list(ordered),
-            TaskStatus.PAUSED,
-            allowed={
-                TaskStatus.QUEUED,
-                TaskStatus.DOWNLOADING,
-                TaskStatus.WAITING_RETRY,
-            },
-            pause_reason=PauseReason.USER,
+        return await self.persistence.execute(
+            lambda: self.repository.update_task_statuses(
+                list(ordered),
+                TaskStatus.PAUSED,
+                allowed={
+                    TaskStatus.QUEUED,
+                    TaskStatus.DOWNLOADING,
+                    TaskStatus.WAITING_RETRY,
+                },
+                pause_reason=PauseReason.USER,
+            )
         )
 
     async def resume_task(self, task_id: str) -> None:
@@ -243,14 +261,16 @@ class DownloadScheduler:
         if self._shutting_down:
             return set()
         ordered = tuple(dict.fromkeys(task_ids))
-        accepted = self.repository.update_task_statuses(
-            list(ordered),
-            TaskStatus.QUEUED,
-            allowed={
-                TaskStatus.PAUSED,
-                TaskStatus.PARTIAL_FAILURE,
-                TaskStatus.WAITING_RETRY,
-            },
+        accepted = await self.persistence.execute(
+            lambda: self.repository.update_task_statuses(
+                list(ordered),
+                TaskStatus.QUEUED,
+                allowed={
+                    TaskStatus.PAUSED,
+                    TaskStatus.PARTIAL_FAILURE,
+                    TaskStatus.WAITING_RETRY,
+                },
+            )
         )
         scheduled = [task_id for task_id in ordered if task_id in accepted]
         for task_id in scheduled:
@@ -282,7 +302,10 @@ class DownloadScheduler:
                 return
             remaining_ids: list[str] = []
             for item_id in ordered_ids:
-                item = self.repository.get_item(item_id)
+                item = await self.persistence.execute(
+                    lambda selected=item_id: self.repository.get_item(selected),
+                    flush_item_ids=(item_id,),
+                )
                 if item.task_id != task_id:
                     raise ValueError("所选媒体项不属于当前任务")
                 if item.status is ItemStatus.QUEUED:
@@ -290,7 +313,10 @@ class DownloadScheduler:
                 elif item.status is not ItemStatus.COMPLETED:
                     raise ValueError("所选媒体项尚未处于等待下载状态")
             if not remaining_ids:
-                self.repository.recompute_task_status(task_id)
+                await self.persistence.execute(
+                    lambda: self.repository.recompute_task_status(task_id),
+                    flush_all=True,
+                )
                 return
             ordered_ids = tuple(remaining_ids)
         await self._queue_operation(task_id, ordered_ids)
@@ -312,15 +338,22 @@ class DownloadScheduler:
     def is_active(self, task_id: str) -> bool:
         return task_id in self._active_operations
 
-    def prioritize_task(self, task_id: str) -> bool:
+    async def prioritize_task(self, task_id: str) -> bool:
         operation = self._operations.get(task_id)
+        if operation is None or task_id in self._active_operations:
+            return False
+        await asyncio.shield(operation.ready)
+        operation = self._operations.get(task_id)
+        if operation is None or operation not in self._pending:
+            return False
+        dispatch_key = await self._dispatch_key(task_id, operation.sequence)
         if (
-            operation is None
+            self._operations.get(task_id) is not operation
             or task_id in self._active_operations
             or operation not in self._pending
         ):
             return False
-        operation.dispatch_key = self._dispatch_key(task_id, operation.sequence)
+        operation.dispatch_key = dispatch_key
         self._pending.sort(key=self._operation_sort_key)
         return True
 
@@ -330,11 +363,19 @@ class DownloadScheduler:
         self._admit_available()
 
     async def shutdown(self) -> None:
+        if self._shutdown_complete:
+            return
         self._shutting_down = True
-        pending = tuple(self._pending)
+        pending = tuple(
+            operation
+            for task_id, operation in self._operations.items()
+            if task_id not in self._active_operations
+        )
         self._pending.clear()
         for operation in pending:
             self._operations.pop(operation.task_id, None)
+            if not operation.ready.done():
+                operation.ready.set_result(None)
             if not operation.completion.done():
                 operation.completion.set_result(None)
 
@@ -342,39 +383,75 @@ class DownloadScheduler:
         runners = tuple(
             operation.runner for operation in active if operation.runner is not None
         )
-        if not runners:
-            return
-        for operation in active:
-            self._pause_flag(operation.task_id).set()
         try:
-            await asyncio.wait_for(
-                asyncio.gather(*runners, return_exceptions=True),
-                timeout=self.shutdown_grace_seconds,
-            )
-        except TimeoutError:
-            for runner in runners:
-                runner.cancel()
-            await asyncio.gather(*runners, return_exceptions=True)
-        await asyncio.sleep(0)
+            if runners:
+                for operation in active:
+                    self._pause_flag(operation.task_id).set()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*runners, return_exceptions=True),
+                        timeout=self.shutdown_grace_seconds,
+                    )
+                except TimeoutError:
+                    for runner in runners:
+                        runner.cancel()
+                    await asyncio.gather(*runners, return_exceptions=True)
+                await asyncio.sleep(0)
+        finally:
+            try:
+                await self.persistence.drain()
+            finally:
+                try:
+                    await self.persistence.close()
+                finally:
+                    self._shutdown_complete = True
 
     async def _queue_operation(
         self,
         task_id: str,
         item_ids: tuple[str, ...] | None,
     ) -> None:
-        loop = asyncio.get_running_loop()
-        self._sequence += 1
-        operation = _QueuedOperation(
-            task_id,
-            item_ids,
-            self._dispatch_key(task_id, self._sequence),
-            self._sequence,
-            loop.create_future(),
-        )
-        self._operations[task_id] = operation
-        self._pending.append(operation)
-        self._pending.sort(key=self._operation_sort_key)
-        self._admit_available()
+        async with self._enqueue_lock:
+            operation = self._operations.get(task_id)
+            created = operation is None
+            if operation is None:
+                loop = asyncio.get_running_loop()
+                self._sequence += 1
+                operation = _QueuedOperation(
+                    task_id,
+                    item_ids,
+                    (0, self._sequence, task_id),
+                    self._sequence,
+                    loop.create_future(),
+                    loop.create_future(),
+                )
+                self._operations[task_id] = operation
+        if created:
+            dispatch_key: tuple[Any, ...] | None = None
+            dispatch_error: BaseException | None = None
+            try:
+                dispatch_key = await self._dispatch_key(task_id, operation.sequence)
+            except BaseException as error:
+                dispatch_error = error
+            async with self._enqueue_lock:
+                if self._operations.get(task_id) is operation:
+                    if dispatch_error is not None:
+                        self._operations.pop(task_id, None)
+                        if not operation.completion.done():
+                            operation.completion.set_exception(dispatch_error)
+                    elif self._shutting_down:
+                        self._operations.pop(task_id, None)
+                        if not operation.completion.done():
+                            operation.completion.set_result(None)
+                    else:
+                        if dispatch_key is None:
+                            raise RuntimeError("任务调度键未初始化")
+                        operation.dispatch_key = dispatch_key
+                        self._pending.append(operation)
+                        self._pending.sort(key=self._operation_sort_key)
+                        self._admit_available()
+                if not operation.ready.done():
+                    operation.ready.set_result(None)
         await asyncio.shield(operation.completion)
 
     def _admit_available(self) -> None:
@@ -405,7 +482,9 @@ class DownloadScheduler:
     async def _perform_active(self, operation: _QueuedOperation) -> None:
         clear_priority = getattr(self.repository, "clear_task_priority", None)
         if clear_priority is not None:
-            clear_priority(operation.task_id)
+            await self.persistence.execute(
+                lambda: clear_priority(operation.task_id)
+            )
         try:
             if operation.item_ids is None:
                 await self._execute_task(operation.task_id)
@@ -446,47 +525,55 @@ class DownloadScheduler:
     def _operation_sort_key(operation: _QueuedOperation) -> tuple[Any, ...]:
         return (*operation.dispatch_key, operation.sequence)
 
-    def _dispatch_key(self, task_id: str, sequence: int) -> tuple[Any, ...]:
+    async def _dispatch_key(self, task_id: str, sequence: int) -> tuple[Any, ...]:
         dispatch_key = getattr(self.repository, "task_dispatch_key", None)
         if dispatch_key is None:
             return (0, sequence, task_id)
-        return tuple(dispatch_key(task_id))
+        return await self.persistence.execute(
+            lambda: tuple(dispatch_key(task_id))
+        )
 
     async def _execute_task(self, task_id: str) -> None:
         pause_flag = self._pause_flag(task_id)
-        self.repository.update_task_status(task_id, TaskStatus.DOWNLOADING)
+        await self._update_task_status(task_id, TaskStatus.DOWNLOADING)
         states = {
             ItemStatus.QUEUED,
             ItemStatus.PAUSED,
             ItemStatus.WAITING_RETRY,
             ItemStatus.FAILED,
         }
-        items = self.repository.list_items(task_id, states)
+        items = await self.persistence.execute(
+            lambda: self.repository.list_items(task_id, states),
+            flush_all=True,
+        )
         results = await asyncio.gather(
             *(self._guarded_item(task_id, item, pause_flag) for item in items)
         )
         if any(status is ItemStatus.PAUSED for status in results):
             reason = self._pause_reasons.pop(task_id, PauseReason.USER)
-            self.repository.update_task_status(
+            await self._update_task_status(
                 task_id,
                 TaskStatus.PAUSED,
                 pause_reason=reason,
             )
             self._publish_disk_full(task_id)
         elif any(status is ItemStatus.FAILED for status in results):
-            failed = self.repository.list_items(task_id, {ItemStatus.FAILED})
+            failed = await self.persistence.execute(
+                lambda: self.repository.list_items(task_id, {ItemStatus.FAILED}),
+                flush_all=True,
+            )
             reason = next(
                 (item.last_error for item in failed if item.last_error),
                 "部分文件下载失败",
             )
-            self.repository.update_task_status(
+            await self._update_task_status(
                 task_id,
                 TaskStatus.PARTIAL_FAILURE,
                 reason,
             )
             self._publish_terminal(EventKind.DOWNLOAD_FAILED, task_id)
         else:
-            self.repository.update_task_status(task_id, TaskStatus.COMPLETED)
+            await self._update_task_status(task_id, TaskStatus.COMPLETED)
             self._publish_terminal(EventKind.DOWNLOAD_COMPLETED, task_id)
 
     async def _execute_items(
@@ -494,7 +581,10 @@ class DownloadScheduler:
         task_id: str,
         item_ids: tuple[str, ...],
     ) -> None:
-        items = [self.repository.get_item(item_id) for item_id in item_ids]
+        items = await self.persistence.execute(
+            lambda: [self.repository.get_item(item_id) for item_id in item_ids],
+            flush_all=True,
+        )
         if any(item.task_id != task_id for item in items):
             raise ValueError("所选媒体项不属于当前任务")
         if any(item.status is not ItemStatus.QUEUED for item in items):
@@ -502,20 +592,23 @@ class DownloadScheduler:
 
         pause_flag = self._pause_flag(task_id)
         pause_flag.clear()
-        self.repository.update_task_status(task_id, TaskStatus.DOWNLOADING)
+        await self._update_task_status(task_id, TaskStatus.DOWNLOADING)
         results = await asyncio.gather(
             *(self._guarded_item(task_id, item, pause_flag) for item in items)
         )
         if any(status is ItemStatus.PAUSED for status in results):
             reason = self._pause_reasons.pop(task_id, PauseReason.USER)
-            self.repository.update_task_status(
+            await self._update_task_status(
                 task_id,
                 TaskStatus.PAUSED,
                 pause_reason=reason,
             )
             self._publish_disk_full(task_id)
         else:
-            terminal = self.repository.recompute_task_status(task_id)
+            terminal = await self.persistence.execute(
+                lambda: self.repository.recompute_task_status(task_id),
+                flush_all=True,
+            )
             if terminal is TaskStatus.COMPLETED:
                 self._publish_terminal(EventKind.DOWNLOAD_COMPLETED, task_id)
             elif terminal is TaskStatus.PARTIAL_FAILURE:
@@ -543,35 +636,35 @@ class DownloadScheduler:
         initial_retries = getattr(item, "retry_count", 0)
         while True:
             if pause_flag.is_set() or self._shutting_down:
-                self._set_item_state(task_id, item.id, ItemStatus.PAUSED)
+                await self._set_item_state(task_id, item.id, ItemStatus.PAUSED)
                 return ItemStatus.PAUSED
             try:
                 await self.downloader.download(
                     item,
                     should_pause=lambda: pause_flag.is_set() or self._shutting_down,
                 )
-                self._set_item_state(task_id, item.id, ItemStatus.COMPLETED)
+                await self._set_item_state(task_id, item.id, ItemStatus.COMPLETED)
                 return ItemStatus.COMPLETED
             except FloodWaitError as error:
-                self._set_item_state(
+                await self._set_item_state(
                     task_id,
                     item.id,
                     ItemStatus.WAITING_RETRY,
                     error=str(error),
                 )
-                self.repository.update_task_status(
+                await self._update_task_status(
                     task_id,
                     TaskStatus.WAITING_RETRY,
                     str(error),
                 )
                 await self.sleep(error.seconds)
                 if not pause_flag.is_set() and not self._shutting_down:
-                    self.repository.update_task_status(task_id, TaskStatus.DOWNLOADING)
+                    await self._update_task_status(task_id, TaskStatus.DOWNLOADING)
             except (TransientNetworkError, MediaReferenceExpired) as error:
                 transient_attempts += 1
                 retry_count = initial_retries + transient_attempts
                 if transient_attempts >= self.retry.attempts:
-                    self._set_item_state(
+                    await self._set_item_state(
                         task_id,
                         item.id,
                         ItemStatus.FAILED,
@@ -579,14 +672,14 @@ class DownloadScheduler:
                         error=str(error),
                     )
                     return ItemStatus.FAILED
-                self._set_item_state(
+                await self._set_item_state(
                     task_id,
                     item.id,
                     ItemStatus.WAITING_RETRY,
                     retry_count=retry_count,
                     error=str(error),
                 )
-                self.repository.update_task_status(
+                await self._update_task_status(
                     task_id,
                     TaskStatus.WAITING_RETRY,
                     str(error),
@@ -594,11 +687,11 @@ class DownloadScheduler:
                 delay = self.retry.base_delay * 2 ** (transient_attempts - 1)
                 await self.sleep(delay)
                 if not pause_flag.is_set() and not self._shutting_down:
-                    self.repository.update_task_status(task_id, TaskStatus.DOWNLOADING)
+                    await self._update_task_status(task_id, TaskStatus.DOWNLOADING)
             except InsufficientSpaceError as error:
                 self._pause_reasons[task_id] = PauseReason.USER
                 self._disk_full_tasks.add(task_id)
-                self._set_item_state(
+                await self._set_item_state(
                     task_id,
                     item.id,
                     ItemStatus.PAUSED,
@@ -606,7 +699,7 @@ class DownloadScheduler:
                 )
                 return ItemStatus.PAUSED
             except DownloadPaused as error:
-                self._set_item_state(
+                await self._set_item_state(
                     task_id,
                     item.id,
                     ItemStatus.PAUSED,
@@ -614,10 +707,10 @@ class DownloadScheduler:
                 )
                 return ItemStatus.PAUSED
             except asyncio.CancelledError:
-                self._set_item_state(task_id, item.id, ItemStatus.PAUSED)
+                await self._set_item_state(task_id, item.id, ItemStatus.PAUSED)
                 raise
             except Exception as error:
-                self._set_item_state(
+                await self._set_item_state(
                     task_id,
                     item.id,
                     ItemStatus.FAILED,
@@ -625,24 +718,71 @@ class DownloadScheduler:
                 )
                 return ItemStatus.FAILED
 
-    def _set_item_state(
+    async def _set_item_state(
         self,
-        task_id: str,
+        _task_id: str,
         item_id: str,
         status: ItemStatus,
         *,
         error: str | None = None,
         retry_count: int | None = None,
     ) -> None:
-        current = self.repository.get_item(item_id)
-        downloaded = getattr(current, "downloaded_bytes", 0)
-        self.repository.update_item_progress(
-            item_id,
-            downloaded,
-            status,
-            error=error,
-            retry_count=retry_count,
+        current = await self.persistence.execute(
+            lambda: self.repository.get_item(item_id),
+            flush_item_ids=(item_id,),
         )
+        downloaded = getattr(current, "downloaded_bytes", 0)
+        if (
+            current.status is status
+            and getattr(current, "last_error", None) == error
+            and (
+                retry_count is None
+                or getattr(current, "retry_count", 0) == retry_count
+            )
+        ):
+            return
+        await self.persistence.execute(
+            lambda: self.repository.update_item_progress(
+                item_id,
+                downloaded,
+                status,
+                error=error,
+                retry_count=retry_count,
+            ),
+            flush_item_ids=(item_id,),
+        )
+
+    async def _update_task_status(
+        self,
+        task_id: str,
+        status: TaskStatus,
+        error: str | None = None,
+        *,
+        pause_reason: PauseReason | None = None,
+    ) -> None:
+        await self.persistence.execute(
+            lambda: self.repository.update_task_status(
+                task_id,
+                status,
+                error,
+                pause_reason=pause_reason,
+            )
+        )
+
+    def _handle_persistence_fault(self, error: BaseException) -> None:
+        self._admission_open = False
+        pending = tuple(self._pending)
+        self._pending.clear()
+        for operation in pending:
+            if self._operations.get(operation.task_id) is operation:
+                self._operations.pop(operation.task_id, None)
+            if not operation.ready.done():
+                operation.ready.set_result(None)
+            if not operation.completion.done():
+                operation.completion.set_exception(error)
+        for task_id in self.active_task_ids:
+            self._pause_flag(task_id).set()
+            self._publish_terminal(EventKind.DOWNLOAD_FAILED, task_id)
 
     def _pause_flag(self, task_id: str) -> asyncio.Event:
         return self._pause_flags.setdefault(task_id, asyncio.Event())
