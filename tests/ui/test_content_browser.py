@@ -18,8 +18,10 @@ from telegram_downloader.content import (
     DialogKind,
     SearchResult,
     SearchScope,
+    SearchSelectionIntent,
     SearchSession,
     SearchStatus,
+    SelectionMode,
 )
 from telegram_downloader.content_progress import SearchProgress, SearchResultBatch
 from telegram_downloader.domain import MediaKind, ScanFilters
@@ -662,6 +664,55 @@ def test_progressive_batches_show_first_immediately_and_coalesce_latest(qtbot) -
     )
     assert page.result_model.rowCount() == 2
     assert page.queue_button.isEnabled() is False
+
+
+def prepared_selectable_page(qtbot, now: datetime) -> ContentBrowserPage:
+    page = ContentBrowserPage()
+    qtbot.addWidget(page)
+    page.set_logged_in(True)
+    page.set_dialogs([dialog(now)])
+    page.dialog_list.setCurrentIndex(page.dialog_model.index(0, 0))
+    page.set_active_search(
+        replace(
+            session(now),
+            status=SearchStatus.COMPLETED,
+            exhausted=True,
+        )
+    )
+    page.set_results(
+        [
+            result(now, "r1", 2),
+            result(now, "r2", 1),
+        ]
+    )
+    return page
+
+
+def test_single_selection_intents_merge_by_result_id(qtbot) -> None:
+    now = datetime(2026, 8, 24, tzinfo=UTC)
+    page = prepared_selectable_page(qtbot, now)
+    intents: list[SearchSelectionIntent] = []
+    page.selection_intent_requested.connect(intents.append)
+
+    page._selection_changed("r1", True)
+    page._selection_changed("r1", False)
+    page._selection_changed("r2", True)
+    qtbot.waitUntil(lambda: len(intents) == 1, timeout=500)
+
+    assert intents[0].mode is SelectionMode.PATCH
+    assert dict(intents[0].final_changes) == {"r1": False, "r2": True}
+
+
+def test_select_all_emits_one_bulk_intent(qtbot) -> None:
+    now = datetime(2026, 8, 24, tzinfo=UTC)
+    page = prepared_selectable_page(qtbot, now)
+    intents: list[SearchSelectionIntent] = []
+    page.selection_intent_requested.connect(intents.append)
+
+    qtbot.mouseClick(page.select_all_button, Qt.MouseButton.LeftButton)
+
+    assert len(intents) == 1
+    assert intents[0].mode is SelectionMode.SELECT_ALL
 
 
 def test_older_generation_batch_cannot_replace_newer_results(qtbot) -> None:

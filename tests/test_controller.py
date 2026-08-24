@@ -23,8 +23,12 @@ from telegram_downloader.content import (
     AccountProfile,
     ContentSearchQuery,
     SearchScope,
+    SearchSelectionIntent,
     SearchSession,
+    SearchSnapshot,
     SearchStatus,
+    SelectionCommit,
+    SelectionMode,
 )
 from telegram_downloader.content_progress import DialogSyncProgress, SearchProgress
 from telegram_downloader.controller import AppController
@@ -3112,6 +3116,9 @@ class ContentPageFake:
         self.results = []
         self.batches = []
         self.active_search_id = None
+        self.batch_generation = None
+        self.selection_revision = 0
+        self.history_busy = []
         self.busy = []
         self.search_progress = []
         self.sync_states = []
@@ -3134,6 +3141,7 @@ class ContentPageFake:
 
     def set_active_search(self, value):
         self.active_search_id = value.id if value else None
+        self.batch_generation = getattr(value, "generation", None)
 
     def set_results(self, value):
         self.results = value
@@ -3157,6 +3165,9 @@ class ContentPageFake:
 
     def set_queue_busy(self, busy):
         self.queue_busy.append(busy)
+
+    def set_history_busy(self, busy):
+        self.history_busy.append(busy)
 
     def set_thumbnail(self, result_id, path):
         self.thumbnails[result_id] = path
@@ -3189,6 +3200,161 @@ class ContentWindowFake:
 
     def showMessage(self, message, _timeout):
         self.message = message
+
+
+@pytest.mark.asyncio
+async def test_selection_writer_preserves_intent_order() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[int] = []
+
+    class Browser:
+        async def persist_selection(self, intent):
+            calls.append(intent.revision)
+            if intent.revision == 1:
+                entered.set()
+                await release.wait()
+            return SelectionCommit(
+                intent.search_id,
+                intent.generation,
+                intent.revision,
+                1,
+            )
+
+    controller = AppController.for_test(
+        content_browser=Browser(),
+        window=ContentWindowFake(),
+    )
+    first = SearchSelectionIntent(
+        "s1",
+        1,
+        1,
+        SelectionMode.SELECT_ALL,
+    )
+    second = SearchSelectionIntent(
+        "s1",
+        1,
+        2,
+        SelectionMode.INVERT,
+    )
+    controller.submit_content_selection(first)
+    await entered.wait()
+    controller.submit_content_selection(second)
+    release.set()
+    await controller._selection_persist_task
+    assert calls == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_selection_failure_reconciles_only_matching_revision() -> None:
+    now = datetime(2026, 8, 24, tzinfo=UTC)
+    query = ContentSearchQuery(
+        "资料",
+        ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 10),
+    )
+    session = SearchSession(
+        "s1",
+        "a1",
+        "-1001",
+        "资料群",
+        query,
+        SearchStatus.COMPLETED,
+        1,
+        None,
+        True,
+        0,
+        now,
+        now,
+    )
+
+    class Browser:
+        account = AccountProfile("a1", "账号")
+
+        async def persist_selection(self, _intent):
+            raise OSError("catalog unavailable")
+
+        async def load_search_snapshot(self, _search_id):
+            return SearchSnapshot(session, ())
+
+    window = ContentWindowFake()
+    window.content_page.set_active_search(session)
+    window.content_page.selection_revision = 1
+    controller = AppController.for_test(
+        content_browser=Browser(),
+        window=window,
+    )
+    intent = SearchSelectionIntent(
+        "s1",
+        1,
+        1,
+        SelectionMode.SELECT_ALL,
+    )
+
+    controller.submit_content_selection(intent)
+    await controller._selection_persist_task
+
+    assert window.content_page.batches[-1].results == ()
+    assert window.content_page.errors[-1]
+    assert "catalog unavailable" not in window.content_page.errors[-1]
+
+    window.content_page.selection_revision = 3
+    controller.submit_content_selection(
+        replace(intent, revision=2, mode=SelectionMode.INVERT)
+    )
+    await controller._selection_persist_task
+    assert len(window.content_page.batches) == 1
+
+
+@pytest.mark.asyncio
+async def test_history_open_latest_request_wins() -> None:
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    now = datetime(2026, 8, 24, tzinfo=UTC)
+    query = ContentSearchQuery(
+        "资料",
+        ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 10),
+    )
+
+    class Browser:
+        account = AccountProfile("a1", "账号")
+
+        async def load_search_snapshot(self, search_id):
+            if search_id == "first":
+                first_started.set()
+                await release_first.wait()
+            return SearchSnapshot(
+                SearchSession(
+                    search_id,
+                    "a1",
+                    "-1001",
+                    "资料群",
+                    query,
+                    SearchStatus.COMPLETED,
+                    1,
+                    None,
+                    True,
+                    0,
+                    now,
+                    now,
+                ),
+                (),
+            )
+
+        async def list_sessions_async(self):
+            return []
+
+    window = ContentWindowFake()
+    controller = AppController.for_test(
+        content_browser=Browser(),
+        window=window,
+    )
+    first = asyncio.create_task(controller.open_content_history("first"))
+    await first_started.wait()
+    await controller.open_content_history("second")
+    release_first.set()
+    await first
+    assert window.content_page.active_search_id == "second"
+    assert window.content_page.history_busy == [True, True, False]
 
 
 @pytest.mark.asyncio
@@ -4410,6 +4576,7 @@ async def test_shutdown_cancels_content_operations_before_services() -> None:
     started = {
         "sync": asyncio.Event(),
         "search": asyncio.Event(),
+        "selection": asyncio.Event(),
         "thumbnail": asyncio.Event(),
     }
     order = []
@@ -4433,6 +4600,10 @@ async def test_shutdown_cancels_content_operations_before_services() -> None:
 
         async def load_thumbnail(self, result_id):
             started["thumbnail"].set()
+            await asyncio.Event().wait()
+
+        async def persist_selection(self, _intent):
+            started["selection"].set()
             await asyncio.Event().wait()
 
         def list_sessions(self):
@@ -4460,6 +4631,14 @@ async def test_shutdown_cancels_content_operations_before_services() -> None:
     )
     sync_task = asyncio.create_task(controller.refresh_content_dialogs())
     search_task = asyncio.create_task(controller.search_content("-1001", object()))
+    controller.submit_content_selection(
+        SearchSelectionIntent(
+            "search-1",
+            1,
+            1,
+            SelectionMode.SELECT_ALL,
+        )
+    )
     controller.request_thumbnail("result-1")
     await asyncio.gather(*(event.wait() for event in started.values()))
 
@@ -4467,6 +4646,8 @@ async def test_shutdown_cancels_content_operations_before_services() -> None:
 
     assert sync_task.cancelled()
     assert search_task.cancelled()
+    assert controller._selection_persist_task is None
+    assert not controller._selection_intents
     assert not controller._thumbnail_tasks
     assert order == ["scheduler", "gateway", "offline"]
 

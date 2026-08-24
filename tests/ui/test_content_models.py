@@ -18,6 +18,7 @@ from telegram_downloader.content import (
     SearchScope,
     SearchSession,
     SearchStatus,
+    SelectionMode,
 )
 from telegram_downloader.domain import MediaKind, ScanFilters
 from telegram_downloader.ui.content_models import (
@@ -440,3 +441,17 @@ def test_result_model_rejects_duplicate_ids_without_changing_rows() -> None:
         "result-0",
         "result-1",
     ]
+
+
+def test_bulk_selection_updates_model_once_without_per_row_signal(qtbot) -> None:
+    model = SearchResultTableModel()
+    model.apply_results(many_results(10_000))
+    changes = QSignalSpy(model.dataChanged)
+    intents = QSignalSpy(model.selection_changed)
+
+    changed = model.apply_selection_mode(SelectionMode.SELECT_ALL)
+
+    assert changed == 10_000
+    assert changes.count() == 1
+    assert intents.count() == 0
+    assert len(model.selected_results()) == 10_000

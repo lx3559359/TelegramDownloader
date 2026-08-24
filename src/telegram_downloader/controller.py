@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import logging
 import os
+from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import replace
@@ -28,6 +29,7 @@ from telegram_downloader.content import (
     ContentSearchQuery,
     SearchResult,
     SearchScope,
+    SearchSelectionIntent,
 )
 from telegram_downloader.content_browser import NothingToQueueError
 from telegram_downloader.content_progress import (
@@ -604,6 +606,10 @@ class AppController:
         self._settings_dialog: Any | None = None
         self._dialog_sync_task: asyncio.Task[Any] | None = None
         self._content_search_task: asyncio.Task[Any] | None = None
+        self._selection_intents: deque[SearchSelectionIntent] = deque()
+        self._selection_persist_task: asyncio.Task[None] | None = None
+        self._selection_committed_revisions: dict[tuple[str, int], int] = {}
+        self._history_generation = 0
         self._subscription_probe_task: asyncio.Task[Any] | None = None
         self._subscription_actions_active = 0
         self._thumbnail_tasks: dict[str, asyncio.Task[Any]] = {}
@@ -1528,7 +1534,7 @@ class AppController:
                 )
             else:
                 page.set_results(results)
-            page.set_sessions(self.content_browser.list_sessions())
+            page.set_sessions(await self._list_content_sessions_async())
             page.show_error(session.last_error or "")
             succeeded = True
         except asyncio.CancelledError:
@@ -1539,7 +1545,7 @@ class AppController:
             page.show_error(self._safe_error(error))
         finally:
             if not succeeded and search_id is not None:
-                self._reload_content_search(search_id)
+                await self._reload_content_search_async(search_id)
             page.set_search_busy(False)
             page.set_search_progress(None)
             if self._content_search_task is current:
@@ -1589,7 +1595,7 @@ class AppController:
                 )
             else:
                 page.set_results(results)
-            page.set_sessions(self.content_browser.list_sessions())
+            page.set_sessions(await self._list_content_sessions_async())
             page.show_error(session.last_error or "")
             succeeded = True
         except asyncio.CancelledError:
@@ -1600,7 +1606,7 @@ class AppController:
             page.show_error(self._safe_error(error))
         finally:
             if not succeeded:
-                self._reload_content_search(search_id)
+                await self._reload_content_search_async(search_id)
             page.set_search_busy(False)
             page.set_search_progress(None)
             if self._content_search_task is current:
@@ -1640,6 +1646,113 @@ class AppController:
             self._content_page().show_error(self._safe_error(error))
             results = self.content_browser.list_results(search_id)
         self._content_page().set_results(results)
+
+    def submit_content_selection(self, intent: SearchSelectionIntent) -> None:
+        self._selection_intents.append(intent)
+        task = self._selection_persist_task
+        if task is None or task.done():
+            self._selection_persist_task = self._spawn_background(
+                self._drain_content_selection()
+            )
+
+    async def _drain_content_selection(self) -> None:
+        page = self._content_page()
+        try:
+            while self._selection_intents:
+                intent = self._selection_intents.popleft()
+                browser = self.content_browser
+                if browser is None:
+                    return
+                account = getattr(browser, "account", None)
+                try:
+                    commit = await browser.persist_selection(intent)
+                    if (
+                        commit.search_id,
+                        commit.generation,
+                        commit.revision,
+                    ) != (
+                        intent.search_id,
+                        intent.generation,
+                        intent.revision,
+                    ):
+                        raise RuntimeError("选择写入返回了不匹配的操作代次")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    _LOGGER.warning(
+                        "content selection persistence failed revision=%d error=%s",
+                        intent.revision,
+                        type(error).__name__,
+                    )
+                    try:
+                        snapshot = await browser.load_search_snapshot(
+                            intent.search_id
+                        )
+                    except Exception as reload_error:
+                        page.show_error(self._safe_error(reload_error))
+                        continue
+                    if (
+                        getattr(browser, "account", None) == account
+                        and getattr(page, "active_search_id", None)
+                        == intent.search_id
+                        and getattr(page, "batch_generation", None)
+                        == intent.generation
+                        and getattr(page, "selection_revision", None)
+                        == intent.revision
+                    ):
+                        page.apply_search_batch(
+                            SearchResultBatch(
+                                snapshot.session.id,
+                                snapshot.session.generation,
+                                snapshot.results,
+                                stable=True,
+                            )
+                        )
+                        page.show_error(self._safe_error(error))
+                    continue
+                self._selection_committed_revisions[
+                    (intent.search_id, intent.generation)
+                ] = intent.revision
+        finally:
+            self._selection_persist_task = None
+
+    async def open_content_history(self, search_id: str) -> None:
+        if self.content_browser is None:
+            return
+        self._history_generation += 1
+        generation = self._history_generation
+        browser = self.content_browser
+        account = getattr(browser, "account", None)
+        page = self._content_page()
+        set_history_busy = getattr(page, "set_history_busy", None)
+        if callable(set_history_busy):
+            set_history_busy(True)
+        try:
+            snapshot, sessions = await asyncio.gather(
+                browser.load_search_snapshot(search_id),
+                self._list_content_sessions_async(),
+            )
+            if (
+                generation != self._history_generation
+                or browser is not self.content_browser
+                or getattr(browser, "account", None) != account
+            ):
+                return
+            page.set_sessions(sessions)
+            page.set_active_search(snapshot.session)
+            page.apply_search_batch(
+                SearchResultBatch(
+                    snapshot.session.id,
+                    snapshot.session.generation,
+                    snapshot.results,
+                    stable=True,
+                )
+            )
+        finally:
+            if generation == self._history_generation and callable(
+                set_history_busy
+            ):
+                set_history_busy(False)
 
     async def queue_content_selection(self, search_id: str) -> None:
         page = self._content_page()
@@ -2995,6 +3108,14 @@ class AppController:
         elif hasattr(page, "set_results"):
             page.set_results([])
 
+    async def _list_content_sessions_async(self) -> list[Any]:
+        if self.content_browser is None:
+            return []
+        async_list = getattr(self.content_browser, "list_sessions_async", None)
+        if callable(async_list):
+            return list(await async_list())
+        return list(await asyncio.to_thread(self.content_browser.list_sessions))
+
     def _reload_content_search(self, search_id: str) -> None:
         if self.content_browser is None:
             return
@@ -3008,11 +3129,28 @@ class AppController:
         except (KeyError, StopIteration):
             self._reload_content_history()
 
+    async def _reload_content_search_async(self, search_id: str) -> None:
+        if self.content_browser is None:
+            return
+        load_snapshot = getattr(
+            self.content_browser,
+            "load_search_snapshot",
+            None,
+        )
+        if callable(load_snapshot):
+            await self.open_content_history(search_id)
+            return
+        self._reload_content_search(search_id)
+
     async def _cancel_content_operations(self) -> None:
         current = asyncio.current_task()
+        self._selection_intents.clear()
+        self._selection_committed_revisions.clear()
+        self._history_generation += 1
         tracked = [
             self._dialog_sync_task,
             self._content_search_task,
+            self._selection_persist_task,
             *self._thumbnail_tasks.values(),
         ]
         pending = [
@@ -3024,6 +3162,7 @@ class AppController:
             await asyncio.gather(*pending, return_exceptions=True)
         self._dialog_sync_task = None
         self._content_search_task = None
+        self._selection_persist_task = None
         self._thumbnail_tasks.clear()
 
     def _start_task(self, task_id: str) -> None:

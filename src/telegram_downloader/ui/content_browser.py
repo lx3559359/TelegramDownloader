@@ -36,8 +36,10 @@ from telegram_downloader.content import (
     ContentDialog,
     SearchResult,
     SearchScope,
+    SearchSelectionIntent,
     SearchSession,
     SearchStatus,
+    SelectionMode,
 )
 from telegram_downloader.content_progress import SearchProgress, SearchResultBatch
 from telegram_downloader.domain import MediaKind
@@ -73,7 +75,7 @@ class ContentBrowserPage(QWidget):
     history_open_requested = Signal(str)
     history_delete_requested = Signal(str)
     history_clear_requested = Signal()
-    selection_changed = Signal(str, str, bool)
+    selection_intent_requested = Signal(object)
     queue_requested = Signal(str)
     thumbnail_requested = Signal(str)
     preview_requested = Signal(str)
@@ -93,6 +95,7 @@ class ContentBrowserPage(QWidget):
         self._connection_action_busy = False
         self._connection_retryable = False
         self._queue_busy = False
+        self._history_busy = False
         self._batch_search_id: str | None = None
         self._batch_generation: int | None = None
         self._results_stable = True
@@ -101,6 +104,12 @@ class ContentBrowserPage(QWidget):
         self._result_batch_timer.setSingleShot(True)
         self._result_batch_timer.setInterval(33)
         self._result_batch_timer.timeout.connect(self._flush_result_batch)
+        self._selection_changes: dict[str, bool] = {}
+        self._selection_revision = 0
+        self._selection_timer = QTimer(self)
+        self._selection_timer.setSingleShot(True)
+        self._selection_timer.setInterval(50)
+        self._selection_timer.timeout.connect(self._flush_selection_changes)
         self._thumbnail_requested_ids: set[str] = set()
         self._preview_dialogs: set[MediaPreviewDialog] = set()
         self._build_ui()
@@ -490,6 +499,9 @@ class ContentBrowserPage(QWidget):
         if (self._batch_search_id, self._batch_generation) != key:
             self._result_batch_timer.stop()
             self._pending_result_batch = None
+            self._selection_timer.stop()
+            self._selection_changes.clear()
+            self._selection_revision = 0
         self.active_session = session
         self.active_search_id = session.id if session is not None else None
         self._batch_search_id, self._batch_generation = key
@@ -618,6 +630,19 @@ class ContentBrowserPage(QWidget):
         )
         self._refresh_actions()
 
+    def set_history_busy(self, busy: bool) -> None:
+        self._history_busy = busy
+        self.history_table.setEnabled(not busy)
+        self._refresh_actions()
+
+    @property
+    def batch_generation(self) -> int | None:
+        return self._batch_generation
+
+    @property
+    def selection_revision(self) -> int:
+        return self._selection_revision
+
     def set_search_progress(self, progress: SearchProgress | None) -> None:
         if progress is None:
             if not self._search_busy:
@@ -740,47 +765,63 @@ class ContentBrowserPage(QWidget):
         )
 
     def _selection_changed(self, result_id: str, selected: bool) -> None:
-        self.results = [
-            self.result_model.result_at(row)
-            for row in range(self.result_model.rowCount())
-        ]
+        self._selection_changes[result_id] = selected
+        self._sync_results_from_model()
+        if not self._selection_timer.isActive():
+            self._selection_timer.start()
+
+    def _sync_results_from_model(self) -> None:
+        self.results = list(self.result_model.results())
         self._update_selection_summary()
         self._refresh_actions()
-        if self.active_search_id:
-            self.selection_changed.emit(self.active_search_id, result_id, selected)
+
+    def _flush_selection_changes(self) -> None:
+        self._selection_timer.stop()
+        changes = tuple(self._selection_changes.items())
+        self._selection_changes.clear()
+        if (
+            not changes
+            or self.active_search_id is None
+            or self._batch_generation is None
+        ):
+            return
+        self._selection_revision += 1
+        self.selection_intent_requested.emit(
+            SearchSelectionIntent(
+                self.active_search_id,
+                self._batch_generation,
+                self._selection_revision,
+                SelectionMode.PATCH,
+                changes,
+            )
+        )
 
     def _select_all(self) -> None:
-        for row in range(self.result_model.rowCount()):
-            index = self.result_model.index(row, 0)
-            if self.result_model.flags(index) & Qt.ItemFlag.ItemIsUserCheckable:
-                self.result_model.setData(
-                    index,
-                    Qt.CheckState.Checked,
-                    Qt.ItemDataRole.CheckStateRole,
-                )
+        self._flush_selection_changes()
+        if self.result_model.apply_selection_mode(SelectionMode.SELECT_ALL) == 0:
+            return
+        self._sync_results_from_model()
+        self._emit_bulk_selection(SelectionMode.SELECT_ALL)
 
     def _invert_selection(self) -> None:
-        for row in range(self.result_model.rowCount()):
-            index = self.result_model.index(row, 0)
-            if not (
-                self.result_model.flags(index)
-                & Qt.ItemFlag.ItemIsUserCheckable
-            ):
-                continue
-            current = self.result_model.data(
-                index,
-                Qt.ItemDataRole.CheckStateRole,
+        self._flush_selection_changes()
+        if self.result_model.apply_selection_mode(SelectionMode.INVERT) == 0:
+            return
+        self._sync_results_from_model()
+        self._emit_bulk_selection(SelectionMode.INVERT)
+
+    def _emit_bulk_selection(self, mode: SelectionMode) -> None:
+        if self.active_search_id is None or self._batch_generation is None:
+            return
+        self._selection_revision += 1
+        self.selection_intent_requested.emit(
+            SearchSelectionIntent(
+                self.active_search_id,
+                self._batch_generation,
+                self._selection_revision,
+                mode,
             )
-            requested = (
-                Qt.CheckState.Unchecked
-                if current == Qt.CheckState.Checked
-                else Qt.CheckState.Checked
-            )
-            self.result_model.setData(
-                index,
-                requested,
-                Qt.ItemDataRole.CheckStateRole,
-            )
+        )
 
     def _emit_queue(self) -> None:
         if self.active_search_id is not None:
@@ -898,12 +939,12 @@ class ContentBrowserPage(QWidget):
             and self._logged_in
         )
         self.load_more_button.setVisible(can_load)
-        self.history_table.setEnabled(True)
+        self.history_table.setEnabled(not self._history_busy)
         self.history_delete_button.setEnabled(
-            self._selected_history_id() is not None
+            not self._history_busy and self._selected_history_id() is not None
         )
         self.history_clear_button.setEnabled(
-            self.history_model.rowCount() > 0
+            not self._history_busy and self.history_model.rowCount() > 0
         )
 
     @staticmethod

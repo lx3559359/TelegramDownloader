@@ -20,6 +20,7 @@ from telegram_downloader.content import (
     SearchResult,
     SearchScope,
     SearchSession,
+    SelectionMode,
 )
 from telegram_downloader.domain import MediaKind
 
@@ -514,6 +515,31 @@ class SearchResultTableModel(QAbstractTableModel):
 
     def selected_results(self) -> tuple[SearchResult, ...]:
         return tuple(item for item in self._results if item.selected)
+
+    def apply_selection_mode(self, mode: SelectionMode) -> int:
+        if mode not in (SelectionMode.SELECT_ALL, SelectionMode.INVERT):
+            raise ValueError("批量选择模式无效")
+        changed_rows: list[int] = []
+        for row, item in enumerate(self._results):
+            if not item.available or item.queued:
+                selected = False
+            else:
+                selected = (
+                    True
+                    if mode is SelectionMode.SELECT_ALL
+                    else not item.selected
+                )
+            if item.selected == selected:
+                continue
+            self._results[row] = replace(item, selected=selected)
+            changed_rows.append(row)
+        for first, last in self._ranges(changed_rows):
+            self.dataChanged.emit(
+                self.index(first, 0),
+                self.index(last, 0),
+                [Qt.ItemDataRole.CheckStateRole],
+            )
+        return len(changed_rows)
 
     def _fallback_icon(self, kind: MediaKind) -> QIcon:
         icon = self._fallback_icons.get(kind)
