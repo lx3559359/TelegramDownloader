@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -26,7 +27,11 @@ from telegram_downloader.content_browser import (
     NothingToQueueError,
     SearchRetryPolicy,
 )
-from telegram_downloader.content_progress import DialogSyncProgress, SearchProgress
+from telegram_downloader.content_progress import (
+    DialogSyncProgress,
+    SearchProgress,
+    SearchResultBatch,
+)
 from telegram_downloader.domain import (
     MediaItem,
     MediaKind,
@@ -1610,6 +1615,104 @@ async def test_direct_hits_emit_before_blocked_album_expansion(tmp_path: Path) -
     ]
     assert batches[-1].stable is True
     assert batches[-1].search_id == session.id
+
+
+@pytest.mark.asyncio
+async def test_search_catalog_work_does_not_block_event_loop(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 8, 24, tzinfo=UTC)
+    gateway = FakeGateway(AccountProfile("a1", "账号"))
+    service = await prepared_online_service(tmp_path, now, gateway)
+    gateway.pages = [RemoteSearchPage((make_hit(1, now),), None, True)]
+    entered = threading.Event()
+    release = threading.Event()
+    original = service.catalog.commit_search_page
+
+    def slow_commit(*args, **kwargs):
+        entered.set()
+        release.wait(timeout=0.30)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service.catalog, "commit_search_page", slow_commit)
+    operation = asyncio.create_task(
+        service.start_search("-1001", make_query(now))
+    )
+    try:
+        while not entered.is_set():
+            await asyncio.sleep(0)
+        heartbeat = 0
+        for _ in range(10):
+            heartbeat += 1
+            await asyncio.sleep(0.01)
+        assert heartbeat == 10
+        assert operation.done() is False
+    finally:
+        release.set()
+    await operation
+
+
+@pytest.mark.asyncio
+async def test_global_provisional_batches_are_cumulative(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 24, tzinfo=UTC)
+    gateway = FakeGateway(AccountProfile("a1", "账号"))
+    service = await prepared_online_service(tmp_path, now, gateway)
+    gateway.all_pages = [
+        RemoteSearchPage(
+            (make_hit(20, now),),
+            SearchCursor(19, 1, "-1001"),
+            False,
+        ),
+        RemoteSearchPage((make_hit(18, now),), None, True),
+    ]
+    batches: list[SearchResultBatch] = []
+
+    await service.start_search(
+        ALL_DIALOGS_SCOPE_REF,
+        make_query(now),
+        scope=SearchScope.ALL_DIALOGS,
+        on_results=batches.append,
+    )
+
+    provisional = [batch for batch in batches if not batch.stable]
+    assert [len(batch.results) for batch in provisional] == [1, 2]
+    assert {item.message_id for item in provisional[-1].results} == {20, 18}
+
+
+@pytest.mark.asyncio
+async def test_load_search_snapshot_runs_through_background_boundary(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 24, tzinfo=UTC)
+    gateway = FakeGateway(AccountProfile("a1", "账号"))
+    service = await prepared_online_service(tmp_path, now, gateway)
+    session = service.catalog.begin_search(
+        "search-1",
+        "a1",
+        "-1001",
+        "资料群",
+        make_query(now),
+        now,
+    )
+    service.catalog.save_search_page(
+        "a1",
+        session.id,
+        session.generation,
+        [make_saved_result(session.id, now, "result-1", 1)],
+    )
+    calls = 0
+    original = service._run_blocking
+
+    async def counted(operation):
+        nonlocal calls
+        calls += 1
+        return await original(operation)
+
+    service._run_blocking = counted
+    snapshot = await service.load_search_snapshot("search-1")
+    assert snapshot.session.id == "search-1"
+    assert calls == 1
 
 
 async def thumbnail_service(tmp_path: Path):

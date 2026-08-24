@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Protocol
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from telegram_downloader.catalog import CatalogRepository
@@ -19,8 +20,11 @@ from telegram_downloader.content import (
     SearchCursor,
     SearchResult,
     SearchScope,
+    SearchSelectionIntent,
     SearchSession,
+    SearchSnapshot,
     SearchStatus,
+    SelectionCommit,
 )
 from telegram_downloader.content_progress import (
     DialogSyncProgress,
@@ -42,6 +46,14 @@ from telegram_downloader.planner import EmptyScanError, ScanPreview, TaskPlanner
 from telegram_downloader.thumbnail_cache import ThumbnailCache
 
 _LOGGER = logging.getLogger("telegram_downloader.content_browser")
+
+
+class BlockingRunner(Protocol):
+    def __call__[T](self, operation: Callable[[], T]) -> Awaitable[T]: ...
+
+
+async def _to_thread[T](operation: Callable[[], T]) -> T:
+    return await asyncio.to_thread(operation)
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +115,7 @@ class ContentBrowserService:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         thumbnail_failure_cooldown: float = 30.0,
         monotonic_clock: Callable[[], float] = time.monotonic,
+        run_blocking: BlockingRunner = _to_thread,
     ) -> None:
         if album_concurrency <= 0 or thumbnail_concurrency <= 0:
             raise ValueError("内容查询并发数必须大于零")
@@ -124,6 +137,7 @@ class ContentBrowserService:
         self._thumbnail_semaphore = asyncio.Semaphore(thumbnail_concurrency)
         self._thumbnail_failure_cooldown = thumbnail_failure_cooldown
         self._monotonic_clock = monotonic_clock
+        self._run_blocking = run_blocking
         self._thumbnail_inflight: dict[str, asyncio.Task[Path | None]] = {}
         self._thumbnail_failures: dict[str, float] = {}
 
@@ -178,6 +192,30 @@ class ContentBrowserService:
         if self.account is None:
             return []
         return self.catalog.list_sessions(self.account.account_id)
+
+    async def list_sessions_async(self) -> list[SearchSession]:
+        account = self._require_account()
+        return await self._run_blocking(
+            lambda: self.catalog.list_sessions(account.account_id)
+        )
+
+    async def load_search_snapshot(self, search_id: str) -> SearchSnapshot:
+        account = self._require_account()
+        return await self._run_blocking(
+            lambda: self.catalog.load_search_snapshot(
+                account.account_id,
+                search_id,
+            )
+        )
+
+    async def persist_selection(
+        self,
+        intent: SearchSelectionIntent,
+    ) -> SelectionCommit:
+        account = self._require_account()
+        return await self._run_blocking(
+            lambda: self.catalog.apply_selection(account.account_id, intent)
+        )
 
     def latest_session(self, peer_ref: str) -> SearchSession | None:
         return next(
@@ -237,24 +275,30 @@ class ContentBrowserService:
         async with self._search_lock:
             account = self._require_account()
             self._require_online()
-            if scope is SearchScope.ALL_DIALOGS:
-                search_peer_ref = ALL_DIALOGS_SCOPE_REF
-                dialog_title = ALL_DIALOGS_TITLE
-            else:
-                dialog = self.catalog.get_dialog(account.account_id, peer_ref)
-                if not dialog.available:
-                    raise ValueError("该群组或频道当前不可用")
-                search_peer_ref = peer_ref
-                dialog_title = dialog.title
-            session = self.catalog.begin_search(
-                self.uuid_factory(),
-                account.account_id,
-                search_peer_ref,
-                dialog_title,
-                query,
-                self.clock(),
-                scope=scope,
-            )
+            search_id = self.uuid_factory()
+            now = self.clock()
+
+            def begin_search() -> SearchSession:
+                if scope is SearchScope.ALL_DIALOGS:
+                    search_peer_ref = ALL_DIALOGS_SCOPE_REF
+                    dialog_title = ALL_DIALOGS_TITLE
+                else:
+                    dialog = self.catalog.get_dialog(account.account_id, peer_ref)
+                    if not dialog.available:
+                        raise ValueError("该群组或频道当前不可用")
+                    search_peer_ref = peer_ref
+                    dialog_title = dialog.title
+                return self.catalog.begin_search(
+                    search_id,
+                    account.account_id,
+                    search_peer_ref,
+                    dialog_title,
+                    query,
+                    now,
+                    scope=scope,
+                )
+
+            session = await self._run_blocking(begin_search)
             return await self._fetch_page(
                 session,
                 on_progress=on_progress,
@@ -271,9 +315,15 @@ class ContentBrowserService:
         async with self._search_lock:
             account = self._require_account()
             self._require_online()
-            session = self.catalog.get_session(account.account_id, search_id)
+            snapshot = await self._run_blocking(
+                lambda: self.catalog.load_search_snapshot(
+                    account.account_id,
+                    search_id,
+                )
+            )
+            session = snapshot.session
             if session.exhausted:
-                results = self.catalog.list_results(account.account_id, search_id)
+                results = list(snapshot.results)
                 if on_results is not None:
                     on_results(
                         SearchResultBatch(
@@ -306,7 +356,14 @@ class ContentBrowserService:
         progress_matched = 0
         request_cursor = session.cursor
         seen_cursors = {request_cursor}
-        stable_results = self.catalog.list_results(account.account_id, session.id)
+        stable_results = list(
+            await self._run_blocking(
+                lambda: self.catalog.list_results(
+                    account.account_id,
+                    session.id,
+                )
+            )
+        )
         result_ids = {
             (item.peer_ref, item.message_id, item.media_id): item.id
             for item in stable_results
@@ -394,14 +451,37 @@ class ContentBrowserService:
                     seen_cursors.add(page.next_cursor)
 
                 if on_results is not None and page.items:
+                    direct = [
+                        result_for(hit)
+                        for hit in self._deduplicate_hits(list(page.items))
+                    ]
+                    provisional_by_key = {
+                        self._result_key(item): item for item in stable_results
+                    }
+                    for item in direct:
+                        previous = provisional_by_key.get(self._result_key(item))
+                        if previous is not None:
+                            item = replace(
+                                item,
+                                selected=previous.selected,
+                                available=previous.available,
+                                queued=previous.queued,
+                            )
+                        provisional_by_key[self._result_key(item)] = item
+                    provisional = sorted(
+                        provisional_by_key.values(),
+                        key=lambda item: (
+                            -item.message_date_utc.timestamp(),
+                            item.peer_ref,
+                            -item.message_id,
+                            item.media_id,
+                        ),
+                    )
                     on_results(
                         SearchResultBatch(
                             session.id,
                             session.generation,
-                            tuple(
-                                result_for(hit)
-                                for hit in self._deduplicate_hits(list(page.items))
-                            ),
+                            tuple(provisional),
                             stable=False,
                         )
                     )
@@ -490,16 +570,6 @@ class ContentBrowserService:
                         self._media_key(hit.remote) for hit in new_items
                     )
 
-                queued_keys = planner.existing_media_keys(
-                    {self._media_key(hit.remote) for hit in accepted}
-                )
-                saved = [
-                    result_for(
-                        hit,
-                        queued=self._media_key(hit.remote) in queued_keys,
-                    )
-                    for hit in accepted
-                ]
                 operation_accepted += len(accepted)
                 projected_count = len(stable_results) + len(accepted)
                 reached_limit = (
@@ -515,19 +585,46 @@ class ContentBrowserService:
                     if deferred
                     else page.next_cursor
                 )
-                commit = self.catalog.commit_search_page(
-                    account.account_id,
-                    session.id,
-                    session.generation,
-                    saved,
-                    cursor=cursor,
-                    complete=complete,
-                    finished_at=self.clock(),
-                    status=(
-                        SearchStatus.COMPLETED if complete else SearchStatus.RUNNING
-                    ),
-                    error="达到数量上限" if skipped_album else None,
-                )
+                finished_at = self.clock()
+
+                def commit_page(
+                    accepted_hits: tuple[RemoteSearchHit, ...] = tuple(accepted),
+                    active_session: SearchSession = session,
+                    next_cursor: SearchCursor | None = cursor,
+                    is_complete: bool = complete,
+                    committed_at: datetime = finished_at,
+                    album_limit_reached: bool = skipped_album,
+                ):
+                    queued_keys = planner.existing_media_keys(
+                        {
+                            self._media_key(hit.remote)
+                            for hit in accepted_hits
+                        }
+                    )
+                    saved = [
+                        result_for(
+                            hit,
+                            queued=self._media_key(hit.remote) in queued_keys,
+                        )
+                        for hit in accepted_hits
+                    ]
+                    return self.catalog.commit_search_page(
+                        account.account_id,
+                        active_session.id,
+                        active_session.generation,
+                        saved,
+                        cursor=next_cursor,
+                        complete=is_complete,
+                        finished_at=committed_at,
+                        status=(
+                            SearchStatus.COMPLETED
+                            if is_complete
+                            else SearchStatus.RUNNING
+                        ),
+                        error="达到数量上限" if album_limit_reached else None,
+                    )
+
+                commit = await self._run_blocking(commit_page)
                 session = commit.session
                 stable_results = list(commit.results)
                 reached_limit = (
@@ -543,8 +640,11 @@ class ContentBrowserService:
                     break
                 request_cursor = session.cursor
         except asyncio.CancelledError:
-            current = self.catalog.get_session(account.account_id, session.id)
-            self._finish_incomplete(current, "搜索已取消")
+            def finish_cancelled() -> None:
+                current = self.catalog.get_session(account.account_id, session.id)
+                self._finish_incomplete(current, "搜索已取消")
+
+            await asyncio.shield(self._run_blocking(finish_cancelled))
             raise
         except FloodWaitError as error:
             message = self._safe_gateway_error(error)
@@ -554,14 +654,24 @@ class ContentBrowserService:
                 retries,
                 request_cursor.offset_id if request_cursor is not None else 0,
             )
-            current = self.catalog.get_session(account.account_id, session.id)
-            self._finish_incomplete(current, message)
-            current = self.catalog.get_session(account.account_id, session.id)
-            results = self.catalog.list_results(account.account_id, session.id)
-            return current, results
+            def finish_flood_wait() -> SearchSnapshot:
+                current = self.catalog.get_session(account.account_id, session.id)
+                self._finish_incomplete(current, message)
+                return self.catalog.load_search_snapshot(
+                    account.account_id,
+                    session.id,
+                )
+
+            snapshot = await self._run_blocking(finish_flood_wait)
+            return snapshot.session, list(snapshot.results)
         except GatewayError as error:
-            current = self.catalog.get_session(account.account_id, session.id)
-            self._finish_incomplete(current, self._safe_gateway_error(error))
+            message = self._safe_gateway_error(error)
+
+            def finish_gateway_error() -> None:
+                current = self.catalog.get_session(account.account_id, session.id)
+                self._finish_incomplete(current, message)
+
+            await asyncio.shield(self._run_blocking(finish_gateway_error))
             raise
         current = session
         results = stable_results
