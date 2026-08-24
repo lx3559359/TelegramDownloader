@@ -246,6 +246,27 @@ def test_search_result_benchmark_is_synthetic_and_private() -> None:
     assert "searchresulttablemodel" in source
 
 
+def test_download_persistence_benchmark_is_synthetic_and_private() -> None:
+    root = Path(__file__).parents[1]
+    script = root / "scripts/benchmark_download_persistence.py"
+    source = script.read_text(encoding="utf-8").casefold()
+
+    assert "temporarydirectory" in source
+    assert "syntheticrepository" in source
+    assert all(
+        forbidden not in source
+        for forbidden in (
+            "telethongateway",
+            "taskrepository(",
+            "secrets.dat",
+            "catalog.sqlite3",
+            "tasks.sqlite3",
+            "t.me/",
+            "api_hash",
+        )
+    )
+
+
 def test_portable_zip_has_private_runtime_entry_gate() -> None:
     root = Path(__file__).parents[1]
     build = (root / "scripts/build.ps1").read_text(encoding="utf-8")
