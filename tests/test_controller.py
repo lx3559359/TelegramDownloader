@@ -2719,7 +2719,7 @@ async def test_verify_tasks_expands_media_and_cancel_stops_operation() -> None:
 
     operation = asyncio.create_task(controller.verify_tasks(["a", "b", "a"]))
     await entered.wait()
-    controller.cancel_integrity()
+    await controller.cancel_integrity()
     await operation
 
     assert integrity.ids == ["one", "two"]
@@ -2757,6 +2757,32 @@ async def test_shutdown_cancels_active_integrity_operation() -> None:
             operation.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await operation
+
+
+@pytest.mark.asyncio
+async def test_shutdown_closes_download_persistence_before_gateway_disconnect() -> None:
+    events: list[str] = []
+
+    class Scheduler:
+        async def shutdown(self):
+            events.extend(("persistence:drain", "persistence:close"))
+
+    class Gateway:
+        async def disconnect(self):
+            events.append("gateway:disconnect")
+
+    controller = AppController.for_test(
+        scheduler=Scheduler(),
+        gateway=Gateway(),
+    )
+
+    await controller.shutdown()
+
+    assert events == [
+        "persistence:drain",
+        "persistence:close",
+        "gateway:disconnect",
+    ]
 
 
 @pytest.mark.asyncio
@@ -2849,7 +2875,7 @@ async def test_cancel_integrity_pauses_active_repair_download() -> None:
             entered.set()
             await release.wait()
 
-        def pause_task(self, task_id):
+        async def pause_task(self, task_id):
             self.paused.append(task_id)
             broken.status = ItemStatus.PAUSED
             release.set()
@@ -2864,8 +2890,7 @@ async def test_cancel_integrity_pauses_active_repair_download() -> None:
     operation = asyncio.create_task(controller.repair_media([broken.id]))
     await entered.wait()
 
-    controller.cancel_integrity()
-    await asyncio.sleep(0)
+    await controller.cancel_integrity()
 
     try:
         assert scheduler.paused == [broken.task_id]
@@ -2899,7 +2924,7 @@ async def test_pause_tasks_uses_bulk_lookup_command_and_one_refresh() -> None:
             return [task_record(task_id, TaskStatus.QUEUED) for task_id in task_ids]
 
     class Scheduler:
-        def pause_tasks(self, task_ids):
+        async def pause_tasks(self, task_ids):
             events.append("pause:" + ",".join(task_ids))
             return set(task_ids)
 
@@ -2925,7 +2950,7 @@ async def test_task_batch_commands_skip_ineligible_states() -> None:
     ]
     repository = SimpleNamespace(get_tasks=Mock(return_value=tasks))
     scheduler = SimpleNamespace(
-        pause_tasks=Mock(return_value={"run"}),
+        pause_tasks=AsyncMock(return_value={"run"}),
         resume_tasks=AsyncMock(side_effect=({"pause"}, {"fail"})),
     )
     controller = AppController.for_test(repository=repository, scheduler=scheduler)
@@ -2935,7 +2960,7 @@ async def test_task_batch_commands_skip_ineligible_states() -> None:
     await controller.resume_tasks(["run", "pause", "fail"])
     await controller.retry_failed_tasks(["run", "pause", "fail"])
 
-    scheduler.pause_tasks.assert_called_once_with(["run"])
+    scheduler.pause_tasks.assert_awaited_once_with(["run"])
     assert scheduler.resume_tasks.await_args_list[0].args == (["pause"],)
     assert scheduler.resume_tasks.await_args_list[1].args == (["fail"],)
 
@@ -4903,7 +4928,7 @@ async def test_prioritize_task_persists_before_reordering_and_reports_position()
             return True
 
     class Scheduler:
-        def prioritize_task(self, task_id):
+        async def prioritize_task(self, task_id):
             events.append(f"scheduler:{task_id}")
             return True
 
@@ -4935,7 +4960,7 @@ async def test_prioritize_task_handles_state_race_without_duplicate_start() -> N
             return True
 
     class Scheduler:
-        def prioritize_task(self, _task_id):
+        async def prioritize_task(self, _task_id):
             return False
 
         def queue_positions(self):

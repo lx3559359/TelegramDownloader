@@ -12,6 +12,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime
+from functools import partial
 from math import ceil
 from pathlib import Path
 from time import monotonic
@@ -55,6 +56,7 @@ from telegram_downloader.download_paths import (
     DownloadPathError,
     DownloadPathPolicy,
 )
+from telegram_downloader.download_persistence import DownloadPersistenceCoordinator
 from telegram_downloader.download_schedule import (
     DownloadScheduleController,
     evaluate_download_schedule,
@@ -507,12 +509,14 @@ def create_application(
             download_root_provider=download_paths.require_current_writable,
         )
         bandwidth = AsyncBandwidthLimiter(resource_settings.speed_limit_kib)
+        persistence = DownloadPersistenceCoordinator(repository)
         downloader = MediaDownloader(
             gateway,
             repository,
             paths,
             bandwidth=bandwidth,
             download_paths=download_paths,
+            persistence=persistence,
         )
         scheduler = DownloadScheduler(
             repository,
@@ -521,6 +525,7 @@ def create_application(
             bandwidth=bandwidth,
             publish=publish_event,
             activity=activity,
+            persistence=persistence,
         )
         schedule_state = evaluate_download_schedule(
             resource_settings.download_schedule,
@@ -1025,8 +1030,11 @@ def create_application(
         storage_service.cancel()
         await asyncio.sleep(0)
 
-    def integrity_cancel_requested() -> None:
-        controller.cancel_integrity()
+    @qasync.asyncSlot(object)
+    async def integrity_cancel_requested(_signal_payload: object) -> None:
+        await controller.cancel_integrity()
+
+    integrity_cancel_signal_slot = partial(integrity_cancel_requested, None)
 
     @qasync.asyncSlot(str)
     async def content_dialog_selected(peer_ref: str) -> None:
@@ -1183,7 +1191,7 @@ def create_application(
     window.batch_scan_requested.connect(batch_scan_requested)
     window.task_selection_changed.connect(task_selection_changed)
     window.open_media_requested.connect(open_media_requested)
-    window.integrity_cancel_requested.connect(integrity_cancel_requested)
+    window.integrity_cancel_requested.connect(integrity_cancel_signal_slot)
     window.open_directory_requested.connect(controller.open_task_directory)
     async_actions.connect(
         window.login_requested,
@@ -1559,6 +1567,7 @@ def create_application(
             verify_tasks_requested,
             repair_media_requested,
             integrity_cancel_requested,
+            integrity_cancel_signal_slot,
             content_dialog_selected,
             content_search_requested,
             content_load_more_requested,

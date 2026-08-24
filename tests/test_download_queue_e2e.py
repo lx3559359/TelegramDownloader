@@ -15,6 +15,7 @@ from telegram_downloader.domain import (
     TaskRecord,
     TaskStatus,
 )
+from telegram_downloader.download_persistence import DownloadPersistenceCoordinator
 from telegram_downloader.downloader import MediaDownloader
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.repository import TaskRepository
@@ -156,6 +157,7 @@ async def test_real_queue_prioritizes_pauses_restarts_and_stays_portable(tmp_pat
 
     gateway = ControlledGateway(payloads)
     bandwidth = AsyncBandwidthLimiter(0)
+    persistence = DownloadPersistenceCoordinator(repository)
     downloader = MediaDownloader(
         gateway,
         repository,
@@ -164,12 +166,14 @@ async def test_real_queue_prioritizes_pauses_restarts_and_stays_portable(tmp_pat
         reserve_bytes=0,
         progress_interval=0,
         bandwidth=bandwidth,
+        persistence=persistence,
     )
     scheduler = DownloadScheduler(
         repository,
         downloader,
         concurrency=2,
         bandwidth=bandwidth,
+        persistence=persistence,
     )
 
     operations = [
@@ -178,10 +182,11 @@ async def test_real_queue_prioritizes_pauses_restarts_and_stays_portable(tmp_pat
     ]
     await wait_until(
         lambda: scheduler.active_task_ids == (link_task.id, search_task.id)
+        and scheduler.queue_positions() == {subscription_task.id: 1}
     )
     assert scheduler.queue_positions() == {subscription_task.id: 1}
     assert repository.prioritize_task(subscription_task.id) is True
-    assert scheduler.prioritize_task(subscription_task.id) is True
+    assert await scheduler.prioritize_task(subscription_task.id) is True
     assert scheduler.queue_positions() == {subscription_task.id: 1}
 
     gateway.release_all(101)
@@ -191,7 +196,7 @@ async def test_real_queue_prioritizes_pauses_restarts_and_stays_portable(tmp_pat
     gateway.release(103, 0)
     part = subscription_item.target_path.with_suffix(".bin.part")
     await wait_until(lambda: (103, 0) in gateway.consumed)
-    scheduler.pause_task(subscription_task.id)
+    await scheduler.pause_task(subscription_task.id)
     gateway.release(103, 1)
     await wait_until(lambda: subscription_task.id not in scheduler.active_task_ids)
     assert part.read_bytes() == b"sub-"
@@ -201,6 +206,12 @@ async def test_real_queue_prioritizes_pauses_restarts_and_stays_portable(tmp_pat
 
     restarted_repository = TaskRepository(paths.database)
     restarted_repository.initialize()
+    paused = restarted_repository.get_item(subscription_item.id)
+    assert paused.status is ItemStatus.PAUSED
+    assert paused.downloaded_bytes == part.stat().st_size == len(b"sub-")
+    assert restarted_repository.get_item(link_item.id).status is ItemStatus.COMPLETED
+    assert restarted_repository.get_item(search_item.id).status is ItemStatus.COMPLETED
+    restarted_persistence = DownloadPersistenceCoordinator(restarted_repository)
     restarted_downloader = MediaDownloader(
         gateway,
         restarted_repository,
@@ -209,12 +220,14 @@ async def test_real_queue_prioritizes_pauses_restarts_and_stays_portable(tmp_pat
         reserve_bytes=0,
         progress_interval=0,
         bandwidth=bandwidth,
+        persistence=restarted_persistence,
     )
     restarted_scheduler = DownloadScheduler(
         restarted_repository,
         restarted_downloader,
         concurrency=3,
         bandwidth=bandwidth,
+        persistence=restarted_persistence,
     )
     resumed = asyncio.create_task(restarted_scheduler.resume_task(subscription_task.id))
     await wait_until(lambda: restarted_scheduler.active_task_id == subscription_task.id)

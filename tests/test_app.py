@@ -25,6 +25,7 @@ from telegram_downloader.content import (
 )
 from telegram_downloader.content_browser import ContentBrowserService
 from telegram_downloader.domain import MediaKind
+from telegram_downloader.download_persistence import DownloadPersistenceCoordinator
 from telegram_downloader.download_schedule import DownloadScheduleController
 from telegram_downloader.file_integrity import FileIntegrityService
 from telegram_downloader.files import DownloadNamingSettings
@@ -770,6 +771,8 @@ def test_service_builder_shares_runtime_download_resource_settings(tmp_path) -> 
         assert scheduler.snapshot().concurrency == 4
         assert scheduler.snapshot().speed_limit_kib == 2048
         assert scheduler.downloader.bandwidth is scheduler._bandwidth
+        assert scheduler.persistence is scheduler.downloader.persistence
+        assert isinstance(scheduler.persistence, DownloadPersistenceCoordinator)
         assert planner.naming == naming
     finally:
         loop.run_until_complete(controller._async_actions.shutdown())
@@ -984,7 +987,10 @@ def test_task_management_signals_route_sync_and_async_actions(
         lambda value: record_async("restore", value),
     )
     monkeypatch.setattr(controller, "open_media_file", record_sync("open"))
-    monkeypatch.setattr(controller, "cancel_integrity", lambda: calls.append(("cancel", None)))
+    async def cancel_integrity():
+        calls.append(("cancel", None))
+
+    monkeypatch.setattr(controller, "cancel_integrity", cancel_integrity)
     monkeypatch.setattr(
         controller,
         "resume_tasks",
@@ -1028,6 +1034,7 @@ def test_task_management_signals_route_sync_and_async_actions(
         controller.window.repair_media_requested.emit(["broken"])
         await controller._async_actions.wait_idle()
         controller.window.integrity_cancel_requested.emit()
+        await asyncio.sleep(0)
 
     try:
         loop.run_until_complete(emit_actions())

@@ -401,10 +401,10 @@ class _NullScheduler:
     async def run_items(self, _task_id: str, _item_ids: list[str]) -> None:
         pass
 
-    def pause_task(self, _task_id: str) -> None:
+    async def pause_task(self, _task_id: str) -> None:
         pass
 
-    def pause_tasks(self, _task_ids: list[str]) -> set[str]:
+    async def pause_tasks(self, _task_ids: list[str]) -> set[str]:
         return set()
 
     def snapshot(self) -> SchedulerSnapshot:
@@ -416,7 +416,7 @@ class _NullScheduler:
     def is_active(self, _task_id: str) -> bool:
         return False
 
-    def prioritize_task(self, _task_id: str) -> bool:
+    async def prioritize_task(self, _task_id: str) -> bool:
         return False
 
     def configure_resources(self, _concurrency: int, _speed_limit_kib: int) -> None:
@@ -2244,7 +2244,7 @@ class AppController:
                 TaskStatus.WAITING_RETRY,
             }
         ]
-        accepted = self.scheduler.pause_tasks(eligible)
+        accepted = await self.scheduler.pause_tasks(eligible)
         await self.refresh_tasks_async()
         self._show_status(f"已暂停 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个")
 
@@ -2264,7 +2264,9 @@ class AppController:
         persisted = (
             bool(await asyncio.to_thread(prioritize, task_id)) if callable(prioritize) else False
         )
-        reordered = self.scheduler.prioritize_task(task_id) if persisted else False
+        reordered = (
+            await self.scheduler.prioritize_task(task_id) if persisted else False
+        )
         if not reordered:
             clear_priority = getattr(self.repository, "clear_task_priority", None)
             if callable(clear_priority):
@@ -2423,13 +2425,16 @@ class AppController:
             self._finish_integrity_operation(current)
             await self._refresh_integrity_views()
 
-    def cancel_integrity(self) -> None:
+    async def cancel_integrity(self) -> None:
         event = self._integrity_cancel_event
         if event is None:
             return
         event.set()
-        for task_id in sorted(self._integrity_repair_task_ids):
-            self.scheduler.pause_task(task_id)
+        task_ids = sorted(self._integrity_repair_task_ids)
+        if task_ids:
+            await asyncio.gather(
+                *(self.scheduler.pause_task(task_id) for task_id in task_ids)
+            )
         self._show_status("正在取消文件校验…")
 
     def _begin_integrity_operation(
