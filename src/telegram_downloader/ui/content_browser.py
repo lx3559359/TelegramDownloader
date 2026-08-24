@@ -96,6 +96,11 @@ class ContentBrowserPage(QWidget):
         self._batch_search_id: str | None = None
         self._batch_generation: int | None = None
         self._results_stable = True
+        self._pending_result_batch: SearchResultBatch | None = None
+        self._result_batch_timer = QTimer(self)
+        self._result_batch_timer.setSingleShot(True)
+        self._result_batch_timer.setInterval(33)
+        self._result_batch_timer.timeout.connect(self._flush_result_batch)
         self._thumbnail_requested_ids: set[str] = set()
         self._preview_dialogs: set[MediaPreviewDialog] = set()
         self._build_ui()
@@ -478,15 +483,23 @@ class ContentBrowserPage(QWidget):
         self._refresh_actions()
 
     def set_active_search(self, session: SearchSession | None) -> None:
+        key = (
+            session.id if session is not None else None,
+            session.generation if session is not None else None,
+        )
+        if (self._batch_search_id, self._batch_generation) != key:
+            self._result_batch_timer.stop()
+            self._pending_result_batch = None
         self.active_session = session
         self.active_search_id = session.id if session is not None else None
-        self._batch_search_id = self.active_search_id
-        self._batch_generation = session.generation if session is not None else None
+        self._batch_search_id, self._batch_generation = key
         self._results_stable = True
         self._set_form_from_session(session)
         self._refresh_actions()
 
     def set_results(self, results: list[SearchResult]) -> None:
+        self._result_batch_timer.stop()
+        self._pending_result_batch = None
         self.results = list(results)
         self.result_model.set_results(results)
         self._results_stable = True
@@ -498,11 +511,90 @@ class ContentBrowserPage(QWidget):
         QTimer.singleShot(0, self.request_visible_thumbnails)
 
     def apply_search_batch(self, batch: SearchResultBatch) -> None:
+        if (
+            self._batch_search_id == batch.search_id
+            and self._batch_generation is not None
+            and batch.generation < self._batch_generation
+        ):
+            return
+        key_changed = (
+            self._batch_search_id,
+            self._batch_generation,
+        ) != (batch.search_id, batch.generation)
+        if key_changed:
+            self._result_batch_timer.stop()
+            self._pending_result_batch = None
         self._batch_search_id = batch.search_id
         self._batch_generation = batch.generation
+        if key_changed or self.result_model.rowCount() == 0 or batch.stable:
+            self._result_batch_timer.stop()
+            self._pending_result_batch = None
+            self._apply_result_batch(batch)
+            return
+        self._pending_result_batch = batch
+        if not self._result_batch_timer.isActive():
+            self._result_batch_timer.start()
+
+    def _flush_result_batch(self) -> None:
+        batch = self._pending_result_batch
+        self._pending_result_batch = None
+        if batch is not None:
+            self._apply_result_batch(batch)
+
+    def _visible_anchor(self) -> tuple[str | None, str | None, int, int]:
+        visible = self._visible_result_rows()
+        top_id = (
+            self.result_model.result_at(visible.start).id
+            if visible.start < self.result_model.rowCount()
+            else None
+        )
+        current = self.result_table.currentIndex()
+        current_id = (
+            str(self.result_model.data(current, Qt.ItemDataRole.UserRole))
+            if current.isValid()
+            else None
+        )
+        current_column = current.column() if current.isValid() else 0
+        return (
+            top_id,
+            current_id,
+            current_column,
+            self.result_table.horizontalScrollBar().value(),
+        )
+
+    def _restore_visible_anchor(
+        self,
+        top_id: str | None,
+        current_id: str | None,
+        current_column: int,
+        horizontal: int,
+    ) -> None:
+        if top_id is not None:
+            row = self.result_model.row_for_result_id(top_id)
+            if row is not None:
+                self.result_table.scrollTo(
+                    self.result_model.index(row, 0),
+                    QAbstractItemView.ScrollHint.PositionAtTop,
+                )
+        if current_id is not None:
+            row = self.result_model.row_for_result_id(current_id)
+            if row is not None:
+                self.result_table.setCurrentIndex(
+                    self.result_model.index(row, current_column)
+                )
+        self.result_table.horizontalScrollBar().setValue(horizontal)
+
+    def _apply_result_batch(self, batch: SearchResultBatch) -> None:
+        if (batch.search_id, batch.generation) != (
+            self._batch_search_id,
+            self._batch_generation,
+        ):
+            return
+        anchor = self._visible_anchor()
         self._results_stable = batch.stable
         self.results = list(batch.results)
         self.result_model.apply_results(self.results)
+        self._restore_visible_anchor(*anchor)
         self._thumbnail_requested_ids.intersection_update(
             item.id for item in self.results
         )

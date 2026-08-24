@@ -636,6 +636,78 @@ def test_progressive_batch_disables_queue_until_results_are_stable(qtbot) -> Non
     assert page.queue_button.isEnabled() is True
 
 
+def test_progressive_batches_show_first_immediately_and_coalesce_latest(qtbot) -> None:
+    now = datetime(2026, 8, 24, tzinfo=UTC)
+    page = ContentBrowserPage()
+    qtbot.addWidget(page)
+    page.set_active_search(session(now))
+    first = result(now, "r1", 3)
+    second = result(now, "r2", 2)
+    third = result(now, "r3", 1)
+
+    page.apply_search_batch(SearchResultBatch("search-1", 1, (first,), False))
+    assert page.result_model.rowCount() == 1
+
+    page.apply_search_batch(
+        SearchResultBatch("search-1", 1, (first, second), False)
+    )
+    page.apply_search_batch(
+        SearchResultBatch("search-1", 1, (first, second, third), False)
+    )
+    assert page.result_model.rowCount() == 1
+    qtbot.waitUntil(lambda: page.result_model.rowCount() == 3, timeout=500)
+
+    page.apply_search_batch(
+        SearchResultBatch("search-1", 1, (first, second), stable=True)
+    )
+    assert page.result_model.rowCount() == 2
+    assert page.queue_button.isEnabled() is False
+
+
+def test_older_generation_batch_cannot_replace_newer_results(qtbot) -> None:
+    now = datetime(2026, 8, 24, tzinfo=UTC)
+    page = ContentBrowserPage()
+    qtbot.addWidget(page)
+    newer = replace(session(now), generation=2)
+    page.set_active_search(newer)
+    page.apply_search_batch(
+        SearchResultBatch("search-1", 2, (result(now, "new", 2),), False)
+    )
+    page.apply_search_batch(
+        SearchResultBatch("search-1", 1, (result(now, "old", 1),), True)
+    )
+    assert page.result_model.result_at(0).id == "new"
+
+
+def test_result_update_restores_top_visible_and_current_ids(qtbot) -> None:
+    now = datetime(2026, 8, 24, tzinfo=UTC)
+    page = ContentBrowserPage()
+    page.resize(1_000, 650)
+    qtbot.addWidget(page)
+    page.show()
+    page.set_active_search(session(now))
+    values = [result(now, f"r{index}", 200 - index) for index in range(120)]
+    page.set_results(values)
+    page.result_table.scrollTo(page.result_model.index(60, 0))
+    page.result_table.setCurrentIndex(page.result_model.index(65, 4))
+    qtbot.wait(20)
+    top_id = page.result_model.result_at(page._visible_result_rows().start).id
+
+    page.apply_search_batch(
+        SearchResultBatch(
+            "search-1",
+            1,
+            tuple([values[0], result(now, "inserted", 199), *values[1:]]),
+            True,
+        )
+    )
+
+    assert page.result_model.data(
+        page.result_table.currentIndex(), Qt.ItemDataRole.UserRole
+    ) == "r65"
+    assert page.result_model.result_at(page._visible_result_rows().start).id == top_id
+
+
 def test_disabled_selection_cells_ignore_mouse_and_keyboard(qtbot) -> None:
     now = datetime(2026, 8, 15, tzinfo=UTC)
     page = ContentBrowserPage()
