@@ -4787,26 +4787,31 @@ async def test_scan_failure_is_persistent_and_releases_busy_state() -> None:
 
 @pytest.mark.asyncio
 async def test_async_task_refresh_does_not_block_event_loop() -> None:
-    import time
-
     loop = asyncio.get_running_loop()
     entered = asyncio.Event()
     heartbeat = asyncio.Event()
+    release = threading.Event()
+    repository_finished = threading.Event()
 
     class Repository:
         def list_task_snapshots(self, *, include_archived=False):
             assert include_archived is True
             loop.call_soon_threadsafe(entered.set)
-            time.sleep(0.05)
+            release.wait(timeout=1)
+            repository_finished.set()
             return []
 
     controller = AppController.for_test(repository=Repository())
     refresh = asyncio.create_task(controller.refresh_tasks_async())
-    await entered.wait()
-    loop.call_soon(heartbeat.set)
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        loop.call_soon(heartbeat.set)
 
-    await asyncio.wait_for(heartbeat.wait(), timeout=0.02)
-    await refresh
+        await asyncio.wait_for(heartbeat.wait(), timeout=0.5)
+        assert repository_finished.is_set() is False
+    finally:
+        release.set()
+        await refresh
 
 
 @pytest.mark.asyncio
