@@ -239,12 +239,14 @@ class SearchHistoryTableModel(QAbstractTableModel):
 
 
 class SearchResultTableModel(QAbstractTableModel):
+    _FRAGMENT_RESET_THRESHOLD = 64
     HEADERS = ("选择", "预览", "日期", "来源", "摘要", "类型", "大小", "状态")
     selection_changed = Signal(str, bool)
 
     def __init__(self) -> None:
         super().__init__()
-        self._results: tuple[SearchResult, ...] = ()
+        self._results: list[SearchResult] = []
+        self._row_by_id: dict[str, int] = {}
         self._thumbnails: dict[str, Path] = {}
         self._fallback_icons: dict[MediaKind, QIcon] = {}
 
@@ -344,9 +346,7 @@ class SearchResultTableModel(QAbstractTableModel):
         result = self._results[index.row()]
         if result.selected == requested:
             return True
-        mutable = list(self._results)
-        mutable[index.row()] = replace(result, selected=requested)
-        self._results = tuple(mutable)
+        self._results[index.row()] = replace(result, selected=requested)
         self.dataChanged.emit(
             index,
             index,
@@ -356,84 +356,155 @@ class SearchResultTableModel(QAbstractTableModel):
         return True
 
     def set_results(self, results: list[SearchResult]) -> None:
-        self.beginResetModel()
-        self._results = tuple(results)
-        ids = {item.id for item in results}
-        self._thumbnails = {
-            result_id: path
-            for result_id, path in self._thumbnails.items()
-            if result_id in ids
-        }
-        self.endResetModel()
-
-    def apply_results(self, results: list[SearchResult]) -> None:
         target = list(results)
-        target_ids = {item.id for item in target}
-        current = list(self._results)
-        row = len(current) - 1
-        while row >= 0:
-            if current[row].id in target_ids:
-                row -= 1
+        self._validate_target(target)
+        self._reset_results(target)
+
+    def row_for_result_id(self, result_id: str) -> int | None:
+        return self._row_by_id.get(result_id)
+
+    def results(self) -> tuple[SearchResult, ...]:
+        return tuple(self._results)
+
+    def _reindex(self) -> None:
+        self._row_by_id = {
+            result.id: row for row, result in enumerate(self._results)
+        }
+
+    @staticmethod
+    def _ranges(rows: list[int]) -> list[tuple[int, int]]:
+        if not rows:
+            return []
+        ranges: list[tuple[int, int]] = []
+        first = previous = rows[0]
+        for row in rows[1:]:
+            if row == previous + 1:
+                previous = row
                 continue
-            last = row
-            while row >= 0 and current[row].id not in target_ids:
-                row -= 1
-            first = row + 1
-            self.beginRemoveRows(_INVALID_INDEX, first, last)
-            del current[first : last + 1]
-            self._results = tuple(current)
-            self.endRemoveRows()
+            ranges.append((first, previous))
+            first = previous = row
+        ranges.append((first, previous))
+        return ranges
 
-        for row, wanted in enumerate(target):
-            existing = next(
-                (
-                    index
-                    for index, item in enumerate(current)
-                    if item.id == wanted.id
-                ),
-                None,
-            )
-            if existing is None:
-                self.beginInsertRows(_INVALID_INDEX, row, row)
-                current.insert(row, wanted)
-                self._results = tuple(current)
-                self.endInsertRows()
-            elif existing != row:
-                self.beginRemoveRows(_INVALID_INDEX, existing, existing)
-                moved = current.pop(existing)
-                self._results = tuple(current)
-                self.endRemoveRows()
-                self.beginInsertRows(_INVALID_INDEX, row, row)
-                current.insert(row, moved)
-                self._results = tuple(current)
-                self.endInsertRows()
-            if current[row] != wanted:
-                current[row] = wanted
-                self._results = tuple(current)
-                self.dataChanged.emit(
-                    self.index(row, 0),
-                    self.index(row, self.columnCount() - 1),
-                )
+    @staticmethod
+    def _validate_target(target: list[SearchResult]) -> None:
+        ids = [result.id for result in target]
+        if len(ids) != len(set(ids)):
+            raise ValueError("搜索结果 ID 重复")
 
-        self._results = tuple(current)
+    def _prune_thumbnails(self, target_ids: set[str]) -> None:
         self._thumbnails = {
             result_id: path
             for result_id, path in self._thumbnails.items()
             if result_id in target_ids
         }
 
-    def set_thumbnail(self, result_id: str, path: Path) -> None:
-        for row, result in enumerate(self._results):
-            if result.id != result_id:
-                continue
-            self._thumbnails[result_id] = path
-            index = self.index(row, 1)
-            self.dataChanged.emit(
-                index,
-                index,
-                [Qt.ItemDataRole.DecorationRole],
-            )
+    def _reset_results(self, target: list[SearchResult]) -> None:
+        self.beginResetModel()
+        self._results = list(target)
+        self._reindex()
+        self._prune_thumbnails(set(self._row_by_id))
+        self.endResetModel()
+
+    def apply_results(self, results: list[SearchResult]) -> None:
+        target = list(results)
+        self._validate_target(target)
+        target_ids = [item.id for item in target]
+        target_id_set = set(target_ids)
+        current_ids = [item.id for item in self._results]
+
+        if current_ids == target_ids:
+            changed_rows = [
+                row
+                for row, (before, after) in enumerate(
+                    zip(self._results, target, strict=True)
+                )
+                if before != after
+            ]
+            self._results = target
+            self._reindex()
+            self._prune_thumbnails(target_id_set)
+            for first, last in self._ranges(changed_rows):
+                self.dataChanged.emit(
+                    self.index(first, 0),
+                    self.index(last, self.columnCount() - 1),
+                )
             return
+
+        removed_rows = [
+            row
+            for row, result in enumerate(self._results)
+            if result.id not in target_id_set
+        ]
+        removed_ranges = self._ranges(removed_rows)
+        if len(removed_ranges) > self._FRAGMENT_RESET_THRESHOLD:
+            self._reset_results(target)
+            return
+        for first, last in reversed(removed_ranges):
+            self.beginRemoveRows(_INVALID_INDEX, first, last)
+            del self._results[first : last + 1]
+            self._reindex()
+            self.endRemoveRows()
+
+        surviving_ids = set(self._row_by_id)
+        additions = [item for item in target if item.id not in surviving_ids]
+        if additions:
+            first = len(self._results)
+            last = first + len(additions) - 1
+            self.beginInsertRows(_INVALID_INDEX, first, last)
+            self._results.extend(additions)
+            self._reindex()
+            self.endInsertRows()
+
+        existing_order = [item.id for item in self._results]
+        if existing_order != target_ids:
+            persistent = self.persistentIndexList()
+            persistent_ids = [
+                self._results[index.row()].id if index.isValid() else ""
+                for index in persistent
+            ]
+            self.layoutAboutToBeChanged.emit()
+            self._results = target
+            self._reindex()
+            remapped = [
+                self.index(self._row_by_id[result_id], index.column())
+                if result_id in self._row_by_id
+                else QModelIndex()
+                for index, result_id in zip(
+                    persistent,
+                    persistent_ids,
+                    strict=True,
+                )
+            ]
+            self.changePersistentIndexList(persistent, remapped)
+            self.layoutChanged.emit()
+        else:
+            before_by_id = {item.id: item for item in self._results}
+            changed_rows = [
+                row
+                for row, item in enumerate(target)
+                if before_by_id[item.id] != item
+            ]
+            self._results = target
+            self._reindex()
+            for first, last in self._ranges(changed_rows):
+                self.dataChanged.emit(
+                    self.index(first, 0),
+                    self.index(last, self.columnCount() - 1),
+                )
+        self._prune_thumbnails(target_id_set)
+
+    def set_thumbnail(self, result_id: str, path: Path) -> None:
+        row = self._row_by_id.get(result_id)
+        if row is None:
+            return
+        self._thumbnails[result_id] = path
+        index = self.index(row, 1)
+        self.dataChanged.emit(
+            index,
+            index,
+            [Qt.ItemDataRole.DecorationRole],
+        )
 
     def thumbnail_path(self, result_id: str) -> Path | None:
         return self._thumbnails.get(result_id)

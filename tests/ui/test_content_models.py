@@ -2,7 +2,8 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+import pytest
+from PySide6.QtCore import QPersistentModelIndex, Qt
 from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtTest import QSignalSpy
 
@@ -376,3 +377,66 @@ def test_apply_results_removes_missing_rows_without_reset(qtbot) -> None:
     model.apply_results(values[:1])
     assert removed.count() == 1
     assert model.rowCount() == 1
+
+
+def many_results(count: int) -> list[SearchResult]:
+    first = search_results(datetime(2026, 8, 24, tzinfo=UTC))[0]
+    return [
+        replace(
+            first,
+            id=f"result-{index}",
+            message_id=count - index,
+            media_id=f"media-{index}",
+            thumbnail_key=f"thumb-{index}",
+        )
+        for index in range(count)
+    ]
+
+
+def test_result_model_indexes_ten_thousand_rows_without_reset(qtbot) -> None:
+    model = SearchResultTableModel()
+    values = many_results(10_000)
+    resets = QSignalSpy(model.modelReset)
+    changed = QSignalSpy(model.dataChanged)
+
+    model.apply_results(values)
+    updated = list(values)
+    updated[7_777] = replace(updated[7_777], selected=True)
+    model.apply_results(updated)
+
+    assert model.row_for_result_id("result-7777") == 7_777
+    assert model.result_at(7_777).selected is True
+    assert resets.count() == 0
+    assert changed.count() == 1
+    assert changed.at(0)[0].row() == 7_777
+    assert changed.at(0)[1].row() == 7_777
+
+
+def test_result_model_reorders_by_stable_id_and_preserves_persistent_index(
+    qtbot,
+) -> None:
+    model = SearchResultTableModel()
+    values = many_results(6)
+    model.apply_results(values)
+    retained = QPersistentModelIndex(model.index(1, 4))
+
+    target = [values[5], values[0], values[1], values[2], values[3], values[4]]
+    model.apply_results(target)
+
+    assert retained.isValid()
+    assert model.data(retained, Qt.ItemDataRole.UserRole) == "result-1"
+    assert retained.row() == 2
+
+
+def test_result_model_rejects_duplicate_ids_without_changing_rows() -> None:
+    model = SearchResultTableModel()
+    values = many_results(2)
+    model.apply_results(values)
+
+    with pytest.raises(ValueError, match="搜索结果 ID 重复"):
+        model.apply_results([values[0], replace(values[1], id=values[0].id)])
+
+    assert [model.result_at(row).id for row in range(model.rowCount())] == [
+        "result-0",
+        "result-1",
+    ]
