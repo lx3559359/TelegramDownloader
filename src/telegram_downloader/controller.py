@@ -608,7 +608,6 @@ class AppController:
         self._content_search_task: asyncio.Task[Any] | None = None
         self._selection_intents: deque[SearchSelectionIntent] = deque()
         self._selection_persist_task: asyncio.Task[None] | None = None
-        self._selection_committed_revisions: dict[tuple[str, int], int] = {}
         self._history_generation = 0
         self._subscription_probe_task: asyncio.Task[Any] | None = None
         self._subscription_actions_active = 0
@@ -1710,9 +1709,6 @@ class AppController:
                         )
                         page.show_error(self._safe_error(error))
                     continue
-                self._selection_committed_revisions[
-                    (intent.search_id, intent.generation)
-                ] = intent.revision
         finally:
             self._selection_persist_task = None
 
@@ -3173,7 +3169,6 @@ class AppController:
     async def _cancel_content_operations(self) -> None:
         current = asyncio.current_task()
         self._selection_intents.clear()
-        self._selection_committed_revisions.clear()
         self._history_generation += 1
         tracked = [
             self._dialog_sync_task,
