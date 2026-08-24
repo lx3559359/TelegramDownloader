@@ -4,7 +4,10 @@ import threading
 import pytest
 
 from telegram_downloader.domain import ItemStatus
-from telegram_downloader.download_persistence import ThreadedDownloadPersistence
+from telegram_downloader.download_persistence import (
+    DownloadPersistenceCoordinator,
+    ThreadedDownloadPersistence,
+)
 from telegram_downloader.repository import ItemProgressUpdate
 
 
@@ -33,6 +36,28 @@ class ThreadRecordingRepository:
     @staticmethod
     def record_thread() -> int:
         return threading.get_ident()
+
+
+class BatchRepository(ThreadRecordingRepository):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batches: list[tuple[ItemProgressUpdate, ...]] = []
+        self.events: list[str] = []
+        self.batch_written = threading.Event()
+        self.batch_failure: BaseException | None = None
+
+    def update_item_progresses(
+        self,
+        updates: tuple[ItemProgressUpdate, ...],
+    ) -> None:
+        if self.batch_failure is not None:
+            raise self.batch_failure
+        batch = tuple(updates)
+        self.batches.append(batch)
+        self.events.append(
+            "batch:" + ",".join(f"{update.item_id}={update.downloaded_bytes}" for update in batch)
+        )
+        self.batch_written.set()
 
 
 @pytest.mark.asyncio
@@ -129,3 +154,196 @@ async def test_threaded_persistence_records_progress_and_rejects_after_close() -
         await persistence.record_progress(update)
     with pytest.raises(RuntimeError, match="已关闭"):
         await persistence.execute(repository.record_thread)
+
+
+@pytest.mark.asyncio
+async def test_coordinator_keeps_only_latest_progress_until_drain() -> None:
+    repository = BatchRepository()
+    persistence = DownloadPersistenceCoordinator(repository)
+
+    for downloaded in range(1, 21):
+        await persistence.record_progress(
+            ItemProgressUpdate("media", downloaded, ItemStatus.DOWNLOADING)
+        )
+    await persistence.drain()
+
+    assert repository.batches == [
+        (ItemProgressUpdate("media", 20, ItemStatus.DOWNLOADING),)
+    ]
+    await persistence.close()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_does_not_extend_an_active_flush_window() -> None:
+    repository = BatchRepository()
+    persistence = DownloadPersistenceCoordinator(repository, flush_interval=0.15)
+
+    await persistence.record_progress(
+        ItemProgressUpdate("media", 1, ItemStatus.DOWNLOADING)
+    )
+    await asyncio.sleep(0.1)
+    await persistence.record_progress(
+        ItemProgressUpdate("media", 2, ItemStatus.DOWNLOADING)
+    )
+
+    assert await asyncio.to_thread(repository.batch_written.wait, 0.09) is True
+    assert repository.batches[0] == (
+        ItemProgressUpdate("media", 2, ItemStatus.DOWNLOADING),
+    )
+    await persistence.close()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_batches_multiple_media_in_one_transaction() -> None:
+    repository = BatchRepository()
+    persistence = DownloadPersistenceCoordinator(repository)
+
+    for index in range(5):
+        await persistence.record_progress(
+            ItemProgressUpdate(f"media-{index}", index, ItemStatus.DOWNLOADING)
+        )
+    await persistence.drain()
+
+    assert len(repository.batches) == 1
+    assert {update.item_id for update in repository.batches[0]} == {
+        f"media-{index}" for index in range(5)
+    }
+    await persistence.close()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_item_barrier_flushes_only_target_before_command() -> None:
+    repository = BatchRepository()
+    persistence = DownloadPersistenceCoordinator(repository)
+    await persistence.record_progress(
+        ItemProgressUpdate("a", 10, ItemStatus.DOWNLOADING)
+    )
+    await persistence.record_progress(
+        ItemProgressUpdate("b", 20, ItemStatus.DOWNLOADING)
+    )
+
+    await persistence.execute(
+        lambda: repository.events.append("terminal:a"),
+        flush_item_ids=("a",),
+    )
+
+    assert repository.events == ["batch:a=10", "terminal:a"]
+    await persistence.drain()
+    assert repository.events == ["batch:a=10", "terminal:a", "batch:b=20"]
+    await persistence.close()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_global_barrier_flushes_all_before_read() -> None:
+    repository = BatchRepository()
+    persistence = DownloadPersistenceCoordinator(repository)
+    await persistence.record_progress(
+        ItemProgressUpdate("a", 10, ItemStatus.DOWNLOADING)
+    )
+    await persistence.record_progress(
+        ItemProgressUpdate("b", 20, ItemStatus.DOWNLOADING)
+    )
+
+    result = await persistence.execute(
+        lambda: repository.events.append("read") or "result",
+        flush_all=True,
+    )
+
+    assert result == "result"
+    assert repository.events == ["batch:a=10,b=20", "read"]
+    await persistence.close()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_terminal_future_waits_for_repository_command() -> None:
+    repository = BatchRepository()
+    persistence = DownloadPersistenceCoordinator(repository)
+    terminal_started = threading.Event()
+    terminal_release = threading.Event()
+
+    def terminal() -> None:
+        terminal_started.set()
+        terminal_release.wait(timeout=1)
+        repository.events.append("terminal")
+
+    await persistence.record_progress(
+        ItemProgressUpdate("media", 5, ItemStatus.DOWNLOADING)
+    )
+    operation = asyncio.create_task(
+        persistence.execute(terminal, flush_item_ids=("media",))
+    )
+    assert await asyncio.to_thread(terminal_started.wait, 1) is True
+    assert operation.done() is False
+
+    terminal_release.set()
+    await operation
+    assert repository.events == ["batch:media=5", "terminal"]
+    await persistence.close()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_cancellation_does_not_cancel_terminal_command() -> None:
+    repository = BatchRepository()
+    persistence = DownloadPersistenceCoordinator(repository)
+    terminal_started = threading.Event()
+    terminal_release = threading.Event()
+
+    def terminal() -> None:
+        terminal_started.set()
+        terminal_release.wait(timeout=1)
+        repository.events.append("terminal")
+
+    operation = asyncio.create_task(persistence.execute(terminal))
+    assert await asyncio.to_thread(terminal_started.wait, 1) is True
+    operation.cancel()
+    await asyncio.sleep(0)
+    terminal_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+    assert repository.events == ["terminal"]
+    await persistence.close()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_failure_is_sticky_and_notifies_once() -> None:
+    repository = BatchRepository()
+    failure = RuntimeError("synthetic storage failure")
+    repository.batch_failure = failure
+    persistence = DownloadPersistenceCoordinator(repository)
+    notified: list[BaseException] = []
+    persistence.set_fault_handler(notified.append)
+    update = ItemProgressUpdate("media", 1, ItemStatus.DOWNLOADING)
+    await persistence.record_progress(update)
+
+    with pytest.raises(RuntimeError) as first:
+        await persistence.drain()
+    with pytest.raises(RuntimeError) as second:
+        await persistence.record_progress(update)
+    with pytest.raises(RuntimeError) as third:
+        await persistence.execute(lambda: None)
+
+    assert first.value is failure
+    assert second.value is failure
+    assert third.value is failure
+    assert notified == [failure]
+    with pytest.raises(RuntimeError) as closing:
+        await persistence.close()
+    assert closing.value is failure
+
+
+@pytest.mark.asyncio
+async def test_coordinator_close_flushes_last_progress_and_rejects_new_work() -> None:
+    repository = BatchRepository()
+    persistence = DownloadPersistenceCoordinator(repository)
+    update = ItemProgressUpdate("media", 9, ItemStatus.DOWNLOADING)
+    await persistence.record_progress(update)
+
+    await persistence.close()
+    await persistence.close()
+
+    assert repository.batches == [(update,)]
+    with pytest.raises(RuntimeError, match="已关闭"):
+        await persistence.record_progress(update)
+    with pytest.raises(RuntimeError, match="已关闭"):
+        await persistence.execute(lambda: None)
