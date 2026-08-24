@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from threading import RLock
 
 from telegram_downloader.content import (
     AccountProfile,
@@ -17,8 +18,12 @@ from telegram_downloader.content import (
     SearchCursor,
     SearchResult,
     SearchScope,
+    SearchSelectionIntent,
     SearchSession,
+    SearchSnapshot,
     SearchStatus,
+    SelectionCommit,
+    SelectionMode,
 )
 from telegram_downloader.domain import MediaKind, ScanFilters
 from telegram_downloader.subscription_matching import (
@@ -207,19 +212,21 @@ _SCHEMA_V5_COLUMN_MIGRATIONS = (
 class CatalogRepository:
     def __init__(self, database: Path) -> None:
         self.database = database.resolve()
+        self._connection_lock = RLock()
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.database, timeout=5)
-        connection.row_factory = sqlite3.Row
-        try:
-            connection.execute("PRAGMA foreign_keys=ON")
-            connection.execute("PRAGMA synchronous=NORMAL")
-            connection.execute("PRAGMA busy_timeout=5000")
-            with connection:
-                yield connection
-        finally:
-            connection.close()
+        with self._connection_lock:
+            connection = sqlite3.connect(self.database, timeout=5)
+            connection.row_factory = sqlite3.Row
+            try:
+                connection.execute("PRAGMA foreign_keys=ON")
+                connection.execute("PRAGMA synchronous=NORMAL")
+                connection.execute("PRAGMA busy_timeout=5000")
+                with connection:
+                    yield connection
+            finally:
+                connection.close()
 
     def initialize(self) -> None:
         self.database.parent.mkdir(parents=True, exist_ok=True)
@@ -436,6 +443,24 @@ class CatalogRepository:
                 (account_id,),
             ).fetchall()
         return [self._session_from_row(row) for row in rows]
+
+    def load_search_snapshot(
+        self,
+        account_id: str,
+        search_id: str,
+    ) -> SearchSnapshot:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM search_sessions WHERE account_id=? AND id=?",
+                (account_id, search_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(search_id)
+            rows = self._select_result_rows(connection, account_id, search_id)
+        return SearchSnapshot(
+            self._session_from_row(row),
+            tuple(self._result_from_row(item) for item in rows),
+        )
 
     def save_search_page(
         self,
@@ -720,35 +745,84 @@ class CatalogRepository:
         result_id: str,
         selected: bool,
     ) -> None:
+        generation = self.get_session(account_id, search_id).generation
+        self.apply_selection(
+            account_id,
+            SearchSelectionIntent(
+                search_id,
+                generation,
+                1,
+                SelectionMode.PATCH,
+                ((result_id, selected),),
+            ),
+        )
+
+    def apply_selection(
+        self,
+        account_id: str,
+        intent: SearchSelectionIntent,
+    ) -> SelectionCommit:
         with self._connection() as connection:
-            cursor = connection.execute(
-                "UPDATE search_results SET selected=? "
-                "WHERE account_id=? AND search_id=? AND id=? "
-                "AND generation=(SELECT generation FROM search_sessions "
-                "WHERE account_id=? AND id=?) "
-                "AND (?=0 OR (available=1 AND queued=0))",
-                (
-                    int(selected),
-                    account_id,
-                    search_id,
-                    result_id,
-                    account_id,
-                    search_id,
-                    int(selected),
-                ),
-            )
-            if cursor.rowcount == 1:
-                return
-            exists = connection.execute(
-                "SELECT 1 FROM search_results AS result "
-                "JOIN search_sessions AS session ON session.id=result.search_id "
-                "WHERE session.account_id=? AND session.id=? AND result.id=? "
-                "AND result.generation=session.generation",
-                (account_id, search_id, result_id),
+            row = connection.execute(
+                "SELECT generation FROM search_sessions WHERE account_id=? AND id=?",
+                (account_id, intent.search_id),
             ).fetchone()
-            if exists is None:
-                raise KeyError(result_id)
-            raise ValueError("该媒体当前不可选择")
+            if row is None or int(row["generation"]) != intent.generation:
+                raise StaleSearchError("选择操作已被更新的搜索代次取代")
+            changed = 0
+            if intent.mode is SelectionMode.PATCH:
+                for result_id, selected in intent.final_changes:
+                    cursor = connection.execute(
+                        "UPDATE search_results SET selected=? WHERE account_id=? "
+                        "AND search_id=? AND id=? AND generation=? "
+                        "AND (?=0 OR (available=1 AND queued=0))",
+                        (
+                            int(selected),
+                            account_id,
+                            intent.search_id,
+                            result_id,
+                            intent.generation,
+                            int(selected),
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        exists = connection.execute(
+                            "SELECT 1 FROM search_results WHERE account_id=? "
+                            "AND search_id=? AND id=? AND generation=?",
+                            (
+                                account_id,
+                                intent.search_id,
+                                result_id,
+                                intent.generation,
+                            ),
+                        ).fetchone()
+                        if exists is None:
+                            raise KeyError(result_id)
+                        raise ValueError("该媒体当前不可选择")
+                    changed += 1
+            elif intent.mode is SelectionMode.SELECT_ALL:
+                cursor = connection.execute(
+                    "UPDATE search_results SET selected=CASE "
+                    "WHEN available=1 AND queued=0 THEN 1 ELSE 0 END "
+                    "WHERE account_id=? AND search_id=? AND generation=?",
+                    (account_id, intent.search_id, intent.generation),
+                )
+                changed = max(0, cursor.rowcount)
+            else:
+                cursor = connection.execute(
+                    "UPDATE search_results SET selected=CASE "
+                    "WHEN available=1 AND queued=0 THEN "
+                    "CASE selected WHEN 1 THEN 0 ELSE 1 END ELSE 0 END "
+                    "WHERE account_id=? AND search_id=? AND generation=?",
+                    (account_id, intent.search_id, intent.generation),
+                )
+                changed = max(0, cursor.rowcount)
+        return SelectionCommit(
+            intent.search_id,
+            intent.generation,
+            intent.revision,
+            changed,
+        )
 
     def mark_queued(self, account_id: str, result_ids: tuple[str, ...]) -> None:
         if not result_ids:

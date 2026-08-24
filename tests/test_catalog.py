@@ -1,4 +1,6 @@
 import sqlite3
+import threading
+import time
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -19,7 +21,9 @@ from telegram_downloader.content import (
     SearchCursor,
     SearchResult,
     SearchScope,
+    SearchSelectionIntent,
     SearchStatus,
+    SelectionMode,
 )
 from telegram_downloader.domain import MediaKind, ScanFilters
 from telegram_downloader.subscription_matching import (
@@ -783,6 +787,122 @@ def test_stale_generation_cannot_overwrite_refreshed_search(tmp_path: Path) -> N
             first.generation,
             [result(first.id, "a1", now)],
         )
+
+
+def prepared_selection_catalog(tmp_path: Path):
+    now = datetime(2026, 8, 24, tzinfo=UTC)
+    repo = CatalogRepository(tmp_path / "catalog.sqlite3")
+    repo.initialize()
+    repo.upsert_account(AccountProfile("a1", "账号"), now)
+    query = ContentSearchQuery(
+        "资料",
+        ScanFilters(now, now, frozenset(MediaKind), 10),
+    )
+    session = repo.begin_search("s1", "a1", "-1001", "群", query, now)
+    repo.save_search_page(
+        "a1",
+        session.id,
+        session.generation,
+        [
+            result(session.id, "a1", now, result_id="r0", message_id=2),
+            result(session.id, "a1", now, result_id="r1", message_id=1),
+        ],
+    )
+    return repo, session
+
+
+def test_catalog_loads_session_and_results_as_one_snapshot(tmp_path: Path) -> None:
+    repo, session = prepared_selection_catalog(tmp_path)
+
+    snapshot = repo.load_search_snapshot("a1", session.id)
+
+    assert snapshot.session == session
+    assert tuple(item.id for item in snapshot.results) == ("r0", "r1")
+
+
+def test_catalog_applies_patch_select_all_and_invert_in_one_transaction(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 24, tzinfo=UTC)
+    repo = CatalogRepository(tmp_path / "catalog.sqlite3")
+    repo.initialize()
+    repo.upsert_account(AccountProfile("a1", "账号"), now)
+    query = ContentSearchQuery(
+        "资料",
+        ScanFilters(now, now, frozenset(MediaKind), 10),
+    )
+    session = repo.begin_search("s1", "a1", "-1001", "群", query, now)
+    values = [
+        result(session.id, "a1", now, result_id=f"r{index}", message_id=index + 1)
+        for index in range(4)
+    ]
+    values[3] = replace(values[3], available=False)
+    repo.save_search_page("a1", session.id, session.generation, values)
+
+    patch = SearchSelectionIntent(
+        session.id,
+        session.generation,
+        1,
+        SelectionMode.PATCH,
+        (("r0", True), ("r1", True), ("r0", False)),
+    )
+    assert repo.apply_selection("a1", patch).changed_count == 2
+    select_all = replace(
+        patch,
+        revision=2,
+        mode=SelectionMode.SELECT_ALL,
+        changes=(),
+    )
+    repo.apply_selection("a1", select_all)
+    invert = replace(
+        patch,
+        revision=3,
+        mode=SelectionMode.INVERT,
+        changes=(),
+    )
+    repo.apply_selection("a1", invert)
+
+    saved = {item.id: item for item in repo.list_results("a1", session.id)}
+    assert all(saved[result_id].selected is False for result_id in ("r0", "r1", "r2"))
+    assert saved["r3"].selected is False
+
+
+def test_catalog_rejects_stale_selection_generation(tmp_path: Path) -> None:
+    repo, session = prepared_selection_catalog(tmp_path)
+    stale = SearchSelectionIntent(
+        session.id,
+        session.generation + 1,
+        1,
+        SelectionMode.SELECT_ALL,
+        (),
+    )
+    with pytest.raises(StaleSearchError):
+        repo.apply_selection("a1", stale)
+
+
+def test_catalog_connection_boundaries_are_serialized(tmp_path: Path) -> None:
+    repo = CatalogRepository(tmp_path / "catalog.sqlite3")
+    repo.initialize()
+    active = 0
+    peak = 0
+    gate = threading.Barrier(3)
+
+    def use_connection() -> None:
+        nonlocal active, peak
+        gate.wait()
+        with repo._connection():
+            active += 1
+            peak = max(peak, active)
+            time.sleep(0.05)
+            active -= 1
+
+    threads = [threading.Thread(target=use_connection) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    gate.wait()
+    for thread in threads:
+        thread.join()
+    assert peak == 1
 
 
 def test_recover_interrupted_searches_preserves_results(tmp_path: Path) -> None:

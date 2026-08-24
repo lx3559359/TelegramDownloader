@@ -173,3 +173,49 @@ class SearchResult:
     queued: bool = False
     source_title: str = ""
     source_kind: ContentSourceKind = ContentSourceKind.UNKNOWN
+
+
+class SelectionMode(StrEnum):
+    PATCH = "patch"
+    SELECT_ALL = "select_all"
+    INVERT = "invert"
+
+
+@dataclass(frozen=True, slots=True)
+class SearchSelectionIntent:
+    search_id: str
+    generation: int
+    revision: int
+    mode: SelectionMode
+    changes: tuple[tuple[str, bool], ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.search_id or self.generation <= 0 or self.revision <= 0:
+            raise ValueError("选择意图缺少有效搜索代次")
+        if self.mode is SelectionMode.PATCH and not self.changes:
+            raise ValueError("选择补丁不能为空")
+        if self.mode is not SelectionMode.PATCH and self.changes:
+            raise ValueError("批量选择模式不能携带逐项补丁")
+
+    @property
+    def final_changes(self) -> tuple[tuple[str, bool], ...]:
+        latest: dict[str, bool] = {}
+        for result_id, selected in self.changes:
+            if not result_id:
+                raise ValueError("选择补丁包含空结果 ID")
+            latest[result_id] = bool(selected)
+        return tuple(latest.items())
+
+
+@dataclass(frozen=True, slots=True)
+class SearchSnapshot:
+    session: SearchSession
+    results: tuple[SearchResult, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SelectionCommit:
+    search_id: str
+    generation: int
+    revision: int
+    changed_count: int
