@@ -855,7 +855,9 @@ class ContentBrowserService:
 
     async def load_thumbnail(self, result_id: str) -> Path | None:
         account = self._require_account()
-        result = self.catalog.get_result(account.account_id, result_id)
+        result = await self._run_blocking(
+            lambda: self.catalog.get_result(account.account_id, result_id)
+        )
         key = result.thumbnail_key
         cached = self.thumbnails.get(key)
         if cached is not None:

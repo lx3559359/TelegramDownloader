@@ -1764,6 +1764,25 @@ async def thumbnail_service(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_thumbnail_catalog_lookup_runs_through_background_boundary(
+    tmp_path: Path,
+) -> None:
+    service, gateway, result_id = await thumbnail_service(tmp_path)
+    gateway.thumbnail_values[10] = b"image"
+    calls = 0
+    original = service._run_blocking
+
+    async def counted(operation):
+        nonlocal calls
+        calls += 1
+        return await original(operation)
+
+    service._run_blocking = counted
+    assert await service.load_thumbnail(result_id) is not None
+    assert calls == 1
+
+
+@pytest.mark.asyncio
 async def test_thumbnail_requests_share_one_gateway_call(tmp_path: Path) -> None:
     service, gateway, result_id = await thumbnail_service(tmp_path)
     started = asyncio.Event()
