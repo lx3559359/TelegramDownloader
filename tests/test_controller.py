@@ -4336,6 +4336,72 @@ async def test_cancelled_queue_confirmation_restores_action_state() -> None:
 
 
 @pytest.mark.asyncio
+async def test_queue_preflight_does_not_block_event_loop() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class ContentService:
+        def prepare_download(self, _search_id):
+            entered.set()
+            release.wait(timeout=0.30)
+            return SimpleNamespace(preview="preview")
+
+    controller = AppController.for_test(
+        content_browser=ContentService(),
+        planner=object(),
+        confirm_preview=lambda _preview: False,
+        window=ContentWindowFake(),
+    )
+    operation = asyncio.create_task(controller.queue_content_selection("s1"))
+    try:
+        while not entered.is_set():
+            await asyncio.sleep(0)
+        heartbeat = 0
+        for _ in range(10):
+            heartbeat += 1
+            await asyncio.sleep(0.01)
+        assert heartbeat == 10
+        assert operation.done() is False
+    finally:
+        release.set()
+    await operation
+
+
+@pytest.mark.asyncio
+async def test_queue_commit_starts_once_when_catalog_reconciliation_fails() -> None:
+    committed = SimpleNamespace(
+        task=SimpleNamespace(id="task-1"),
+        accepted_keys=frozenset({("peer", 1, "media")}),
+    )
+
+    class ContentService:
+        def prepare_download(self, _search_id):
+            return SimpleNamespace(preview="preview")
+
+        def finalize_queue(self, _search_id, _joined_count):
+            raise OSError("catalog unavailable")
+
+        def reconcile_queue(self, _search_id):
+            return SimpleNamespace(results=())
+
+    planner = SimpleNamespace(commit_selected=Mock(return_value=committed))
+    controller = AppController.for_test(
+        content_browser=ContentService(),
+        planner=planner,
+        confirm_preview=lambda _preview: True,
+        window=ContentWindowFake(),
+    )
+    controller._start_task = Mock()
+    controller.refresh_tasks_async = AsyncMock()
+
+    await controller.queue_content_selection("s1")
+
+    planner.commit_selected.assert_called_once_with("preview")
+    controller._start_task.assert_called_once_with("task-1")
+    controller.refresh_tasks_async.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_queue_selection_waits_for_async_user_confirmation() -> None:
     entered = asyncio.Event()
     release = asyncio.Event()

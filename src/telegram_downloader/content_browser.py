@@ -831,6 +831,28 @@ class ContentBrowserService:
             queued_result_ids=queued_ids,
         )
 
+    def reconcile_queue(self, search_id: str) -> SearchSnapshot:
+        account = self._require_account()
+        planner = self._require_planner()
+        snapshot = self.catalog.load_search_snapshot(
+            account.account_id,
+            search_id,
+        )
+        eligible = [item for item in snapshot.results if item.available]
+        existing = planner.existing_media_keys(
+            {self._result_key(item) for item in eligible}
+        )
+        queued_ids = tuple(
+            item.id
+            for item in eligible
+            if self._result_key(item) in existing
+        )
+        self.catalog.mark_queued(account.account_id, queued_ids)
+        return self.catalog.load_search_snapshot(
+            account.account_id,
+            search_id,
+        )
+
     async def load_thumbnail(self, result_id: str) -> Path | None:
         account = self._require_account()
         result = self.catalog.get_result(account.account_id, result_id)

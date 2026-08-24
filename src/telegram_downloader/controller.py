@@ -1762,19 +1762,50 @@ class AppController:
             if self.content_browser is None or self.planner is None:
                 self._show_error("请先连接 Telegram 账号")
                 return
-            preparation = self.content_browser.prepare_download(search_id)
+            preparation = await asyncio.to_thread(
+                self.content_browser.prepare_download,
+                search_id,
+            )
             if not await self._confirm_download_preview(preparation.preview):
                 self._show_status("已取消创建任务")
                 return
-            committed = self.planner.commit_selected(preparation.preview)
-            joined_count = len(committed.accepted_keys)
-            report = self.content_browser.finalize_queue(
-                search_id,
-                joined_count,
+            committed = await asyncio.to_thread(
+                self.planner.commit_selected,
+                preparation.preview,
             )
-            self._reload_content_search(search_id)
-            await self.refresh_tasks_async()
+            joined_count = len(committed.accepted_keys)
             self._start_task(committed.task.id)
+            try:
+                report = await asyncio.to_thread(
+                    self.content_browser.finalize_queue,
+                    search_id,
+                    joined_count,
+                )
+            except Exception:
+                try:
+                    snapshot = await asyncio.to_thread(
+                        self.content_browser.reconcile_queue,
+                        search_id,
+                    )
+                    if (
+                        getattr(page, "active_search_id", None)
+                        == snapshot.session.id
+                        and getattr(page, "batch_generation", None)
+                        == snapshot.session.generation
+                    ):
+                        page.apply_search_batch(
+                            SearchResultBatch(
+                                snapshot.session.id,
+                                snapshot.session.generation,
+                                snapshot.results,
+                                stable=True,
+                            )
+                        )
+                finally:
+                    await self.refresh_tasks_async()
+                raise
+            await self._reload_content_search_async(search_id)
+            await self.refresh_tasks_async()
             self._show_status(
                 f"选择 {report.selected_count} 项，加入 {report.joined_count} 项，"
                 f"跳过重复 {report.duplicate_count} 项，"

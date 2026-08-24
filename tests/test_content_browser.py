@@ -1454,6 +1454,45 @@ async def test_prepare_and_finalize_queue_report_duplicates_and_unavailable(
     assert all(not saved[item_id].selected for item_id in ("valid-1", "valid-2", "duplicate"))
 
 
+def test_reconcile_queue_marks_only_media_present_in_task_repository(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 24, tzinfo=UTC)
+    catalog = initialized_catalog(tmp_path)
+    catalog.upsert_account(AccountProfile("a1", "账号"), now)
+    session = catalog.begin_search(
+        "search-1",
+        "a1",
+        "-1001",
+        "资料群",
+        make_query(now),
+        now,
+    )
+    queued = make_saved_result(session.id, now, "queued", 11)
+    untouched = make_saved_result(session.id, now, "untouched", 10)
+    catalog.save_search_page(
+        "a1",
+        session.id,
+        session.generation,
+        [queued, untouched],
+    )
+    service = ContentBrowserService(
+        catalog,
+        ThumbnailCache(tmp_path / "thumbs"),
+        planner=PlannerStub({("-1001", 11, "m11")}),
+        clock=lambda: now,
+    )
+    service.account = AccountProfile("a1", "账号")
+
+    snapshot = service.reconcile_queue(session.id)
+
+    saved = {item.id: item for item in snapshot.results}
+    assert saved["queued"].queued is True
+    assert saved["queued"].selected is False
+    assert saved["untouched"].queued is False
+    assert saved["untouched"].selected is True
+
+
 @pytest.mark.asyncio
 async def test_prepare_download_rejects_all_skipped_selection(tmp_path: Path) -> None:
     now = datetime(2026, 8, 14, tzinfo=UTC)
