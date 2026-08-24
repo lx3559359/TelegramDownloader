@@ -17,8 +17,13 @@ from telegram_downloader.download_io import (
     submit_batch,
 )
 from telegram_downloader.download_paths import DownloadPathPolicy
+from telegram_downloader.download_persistence import (
+    DownloadPersistence,
+    ThreadedDownloadPersistence,
+)
 from telegram_downloader.gateway import TelegramGateway
 from telegram_downloader.paths import PortablePaths
+from telegram_downloader.repository import ItemProgressUpdate
 from telegram_downloader.resource_control import AsyncBandwidthLimiter
 
 
@@ -93,6 +98,7 @@ class MediaDownloader:
         write_batch_interval: float = 0.5,
         batch_submit: BatchSubmit | None = None,
         download_paths: DownloadPathPolicy | PortablePaths | None = None,
+        persistence: DownloadPersistence | None = None,
     ) -> None:
         if reserve_bytes < 0 or progress_interval < 0:
             raise ValueError("磁盘预留和进度间隔不能为负数")
@@ -109,6 +115,7 @@ class MediaDownloader:
         self.write_batch_bytes = write_batch_bytes
         self.write_batch_interval = write_batch_interval
         self.batch_submit = batch_submit or submit_batch
+        self.persistence = persistence or ThreadedDownloadPersistence(repository)
 
     async def download(
         self,
@@ -123,7 +130,7 @@ class MediaDownloader:
             actual_size = target.stat().st_size
             if item.expected_size is None or actual_size == item.expected_size:
                 digest = await asyncio.to_thread(_hash_file, target)
-                self.repository.complete_item(
+                await self._complete_item(
                     item.id,
                     actual_size,
                     digest.hexdigest(),
@@ -144,17 +151,17 @@ class MediaDownloader:
         try:
             self._ensure_space(target.parent, item.expected_size, offset)
         except InsufficientSpaceError:
-            self.repository.update_item_progress(
+            await self._persist_progress(
                 item.id,
                 offset,
                 ItemStatus.PAUSED,
             )
             raise
         if pause_requested():
-            self.repository.update_item_progress(item.id, offset, ItemStatus.PAUSED)
+            await self._persist_progress(item.id, offset, ItemStatus.PAUSED)
             raise DownloadPaused("下载已暂停")
 
-        self.repository.update_item_progress(item.id, offset, ItemStatus.DOWNLOADING)
+        await self._persist_progress(item.id, offset, ItemStatus.DOWNLOADING)
         bytes_since_disk_check = 0
         last_progress = time.monotonic()
         writer: BufferedPartWriter | None = None
@@ -184,7 +191,7 @@ class MediaDownloader:
                 )
                 if not bandwidth_ready or pause_requested():
                     durable_offset = await persist_writer(writer)
-                    self.repository.update_item_progress(
+                    await self._persist_progress(
                         item.id,
                         durable_offset,
                         ItemStatus.PAUSED,
@@ -206,10 +213,12 @@ class MediaDownloader:
                     self.progress_interval == 0
                     or now - last_progress >= self.progress_interval
                 ):
-                    self.repository.update_item_progress(
-                        item.id,
-                        writer.persisted_bytes,
-                        ItemStatus.DOWNLOADING,
+                    await self.persistence.record_progress(
+                        ItemProgressUpdate(
+                            item.id,
+                            writer.persisted_bytes,
+                            ItemStatus.DOWNLOADING,
+                        )
                     )
                     last_progress = now
 
@@ -223,7 +232,7 @@ class MediaDownloader:
 
                 if pause_requested():
                     durable_offset = await persist_writer(writer)
-                    self.repository.update_item_progress(
+                    await self._persist_progress(
                         item.id,
                         durable_offset,
                         ItemStatus.PAUSED,
@@ -234,7 +243,7 @@ class MediaDownloader:
             durable_offset = (
                 await persist_writer(writer) if writer is not None else offset
             )
-            self.repository.update_item_progress(
+            await self._persist_progress(
                 item.id,
                 durable_offset,
                 ItemStatus.PAUSED,
@@ -244,7 +253,7 @@ class MediaDownloader:
             durable_offset = (
                 await persist_writer(writer) if writer is not None else offset
             )
-            self.repository.update_item_progress(
+            await self._persist_progress(
                 item.id,
                 durable_offset,
                 ItemStatus.PAUSED,
@@ -262,13 +271,49 @@ class MediaDownloader:
                 f"期望 {item.expected_size}，实际 {writer.persisted_bytes}"
             )
         os.replace(part, target)
-        self.repository.complete_item(
+        await self._complete_item(
             item.id,
             writer.persisted_bytes,
             writer.hexdigest(),
             datetime.now(UTC),
         )
         return target
+
+    async def _persist_progress(
+        self,
+        item_id: str,
+        downloaded_bytes: int,
+        status: ItemStatus,
+        error: str | None = None,
+        retry_count: int | None = None,
+    ) -> None:
+        await self.persistence.execute(
+            lambda: self.repository.update_item_progress(
+                item_id,
+                downloaded_bytes,
+                status,
+                error,
+                retry_count,
+            ),
+            flush_item_ids=(item_id,),
+        )
+
+    async def _complete_item(
+        self,
+        item_id: str,
+        downloaded_bytes: int,
+        sha256: str,
+        verified_at: datetime,
+    ) -> None:
+        await self.persistence.execute(
+            lambda: self.repository.complete_item(
+                item_id,
+                downloaded_bytes,
+                sha256,
+                verified_at,
+            ),
+            flush_item_ids=(item_id,),
+        )
 
     async def _acquire_bandwidth(
         self,

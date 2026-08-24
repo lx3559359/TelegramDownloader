@@ -1,5 +1,7 @@
 import asyncio
 import hashlib
+import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -7,6 +9,7 @@ import pytest
 
 from telegram_downloader.domain import ItemStatus, MediaItem, MediaKind
 from telegram_downloader.download_paths import DownloadPathError, DownloadPathPolicy
+from telegram_downloader.download_persistence import DownloadPersistenceCoordinator
 from telegram_downloader.downloader import (
     DownloadPaused,
     InsufficientSpaceError,
@@ -14,6 +17,7 @@ from telegram_downloader.downloader import (
     SizeMismatchError,
 )
 from telegram_downloader.paths import PathOutsideRootError, PortablePaths
+from telegram_downloader.repository import ItemProgressUpdate
 from telegram_downloader.settings import DownloadStorageSettings
 
 
@@ -47,6 +51,61 @@ class FakeRepository:
 
     def complete_item(self, item_id, downloaded_bytes, sha256, verified_at):
         self.completed.append((item_id, downloaded_bytes, sha256, verified_at))
+
+
+class SlowPersistenceRepository(FakeRepository):
+    def __init__(self, delay: float = 0.05) -> None:
+        super().__init__()
+        self.delay = delay
+        self.media_write_calls = 0
+        self.terminal_committed = False
+
+    def update_item_progress(
+        self,
+        item_id,
+        downloaded_bytes,
+        status,
+        error=None,
+        retry_count=None,
+    ):
+        time.sleep(self.delay)
+        self.media_write_calls += 1
+        super().update_item_progress(
+            item_id,
+            downloaded_bytes,
+            status,
+            error,
+            retry_count,
+        )
+
+    def update_item_progresses(
+        self,
+        updates: tuple[ItemProgressUpdate, ...],
+    ) -> None:
+        time.sleep(self.delay)
+        self.media_write_calls += 1
+        self.updates.extend(
+            (update.item_id, update.downloaded_bytes, update.status)
+            for update in updates
+        )
+
+    def complete_item(self, item_id, downloaded_bytes, sha256, verified_at):
+        time.sleep(self.delay)
+        self.media_write_calls += 1
+        super().complete_item(item_id, downloaded_bytes, sha256, verified_at)
+        self.terminal_committed = True
+
+
+class BlockingCompleteRepository(SlowPersistenceRepository):
+    def __init__(self) -> None:
+        super().__init__(delay=0)
+        self.complete_started = threading.Event()
+        self.complete_release = threading.Event()
+
+    def complete_item(self, item_id, downloaded_bytes, sha256, verified_at):
+        self.complete_started.set()
+        self.complete_release.wait(timeout=1)
+        super().complete_item(item_id, downloaded_bytes, sha256, verified_at)
 
 
 class RecordingBandwidth:
@@ -435,8 +494,6 @@ async def test_slow_batch_write_allows_event_loop_heartbeat(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import time
-
     from telegram_downloader import download_io
 
     paths = PortablePaths(tmp_path)
@@ -471,3 +528,75 @@ async def test_slow_batch_write_allows_event_loop_heartbeat(
         running = False
         await pulse
     assert ticks > 10
+
+
+@pytest.mark.asyncio
+async def test_slow_repository_keeps_event_loop_responsive_and_coalesces_progress(
+    tmp_path: Path,
+) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    target = paths.downloads / "responsive.bin"
+    repository = SlowPersistenceRepository()
+    persistence = DownloadPersistenceCoordinator(repository)
+    media = MediaDownloader(
+        FakeGateway([b"x"] * 20),
+        repository,
+        paths,
+        free_bytes=lambda _: 10**9,
+        reserve_bytes=0,
+        progress_interval=0,
+        write_batch_bytes=1,
+        persistence=persistence,
+    )
+    gaps: list[float] = []
+    running = True
+
+    async def heartbeat() -> None:
+        previous = asyncio.get_running_loop().time()
+        while running:
+            await asyncio.sleep(0)
+            current = asyncio.get_running_loop().time()
+            gaps.append((current - previous) * 1000)
+            previous = current
+
+    pulse = asyncio.create_task(heartbeat())
+    try:
+        await media.download(item(target, size=20))
+    finally:
+        running = False
+        await pulse
+        await persistence.close()
+
+    assert max(gaps) <= 20.0
+    assert repository.media_write_calls <= 4
+    assert repository.terminal_committed is True
+
+
+@pytest.mark.asyncio
+async def test_download_waits_until_completion_is_durable(tmp_path: Path) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    target = paths.downloads / "durable.bin"
+    repository = BlockingCompleteRepository()
+    persistence = DownloadPersistenceCoordinator(repository)
+    media = MediaDownloader(
+        FakeGateway([b"done"]),
+        repository,
+        paths,
+        free_bytes=lambda _: 10**9,
+        reserve_bytes=0,
+        progress_interval=0,
+        write_batch_bytes=1,
+        persistence=persistence,
+    )
+
+    operation = asyncio.create_task(media.download(item(target, size=4)))
+    assert await asyncio.to_thread(repository.complete_started.wait, 1) is True
+    assert operation.done() is False
+    assert repository.terminal_committed is False
+
+    repository.complete_release.set()
+    await operation
+    assert repository.terminal_committed is True
+    await persistence.close()
