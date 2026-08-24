@@ -17,7 +17,11 @@ from telegram_downloader.domain import (
     TaskRecord,
     TaskStatus,
 )
-from telegram_downloader.repository import AllMediaAlreadyExists, TaskRepository
+from telegram_downloader.repository import (
+    AllMediaAlreadyExists,
+    ItemProgressUpdate,
+    TaskRepository,
+)
 
 
 def records(tmp_path: Path) -> tuple[TaskRecord, MediaItem]:
@@ -61,6 +65,81 @@ def test_round_trip_and_unique_source_item(tmp_path: Path) -> None:
     assert repo.get_task(task.id) == task
     assert repo.list_items(task.id)[0].downloaded_bytes == 4
     assert repo.insert_item_if_new(replace(item, id="duplicate")) is False
+
+
+def test_batch_item_progress_updates_commit_in_one_call(tmp_path: Path) -> None:
+    repo = TaskRepository(tmp_path / "tasks.sqlite3")
+    repo.initialize()
+    task, first = records(tmp_path)
+    second = replace(
+        first,
+        id="item-2",
+        message_id=8,
+        media_id="media-8",
+        target_path=tmp_path / "y.mp4",
+    )
+    repo.create_task(task, [first, second])
+
+    repo.update_item_progresses(
+        [
+            ItemProgressUpdate(first.id, 3, ItemStatus.DOWNLOADING),
+            ItemProgressUpdate(
+                second.id,
+                5,
+                ItemStatus.WAITING_RETRY,
+                "network",
+                2,
+            ),
+        ]
+    )
+
+    stored = {item.id: item for item in repo.list_items(task.id)}
+    assert stored[first.id].downloaded_bytes == 3
+    assert stored[second.id].retry_count == 2
+    assert stored[second.id].last_error == "network"
+
+
+def test_batch_item_progress_rejects_duplicates_before_writing(tmp_path: Path) -> None:
+    repo = TaskRepository(tmp_path / "tasks.sqlite3")
+    repo.initialize()
+    task, media = records(tmp_path)
+    repo.create_task(task, [media])
+
+    with pytest.raises(ValueError, match="重复"):
+        repo.update_item_progresses(
+            [
+                ItemProgressUpdate(media.id, 1, ItemStatus.DOWNLOADING),
+                ItemProgressUpdate(media.id, 2, ItemStatus.DOWNLOADING),
+            ]
+        )
+
+    assert repo.get_item(media.id).downloaded_bytes == 0
+
+
+def test_batch_item_progress_rolls_back_if_any_item_is_missing(tmp_path: Path) -> None:
+    repo = TaskRepository(tmp_path / "tasks.sqlite3")
+    repo.initialize()
+    task, media = records(tmp_path)
+    repo.create_task(task, [media])
+
+    with pytest.raises(KeyError, match="missing"):
+        repo.update_item_progresses(
+            [
+                ItemProgressUpdate(media.id, 4, ItemStatus.DOWNLOADING),
+                ItemProgressUpdate("missing", 7, ItemStatus.DOWNLOADING),
+            ]
+        )
+
+    assert repo.get_item(media.id).downloaded_bytes == 0
+
+
+def test_empty_batch_item_progress_does_not_open_database(tmp_path: Path) -> None:
+    database = tmp_path / "tasks.sqlite3"
+    repo = TaskRepository(database)
+
+    repo.update_item_progresses([])
+
+    assert database.exists() is False
 
 
 def test_pause_reason_round_trips_and_clears_for_non_paused_status(tmp_path: Path) -> None:

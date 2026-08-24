@@ -106,6 +106,15 @@ class AllMediaAlreadyExists(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class ItemProgressUpdate:
+    item_id: str
+    downloaded_bytes: int
+    status: ItemStatus
+    error: str | None = None
+    retry_count: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class TaskSnapshot:
     task: TaskRecord
     total_items: int
@@ -580,24 +589,61 @@ class TaskRepository:
         error: str | None = None,
         retry_count: int | None = None,
     ) -> None:
-        if downloaded_bytes < 0:
+        update = ItemProgressUpdate(
+            item_id,
+            downloaded_bytes,
+            status,
+            error,
+            retry_count,
+        )
+        self._validate_item_progress(update)
+        with self._connection() as connection:
+            self._update_item_progress_on_connection(connection, update)
+
+    def update_item_progresses(
+        self,
+        updates: Sequence[ItemProgressUpdate],
+    ) -> None:
+        ordered = tuple(updates)
+        if not ordered:
+            return
+        item_ids = [update.item_id for update in ordered]
+        if len(item_ids) != len(set(item_ids)):
+            raise ValueError("批量进度包含重复媒体 ID")
+        for update in ordered:
+            self._validate_item_progress(update)
+        with self._connection() as connection:
+            for update in ordered:
+                self._update_item_progress_on_connection(connection, update)
+
+    @staticmethod
+    def _validate_item_progress(update: ItemProgressUpdate) -> None:
+        if update.downloaded_bytes < 0:
             raise ValueError("下载字节数不能为负数")
-        if retry_count is not None and retry_count < 0:
+        if update.retry_count is not None and update.retry_count < 0:
             raise ValueError("重试次数不能为负数")
 
+    @staticmethod
+    def _update_item_progress_on_connection(
+        connection: sqlite3.Connection,
+        update: ItemProgressUpdate,
+    ) -> None:
         assignments = "downloaded_bytes = ?, status = ?, last_error = ?"
-        parameters: list[object] = [downloaded_bytes, status.value, error]
-        if retry_count is not None:
+        parameters: list[object] = [
+            update.downloaded_bytes,
+            update.status.value,
+            update.error,
+        ]
+        if update.retry_count is not None:
             assignments += ", retry_count = ?"
-            parameters.append(retry_count)
-        parameters.append(item_id)
-        with self._connection() as connection:
-            cursor = connection.execute(
-                f"UPDATE media_items SET {assignments} WHERE id = ?",
-                parameters,
-            )
-            if cursor.rowcount != 1:
-                raise KeyError(item_id)
+            parameters.append(update.retry_count)
+        parameters.append(update.item_id)
+        cursor = connection.execute(
+            f"UPDATE media_items SET {assignments} WHERE id = ?",
+            parameters,
+        )
+        if cursor.rowcount != 1:
+            raise KeyError(update.item_id)
 
     def record_integrity_success(
         self,
