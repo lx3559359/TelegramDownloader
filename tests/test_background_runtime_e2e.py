@@ -206,9 +206,11 @@ async def test_background_schedule_notification_restart_contract(tmp_path) -> No
     assert reopened.get_task(task.id).status is TaskStatus.COMPLETED
 
 
-async def wait_until(predicate, attempts: int = 100) -> None:
-    for _ in range(attempts):
+async def wait_until(predicate, timeout: float = 1.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
         if predicate():
             return
-        await asyncio.sleep(0)
-    raise AssertionError("condition was not reached")
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(f"condition was not reached within {timeout:.1f}s")
+        await asyncio.sleep(0.005)
