@@ -163,6 +163,9 @@ def test_v0184_version_and_runtime_contracts_are_consistent() -> None:
         term in readme
         for term in ("健康诊断", "开始自检", "导出诊断包", "data/diagnostics")
     )
+    assert "命令行自检不会恢复或改写业务状态" in readme
+    assert "当前下载目录的可写性和所在磁盘空间" in readme
+    assert "Telegram 与双更新源检查均有 20 秒总时限" in readme
     assert "默认选择“全部会话”" in readme
     assert "每条结果的真实来源" in readme
     assert "继续搜索" in readme

@@ -603,7 +603,10 @@ class DiagnosticReportStore:
                 content = archive.read(name)
                 if content != payload:
                     raise DiagnosticPrivacyError("诊断包内容校验失败")
-                self.validate_value(content.decode("utf-8"))
+                if name == "diagnostic-report.json":
+                    self.deserialize(content)
+                else:
+                    self.validate_value(content.decode("utf-8"))
 
 
 def _report_document(report: DiagnosticReport) -> dict[str, object]:

@@ -23,7 +23,12 @@ from telegram_downloader.diagnostic_probes import (
     probe_update_sources,
 )
 from telegram_downloader.diagnostic_store import DiagnosticReportStore
-from telegram_downloader.diagnostics import DiagnosticsService
+from telegram_downloader.diagnostics import (
+    DiagnosticReport,
+    DiagnosticResult,
+    DiagnosticsService,
+    DiagnosticStatus,
+)
 from telegram_downloader.domain import (
     IntegrityStatus,
     ItemStatus,
@@ -246,3 +251,152 @@ async def test_diagnostic_bundle_is_structured_private_and_read_only(
     for private in private_values:
         assert private.encode("utf-8") not in payload
     assert digest_files(paths) == before
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        DiagnosticResult(
+            "task-database",
+            "下载任务数据库",
+            DiagnosticStatus.FAILED,
+            "database-semantics-invalid",
+            "下载任务数据库包含无效关系或状态",
+            1,
+            {"foreignKeysValid": False, "stateValuesValid": True},
+        ),
+        DiagnosticResult(
+            "content-database",
+            "账号内容数据库",
+            DiagnosticStatus.FAILED,
+            "database-semantics-invalid",
+            "账号内容数据库包含无效关系或状态",
+            1,
+            {"foreignKeysValid": True, "stateValuesValid": False},
+        ),
+        DiagnosticResult(
+            "credentials",
+            "登录凭据",
+            DiagnosticStatus.WARNING,
+            "credentials-not-configured",
+            "尚未配置 Telegram 登录凭据",
+            1,
+            {"credentialsConfigured": False},
+        ),
+        DiagnosticResult(
+            "project-write",
+            "项目内写入",
+            DiagnosticStatus.FAILED,
+            "download-write-failed",
+            "当前下载目录写入检查失败",
+            1,
+            {"downloadWritable": False},
+        ),
+        DiagnosticResult(
+            "project-write",
+            "项目内写入",
+            DiagnosticStatus.PASSED,
+            "project-write-ok",
+            "项目内临时写入和当前下载目录写入正常",
+            1,
+            {"downloadWritable": True},
+        ),
+        DiagnosticResult(
+            "disk",
+            "磁盘空间",
+            DiagnosticStatus.PASSED,
+            "disk-space-ok",
+            "应用和下载所在磁盘可用空间正常",
+            1,
+            {
+                "totalBytes": 8 * 1024**3,
+                "freeBytes": 2 * 1024**3,
+                "downloadSameVolume": False,
+                "downloadTotalBytes": 16 * 1024**3,
+                "downloadFreeBytes": 4 * 1024**3,
+            },
+        ),
+        DiagnosticResult(
+            "disk",
+            "磁盘空间",
+            DiagnosticStatus.FAILED,
+            "download-disk-unavailable",
+            "无法读取下载所在磁盘的空间信息",
+            1,
+            {
+                "totalBytes": 8 * 1024**3,
+                "freeBytes": 2 * 1024**3,
+                "downloadSameVolume": False,
+            },
+        ),
+        DiagnosticResult(
+            "disk",
+            "磁盘空间",
+            DiagnosticStatus.FAILED,
+            "download-disk-space-critical",
+            "下载所在磁盘可用空间低于 256 MiB",
+            1,
+            {
+                "totalBytes": 8 * 1024**3,
+                "freeBytes": 2 * 1024**3,
+                "downloadSameVolume": False,
+                "downloadTotalBytes": 8 * 1024**3,
+                "downloadFreeBytes": 128 * 1024**2,
+            },
+        ),
+        DiagnosticResult(
+            "disk",
+            "磁盘空间",
+            DiagnosticStatus.WARNING,
+            "download-disk-space-low",
+            "下载所在磁盘可用空间低于 1 GiB",
+            1,
+            {
+                "totalBytes": 8 * 1024**3,
+                "freeBytes": 2 * 1024**3,
+                "downloadSameVolume": False,
+                "downloadTotalBytes": 8 * 1024**3,
+                "downloadFreeBytes": 512 * 1024**2,
+            },
+        ),
+        DiagnosticResult(
+            "telegram",
+            "Telegram 连接",
+            DiagnosticStatus.WARNING,
+            "telegram-network-timeout",
+            "Telegram 连接检查超时",
+            1,
+        ),
+        DiagnosticResult(
+            "updates",
+            "签名更新源",
+            DiagnosticStatus.WARNING,
+            "update-sources-timeout",
+            "签名更新源检查超时",
+            1,
+        ),
+    ],
+)
+def test_hardened_diagnostic_variants_round_trip_without_private_data(
+    tmp_path: Path,
+    result: DiagnosticResult,
+) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    report = DiagnosticReport.build("0.18.4", NOW, NOW, (result,))
+    private_values = {"api-secret", r"D:\private\media"}
+    store = DiagnosticReportStore(paths, secrets=private_values)
+
+    serialized = store.serialize(report)
+    assert store.deserialize(serialized) == report
+    package = store.export(report)
+
+    with ZipFile(package) as archive:
+        assert sorted(archive.namelist()) == [
+            "diagnostic-report.json",
+            "diagnostic-summary.txt",
+        ]
+        payload = b"\n".join(archive.read(name) for name in archive.namelist())
+    for private in private_values:
+        assert private.encode("utf-8") not in serialized
+        assert private.encode("utf-8") not in payload
