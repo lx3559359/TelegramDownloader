@@ -71,6 +71,7 @@ from telegram_downloader.scheduler import SchedulerSnapshot
 from telegram_downloader.settings import AppSettings, ProxySettings
 from telegram_downloader.storage_maintenance import StorageMaintenanceError
 from telegram_downloader.subscriptions import SubscriptionDraft
+from telegram_downloader.task_center import ProgressSample, TaskView, build_task_view
 from telegram_downloader.ui.models import TaskItemSummary, TaskSummary
 from telegram_downloader.update import UpdateStartupResult
 
@@ -620,7 +621,7 @@ class AppController:
         self._task_refresh_pending = False
         self._progress_refresh_interval = progress_refresh_interval
         self._next_progress_refresh = 0.0
-        self._progress_samples: dict[str, tuple[float, int]] = {}
+        self._progress_samples: dict[str, ProgressSample] = {}
         self._session_expiry_lock = asyncio.Lock()
         self._session_expiry_handled = False
         self._background_launch = False
@@ -2598,13 +2599,14 @@ class AppController:
         sampled_at = monotonic_clock() if now is None else now
         scheduler_state, queue_positions = self._task_scheduler_state()
         snapshots = self.repository.list_task_snapshots(include_archived=True)
-        summaries = self._summaries_from_snapshots(
+        view = build_task_view(
             snapshots,
-            scheduler_state,
-            queue_positions,
-            sampled_at,
+            scheduler_state=scheduler_state,
+            queue_positions=queue_positions,
+            sampled_at=sampled_at,
+            previous_samples=self._progress_samples,
         )
-        self._apply_task_summaries(summaries, scheduler_state)
+        self._apply_task_view(view, scheduler_state)
 
     async def refresh_tasks_async(self, *, now: float | None = None) -> None:
         active = self._task_refresh_task
@@ -2627,13 +2629,14 @@ class AppController:
                 include_archived=True,
             )
             scheduler_state, queue_positions = self._task_scheduler_state()
-            summaries = self._summaries_from_snapshots(
+            view = build_task_view(
                 snapshots,
-                scheduler_state,
-                queue_positions,
-                sampled_at,
+                scheduler_state=scheduler_state,
+                queue_positions=queue_positions,
+                sampled_at=sampled_at,
+                previous_samples=self._progress_samples,
             )
-            self._apply_task_summaries(summaries, scheduler_state)
+            self._apply_task_view(view, scheduler_state)
             if not self._task_refresh_pending:
                 return
 
@@ -2659,60 +2662,13 @@ class AppController:
         queue_positions = queue_positions_method() if callable(queue_positions_method) else {}
         return scheduler_state, queue_positions
 
-    def _summaries_from_snapshots(
+    def _apply_task_view(
         self,
-        snapshots: list[Any],
+        view: TaskView,
         scheduler_state: SchedulerSnapshot,
-        queue_positions: dict[str, int],
-        sampled_at: float,
-    ) -> list[TaskSummary]:
-        summaries: list[TaskSummary] = []
-        active_ids: set[str] = set()
-        for snapshot in snapshots:
-            task = snapshot.task
-            archived = task.archived_at is not None
-            total_bytes = None if snapshot.unknown_size_count else snapshot.known_size
-            speed = self._sample_speed(
-                task.id,
-                task.status if not archived else TaskStatus.COMPLETED,
-                snapshot.downloaded_bytes,
-                sampled_at,
-            )
-            remaining_seconds = None
-            if total_bytes is not None and speed > 0:
-                remaining_seconds = max(
-                    0,
-                    round((total_bytes - snapshot.downloaded_bytes) / speed),
-                )
-            error_text = task.last_error or snapshot.item_error or "—"
-            summaries.append(
-                TaskSummary(
-                    task.id,
-                    getattr(task, "display_title", None) or task.source_title,
-                    task.status,
-                    f"{snapshot.completed_items} / {snapshot.total_items}",
-                    self._format_bytes(snapshot.known_size)
-                    + (" + 未知" if snapshot.unknown_size_count else ""),
-                    self._format_rate(speed),
-                    self._format_duration(remaining_seconds),
-                    error_text,
-                    snapshot.completed_items,
-                    snapshot.total_items,
-                    snapshot.downloaded_bytes,
-                    total_bytes,
-                    speed,
-                    remaining_seconds,
-                    archived,
-                    queue_positions.get(task.id)
-                    if task.status is TaskStatus.QUEUED and not archived
-                    else None,
-                )
-            )
-            if not archived and task.status is TaskStatus.DOWNLOADING:
-                active_ids.add(task.id)
-        for task_id in set(self._progress_samples) - active_ids:
-            self._progress_samples.pop(task_id, None)
-        return summaries
+    ) -> None:
+        self._progress_samples = dict(view.progress_samples)
+        self._apply_task_summaries(list(view.ordered), scheduler_state)
 
     def _apply_task_summaries(
         self,
@@ -2728,24 +2684,6 @@ class AppController:
                 concurrency=scheduler_state.concurrency,
                 speed_limit_kib=scheduler_state.speed_limit_kib,
             )
-
-    def _sample_speed(
-        self,
-        task_id: str,
-        status: TaskStatus,
-        downloaded: int,
-        now: float,
-    ) -> float:
-        if status is not TaskStatus.DOWNLOADING:
-            self._progress_samples.pop(task_id, None)
-            return 0.0
-        previous = self._progress_samples.get(task_id)
-        self._progress_samples[task_id] = (now, downloaded)
-        if previous is None:
-            return 0.0
-        elapsed = now - previous[0]
-        delta = downloaded - previous[1]
-        return delta / elapsed if elapsed > 0 and delta > 0 else 0.0
 
     async def _refresh_tasks_if_due(self, now: float | None = None) -> None:
         sampled_at = monotonic_clock() if now is None else now
@@ -3316,19 +3254,6 @@ class AppController:
                 return f"{amount:.0f} {unit}" if unit == "B" else f"{amount:.1f} {unit}"
             amount /= 1024
         return f"{value} B"
-
-    @classmethod
-    def _format_rate(cls, value: float) -> str:
-        return "—" if value <= 0 else f"{cls._format_bytes(round(value))}/s"
-
-    @staticmethod
-    def _format_duration(value: int | None) -> str:
-        if value is None:
-            return "—"
-        if value < 60:
-            return f"{value} 秒"
-        minutes, seconds = divmod(value, 60)
-        return f"{minutes} 分 {seconds} 秒"
 
     @staticmethod
     def filters_from_dates(
