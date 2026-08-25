@@ -69,6 +69,7 @@ from telegram_downloader.maintenance_activity import (
 )
 from telegram_downloader.notifications import EventKind
 from telegram_downloader.paths import PortablePaths
+from telegram_downloader.repository import ItemPage
 from telegram_downloader.scheduler import SchedulerSnapshot
 from telegram_downloader.settings import AppSettings, DownloadStorageSettings, ProxySettings
 from telegram_downloader.ui.login import LoginPage
@@ -899,6 +900,7 @@ async def test_candidate_commit_same_account_skips_switch_confirmation() -> None
     vault.value = {"api_hash": "saved", "session": "old-session"}
     switch_confirmations = []
     bindings = []
+    refresh = _TaskRefreshFake()
     controller = AppController.for_test(
         gateway=old_gateway,
         planner="old-planner",
@@ -915,6 +917,7 @@ async def test_candidate_commit_same_account_skips_switch_confirmation() -> None
         confirm_account_switch=lambda old, new: switch_confirmations.append(
             (old, new)
         ),
+        task_refresh=refresh,
     )
     controller._candidate_login = CandidateLoginSession(candidate_gateway)
 
@@ -929,6 +932,7 @@ async def test_candidate_commit_same_account_skips_switch_confirmation() -> None
     assert bindings[-1].gateway is candidate_gateway
     assert old_gateway.disconnect_calls == 1
     assert old_scheduler.shutdown_calls == 1
+    assert refresh.generations == 1
 
 
 @pytest.mark.asyncio
@@ -2169,7 +2173,7 @@ async def test_confirmed_scan_awaits_async_task_refresh_before_start() -> None:
         confirm_preview=lambda _preview: True,
     )
     controller.refresh_tasks = Mock(side_effect=AssertionError("同步刷新不应被调用"))
-    controller.refresh_tasks_async = AsyncMock()
+    controller.task_refresh.refresh_now = AsyncMock()
     controller._start_task = Mock()
 
     await controller.scan_link(
@@ -2177,7 +2181,7 @@ async def test_confirmed_scan_awaits_async_task_refresh_before_start() -> None:
         controller.default_filters(datetime(2026, 8, 13, tzinfo=UTC)),
     )
 
-    controller.refresh_tasks_async.assert_awaited_once()
+    controller.task_refresh.refresh_now.assert_awaited_once_with(("task-1",))
     controller._start_task.assert_called_once_with("task-1")
 
 
@@ -2214,7 +2218,7 @@ async def test_confirmed_batch_scan_previews_and_commits_one_task() -> None:
     )
     controller.window.finish_batch_preflight = Mock()
     controller.window.set_batch_scan_progress = Mock()
-    controller.refresh_tasks_async = AsyncMock()
+    controller.task_refresh.refresh_now = AsyncMock()
     controller._start_task = Mock()
 
     await controller.scan_links(
@@ -2300,6 +2304,13 @@ async def test_running_task_refreshes_window_before_download_finishes() -> None:
             item.downloaded_bytes = 100
             item.status = ItemStatus.COMPLETED
             task.status = TaskStatus.COMPLETED
+
+        def snapshot(self):
+            active = (task.id,) if task.status is TaskStatus.DOWNLOADING else ()
+            return SchedulerSnapshot(active, (), 1, 0)
+
+        def queue_positions(self):
+            return {}
 
     class Window:
         def __init__(self):
@@ -2527,51 +2538,175 @@ def test_task_directory_rejects_persisted_path_outside_download_root(
     assert "安全限制" in controller.window.message.last_message
 
 
-def test_task_detail_selection_loads_only_one_selected_task() -> None:
-    item = SimpleNamespace(
-        id="item-1",
-        original_name="video.mp4",
-        media_kind=MediaKind.VIDEO,
-        status=ItemStatus.DOWNLOADING,
-        downloaded_bytes=5,
-        expected_size=10,
-        retry_count=2,
-        last_error="safe-error",
-        integrity_status=IntegrityStatus.HASH_MISMATCH,
-        verified_at=datetime(2026, 8, 16, tzinfo=UTC),
+@pytest.mark.asyncio
+async def test_task_detail_selection_loads_only_one_selected_task_without_blocking() -> None:
+    loop = asyncio.get_running_loop()
+    started = threading.Event()
+    release = threading.Event()
+    heartbeat = asyncio.Event()
+    items = tuple(
+        SimpleNamespace(
+            id=f"item-{index}",
+            original_name=f"video-{index}.mp4",
+            media_kind=MediaKind.VIDEO,
+            status=ItemStatus.DOWNLOADING,
+            downloaded_bytes=5,
+            expected_size=10,
+            retry_count=2,
+            last_error="safe-error",
+            integrity_status=IntegrityStatus.HASH_MISMATCH,
+            verified_at=datetime(2026, 8, 16, tzinfo=UTC),
+        )
+        for index in range(500)
     )
 
     class Repository:
         def __init__(self):
             self.calls = []
 
-        def list_items(self, task_id):
+        def list_items_page(self, task_id, *, after=None, limit=100):
             self.calls.append(task_id)
-            return [item]
+            assert after is None
+            assert limit == 500
+            started.set()
+            assert release.wait(timeout=1)
+            return ItemPage(items, None, len(items))
 
     class Window:
         def __init__(self):
-            self.details = []
+            self.pages = []
 
-        def set_task_items(self, task_id, items):
-            self.details.append((task_id, items))
+        def begin_task_items(self, task_id, *, total_count):
+            self.pages.append(SimpleNamespace(task_id=task_id, items=(), total=total_count))
+
+        def append_task_items(self, task_id, values, *, total_count):
+            self.pages.append(
+                SimpleNamespace(task_id=task_id, items=tuple(values), total=total_count)
+            )
 
     repository = Repository()
     window = Window()
     controller = AppController.for_test(repository=repository, window=window)
 
-    controller.select_task_details([])
-    controller.select_task_details(["task-1", "task-2"])
-    controller.select_task_details(["task-1"])
+    await controller.select_task_details([])
+    await controller.select_task_details(["task-1", "task-2"])
+    operation = asyncio.create_task(controller.select_task_details(["task-1"]))
+    assert await asyncio.to_thread(started.wait, 1) is True
+    loop.call_soon(heartbeat.set)
+    await asyncio.wait_for(heartbeat.wait(), timeout=0.5)
+    assert operation.done() is False
+    release.set()
+    await operation
 
     assert repository.calls == ["task-1"]
-    task_id, summaries = window.details[-1]
-    assert task_id == "task-1"
-    assert len(summaries) == 1
-    assert summaries[0].id == item.id
+    page = window.pages[-1]
+    assert page.task_id == "task-1"
+    assert len(page.items) == 500
+    assert page.items[0].id == items[0].id
+    summaries = page.items
     assert summaries[0].error_text == "safe-error"
     assert summaries[0].integrity_status is IntegrityStatus.HASH_MISMATCH
-    assert summaries[0].verified_at == item.verified_at
+    assert summaries[0].verified_at == items[0].verified_at
+
+
+@pytest.mark.asyncio
+async def test_detail_page_load_more_is_deduplicated_and_failure_is_retryable() -> None:
+    item = _integrity_item("page-item")
+    second_item = _integrity_item("page-item-2")
+    cursor = SimpleNamespace(message_date_utc=datetime.now(UTC), message_id=1, item_id="one")
+    load_more_started = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    class Repository:
+        def list_items_page(self, task_id, *, after=None, limit=100):
+            nonlocal calls
+            assert task_id == "task"
+            assert limit == 500
+            calls += 1
+            if after is None:
+                return ItemPage((item,), cursor, 2)
+            if calls == 2:
+                load_more_started.set()
+                assert release.wait(timeout=1)
+                raise OSError("private media name")
+            return ItemPage((second_item,), None, 2)
+
+    class Window:
+        def __init__(self):
+            self.pages = []
+            self.errors = []
+
+        def begin_task_items(self, task_id, *, total_count):
+            self.pages.clear()
+
+        def append_task_items(self, task_id, items, *, total_count):
+            self.pages.append(tuple(value.id for value in items))
+
+        def set_task_items_page_busy(self, _busy):
+            pass
+
+        def show_task_items_page_error(self, message):
+            self.errors.append(message)
+
+    window = Window()
+    controller = AppController.for_test(repository=Repository(), window=window)
+    await controller.select_task_details(["task"])
+    first = asyncio.create_task(controller.load_more_task_items("task"))
+    assert await asyncio.to_thread(load_more_started.wait, 1) is True
+    second = asyncio.create_task(controller.load_more_task_items("task"))
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(first, second)
+
+    assert calls == 2
+    assert window.pages == [("page-item",)]
+    assert len(window.errors) == 1
+    assert "private media name" not in window.errors[0]
+
+    await controller.load_more_task_items("task")
+
+    assert calls == 3
+    assert window.pages == [("page-item",), ("page-item-2",)]
+
+
+@pytest.mark.asyncio
+async def test_detail_page_drops_old_generation_after_task_switch() -> None:
+    old_started = threading.Event()
+    old_release = threading.Event()
+    old_item = _integrity_item("old", "old-task")
+    new_item = _integrity_item("new", "new-task")
+
+    class Repository:
+        def list_items_page(self, task_id, *, after=None, limit=100):
+            assert after is None
+            assert limit == 500
+            if task_id == "old-task":
+                old_started.set()
+                assert old_release.wait(timeout=1)
+                return ItemPage((old_item,), None, 1)
+            return ItemPage((new_item,), None, 1)
+
+    class Window:
+        def __init__(self):
+            self.pages = []
+
+        def begin_task_items(self, task_id, *, total_count):
+            pass
+
+        def append_task_items(self, task_id, items, *, total_count):
+            self.pages.append((task_id, tuple(value.id for value in items)))
+
+    window = Window()
+    controller = AppController.for_test(repository=Repository(), window=window)
+    old = asyncio.create_task(controller.select_task_details(["old-task"]))
+    assert await asyncio.to_thread(old_started.wait, 1) is True
+
+    await controller.select_task_details(["new-task"])
+    old_release.set()
+    await old
+
+    assert window.pages == [("new-task", ("new",))]
 
 
 def _integrity_item(
@@ -2669,7 +2804,7 @@ async def test_verify_media_forwards_progress_suppresses_duplicate_and_refreshes
         integrity_service=integrity,
     )
     controller.refresh_tasks = Mock(side_effect=AssertionError("同步刷新不应被调用"))
-    controller.select_task_details([item.task_id])
+    await controller.select_task_details([item.task_id])
 
     active = asyncio.create_task(controller.verify_media([item.id, item.id]))
     await entered.wait()
@@ -2832,7 +2967,7 @@ async def test_repair_selected_media_runs_only_prepared_ids() -> None:
         window=window,
         integrity_service=Integrity(),
     )
-    controller.select_task_details([broken.task_id])
+    await controller.select_task_details([broken.task_id])
 
     await controller.repair_media([broken.id, healthy.id])
 
@@ -2932,8 +3067,8 @@ async def test_pause_tasks_uses_bulk_lookup_command_and_one_refresh() -> None:
         repository=Repository(),
         scheduler=Scheduler(),
     )
-    controller.refresh_tasks_async = AsyncMock(
-        side_effect=lambda: events.append("refresh")
+    controller.task_refresh.refresh_now = AsyncMock(
+        side_effect=lambda _ids: events.append("refresh")
     )
 
     await controller.pause_tasks(["a", "b", "a"])
@@ -2954,7 +3089,7 @@ async def test_task_batch_commands_skip_ineligible_states() -> None:
         resume_tasks=AsyncMock(side_effect=({"pause"}, {"fail"})),
     )
     controller = AppController.for_test(repository=repository, scheduler=scheduler)
-    controller.refresh_tasks_async = AsyncMock()
+    controller.task_refresh.refresh_now = AsyncMock()
 
     await controller.pause_tasks(["run", "pause", "fail"])
     await controller.resume_tasks(["run", "pause", "fail"])
@@ -2986,13 +3121,13 @@ async def test_resume_commands_use_one_bulk_lookup_and_refresh(
         resume_tasks=AsyncMock(return_value={"a", "b"}),
     )
     controller = AppController.for_test(repository=repository, scheduler=scheduler)
-    controller.refresh_tasks_async = AsyncMock()
+    controller.task_refresh.refresh_now = AsyncMock()
 
     await getattr(controller, method)(["a", "b", "a"])
 
     repository.get_tasks.assert_called_once_with(["a", "b"])
     scheduler.resume_tasks.assert_awaited_once_with(["a", "b"])
-    controller.refresh_tasks_async.assert_awaited_once()
+    controller.task_refresh.refresh_now.assert_awaited_once_with(("a", "b"))
 
 
 @pytest.mark.asyncio
@@ -3001,12 +3136,12 @@ async def test_archive_commands_write_and_refresh_once(method: str) -> None:
     repository = SimpleNamespace()
     setattr(repository, method, Mock(return_value={"a", "b"}))
     controller = AppController.for_test(repository=repository)
-    controller.refresh_tasks_async = AsyncMock()
+    controller.task_refresh.refresh_now = AsyncMock()
 
     await getattr(controller, method)(["a", "b", "a"])
 
     getattr(repository, method).assert_called_once_with(["a", "b"])
-    controller.refresh_tasks_async.assert_awaited_once()
+    controller.task_refresh.refresh_now.assert_awaited_once_with(("a", "b"))
 
 
 def test_open_media_file_requires_completed_local_existing_file(
@@ -3112,25 +3247,311 @@ def test_open_media_and_task_directory_accept_external_trusted_root(
 
 
 @pytest.mark.asyncio
-async def test_progress_refresh_is_throttled_across_concurrent_callers() -> None:
-    controller = AppController.for_test(progress_refresh_interval=0.5)
-    refreshes: list[float | None] = []
-
-    async def refresh(*, now=None) -> None:
-        refreshes.append(now)
-
-    controller.refresh_tasks_async = refresh
+async def test_progress_refresh_delegates_fixed_window_to_coordinator() -> None:
+    refresh = _TaskRefreshFake()
+    scheduler = SimpleNamespace(
+        snapshot=Mock(return_value=SchedulerSnapshot(("active",), (), 1, 0)),
+        queue_positions=Mock(return_value={}),
+    )
+    controller = AppController.for_test(
+        scheduler=scheduler,
+        progress_refresh_interval=0.5,
+        task_refresh=refresh,
+    )
 
     await controller._refresh_tasks_if_due(20.0)
     await controller._refresh_tasks_if_due(20.1)
     await controller._refresh_tasks_if_due(20.5)
 
-    assert refreshes == [20.0, 20.5]
+    assert refresh.marked == [("active",), ("active",), ("active",)]
 
 
 def test_progress_refresh_interval_must_be_positive() -> None:
     with pytest.raises(ValueError, match="进度刷新间隔必须大于零"):
         AppController.for_test(progress_refresh_interval=0)
+
+
+class _TaskRefreshFake:
+    def __init__(self) -> None:
+        self.activations = 0
+        self.deactivations = 0
+        self.marked: list[tuple[str, ...]] = []
+        self.immediate: list[tuple[str, ...]] = []
+        self.reconciliations = 0
+        self.generations = 0
+        self.closed = 0
+
+    async def activate(self) -> None:
+        self.activations += 1
+
+    def deactivate(self) -> None:
+        self.deactivations += 1
+
+    def mark_progress(self, task_ids) -> None:
+        self.marked.append(tuple(task_ids))
+
+    async def refresh_now(self, task_ids) -> None:
+        self.immediate.append(tuple(task_ids))
+
+    async def reconcile_now(self) -> None:
+        self.reconciliations += 1
+
+    def replace_generation(self) -> None:
+        self.generations += 1
+
+    async def close(self) -> None:
+        self.closed += 1
+
+
+@pytest.mark.asyncio
+async def test_async_start_builds_indexes_and_full_snapshot_off_event_loop() -> None:
+    loop = asyncio.get_running_loop()
+    index_threads: list[int] = []
+    snapshot_started = threading.Event()
+    snapshot_release = threading.Event()
+    heartbeat = asyncio.Event()
+
+    class Repository:
+        def ensure_task_center_indexes(self):
+            index_threads.append(threading.get_ident())
+
+        def list_task_snapshots(self, *, include_archived=False):
+            assert include_archived is True
+            snapshot_started.set()
+            assert snapshot_release.wait(timeout=1)
+            return []
+
+    class Window:
+        def __init__(self):
+            self.snapshots = []
+            self.message = SimpleNamespace(showMessage=lambda *_args: None)
+
+        def set_task_snapshot(self, tasks, order_keys, dashboard):
+            self.snapshots.append((tuple(tasks), dict(order_keys), dashboard))
+
+        def statusBar(self):
+            return self.message
+
+    window = Window()
+    controller = AppController.for_test(repository=Repository(), window=window)
+    controller.refresh_tasks = Mock(side_effect=AssertionError("不得同步启动刷新"))
+    operation = asyncio.create_task(controller.start())
+    try:
+        assert await asyncio.to_thread(snapshot_started.wait, 1) is True
+        loop.call_soon(heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), timeout=0.5)
+        assert operation.done() is False
+        assert index_threads and index_threads[0] != threading.get_ident()
+    finally:
+        snapshot_release.set()
+        await operation
+        await controller.shutdown()
+
+    assert len(window.snapshots) == 1
+
+
+@pytest.mark.asyncio
+async def test_task_refresh_actions_use_only_accepted_ids() -> None:
+    refresh = _TaskRefreshFake()
+    status_by_id = {
+        "pause": TaskStatus.DOWNLOADING,
+        "resume": TaskStatus.PAUSED,
+        "retry": TaskStatus.PARTIAL_FAILURE,
+    }
+
+    class Repository:
+        def get_tasks(self, task_ids):
+            return [task_record(task_id, status_by_id[task_id]) for task_id in task_ids]
+
+        def archive_tasks(self, _task_ids):
+            return {"archive"}
+
+        def restore_tasks(self, _task_ids):
+            return {"restore"}
+
+    class Scheduler:
+        async def pause_tasks(self, _task_ids):
+            return {"pause"}
+
+        async def resume_tasks(self, task_ids):
+            return set(task_ids)
+
+    controller = AppController.for_test(
+        repository=Repository(),
+        scheduler=Scheduler(),
+        task_refresh=refresh,
+    )
+
+    await controller.pause_tasks(["pause", "resume"])
+    await controller.resume_tasks(["pause", "resume"])
+    await controller.retry_failed_tasks(["retry", "resume"])
+    await controller.archive_tasks(["archive", "skip"])
+    await controller.restore_tasks(["restore", "skip"])
+
+    assert refresh.immediate == [
+        ("pause",),
+        ("resume",),
+        ("retry",),
+        ("archive",),
+        ("restore",),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_task_refresh_priority_updates_all_linked_queued_ids() -> None:
+    refresh = _TaskRefreshFake()
+    task = task_record("target", TaskStatus.QUEUED)
+
+    class Repository:
+        def get_tasks(self, _task_ids):
+            return [task]
+
+        def prioritize_task(self, _task_id):
+            return True
+
+    class Scheduler:
+        async def prioritize_task(self, _task_id):
+            return True
+
+        def snapshot(self):
+            return SchedulerSnapshot((), ("target", "linked"), 2, 0)
+
+        def queue_positions(self):
+            return {"target": 1, "linked": 2}
+
+    controller = AppController.for_test(
+        repository=Repository(),
+        scheduler=Scheduler(),
+        task_refresh=refresh,
+    )
+
+    await controller.prioritize_task(task.id)
+
+    assert refresh.immediate == [("target", "linked")]
+
+
+@pytest.mark.asyncio
+async def test_task_refresh_marks_active_ids_and_updates_only_visible_media() -> None:
+    refresh = _TaskRefreshFake()
+    requested: list[tuple[str, ...]] = []
+    item_by_id = {
+        item_id: SimpleNamespace(
+            id=item_id,
+            original_name=f"{item_id}.bin",
+            media_kind=MediaKind.DOCUMENT,
+            status=ItemStatus.DOWNLOADING,
+            downloaded_bytes=3,
+            expected_size=10,
+            retry_count=0,
+            last_error=None,
+            integrity_status=IntegrityStatus.UNVERIFIED,
+            verified_at=None,
+        )
+        for item_id in ("visible", "selected")
+    }
+
+    class Repository:
+        def get_items(self, item_ids):
+            requested.append(tuple(item_ids))
+            return [item_by_id[item_id] for item_id in item_ids]
+
+    class Scheduler:
+        def snapshot(self):
+            return SchedulerSnapshot(("active", "second"), ("queued",), 2, 0)
+
+        def queue_positions(self):
+            return {"queued": 1}
+
+    class Window:
+        def __init__(self):
+            self.applied = []
+
+        def visible_task_item_ids(self):
+            return ("visible",)
+
+        def selected_media_ids(self):
+            return ["selected", "visible"]
+
+        def apply_task_items(self, task_id, items):
+            self.applied.append((task_id, tuple(item.id for item in items)))
+
+    window = Window()
+    controller = AppController.for_test(
+        repository=Repository(),
+        scheduler=Scheduler(),
+        window=window,
+        task_refresh=refresh,
+    )
+    controller._detail_task_id = "active"
+
+    await controller._refresh_tasks_if_due(20.0)
+
+    assert refresh.marked == [("active", "second")]
+    assert requested == [("visible", "selected")]
+    assert window.applied == [("active", ("visible", "selected"))]
+
+
+@pytest.mark.asyncio
+async def test_task_refresh_terminal_event_is_immediate() -> None:
+    refresh = _TaskRefreshFake()
+
+    class Scheduler:
+        async def run_task(self, _task_id):
+            return None
+
+        def is_active(self, _task_id):
+            return False
+
+    controller = AppController.for_test(scheduler=Scheduler(), task_refresh=refresh)
+
+    await controller._run_and_refresh("finished")
+
+    assert refresh.immediate == [("finished",)]
+
+
+@pytest.mark.asyncio
+async def test_task_refresh_index_failure_is_sanitized_and_retries_only_when_idle() -> None:
+    refresh = _TaskRefreshFake()
+    attempts = 0
+    active_ids: tuple[str, ...] = ("downloading",)
+
+    class Repository:
+        def ensure_task_center_indexes(self):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("private database path")
+
+        def list_task_snapshots(self, *, include_archived=False):
+            assert include_archived is True
+            return []
+
+    class Scheduler:
+        def snapshot(self):
+            return SchedulerSnapshot(active_ids, (), 1, 0)
+
+        def queue_positions(self):
+            return {}
+
+    controller = AppController.for_test(
+        repository=Repository(),
+        scheduler=Scheduler(),
+        task_refresh=refresh,
+    )
+
+    await controller.start()
+
+    assert attempts == 1
+    assert "private database path" not in controller.window.message.last_message
+    controller._task_center_index_retry_at = 0.0
+    await controller._load_full_task_view()
+    assert attempts == 1
+    active_ids = ()
+    await controller._load_full_task_view()
+    assert attempts == 2
+    assert controller._task_center_index_ready is True
+    await controller.shutdown()
+    assert refresh.closed == 1
 
 
 class ContentPageFake:
@@ -4330,12 +4751,12 @@ async def test_queue_selection_awaits_async_task_refresh_before_start() -> None:
     )
     controller._reload_content_search = Mock()
     controller.refresh_tasks = Mock(side_effect=AssertionError("同步刷新不应被调用"))
-    controller.refresh_tasks_async = AsyncMock()
+    controller.task_refresh.refresh_now = AsyncMock()
     controller._start_task = Mock()
 
     await controller.queue_content_selection("search-1")
 
-    controller.refresh_tasks_async.assert_awaited_once()
+    controller.task_refresh.refresh_now.assert_awaited_once_with(("task-1",))
     controller._start_task.assert_called_once_with("task-1")
 
 
@@ -4417,13 +4838,13 @@ async def test_queue_commit_starts_once_when_catalog_reconciliation_fails() -> N
         window=ContentWindowFake(),
     )
     controller._start_task = Mock()
-    controller.refresh_tasks_async = AsyncMock()
+    controller.task_refresh.refresh_now = AsyncMock()
 
     await controller.queue_content_selection("s1")
 
     planner.commit_selected.assert_called_once_with("preview")
     controller._start_task.assert_called_once_with("task-1")
-    controller.refresh_tasks_async.assert_awaited_once()
+    controller.task_refresh.refresh_now.assert_awaited_once_with(("task-1",))
 
 
 @pytest.mark.asyncio
@@ -4944,12 +5365,12 @@ async def test_prioritize_task_persists_before_reordering_and_reports_position()
         repository=Repository(),
         scheduler=Scheduler(),
     )
-    controller.refresh_tasks_async = AsyncMock()
+    controller.task_refresh.refresh_now = AsyncMock()
 
     await controller.prioritize_task(task.id)
 
     assert events == ["repository:queued", "scheduler:queued"]
-    controller.refresh_tasks_async.assert_awaited_once()
+    controller.task_refresh.refresh_now.assert_awaited_once_with(("queued",))
     assert "第 1 位" in controller.window.message.last_message
 
 
@@ -4975,11 +5396,11 @@ async def test_prioritize_task_handles_state_race_without_duplicate_start() -> N
         repository=Repository(),
         scheduler=Scheduler(),
     )
-    controller.refresh_tasks_async = AsyncMock()
+    controller.task_refresh.refresh_now = AsyncMock()
 
     await controller.prioritize_task(task.id)
 
-    controller.refresh_tasks_async.assert_awaited_once()
+    controller.task_refresh.refresh_now.assert_awaited_once_with(("queued",))
     assert "已经开始下载" in controller.window.message.last_message
 
 
@@ -5234,20 +5655,14 @@ async def test_waiting_run_does_not_poll_database_until_completion() -> None:
         scheduler=Scheduler(),
         progress_refresh_interval=0.01,
     )
-    refreshes = 0
-
-    async def refresh() -> None:
-        nonlocal refreshes
-        refreshes += 1
-
-    controller.refresh_tasks_async = refresh
+    controller.task_refresh.refresh_now = AsyncMock()
     operation = asyncio.create_task(controller._run_and_refresh("waiting"))
     await asyncio.sleep(0.03)
-    assert refreshes == 0
+    controller.task_refresh.refresh_now.assert_not_awaited()
 
     release.set()
     await operation
-    assert refreshes == 1
+    controller.task_refresh.refresh_now.assert_awaited_once_with(("waiting",))
 
 
 @pytest.mark.asyncio

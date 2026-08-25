@@ -5,7 +5,7 @@ import inspect
 import logging
 import os
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
@@ -67,11 +67,20 @@ from telegram_downloader.maintenance_activity import (
 )
 from telegram_downloader.notifications import ApplicationEvent, auth_required_event
 from telegram_downloader.paths import PortablePaths
+from telegram_downloader.repository import ItemPage, ItemPageCursor
 from telegram_downloader.scheduler import SchedulerSnapshot
 from telegram_downloader.settings import AppSettings, ProxySettings
 from telegram_downloader.storage_maintenance import StorageMaintenanceError
 from telegram_downloader.subscriptions import SubscriptionDraft
-from telegram_downloader.task_center import ProgressSample, TaskView, build_task_view
+from telegram_downloader.task_center import (
+    ProgressSample,
+    TaskView,
+    TaskViewPatch,
+    build_task_patch,
+    build_task_view,
+    patch_task_view,
+)
+from telegram_downloader.task_refresh import TaskRefreshCoordinator
 from telegram_downloader.ui.models import TaskItemSummary, TaskSummary
 from telegram_downloader.update import UpdateStartupResult
 
@@ -150,6 +159,27 @@ class _NullWindow:
     def set_task_summaries(self, value: list[TaskSummary]) -> None:
         self.tasks = value
 
+    def set_task_snapshot(
+        self,
+        tasks: Sequence[TaskSummary],
+        _order_keys: object,
+        _dashboard: object,
+    ) -> None:
+        self.tasks = list(tasks)
+
+    def apply_task_patch(
+        self,
+        tasks: Sequence[TaskSummary],
+        _order_keys: object,
+        removed_ids: Collection[str],
+        _dashboard: object,
+    ) -> None:
+        by_id = {task.id: task for task in self.tasks}
+        for task_id in removed_ids:
+            by_id.pop(task_id, None)
+        by_id.update((task.id, task) for task in tasks)
+        self.tasks = list(by_id.values())
+
     def set_scheduler_summary(
         self,
         *,
@@ -161,6 +191,37 @@ class _NullWindow:
         pass
 
     def set_task_items(self, _task_id: str, _items: list[TaskItemSummary]) -> None:
+        pass
+
+    def begin_task_items(self, _task_id: str, *, total_count: int) -> None:
+        pass
+
+    def append_task_items(
+        self,
+        _task_id: str,
+        _items: Sequence[TaskItemSummary],
+        *,
+        total_count: int,
+    ) -> None:
+        pass
+
+    def apply_task_items(
+        self,
+        _task_id: str,
+        _items: Sequence[TaskItemSummary],
+    ) -> None:
+        pass
+
+    def visible_task_item_ids(self) -> tuple[str, ...]:
+        return ()
+
+    def selected_media_ids(self) -> list[str]:
+        return []
+
+    def set_task_items_page_busy(self, _busy: bool) -> None:
+        pass
+
+    def show_task_items_page_error(self, _message: str) -> None:
         pass
 
     def set_scan_busy(self, _busy: bool) -> None:
@@ -370,6 +431,29 @@ class _NullRepository:
     def list_items(self, _task_id: str, _statuses=None) -> list[object]:
         return []
 
+    def list_task_snapshots_by_ids(
+        self,
+        _task_ids: Collection[str],
+        *,
+        include_archived: bool = False,
+    ) -> list[object]:
+        return []
+
+    def list_items_page(
+        self,
+        _task_id: str,
+        *,
+        after: ItemPageCursor | None = None,
+        limit: int = 100,
+    ) -> ItemPage:
+        return ItemPage((), None, 0)
+
+    def get_items(self, _item_ids: Collection[str]) -> list[object]:
+        return []
+
+    def ensure_task_center_indexes(self) -> None:
+        pass
+
     def get_task(self, task_id: str):
         raise KeyError(task_id)
 
@@ -534,6 +618,7 @@ class AppController:
         connection_monitor_interval: float = 30.0,
         connection_sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
         progress_refresh_interval: float = 0.5,
+        task_refresh: Any | None = None,
         utc_now: Callable[[], datetime] | None = None,
     ) -> None:
         if progress_refresh_interval <= 0:
@@ -617,11 +702,34 @@ class AppController:
         self._integrity_cancel_event: Event | None = None
         self._integrity_repair_task_ids: set[str] = set()
         self._detail_task_id: str | None = None
-        self._task_refresh_task: asyncio.Task[None] | None = None
-        self._task_refresh_pending = False
+        self._detail_generation = 0
+        self._detail_next_cursor: ItemPageCursor | None = None
+        self._detail_total_count = 0
+        self._detail_page_task: asyncio.Task[None] | None = None
         self._progress_refresh_interval = progress_refresh_interval
-        self._next_progress_refresh = 0.0
         self._progress_samples: dict[str, ProgressSample] = {}
+        scheduler_state, _queue_positions = self._task_scheduler_state()
+        self._task_view = build_task_view(
+            (),
+            scheduler_state=scheduler_state,
+            queue_positions={},
+            sampled_at=monotonic_clock(),
+            previous_samples={},
+        )
+        self._task_center_index_ready = False
+        self._task_center_index_retry_at = 0.0
+        self.task_refresh = task_refresh or TaskRefreshCoordinator[
+            TaskView,
+            TaskViewPatch,
+        ](
+            load_full=self._load_full_task_view,
+            load_ids=self._load_task_patch,
+            apply_full=self._apply_full_task_view,
+            apply_patch=self._apply_incremental_task_view,
+            progress_interval=progress_refresh_interval,
+            reconcile_interval=5.0,
+            on_error=self._task_refresh_error,
+        )
         self._session_expiry_lock = asyncio.Lock()
         self._session_expiry_handled = False
         self._background_launch = False
@@ -773,7 +881,8 @@ class AppController:
 
     async def start(self, *, background: bool = False) -> None:
         self._background_launch = bool(background)
-        self.refresh_tasks()
+        await self._prepare_task_center_index()
+        await self.task_refresh.activate()
         await self.activate_cached_content_account()
         if self.gateway is None:
             if background:
@@ -881,6 +990,7 @@ class AppController:
                 self.bind_online_services(services)
                 self.planner = services.planner
                 self.scheduler = services.scheduler
+            self._replace_task_refresh_generation()
             await self.begin_qr_login()
         except Exception as error:
             self.login_dialog.show_error(self._safe_error(error))
@@ -1248,7 +1358,7 @@ class AppController:
                 self._show_status("已取消创建任务")
                 return
             committed = self.planner.commit(preview)
-            await self.refresh_tasks_async()
+            await self._refresh_task_ids_now((committed.task.id,))
             self._start_task(committed.task.id)
             self._show_status(
                 f"加入 {len(committed.accepted_keys)} 项，"
@@ -1292,7 +1402,7 @@ class AppController:
                 self._show_status("已取消批量创建任务")
                 return
             committed = self.planner.commit(batch.preview)
-            await self.refresh_tasks_async()
+            await self._refresh_task_ids_now((committed.task.id,))
             self._start_task(committed.task.id)
             self._show_status(
                 f"批量加入 {len(committed.accepted_keys)} 项，"
@@ -1798,10 +1908,10 @@ class AppController:
                             )
                         )
                 finally:
-                    await self.refresh_tasks_async()
+                    await self._refresh_task_ids_now((committed.task.id,))
                 raise
             await self._reload_content_search_async(search_id)
-            await self.refresh_tasks_async()
+            await self._refresh_task_ids_now((committed.task.id,))
             self._show_status(
                 f"选择 {report.selected_count} 项，加入 {report.joined_count} 项，"
                 f"跳过重复 {report.duplicate_count} 项，"
@@ -2246,18 +2356,18 @@ class AppController:
             }
         ]
         accepted = await self.scheduler.pause_tasks(eligible)
-        await self.refresh_tasks_async()
+        await self._refresh_accepted_task_ids(eligible, accepted)
         self._show_status(f"已暂停 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个")
 
     async def prioritize_task(self, task_id: str) -> None:
         tasks = await asyncio.to_thread(self.repository.get_tasks, [task_id])
         if not tasks:
-            await self.refresh_tasks_async()
+            await self._refresh_task_ids_now((task_id,))
             self._show_status("任务不存在或已被移除")
             return
         task = tasks[0]
         if task.archived_at is not None or task.status is not TaskStatus.QUEUED:
-            await self.refresh_tasks_async()
+            await self._refresh_task_ids_now((task_id,))
             self._show_status("任务已经开始下载或状态已变化")
             return
 
@@ -2272,7 +2382,10 @@ class AppController:
             clear_priority = getattr(self.repository, "clear_task_priority", None)
             if callable(clear_priority):
                 await asyncio.to_thread(clear_priority, task_id)
-        await self.refresh_tasks_async()
+        scheduler_state, _queue_positions = self._task_scheduler_state()
+        await self._refresh_task_ids_now(
+            tuple(dict.fromkeys((*scheduler_state.queued_task_ids, task_id)))
+        )
         if reordered:
             position = self.scheduler.queue_positions().get(task_id)
             if position is not None:
@@ -2291,7 +2404,7 @@ class AppController:
             if task.archived_at is None and task.status is TaskStatus.PAUSED
         ]
         accepted = await self.scheduler.resume_tasks(eligible) if eligible else set()
-        await self.refresh_tasks_async()
+        await self._refresh_accepted_task_ids(eligible, accepted)
         self._show_status(f"已继续 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个")
 
     async def retry_failed_tasks(self, task_ids: list[str]) -> None:
@@ -2303,13 +2416,13 @@ class AppController:
             if task.archived_at is None and task.status is TaskStatus.PARTIAL_FAILURE
         ]
         accepted = await self.scheduler.resume_tasks(eligible) if eligible else set()
-        await self.refresh_tasks_async()
+        await self._refresh_accepted_task_ids(eligible, accepted)
         self._show_status(f"已重试 {len(accepted)} 个任务，跳过 {len(unique) - len(accepted)} 个")
 
     async def archive_tasks(self, task_ids: list[str]) -> None:
         unique = self._unique_task_ids(task_ids)
         accepted = await asyncio.to_thread(self.repository.archive_tasks, unique)
-        await self.refresh_tasks_async()
+        await self._refresh_accepted_task_ids(unique, accepted)
         self._show_status(
             f"已归档 {len(accepted)} 个完成任务；下载文件已保留，"
             f"跳过 {len(unique) - len(accepted)} 个"
@@ -2318,22 +2431,143 @@ class AppController:
     async def restore_tasks(self, task_ids: list[str]) -> None:
         unique = self._unique_task_ids(task_ids)
         accepted = await asyncio.to_thread(self.repository.restore_tasks, unique)
-        await self.refresh_tasks_async()
+        await self._refresh_accepted_task_ids(unique, accepted)
         self._show_status(
             f"已恢复 {len(accepted)} 个归档任务，跳过 {len(unique) - len(accepted)} 个"
         )
 
-    def select_task_details(self, task_ids: list[str]) -> None:
+    async def select_task_details(self, task_ids: list[str]) -> None:
+        self._invalidate_task_details()
+        generation = self._detail_generation
         unique = self._unique_task_ids(task_ids)
         if len(unique) != 1:
-            self._detail_task_id = None
             return
         task_id = unique[0]
-        try:
-            items = self.repository.list_items(task_id)
-        except KeyError:
+        self._detail_task_id = task_id
+        operation = asyncio.create_task(
+            self._load_task_items_page(
+                task_id,
+                after=None,
+                generation=generation,
+                initial=True,
+            )
+        )
+        self._detail_page_task = operation
+        operation.add_done_callback(self._detail_page_finished)
+        await asyncio.shield(operation)
+
+    async def load_more_task_items(self, task_id: str) -> None:
+        if task_id != self._detail_task_id or self._detail_next_cursor is None:
             return
-        summaries = [
+        active = self._detail_page_task
+        if active is not None and not active.done():
+            await asyncio.shield(active)
+            return
+        generation = self._detail_generation
+        set_busy = getattr(self.window, "set_task_items_page_busy", None)
+        if callable(set_busy):
+            set_busy(True)
+        operation = asyncio.create_task(
+            self._load_task_items_page(
+                task_id,
+                after=self._detail_next_cursor,
+                generation=generation,
+                initial=False,
+            )
+        )
+        self._detail_page_task = operation
+        operation.add_done_callback(self._detail_page_finished)
+        await asyncio.shield(operation)
+
+    async def _load_task_items_page(
+        self,
+        task_id: str,
+        *,
+        after: ItemPageCursor | None,
+        generation: int,
+        initial: bool,
+    ) -> None:
+        try:
+            page = await asyncio.to_thread(
+                self._list_task_items_page,
+                task_id,
+                after,
+            )
+        except Exception as error:
+            if self._detail_is_current(task_id, generation):
+                self._show_task_items_page_error(
+                    f"加载媒体明细失败（{type(error).__name__}）"
+                )
+            return
+        if not self._detail_is_current(task_id, generation):
+            return
+        summaries = self._task_item_summaries(page.items)
+        self._detail_next_cursor = page.next_cursor
+        self._detail_total_count = page.total_count
+        begin = getattr(self.window, "begin_task_items", None)
+        append = getattr(self.window, "append_task_items", None)
+        if callable(begin) and callable(append):
+            if initial:
+                begin(task_id, total_count=page.total_count)
+            append(task_id, summaries, total_count=page.total_count)
+            return
+        set_items = getattr(self.window, "set_task_items", None)
+        if callable(set_items):
+            set_items(task_id, summaries)
+
+    def _list_task_items_page(
+        self,
+        task_id: str,
+        after: ItemPageCursor | None,
+    ) -> ItemPage:
+        list_page = getattr(self.repository, "list_items_page", None)
+        if callable(list_page):
+            return list_page(task_id, after=after, limit=500)
+        if after is not None:
+            return ItemPage((), None, 0)
+        items = tuple(self.repository.list_items(task_id))
+        return ItemPage(items, None, len(items))
+
+    async def refresh_visible_task_items(self) -> None:
+        task_id = self._detail_task_id
+        if task_id is None:
+            return
+        generation = self._detail_generation
+        visible = getattr(self.window, "visible_task_item_ids", None)
+        selected = getattr(self.window, "selected_media_ids", None)
+        item_ids = tuple(
+            dict.fromkeys(
+                (
+                    *(visible() if callable(visible) else ()),
+                    *(selected() if callable(selected) else ()),
+                )
+            )
+        )
+        if not item_ids:
+            return
+        get_items = getattr(self.repository, "get_items", None)
+        try:
+            if callable(get_items):
+                items = await asyncio.to_thread(get_items, item_ids)
+            else:
+                items = await asyncio.to_thread(
+                    lambda: [self.repository.get_item(item_id) for item_id in item_ids]
+                )
+        except Exception as error:
+            if self._detail_is_current(task_id, generation):
+                self._show_task_items_page_error(
+                    f"刷新可见媒体失败（{type(error).__name__}）"
+                )
+            return
+        if not self._detail_is_current(task_id, generation):
+            return
+        apply_items = getattr(self.window, "apply_task_items", None)
+        if callable(apply_items):
+            apply_items(task_id, self._task_item_summaries(items))
+
+    @staticmethod
+    def _task_item_summaries(items: Sequence[object]) -> list[TaskItemSummary]:
+        return [
             TaskItemSummary(
                 item.id,
                 item.original_name,
@@ -2343,17 +2577,33 @@ class AppController:
                 item.expected_size,
                 item.retry_count,
                 item.last_error or "—",
-                getattr(
-                    item,
-                    "integrity_status",
-                    IntegrityStatus.UNVERIFIED,
-                ),
+                getattr(item, "integrity_status", IntegrityStatus.UNVERIFIED),
                 getattr(item, "verified_at", None),
             )
             for item in items
         ]
-        self._detail_task_id = task_id
-        self.window.set_task_items(task_id, summaries)
+
+    def _detail_is_current(self, task_id: str, generation: int) -> bool:
+        return self._detail_task_id == task_id and self._detail_generation == generation
+
+    def _show_task_items_page_error(self, message: str) -> None:
+        show_error = getattr(self.window, "show_task_items_page_error", None)
+        if callable(show_error):
+            show_error(message)
+        else:
+            self._show_status(message)
+
+    def _detail_page_finished(self, task: asyncio.Task[None]) -> None:
+        if self._detail_page_task is task:
+            self._detail_page_task = None
+        if not task.cancelled():
+            task.exception()
+
+    def _invalidate_task_details(self) -> None:
+        self._detail_generation += 1
+        self._detail_task_id = None
+        self._detail_next_cursor = None
+        self._detail_total_count = 0
 
     async def verify_media(self, item_ids: list[str]) -> None:
         unique = self._unique_task_ids(item_ids)
@@ -2465,9 +2715,10 @@ class AppController:
         self.window.set_integrity_busy(False)
 
     async def _refresh_integrity_views(self) -> None:
-        await self.refresh_tasks_async()
-        if self._detail_task_id is not None:
-            self.select_task_details([self._detail_task_id])
+        task_id = self._detail_task_id
+        if task_id is not None:
+            await self._refresh_task_ids_now((task_id,))
+            await self.refresh_visible_task_items()
 
     @staticmethod
     def _integrity_summary_text(summary: IntegritySummary) -> str:
@@ -2518,6 +2769,28 @@ class AppController:
     def _unique_task_ids(task_ids: list[str]) -> list[str]:
         return list(dict.fromkeys(str(value) for value in task_ids if value))
 
+    async def _refresh_accepted_task_ids(
+        self,
+        requested_ids: Sequence[str],
+        accepted_ids: Collection[str],
+    ) -> None:
+        accepted = frozenset(accepted_ids)
+        ordered = tuple(task_id for task_id in requested_ids if task_id in accepted)
+        if ordered:
+            await self._refresh_task_ids_now(ordered)
+
+    async def _refresh_task_ids_now(self, task_ids: Collection[str]) -> None:
+        ordered = tuple(dict.fromkeys(task_ids))
+        if not ordered:
+            return
+        try:
+            await self.task_refresh.refresh_now(ordered)
+        except Exception as error:
+            _LOGGER.warning(
+                "immediate task refresh failed (%s)",
+                type(error).__name__,
+            )
+
     def open_task_directory(self, task_id: str) -> None:
         if self.download_paths is None:
             return
@@ -2550,30 +2823,40 @@ class AppController:
         if self._shutting_down:
             return
         self._shutting_down = True
-        if self.diagnostics is not None:
-            with suppress(Exception):
-                await self.diagnostics.cancel()
-        await self._cancel_integrity_for_shutdown()
-        await self._cancel_connection_monitor()
-        await self._cancel_qr_wait()
-        if self._candidate_login is not None:
-            await self._discard_candidate_login()
-        await self._cancel_subscription_probe()
-        await self._cancel_content_operations()
-        await self.subscription_scheduler.shutdown()
-        await self.connection_recovery.cancel()
-        await self.scheduler.shutdown()
-        pending = tuple(task for task in self._background if not task.done())
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        if self.gateway is not None:
-            await self.gateway.disconnect()
-        if self.content_browser is not None:
-            go_offline = getattr(self.content_browser, "go_offline", None)
-            if go_offline is not None:
-                go_offline()
-        self.subscriptions.go_offline()
-        self.subscription_scheduler.set_account(None)
+        detail_page = self._detail_page_task
+        self._invalidate_task_details()
+        try:
+            if self.diagnostics is not None:
+                with suppress(Exception):
+                    await self.diagnostics.cancel()
+            await self._cancel_integrity_for_shutdown()
+            await self._cancel_connection_monitor()
+            await self._cancel_qr_wait()
+            if self._candidate_login is not None:
+                await self._discard_candidate_login()
+            await self._cancel_subscription_probe()
+            await self._cancel_content_operations()
+            await self.subscription_scheduler.shutdown()
+            await self.connection_recovery.cancel()
+            shutdown_scheduler = getattr(self.scheduler, "shutdown", None)
+            if callable(shutdown_scheduler):
+                await shutdown_scheduler()
+            pending = tuple(task for task in self._background if not task.done())
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            if self.gateway is not None:
+                await self.gateway.disconnect()
+            if self.content_browser is not None:
+                go_offline = getattr(self.content_browser, "go_offline", None)
+                if go_offline is not None:
+                    go_offline()
+            self.subscriptions.go_offline()
+            self.subscription_scheduler.set_account(None)
+        finally:
+            if detail_page is not None and not detail_page.done():
+                with suppress(Exception):
+                    await asyncio.shield(detail_page)
+            await self.task_refresh.close()
 
     async def _cancel_integrity_for_shutdown(self) -> None:
         task = self._integrity_task
@@ -2606,45 +2889,89 @@ class AppController:
             sampled_at=sampled_at,
             previous_samples=self._progress_samples,
         )
-        self._apply_task_view(view, scheduler_state)
+        self._apply_full_task_view(view)
 
     async def refresh_tasks_async(self, *, now: float | None = None) -> None:
-        active = self._task_refresh_task
-        if active is not None and not active.done():
-            self._task_refresh_pending = True
-            await asyncio.shield(active)
+        del now
+        await self.task_refresh.reconcile_now()
+
+    async def _prepare_task_center_index(self) -> None:
+        ensure = getattr(self.repository, "ensure_task_center_indexes", None)
+        if not callable(ensure):
+            self._task_center_index_ready = True
             return
+        try:
+            await asyncio.to_thread(ensure)
+        except Exception as error:
+            self._task_center_index_ready = False
+            self._task_center_index_retry_at = monotonic_clock() + 5.0
+            _LOGGER.warning(
+                "task center index preparation failed (%s)",
+                type(error).__name__,
+            )
+            self._show_status(
+                f"任务中心索引准备失败，将在空闲时重试（{type(error).__name__}）"
+            )
+        else:
+            self._task_center_index_ready = True
 
-        refresh = asyncio.create_task(self._refresh_task_views(now=now))
-        self._task_refresh_task = refresh
-        refresh.add_done_callback(self._task_refresh_finished)
-        await asyncio.shield(refresh)
+    async def _retry_task_center_index_if_idle(self) -> None:
+        if self._task_center_index_ready:
+            return
+        if monotonic_clock() < self._task_center_index_retry_at:
+            return
+        scheduler_state, _queue_positions = self._task_scheduler_state()
+        if scheduler_state.active_task_ids or scheduler_state.queued_task_ids:
+            return
+        await self._prepare_task_center_index()
 
-    async def _refresh_task_views(self, *, now: float | None) -> None:
-        while True:
-            self._task_refresh_pending = False
-            sampled_at = monotonic_clock() if now is None else now
+    async def _load_full_task_view(self) -> TaskView:
+        await self._retry_task_center_index_if_idle()
+        snapshots = await asyncio.to_thread(
+            self.repository.list_task_snapshots,
+            include_archived=True,
+        )
+        scheduler_state, queue_positions = self._task_scheduler_state()
+        sampled_at = monotonic_clock()
+        previous_samples = dict(self._progress_samples)
+        return await asyncio.to_thread(
+            build_task_view,
+            snapshots,
+            scheduler_state=scheduler_state,
+            queue_positions=queue_positions,
+            sampled_at=sampled_at,
+            previous_samples=previous_samples,
+        )
+
+    async def _load_task_patch(self, task_ids: tuple[str, ...]) -> TaskViewPatch:
+        list_by_ids = getattr(self.repository, "list_task_snapshots_by_ids", None)
+        if callable(list_by_ids):
             snapshots = await asyncio.to_thread(
+                list_by_ids,
+                task_ids,
+                include_archived=True,
+            )
+        else:
+            all_snapshots = await asyncio.to_thread(
                 self.repository.list_task_snapshots,
                 include_archived=True,
             )
-            scheduler_state, queue_positions = self._task_scheduler_state()
-            view = build_task_view(
-                snapshots,
-                scheduler_state=scheduler_state,
-                queue_positions=queue_positions,
-                sampled_at=sampled_at,
-                previous_samples=self._progress_samples,
-            )
-            self._apply_task_view(view, scheduler_state)
-            if not self._task_refresh_pending:
-                return
-
-    def _task_refresh_finished(self, task: asyncio.Task[None]) -> None:
-        if self._task_refresh_task is task:
-            self._task_refresh_task = None
-        if not task.cancelled():
-            task.exception()
+            requested = frozenset(task_ids)
+            snapshots = [
+                snapshot for snapshot in all_snapshots if snapshot.task.id in requested
+            ]
+        scheduler_state, queue_positions = self._task_scheduler_state()
+        sampled_at = monotonic_clock()
+        previous_samples = dict(self._progress_samples)
+        return await asyncio.to_thread(
+            build_task_patch,
+            snapshots,
+            requested_ids=task_ids,
+            scheduler_state=scheduler_state,
+            queue_positions=queue_positions,
+            sampled_at=sampled_at,
+            previous_samples=previous_samples,
+        )
 
     def _task_scheduler_state(self) -> tuple[SchedulerSnapshot, dict[str, int]]:
         snapshot_method = getattr(self.scheduler, "snapshot", None)
@@ -2662,20 +2989,38 @@ class AppController:
         queue_positions = queue_positions_method() if callable(queue_positions_method) else {}
         return scheduler_state, queue_positions
 
-    def _apply_task_view(
-        self,
-        view: TaskView,
-        scheduler_state: SchedulerSnapshot,
-    ) -> None:
+    def _apply_full_task_view(self, view: TaskView) -> None:
+        self._task_view = view
         self._progress_samples = dict(view.progress_samples)
-        self._apply_task_summaries(list(view.ordered), scheduler_state)
+        apply_snapshot = getattr(self.window, "set_task_snapshot", None)
+        if callable(apply_snapshot):
+            apply_snapshot(view.ordered, view.order_keys, view.dashboard)
+        else:
+            set_summaries = getattr(self.window, "set_task_summaries", None)
+            if callable(set_summaries):
+                set_summaries(list(view.ordered))
+        self._apply_scheduler_summary()
 
-    def _apply_task_summaries(
-        self,
-        summaries: list[TaskSummary],
-        scheduler_state: SchedulerSnapshot,
-    ) -> None:
-        self.window.set_task_summaries(summaries)
+    def _apply_incremental_task_view(self, patch: TaskViewPatch) -> None:
+        updated = patch_task_view(self._task_view, patch)
+        self._task_view = updated
+        self._progress_samples = dict(updated.progress_samples)
+        apply_patch = getattr(self.window, "apply_task_patch", None)
+        if callable(apply_patch):
+            apply_patch(
+                tuple(patch.replacements.values()),
+                patch.order_keys,
+                patch.removed_ids,
+                updated.dashboard,
+            )
+        else:
+            set_summaries = getattr(self.window, "set_task_summaries", None)
+            if callable(set_summaries):
+                set_summaries(list(updated.ordered))
+        self._apply_scheduler_summary()
+
+    def _apply_scheduler_summary(self) -> None:
+        scheduler_state, _queue_positions = self._task_scheduler_state()
         set_scheduler_summary = getattr(self.window, "set_scheduler_summary", None)
         if callable(set_scheduler_summary):
             set_scheduler_summary(
@@ -2686,11 +3031,20 @@ class AppController:
             )
 
     async def _refresh_tasks_if_due(self, now: float | None = None) -> None:
-        sampled_at = monotonic_clock() if now is None else now
-        if sampled_at < self._next_progress_refresh:
-            return
-        self._next_progress_refresh = sampled_at + self._progress_refresh_interval
-        await self.refresh_tasks_async(now=sampled_at)
+        del now
+        scheduler_state, _queue_positions = self._task_scheduler_state()
+        self.task_refresh.mark_progress(scheduler_state.active_task_ids)
+        await self.refresh_visible_task_items()
+
+    def _task_refresh_error(self, error: BaseException) -> None:
+        _LOGGER.warning("task center refresh failed (%s)", type(error).__name__)
+        self._show_status(f"任务中心刷新失败（{type(error).__name__}）")
+
+    def set_task_center_visible(self, visible: bool) -> None:
+        if visible:
+            self._spawn_background(self.task_refresh.activate())
+        else:
+            self.task_refresh.deactivate()
 
     async def show_account_access(self) -> None:
         if (
@@ -2889,6 +3243,7 @@ class AppController:
         if not committed:
             return
 
+        self._replace_task_refresh_generation()
         self._candidate_login = None
         candidate.qr_wait_task = None
         self._session_expiry_handled = False
@@ -2992,7 +3347,12 @@ class AppController:
                     self.planner = services.planner
                     self.scheduler = services.scheduler
 
+            self._replace_task_refresh_generation()
             self._request_login(publish=False)
+
+    def _replace_task_refresh_generation(self) -> None:
+        self.task_refresh.replace_generation()
+        self._invalidate_task_details()
 
     def _publish_event(self, event: ApplicationEvent) -> None:
         try:
@@ -3222,7 +3582,7 @@ class AppController:
                     continue
             await operation
         finally:
-            await self.refresh_tasks_async()
+            await self._refresh_task_ids_now((task_id,))
 
     def _show_status(self, message: str) -> None:
         self.window.statusBar().showMessage(message, 8000)
