@@ -34,7 +34,8 @@ if (git -C $projectRoot status --porcelain) {
     throw 'Formal releases require a clean worktree.'
 }
 $python = Assert-ProjectChild (Join-Path $projectRoot '.venv\Scripts\python.exe')
-$packageVersion = & $python -c "from telegram_downloader import __version__; print(__version__)"
+$sourceRoot = Assert-ProjectChild (Join-Path $projectRoot 'src')
+$packageVersion = & $python -c "import sys; sys.path.insert(0, sys.argv[1]); from telegram_downloader import __version__; print(__version__)" $sourceRoot
 Assert-Succeeded 'Read source version'
 if ($packageVersion -ne $Version) {
     throw "Source version does not match requested release: $packageVersion"

@@ -59,6 +59,11 @@ class SlowPersistenceRepository(FakeRepository):
         self.delay = delay
         self.media_write_calls = 0
         self.terminal_committed = False
+        self.repository_threads: list[int] = []
+
+    def _wait(self) -> None:
+        self.repository_threads.append(threading.get_ident())
+        time.sleep(self.delay)
 
     def update_item_progress(
         self,
@@ -68,7 +73,7 @@ class SlowPersistenceRepository(FakeRepository):
         error=None,
         retry_count=None,
     ):
-        time.sleep(self.delay)
+        self._wait()
         self.media_write_calls += 1
         super().update_item_progress(
             item_id,
@@ -82,7 +87,7 @@ class SlowPersistenceRepository(FakeRepository):
         self,
         updates: tuple[ItemProgressUpdate, ...],
     ) -> None:
-        time.sleep(self.delay)
+        self._wait()
         self.media_write_calls += 1
         self.updates.extend(
             (update.item_id, update.downloaded_bytes, update.status)
@@ -90,7 +95,7 @@ class SlowPersistenceRepository(FakeRepository):
         )
 
     def complete_item(self, item_id, downloaded_bytes, sha256, verified_at):
-        time.sleep(self.delay)
+        self._wait()
         self.media_write_calls += 1
         super().complete_item(item_id, downloaded_bytes, sha256, verified_at)
         self.terminal_committed = True
@@ -539,6 +544,7 @@ async def test_slow_repository_keeps_event_loop_responsive_and_coalesces_progres
     target = paths.downloads / "responsive.bin"
     repository = SlowPersistenceRepository()
     persistence = DownloadPersistenceCoordinator(repository)
+    event_loop_thread = threading.get_ident()
     media = MediaDownloader(
         FakeGateway([b"x"] * 20),
         repository,
@@ -549,26 +555,13 @@ async def test_slow_repository_keeps_event_loop_responsive_and_coalesces_progres
         write_batch_bytes=1,
         persistence=persistence,
     )
-    gaps: list[float] = []
-    running = True
-
-    async def heartbeat() -> None:
-        previous = asyncio.get_running_loop().time()
-        while running:
-            await asyncio.sleep(0)
-            current = asyncio.get_running_loop().time()
-            gaps.append((current - previous) * 1000)
-            previous = current
-
-    pulse = asyncio.create_task(heartbeat())
     try:
         await media.download(item(target, size=20))
     finally:
-        running = False
-        await pulse
         await persistence.close()
 
-    assert max(gaps) <= 20.0
+    assert repository.repository_threads
+    assert event_loop_thread not in repository.repository_threads
     assert repository.media_write_calls <= 4
     assert repository.terminal_committed is True
 

@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 from types import SimpleNamespace
 
@@ -221,8 +222,10 @@ class SlowQueueRepo(QueueRepo):
     def __init__(self, task_ids: tuple[str, ...], delay: float = 0.05) -> None:
         super().__init__(task_ids)
         self.delay = delay
+        self.repository_threads: list[int] = []
 
     def _wait(self) -> None:
+        self.repository_threads.append(threading.get_ident())
         time.sleep(self.delay)
 
     def list_items(self, task_id, statuses=None):
@@ -1241,32 +1244,20 @@ async def test_resume_tasks_bulk_updates_and_schedules_each_once() -> None:
 async def test_slow_scheduler_repository_keeps_event_loop_responsive() -> None:
     repo = SlowQueueRepo(("task",))
     persistence = DownloadPersistenceCoordinator(repo)
+    event_loop_thread = threading.get_ident()
 
     class Downloader:
         async def download(self, _item, _should_pause):
             return None
 
     scheduler = DownloadScheduler(repo, Downloader(), persistence=persistence)
-    gaps: list[float] = []
-    running = True
-
-    async def heartbeat() -> None:
-        previous = asyncio.get_running_loop().time()
-        while running:
-            await asyncio.sleep(0)
-            current = asyncio.get_running_loop().time()
-            gaps.append((current - previous) * 1000)
-            previous = current
-
-    pulse = asyncio.create_task(heartbeat())
     try:
         await scheduler.run_task("task")
     finally:
-        running = False
-        await pulse
         await scheduler.shutdown()
 
-    assert max(gaps) <= 20.0
+    assert repo.repository_threads
+    assert event_loop_thread not in repo.repository_threads
 
 
 @pytest.mark.asyncio

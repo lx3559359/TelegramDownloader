@@ -113,6 +113,7 @@ async def test_blocking_ui_actions_leave_event_loop_responsive(action_name) -> N
     main_thread_id = threading.get_ident()
     entered = asyncio.Event()
     heartbeat = asyncio.Event()
+    release = threading.Event()
     worker_ids: list[int] = []
     ui_ids: list[int] = []
 
@@ -120,7 +121,7 @@ async def test_blocking_ui_actions_leave_event_loop_responsive(action_name) -> N
         def call(*_args, **_kwargs):
             worker_ids.append(threading.get_ident())
             loop.call_soon_threadsafe(entered.set)
-            time.sleep(0.05)
+            assert release.wait(timeout=1)
             return result
 
         return call
@@ -222,8 +223,11 @@ async def test_blocking_ui_actions_leave_event_loop_responsive(action_name) -> N
     operation = asyncio.create_task(action(controller))
     await entered.wait()
     loop.call_soon(heartbeat.set)
-
-    await asyncio.wait_for(heartbeat.wait(), timeout=0.02)
+    try:
+        await asyncio.wait_for(heartbeat.wait(), timeout=0.5)
+        assert operation.done() is False
+    finally:
+        release.set()
     await operation
 
     assert worker_ids and worker_ids[0] != main_thread_id

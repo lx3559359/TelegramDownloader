@@ -193,6 +193,15 @@ def test_release_script_keeps_modelscope_asset_main_and_source_history_separate(
     assert "push modelscope HEAD:main $tag" not in script
 
 
+def test_release_script_reads_version_from_src_layout_without_editable_install() -> None:
+    root = Path(__file__).parents[2]
+    script = (root / "scripts" / "release" / "release.ps1").read_text(encoding="utf-8")
+
+    assert "$sourceRoot = Assert-ProjectChild (Join-Path $projectRoot 'src')" in script
+    assert "sys.path.insert(0, sys.argv[1])" in script
+    assert "$sourceRoot" in script[script.index("$packageVersion =") :]
+
+
 def test_github_workflow_uses_node24_actions() -> None:
     root = Path(__file__).parents[2]
     workflow = (root / ".github" / "workflows" / "verify.yml").read_text(encoding="utf-8")
