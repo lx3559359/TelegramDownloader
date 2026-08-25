@@ -145,6 +145,60 @@ def test_page_progress_is_bounded_and_shows_current_check(qtbot) -> None:
     assert page.status_banner.property("status") == "running"
 
 
+def test_page_selection_updates_safe_details_and_clears_without_report(qtbot) -> None:
+    page = DiagnosticsPage()
+    qtbot.addWidget(page)
+    report = DiagnosticReport.build(
+        "0.18.4",
+        NOW,
+        NOW + timedelta(seconds=1),
+        (
+            DiagnosticResult(
+                "disk",
+                "磁盘空间",
+                DiagnosticStatus.WARNING,
+                "download-disk-space-low",
+                "下载所在磁盘可用空间低于 1 GiB",
+                1,
+                {
+                    "downloadFreeBytes": 512 * 1024**2,
+                    "privateUnknown": "D:/private",
+                },
+            ),
+            DiagnosticResult(
+                "credentials",
+                "登录凭据",
+                DiagnosticStatus.WARNING,
+                "credentials-not-configured",
+                "尚未配置 Telegram 登录凭据",
+                1,
+                {
+                    "credentialsConfigured": False,
+                    "privateUnknown": "api-secret",
+                },
+            ),
+        ),
+    )
+
+    page.set_report(report, historical=False)
+
+    assert page.table.currentIndex().row() == 0
+    assert "清理下载所在磁盘" in page.details_remediation_label.text()
+    assert "512 MiB" in page.details_metrics_label.text()
+    assert "D:/private" not in page.details_metrics_label.text()
+
+    page.table.setCurrentIndex(page.model.index(1, 0))
+
+    assert "重新录入" in page.details_remediation_label.text()
+    assert "API 凭据完整：否" in page.details_metrics_label.text()
+    assert "api-secret" not in page.details_metrics_label.text()
+
+    page.set_report(None, historical=True)
+
+    assert page.details_remediation_label.text() == ""
+    assert page.details_metrics_label.text() == ""
+
+
 def test_page_emits_intent_only_signals_and_displays_safe_error(qtbot) -> None:
     page = DiagnosticsPage()
     qtbot.addWidget(page)

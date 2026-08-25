@@ -23,6 +23,7 @@ from telegram_downloader.diagnostics import (
     DiagnosticResult,
     DiagnosticStatus,
 )
+from telegram_downloader.ui.diagnostic_details import present_diagnostic_details
 from telegram_downloader.ui.effects import ElevationLevel, apply_elevation
 
 _INVALID_INDEX = QModelIndex()
@@ -182,6 +183,42 @@ class DiagnosticsPage(QWidget):
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         results_layout.addWidget(self.table, 1)
 
+        self.details_card = QFrame(self.results_card)
+        self.details_card.setObjectName("elevatedSubCard")
+        details_layout = QHBoxLayout(self.details_card)
+        details_layout.setContentsMargins(10, 8, 10, 8)
+        details_layout.setSpacing(18)
+
+        remediation_layout = QVBoxLayout()
+        remediation_heading = QLabel("处理建议")
+        remediation_heading.setObjectName("sectionTitle")
+        self.details_remediation_label = QLabel()
+        self.details_remediation_label.setObjectName("muted")
+        self.details_remediation_label.setWordWrap(True)
+        self.details_remediation_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        remediation_layout.addWidget(remediation_heading)
+        remediation_layout.addWidget(self.details_remediation_label)
+        remediation_layout.addStretch()
+
+        metrics_layout = QVBoxLayout()
+        metrics_heading = QLabel("安全指标")
+        metrics_heading.setObjectName("sectionTitle")
+        self.details_metrics_label = QLabel()
+        self.details_metrics_label.setObjectName("muted")
+        self.details_metrics_label.setWordWrap(True)
+        self.details_metrics_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        metrics_layout.addWidget(metrics_heading)
+        metrics_layout.addWidget(self.details_metrics_label)
+        metrics_layout.addStretch()
+
+        details_layout.addLayout(remediation_layout, 1)
+        details_layout.addLayout(metrics_layout, 1)
+        results_layout.addWidget(self.details_card)
+
         privacy = QLabel(
             "诊断不会修改任务或账号数据。导出包只包含聚合状态与固定说明，不包含日志、凭据、群组、消息或文件路径。"
         )
@@ -217,15 +254,25 @@ class DiagnosticsPage(QWidget):
         self.cancel_button.clicked.connect(self.cancel_requested.emit)
         self.export_button.clicked.connect(self.export_requested.emit)
         self.open_button.clicked.connect(self.open_directory_requested.emit)
+        self.table.selectionModel().currentRowChanged.connect(
+            self._show_details_for_index
+        )
         self.set_running(False)
 
     def set_report(self, report: DiagnosticReport | None, *, historical: bool) -> None:
         self.report = report
         self.model.set_results(report.results if report is not None else ())
         if report is None:
+            self.table.clearSelection()
+            self.table.setCurrentIndex(QModelIndex())
+            self._clear_details()
             self.report_context_label.setText("等待本次自检")
             self._set_status_banner("尚未运行自检", DiagnosticStatus.PENDING)
         else:
+            first = self.model.index(0, 0)
+            self.table.setCurrentIndex(first)
+            self.table.selectRow(0)
+            self._show_details_for_index(first)
             completed = report.finished_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
             self.report_context_label.setText(
                 f"历史结果 · 上次自检 {completed}"
@@ -287,6 +334,18 @@ class DiagnosticsPage(QWidget):
             )
             self.show_error("")
         self._update_buttons()
+
+    def _show_details_for_index(self, current: QModelIndex, _previous=None) -> None:
+        if not current.isValid() or not 0 <= current.row() < self.model.rowCount():
+            self._clear_details()
+            return
+        details = present_diagnostic_details(self.model.result_at(current.row()))
+        self.details_remediation_label.setText(details.remediation)
+        self.details_metrics_label.setText(details.metrics_text)
+
+    def _clear_details(self) -> None:
+        self.details_remediation_label.clear()
+        self.details_metrics_label.clear()
 
     def set_cancelling(self, cancelling: bool) -> None:
         self._cancelling = bool(cancelling and self._running)
