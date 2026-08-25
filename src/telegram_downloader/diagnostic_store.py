@@ -43,6 +43,9 @@ _ALLOWED_METRICS = {
             "taskCount",
             "mediaCount",
             "schemaCompatible",
+            "foreignKeysValid",
+            "stateValuesValid",
+            "taskStatusDraft",
             "taskStatusQueued",
             "taskStatusScanning",
             "taskStatusDownloading",
@@ -71,6 +74,8 @@ _ALLOWED_METRICS = {
         {
             "schemaVersion",
             "schemaCompatible",
+            "foreignKeysValid",
+            "stateValuesValid",
             "accountCount",
             "dialogCount",
             "searchCount",
@@ -107,6 +112,8 @@ _BOOLEAN_METRICS = frozenset(
         "windowsX64",
         "nonSystemVolume",
         "schemaCompatible",
+        "foreignKeysValid",
+        "stateValuesValid",
         "pyside6",
         "telethon",
         "qasync",
@@ -223,6 +230,11 @@ _RESULT_VARIANTS = {
                 "下载任务数据库结构不兼容",
             ),
             (
+                DiagnosticStatus.FAILED,
+                "database-semantics-invalid",
+                "下载任务数据库包含无效关系或状态",
+            ),
+            (
                 DiagnosticStatus.PASSED,
                 "task-database-ok",
                 "下载任务数据库结构和聚合状态正常",
@@ -238,6 +250,11 @@ _RESULT_VARIANTS = {
                 DiagnosticStatus.FAILED,
                 "database-schema-incompatible",
                 "账号内容数据库结构不兼容",
+            ),
+            (
+                DiagnosticStatus.FAILED,
+                "database-semantics-invalid",
+                "账号内容数据库包含无效关系或状态",
             ),
             (
                 DiagnosticStatus.PASSED,

@@ -15,6 +15,14 @@ from uuid import uuid4
 
 from telegram_downloader.catalog import CATALOG_SCHEMA_VERSION
 from telegram_downloader.diagnostics import DiagnosticResult, DiagnosticStatus
+from telegram_downloader.domain import (
+    IntegrityStatus,
+    ItemStatus,
+    MediaKind,
+    PauseReason,
+    SourceKind,
+    TaskStatus,
+)
 from telegram_downloader.download_paths import DownloadPathPolicy
 from telegram_downloader.gateway import (
     AuthorizationFailureReason,
@@ -269,8 +277,13 @@ def probe_task_database(database: Path) -> DiagnosticResult:
         compatible = _schema_contains(
             connection,
             {
-                "tasks": {"id", "status"},
-                "media_items": {"id", "status", "integrity_status"},
+                "tasks": {"id", "source_kind", "status", "pause_reason"},
+                "media_items": {
+                    "id",
+                    "media_kind",
+                    "status",
+                    "integrity_status",
+                },
             },
         )
         if not compatible:
@@ -282,10 +295,54 @@ def probe_task_database(database: Path) -> DiagnosticResult:
                 "下载任务数据库结构不兼容",
                 {"schemaCompatible": False},
             )
+        foreign_keys_valid = _foreign_keys_valid(connection)
+        state_values_valid = all(
+            (
+                _column_values_valid(
+                    connection,
+                    "tasks",
+                    "source_kind",
+                    tuple(value.value for value in SourceKind),
+                ),
+                _column_values_valid(
+                    connection,
+                    "tasks",
+                    "status",
+                    tuple(value.value for value in TaskStatus),
+                ),
+                _column_values_valid(
+                    connection,
+                    "tasks",
+                    "pause_reason",
+                    tuple(value.value for value in PauseReason),
+                    nullable=True,
+                ),
+                _column_values_valid(
+                    connection,
+                    "media_items",
+                    "media_kind",
+                    tuple(value.value for value in MediaKind),
+                ),
+                _column_values_valid(
+                    connection,
+                    "media_items",
+                    "status",
+                    tuple(value.value for value in ItemStatus),
+                ),
+                _column_values_valid(
+                    connection,
+                    "media_items",
+                    "integrity_status",
+                    tuple(value.value for value in IntegrityStatus),
+                ),
+            )
+        )
         metrics: dict[str, bool | int] = {
             "taskCount": _row_count(connection, "tasks"),
             "mediaCount": _row_count(connection, "media_items"),
             "schemaCompatible": True,
+            "foreignKeysValid": foreign_keys_valid,
+            "stateValuesValid": state_values_valid,
         }
         metrics.update(
             _grouped_state_counts(
@@ -293,15 +350,7 @@ def probe_task_database(database: Path) -> DiagnosticResult:
                 "tasks",
                 "status",
                 "taskStatus",
-                (
-                    "queued",
-                    "scanning",
-                    "downloading",
-                    "waiting_retry",
-                    "paused",
-                    "completed",
-                    "partial_failure",
-                ),
+                tuple(value.value for value in TaskStatus),
             )
         )
         metrics.update(
@@ -310,7 +359,7 @@ def probe_task_database(database: Path) -> DiagnosticResult:
                 "media_items",
                 "status",
                 "itemStatus",
-                ("queued", "downloading", "waiting_retry", "paused", "completed", "failed"),
+                tuple(value.value for value in ItemStatus),
             )
         )
         metrics.update(
@@ -319,16 +368,22 @@ def probe_task_database(database: Path) -> DiagnosticResult:
                 "media_items",
                 "integrity_status",
                 "integrityStatus",
-                (
-                    "unverified",
-                    "verified",
-                    "missing",
-                    "size_mismatch",
-                    "hash_mismatch",
-                    "read_error",
-                ),
+                tuple(value.value for value in IntegrityStatus),
             )
         )
+        if (
+            not foreign_keys_valid
+            or not state_values_valid
+            or any(key.endswith("Other") for key in metrics)
+        ):
+            return _result(
+                "task-database",
+                title,
+                DiagnosticStatus.FAILED,
+                "database-semantics-invalid",
+                "下载任务数据库包含无效关系或状态",
+                metrics,
+            )
     except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
         return _database_failure("task-database", title, "database-unreadable")
     finally:
@@ -633,13 +688,17 @@ def _open_read_only_database(database: Path) -> sqlite3.Connection | DiagnosticR
             "database-missing",
             "数据库文件不存在",
         )
+    connection: sqlite3.Connection | None = None
     try:
-        uri = f"{database.resolve().as_uri()}?mode=ro&immutable=1"
+        uri = f"{database.resolve().as_uri()}?mode=ro"
         connection = sqlite3.connect(uri, uri=True, timeout=2)
         connection.execute("PRAGMA query_only=ON")
         connection.execute("PRAGMA busy_timeout=2000")
+        connection.execute("BEGIN")
         return connection
     except (OSError, sqlite3.DatabaseError, ValueError):
+        if connection is not None:
+            connection.close()
         return _result(
             "database",
             "数据库",
@@ -652,6 +711,33 @@ def _open_read_only_database(database: Path) -> sqlite3.Connection | DiagnosticR
 def _database_integrity_ok(connection: sqlite3.Connection) -> bool:
     row = connection.execute("PRAGMA quick_check").fetchone()
     return row is not None and str(row[0]).casefold() == "ok"
+
+
+def _foreign_keys_valid(connection: sqlite3.Connection) -> bool:
+    return connection.execute("PRAGMA foreign_key_check").fetchone() is None
+
+
+def _column_values_valid(
+    connection: sqlite3.Connection,
+    table: str,
+    column: str,
+    allowed: tuple[str, ...],
+    *,
+    nullable: bool = False,
+) -> bool:
+    placeholders = ",".join("?" for _ in allowed)
+    predicate = (
+        f"{column} IS NOT NULL AND {column} NOT IN ({placeholders})"
+        if nullable
+        else f"{column} IS NULL OR {column} NOT IN ({placeholders})"
+    )
+    return (
+        connection.execute(
+            f"SELECT 1 FROM {table} WHERE {predicate} LIMIT 1",
+            allowed,
+        ).fetchone()
+        is None
+    )
 
 
 def _schema_contains(

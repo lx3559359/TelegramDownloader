@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from collections import namedtuple
 from datetime import UTC, datetime
 from pathlib import Path
@@ -319,6 +320,8 @@ def test_task_database_probe_reports_schema_and_aggregate_counts_only(
         "taskCount": 1,
         "mediaCount": 2,
         "schemaCompatible": True,
+        "foreignKeysValid": True,
+        "stateValuesValid": True,
         "taskStatusCompleted": 1,
         "itemStatusCompleted": 2,
         "integrityStatusUnverified": 1,
@@ -327,6 +330,140 @@ def test_task_database_probe_reports_schema_and_aggregate_counts_only(
     serialized = repr(dict(result.metrics)) + result.summary
     assert "private" not in serialized
     assert str(tmp_path) not in serialized
+
+
+def test_task_database_probe_reads_committed_wal_state(tmp_path: Path) -> None:
+    database = tmp_path / "tasks.sqlite3"
+    TaskRepository(database).initialize()
+    now = datetime(2026, 8, 16, tzinfo=UTC).isoformat()
+    writer = sqlite3.connect(database)
+    try:
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute(
+            "INSERT INTO tasks("
+            "id, source_kind, source_ref, source_title, source_url, date_from_utc, "
+            "date_to_utc, media_kinds, item_limit, status, created_at, updated_at"
+            ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "task-wal",
+                SourceKind.CHANNEL_OR_GROUP.value,
+                "private-peer",
+                "private-title",
+                "https://t.me/private",
+                now,
+                now,
+                MediaKind.VIDEO.value,
+                1,
+                TaskStatus.QUEUED.value,
+                now,
+                now,
+            ),
+        )
+        writer.commit()
+        assert database.with_name(f"{database.name}-wal").is_file()
+
+        result = probe_task_database(database)
+
+        assert result.status is DiagnosticStatus.PASSED
+        assert result.metrics["taskCount"] == 1
+    finally:
+        writer.close()
+
+
+def test_task_database_probe_rejects_dangling_foreign_key(tmp_path: Path) -> None:
+    database = tmp_path / "tasks.sqlite3"
+    TaskRepository(database).initialize()
+    now = datetime(2026, 8, 16, tzinfo=UTC).isoformat()
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute(
+            "INSERT INTO media_items("
+            "id, task_id, peer_ref, message_id, media_id, media_kind, original_name, "
+            "target_path, message_date_utc, status"
+            ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "item-orphan",
+                "private-missing-task",
+                "private-peer",
+                7,
+                "private-media",
+                MediaKind.VIDEO.value,
+                "private.mp4",
+                str(tmp_path / "private.mp4"),
+                now,
+                ItemStatus.QUEUED.value,
+            ),
+        )
+
+    result = probe_task_database(database)
+
+    assert result.status is DiagnosticStatus.FAILED
+    assert result.code == "database-semantics-invalid"
+    assert result.metrics["foreignKeysValid"] is False
+    assert "private" not in result.summary + repr(dict(result.metrics))
+
+
+@pytest.mark.parametrize(
+    ("table", "column"),
+    [
+        ("tasks", "source_kind"),
+        ("tasks", "status"),
+        ("tasks", "pause_reason"),
+        ("media_items", "media_kind"),
+        ("media_items", "status"),
+        ("media_items", "integrity_status"),
+    ],
+)
+def test_task_database_probe_rejects_unknown_domain_value(
+    tmp_path: Path,
+    table: str,
+    column: str,
+) -> None:
+    database = tmp_path / "tasks.sqlite3"
+    repository = TaskRepository(database)
+    repository.initialize()
+    now = datetime(2026, 8, 16, tzinfo=UTC)
+    task = TaskRecord(
+        "task-domain",
+        SourceKind.CHANNEL_OR_GROUP,
+        "private-peer",
+        "private-title",
+        "https://t.me/private",
+        ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 1),
+        TaskStatus.QUEUED,
+        now,
+        now,
+    )
+    repository.create_task(
+        task,
+        [
+            MediaItem(
+                "item-domain",
+                task.id,
+                "private-peer",
+                7,
+                None,
+                "private-media",
+                MediaKind.VIDEO,
+                "private.mp4",
+                tmp_path / "private.mp4",
+                8,
+                now,
+            )
+        ],
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            f"UPDATE {table} SET {column} = ?",
+            ("private-invalid-value",),
+        )
+
+    result = probe_task_database(database)
+
+    assert result.status is DiagnosticStatus.FAILED
+    assert result.code == "database-semantics-invalid"
+    assert result.metrics["stateValuesValid"] is False
+    assert "private-invalid-value" not in result.summary + repr(dict(result.metrics))
 
 
 def test_content_database_probe_reports_schema_and_counts_only(tmp_path: Path) -> None:

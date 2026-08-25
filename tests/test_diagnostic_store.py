@@ -61,6 +61,51 @@ def telegram_expired_report(reason: str) -> DiagnosticReport:
     )
 
 
+@pytest.mark.parametrize(
+    ("result_id", "title", "summary"),
+    [
+        (
+            "task-database",
+            "下载任务数据库",
+            "下载任务数据库包含无效关系或状态",
+        ),
+        (
+            "content-database",
+            "账号内容数据库",
+            "账号内容数据库包含无效关系或状态",
+        ),
+    ],
+)
+def test_database_semantic_failure_metrics_round_trip(
+    tmp_path: Path,
+    result_id: str,
+    title: str,
+    summary: str,
+) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    result = DiagnosticResult(
+        result_id,
+        title,
+        DiagnosticStatus.FAILED,
+        "database-semantics-invalid",
+        summary,
+        3,
+        {"foreignKeysValid": False, "stateValuesValid": True},
+    )
+    semantic_report = DiagnosticReport.build(
+        "0.18.4",
+        NOW,
+        NOW + timedelta(seconds=1),
+        (result,),
+    )
+    store = DiagnosticReportStore(paths, secrets=set())
+
+    store.save(semantic_report)
+
+    assert store.load_latest() == semantic_report
+
+
 def test_report_accepts_only_whitelisted_authorization_reasons(tmp_path: Path) -> None:
     store = DiagnosticReportStore(PortablePaths(tmp_path), secrets=set())
 
