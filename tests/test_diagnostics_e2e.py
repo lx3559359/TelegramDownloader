@@ -89,6 +89,8 @@ def digest_files(paths: PortablePaths) -> dict[str, str]:
             paths.diagnostic_temp
         ):
             continue
+        if path.name.endswith(("-wal", "-shm")):
+            continue
         values[path.relative_to(paths.root).as_posix()] = hashlib.sha256(
             path.read_bytes()
         ).hexdigest()
@@ -219,6 +221,7 @@ async def test_diagnostic_bundle_is_structured_private_and_read_only(
                     settings_readable=True,
                     secrets_present=True,
                     secrets_decrypted=True,
+                    credentials_configured=True,
                 ),
             ),
             Probe("telegram", "Telegram 连接", lambda: probe_telegram(Gateway())),

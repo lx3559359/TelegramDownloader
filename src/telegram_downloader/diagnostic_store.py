@@ -85,7 +85,12 @@ _ALLOWED_METRICS = {
         }
     ),
     "credentials": frozenset(
-        {"settingsReadable", "secretsPresent", "secretsDecryptable"}
+        {
+            "settingsReadable",
+            "secretsPresent",
+            "secretsDecryptable",
+            "credentialsConfigured",
+        }
     ),
     "telegram": frozenset({"authorizationReason"}),
     "updates": frozenset(
@@ -123,6 +128,7 @@ _BOOLEAN_METRICS = frozenset(
         "settingsReadable",
         "secretsPresent",
         "secretsDecryptable",
+        "credentialsConfigured",
     }
 )
 _SOURCE_STATUS_METRICS = frozenset({"githubStatus", "modelscopeStatus"})

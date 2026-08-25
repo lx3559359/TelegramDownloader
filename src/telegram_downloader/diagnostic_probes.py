@@ -511,11 +511,13 @@ def probe_credentials(
     settings_readable: bool,
     secrets_present: bool,
     secrets_decrypted: bool,
+    credentials_configured: bool,
 ) -> DiagnosticResult:
     metrics = {
         "settingsReadable": bool(settings_readable),
         "secretsPresent": bool(secrets_present),
         "secretsDecryptable": bool(secrets_decrypted),
+        "credentialsConfigured": bool(credentials_configured),
     }
     if not settings_readable:
         return _result(
@@ -542,6 +544,15 @@ def probe_credentials(
             DiagnosticStatus.FAILED,
             "credentials-unreadable",
             "Telegram 登录凭据无法解密",
+            metrics,
+        )
+    if not credentials_configured:
+        return _result(
+            "credentials",
+            "登录凭据",
+            DiagnosticStatus.WARNING,
+            "credentials-not-configured",
+            "尚未配置 Telegram 登录凭据",
             metrics,
         )
     return _result(

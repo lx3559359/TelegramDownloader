@@ -698,20 +698,28 @@ def create_application(
 
     def credential_health() -> DiagnosticResult:
         try:
-            settings_store.load()
+            current_settings = settings_store.load()
             current_settings_readable = True
         except SettingsError:
+            current_settings = None
             current_settings_readable = False
         current_secrets_present = paths.secrets.is_file()
         try:
-            vault.load()
+            current_secrets = vault.load()
             current_secrets_decryptable = True
         except SecretsError:
+            current_secrets = {}
             current_secrets_decryptable = False
+        credentials_configured = (
+            current_settings is not None
+            and current_settings.api_id > 0
+            and bool(current_secrets.get("api_hash", "").strip())
+        )
         return probe_credentials(
             settings_readable=current_settings_readable,
             secrets_present=current_secrets_present,
             secrets_decrypted=current_secrets_decryptable,
+            credentials_configured=credentials_configured,
         )
 
     async def telegram_health() -> DiagnosticResult:

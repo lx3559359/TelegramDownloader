@@ -705,21 +705,31 @@ def test_credentials_probe_exposes_only_boolean_state() -> None:
         settings_readable=True,
         secrets_present=True,
         secrets_decrypted=True,
+        credentials_configured=True,
+    )
+    incomplete = probe_credentials(
+        settings_readable=True,
+        secrets_present=True,
+        secrets_decrypted=True,
+        credentials_configured=False,
     )
     absent = probe_credentials(
         settings_readable=True,
         secrets_present=False,
         secrets_decrypted=False,
+        credentials_configured=False,
     )
     unreadable = probe_credentials(
         settings_readable=True,
         secrets_present=True,
         secrets_decrypted=False,
+        credentials_configured=False,
     )
     settings_error = probe_credentials(
         settings_readable=False,
         secrets_present=True,
         secrets_decrypted=True,
+        credentials_configured=False,
     )
 
     assert ready.status is DiagnosticStatus.PASSED
@@ -727,7 +737,13 @@ def test_credentials_probe_exposes_only_boolean_state() -> None:
         "settingsReadable": True,
         "secretsPresent": True,
         "secretsDecryptable": True,
+        "credentialsConfigured": True,
     }
+    assert (incomplete.status, incomplete.code) == (
+        DiagnosticStatus.WARNING,
+        "credentials-not-configured",
+    )
+    assert incomplete.metrics["credentialsConfigured"] is False
     assert (absent.status, absent.code) == (
         DiagnosticStatus.WARNING,
         "credentials-not-configured",

@@ -106,6 +106,36 @@ def test_database_semantic_failure_metrics_round_trip(
     assert store.load_latest() == semantic_report
 
 
+def test_credentials_configuration_metric_round_trips(tmp_path: Path) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    result = DiagnosticResult(
+        "credentials",
+        "登录凭据",
+        DiagnosticStatus.WARNING,
+        "credentials-not-configured",
+        "尚未配置 Telegram 登录凭据",
+        3,
+        {
+            "settingsReadable": True,
+            "secretsPresent": True,
+            "secretsDecryptable": True,
+            "credentialsConfigured": False,
+        },
+    )
+    credential_report = DiagnosticReport.build(
+        "0.18.4",
+        NOW,
+        NOW + timedelta(seconds=1),
+        (result,),
+    )
+    store = DiagnosticReportStore(paths, secrets=set())
+
+    store.save(credential_report)
+
+    assert store.load_latest() == credential_report
+
+
 def test_report_accepts_only_whitelisted_authorization_reasons(tmp_path: Path) -> None:
     store = DiagnosticReportStore(PortablePaths(tmp_path), secrets=set())
 

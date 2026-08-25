@@ -166,6 +166,51 @@ def close_created_application(application, loop, controller) -> None:
     application.processEvents()
 
 
+@pytest.mark.parametrize(
+    ("api_id", "secret_values", "expected_code", "configured"),
+    [
+        (0, {}, "credentials-not-configured", False),
+        (17, {"api_hash": "configured-hash"}, "credentials-ok", True),
+    ],
+)
+def test_create_application_credential_diagnostic_requires_complete_configuration(
+    tmp_path,
+    monkeypatch,
+    api_id: int,
+    secret_values: dict[str, str],
+    expected_code: str,
+    configured: bool,
+) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    SettingsStore(paths.settings).save(AppSettings(api_id=api_id))
+    paths.secrets.write_bytes(b"decryptable-test-secrets")
+
+    class VaultStub:
+        def __init__(self, path) -> None:
+            self.path = path
+
+        def load(self) -> dict[str, str]:
+            return dict(secret_values)
+
+        def save(self, _values: dict[str, str]) -> None:
+            pass
+
+    monkeypatch.setattr(app, "SecretsVault", VaultStub)
+
+    application, loop, controller = app.create_application(tmp_path)
+    try:
+        credential_probe = next(
+            probe for probe in controller.diagnostics.probes if probe.id == "credentials"
+        )
+        result = loop.run_until_complete(credential_probe.run(asyncio.Event()))
+
+        assert result.code == expected_code
+        assert result.metrics["credentialsConfigured"] is configured
+    finally:
+        close_created_application(application, loop, controller)
+
+
 def test_create_application_applies_user_visible_brand(tmp_path) -> None:
     application, loop, controller = app.create_application(tmp_path)
 
