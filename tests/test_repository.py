@@ -414,6 +414,89 @@ def test_task_snapshots_aggregate_items_without_hiding_unknown_sizes(
     assert snapshot.item_error == "item-error"
 
 
+def test_task_snapshots_by_ids_are_bulk_ordered_and_ignore_missing(
+    tmp_path: Path,
+) -> None:
+    repo = TaskRepository(tmp_path / "tasks.sqlite3")
+    repo.initialize()
+    first, media = records(tmp_path)
+    second = replace(
+        first,
+        id="task-2",
+        created_at=first.created_at + timedelta(seconds=1),
+        updated_at=first.updated_at + timedelta(seconds=1),
+    )
+    third = replace(
+        first,
+        id="task-3",
+        created_at=first.created_at + timedelta(seconds=2),
+        updated_at=first.updated_at + timedelta(seconds=2),
+    )
+    repo.create_task(first, [media])
+    repo.create_task(
+        second,
+        [replace(media, id="item-2", task_id=second.id, message_id=8, media_id="m8")],
+    )
+    repo.create_task(
+        third,
+        [replace(media, id="item-3", task_id=third.id, message_id=9, media_id="m9")],
+    )
+
+    snapshots = repo.list_task_snapshots_by_ids(
+        [first.id, "missing", third.id, first.id],
+        include_archived=True,
+    )
+
+    assert [snapshot.task.id for snapshot in snapshots] == [third.id, first.id]
+    assert repo.list_task_snapshots_by_ids([]) == []
+
+
+def test_task_snapshots_by_ids_use_bounded_bulk_selects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = TaskRepository(tmp_path / "tasks.sqlite3")
+    repo.initialize()
+    task, media = records(tmp_path)
+    repo.create_task(task, [media])
+    original_connection = repo._connection
+    select_count = 0
+
+    class CountingConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        def execute(self, sql: str, parameters=()):
+            nonlocal select_count
+            if sql.lstrip().upper().startswith("SELECT"):
+                select_count += 1
+            return self._connection.execute(sql, parameters)
+
+    @contextmanager
+    def counting_connection():
+        with original_connection() as connection:
+            yield CountingConnection(connection)
+
+    monkeypatch.setattr(repo, "_connection", counting_connection)
+    monkeypatch.setattr(
+        repo,
+        "get_task",
+        lambda *_args, **_kwargs: pytest.fail("must not call get_task"),
+    )
+    monkeypatch.setattr(
+        repo,
+        "list_items",
+        lambda *_args, **_kwargs: pytest.fail("must not call list_items"),
+    )
+
+    snapshots = repo.list_task_snapshots_by_ids(
+        [*(f"missing-{index}" for index in range(400)), task.id]
+    )
+
+    assert [snapshot.task.id for snapshot in snapshots] == [task.id]
+    assert select_count <= 3
+
+
 def test_completed_tasks_can_be_archived_restored_and_still_deduplicate(
     tmp_path: Path,
 ) -> None:

@@ -412,42 +412,87 @@ class TaskRepository:
         *,
         include_archived: bool = False,
     ) -> list[TaskSnapshot]:
-        where = "" if include_archived else "WHERE t.archived_at IS NULL"
         with self._connection() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT {_QUALIFIED_TASK_COLUMNS},
-                       COUNT(i.id) AS total_items,
-                       COALESCE(
-                           SUM(CASE WHEN i.status = ? THEN 1 ELSE 0 END),
-                           0
-                       ) AS completed_items,
-                       COALESCE(SUM(i.downloaded_bytes), 0) AS downloaded_bytes,
-                       COALESCE(SUM(COALESCE(i.expected_size, 0)), 0) AS known_size,
-                       COALESCE(
-                           SUM(
-                               CASE
-                                   WHEN i.id IS NOT NULL AND i.expected_size IS NULL
-                                   THEN 1 ELSE 0
-                               END
-                           ),
-                           0
-                       ) AS unknown_size_count,
-                       (
-                           SELECT e.last_error
-                           FROM media_items AS e
-                           WHERE e.task_id = t.id AND e.last_error IS NOT NULL
-                           ORDER BY e.message_date_utc DESC, e.message_id DESC, e.id
-                           LIMIT 1
-                       ) AS item_error
-                FROM tasks AS t
-                LEFT JOIN media_items AS i ON i.task_id = t.id
-                {where}
-                GROUP BY t.id
-                ORDER BY t.created_at DESC, t.id
-                """,
-                (ItemStatus.COMPLETED.value,),
-            ).fetchall()
+            return self._list_task_snapshots_on_connection(
+                connection,
+                None,
+                include_archived=include_archived,
+            )
+
+    def list_task_snapshots_by_ids(
+        self,
+        task_ids: Sequence[str],
+        *,
+        include_archived: bool = True,
+    ) -> list[TaskSnapshot]:
+        ordered = tuple(dict.fromkeys(task_ids))
+        if not ordered:
+            return []
+        snapshots: list[TaskSnapshot] = []
+        with self._connection() as connection:
+            for selected in batched(ordered, 200):
+                snapshots.extend(
+                    self._list_task_snapshots_on_connection(
+                        connection,
+                        tuple(selected),
+                        include_archived=include_archived,
+                    )
+                )
+        return sorted(
+            snapshots,
+            key=lambda value: (-value.task.created_at.timestamp(), value.task.id),
+        )
+
+    def _list_task_snapshots_on_connection(
+        self,
+        connection: sqlite3.Connection,
+        task_ids: Sequence[str] | None,
+        *,
+        include_archived: bool,
+    ) -> list[TaskSnapshot]:
+        conditions: list[str] = []
+        parameters: list[object] = [ItemStatus.COMPLETED.value]
+        if task_ids is not None:
+            marks = ",".join("?" for _ in task_ids)
+            conditions.append(f"t.id IN ({marks})")
+            parameters.extend(task_ids)
+        if not include_archived:
+            conditions.append("t.archived_at IS NULL")
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        rows = connection.execute(
+            f"""
+            SELECT {_QUALIFIED_TASK_COLUMNS},
+                   COUNT(i.id) AS total_items,
+                   COALESCE(
+                       SUM(CASE WHEN i.status = ? THEN 1 ELSE 0 END),
+                       0
+                   ) AS completed_items,
+                   COALESCE(SUM(i.downloaded_bytes), 0) AS downloaded_bytes,
+                   COALESCE(SUM(COALESCE(i.expected_size, 0)), 0) AS known_size,
+                   COALESCE(
+                       SUM(
+                           CASE
+                               WHEN i.id IS NOT NULL AND i.expected_size IS NULL
+                               THEN 1 ELSE 0
+                           END
+                       ),
+                       0
+                   ) AS unknown_size_count,
+                   (
+                       SELECT e.last_error
+                       FROM media_items AS e
+                       WHERE e.task_id = t.id AND e.last_error IS NOT NULL
+                       ORDER BY e.message_date_utc DESC, e.message_id DESC, e.id
+                       LIMIT 1
+                   ) AS item_error
+            FROM tasks AS t
+            LEFT JOIN media_items AS i ON i.task_id = t.id
+            {where}
+            GROUP BY t.id
+            ORDER BY t.created_at DESC, t.id
+            """,
+            tuple(parameters),
+        ).fetchall()
         return [self._snapshot_from_row(row) for row in rows]
 
     def archive_tasks(self, task_ids: list[str]) -> set[str]:
