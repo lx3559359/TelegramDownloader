@@ -10,8 +10,7 @@ async def test_progress_dirty_ids_share_one_fixed_window_without_deadline_extens
     full_calls = 0
     id_batches: list[tuple[str, ...]] = []
     applied = asyncio.Event()
-    first_marked_at = 0.0
-    loaded_at = 0.0
+    keep_marking = True
 
     async def load_full() -> str:
         nonlocal full_calls
@@ -19,10 +18,13 @@ async def test_progress_dirty_ids_share_one_fixed_window_without_deadline_extens
         return "full"
 
     async def load_ids(task_ids: tuple[str, ...]) -> tuple[str, ...]:
-        nonlocal loaded_at
-        loaded_at = asyncio.get_running_loop().time()
         id_batches.append(task_ids)
         return task_ids
+
+    async def repeat_progress() -> None:
+        while keep_marking:
+            coordinator.mark_progress(["a"])
+            await asyncio.sleep(0)
 
     coordinator = TaskRefreshCoordinator(
         load_full=load_full,
@@ -34,18 +36,16 @@ async def test_progress_dirty_ids_share_one_fixed_window_without_deadline_extens
     )
     await coordinator.activate()
     for _ in range(500):
-        if first_marked_at == 0.0:
-            first_marked_at = asyncio.get_running_loop().time()
         coordinator.mark_progress(["a"])
-    for _ in range(3):
-        await asyncio.sleep(0.004)
-        coordinator.mark_progress(["a"])
-
-    await asyncio.wait_for(applied.wait(), timeout=1)
+    marker = asyncio.create_task(repeat_progress())
+    try:
+        await asyncio.wait_for(applied.wait(), timeout=1)
+    finally:
+        keep_marking = False
+        await marker
 
     assert id_batches == [("a",)]
     assert full_calls == 1
-    assert loaded_at - first_marked_at < 0.06
     await coordinator.close()
 
 

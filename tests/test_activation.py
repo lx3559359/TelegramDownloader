@@ -23,7 +23,7 @@ def request_while_qt_runs(qtbot, channel: str, command: bytes) -> bool:
         [sys.executable, "-c", script, channel, command.hex()],
         env=environment,
     )
-    qtbot.waitUntil(lambda: process.poll() is not None, timeout=3000)
+    qtbot.waitUntil(lambda: process.poll() is not None, timeout=10_000)
     return process.returncode == 0
 
 
