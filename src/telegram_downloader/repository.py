@@ -115,6 +115,20 @@ class ItemProgressUpdate:
 
 
 @dataclass(frozen=True, slots=True)
+class ItemPageCursor:
+    message_date_utc: datetime
+    message_id: int
+    item_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ItemPage:
+    items: tuple[MediaItem, ...]
+    next_cursor: ItemPageCursor | None
+    total_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class TaskSnapshot:
     task: TaskRecord
     total_items: int
@@ -300,6 +314,23 @@ class TaskRepository:
         if row is None:
             raise KeyError(item_id)
         return self._item_from_row(row)
+
+    def get_items(self, item_ids: Sequence[str]) -> list[MediaItem]:
+        ordered = tuple(dict.fromkeys(item_ids))
+        if not ordered:
+            return []
+        found: dict[str, MediaItem] = {}
+        with self._connection() as connection:
+            for selected in batched(ordered, 200):
+                marks = ",".join("?" for _ in selected)
+                rows = connection.execute(
+                    f"SELECT {_ITEM_COLUMNS} FROM media_items WHERE id IN ({marks})",
+                    tuple(selected),
+                ).fetchall()
+                found.update(
+                    (str(row["id"]), self._item_from_row(row)) for row in rows
+                )
+        return [found[item_id] for item_id in ordered if item_id in found]
 
     def maintenance_media_by_targets(
         self,
@@ -562,6 +593,71 @@ class TaskRepository:
                 parameters,
             ).fetchall()
         return [self._item_from_row(row) for row in rows]
+
+    def list_items_page(
+        self,
+        task_id: str,
+        *,
+        after: ItemPageCursor | None = None,
+        limit: int = 100,
+    ) -> ItemPage:
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit 必须在 1 到 1000 之间")
+        parameters: list[object] = [task_id]
+        cursor_sql = ""
+        if after is not None:
+            timestamp = after.message_date_utc.isoformat()
+            cursor_sql = """
+                AND (
+                    message_date_utc < ?
+                    OR (message_date_utc = ? AND message_id < ?)
+                    OR (message_date_utc = ? AND message_id = ? AND id > ?)
+                )
+            """
+            parameters.extend(
+                (
+                    timestamp,
+                    timestamp,
+                    after.message_id,
+                    timestamp,
+                    after.message_id,
+                    after.item_id,
+                )
+            )
+        parameters.append(limit + 1)
+        with self._connection() as connection:
+            total_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM media_items WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                f"SELECT {_ITEM_COLUMNS} FROM media_items "
+                f"WHERE task_id = ? {cursor_sql} "
+                "ORDER BY message_date_utc DESC, message_id DESC, id ASC "
+                "LIMIT ?",
+                parameters,
+            ).fetchall()
+        has_more = len(rows) > limit
+        items = tuple(self._item_from_row(row) for row in rows[:limit])
+        next_cursor = None
+        if has_more:
+            last = items[-1]
+            next_cursor = ItemPageCursor(
+                last.message_date_utc,
+                last.message_id,
+                last.id,
+            )
+        return ItemPage(items, next_cursor, total_count)
+
+    def ensure_task_center_indexes(self) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_items_task_page "
+                "ON media_items("
+                "task_id, message_date_utc DESC, message_id DESC, id ASC)"
+            )
 
     def update_task_status(
         self,

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import telegram_downloader.repository as repository_module
 from telegram_downloader.domain import (
     IntegrityStatus,
     ItemStatus,
@@ -232,6 +233,95 @@ def test_filters_items_and_updates_retry_and_error(tmp_path: Path) -> None:
     assert selected[0].retry_count == 2
     assert selected[0].last_error == "network"
     assert repo.list_items(task.id, set()) == []
+
+
+def test_media_keyset_pages_are_complete_stable_and_counted(tmp_path: Path) -> None:
+    repo = TaskRepository(tmp_path / "tasks.sqlite3")
+    repo.initialize()
+    task, first = records(tmp_path)
+    items = [
+        replace(
+            first,
+            id=f"item-{index}",
+            message_id=10 - index // 2,
+            media_id=f"media-{index}",
+            target_path=tmp_path / f"{index}.bin",
+        )
+        for index in range(7)
+    ]
+    repo.create_task(task, items)
+
+    first_page = repo.list_items_page(task.id, limit=3)
+    assert isinstance(first_page, repository_module.ItemPage)
+    assert isinstance(first_page.next_cursor, repository_module.ItemPageCursor)
+    second_page = repo.list_items_page(task.id, after=first_page.next_cursor, limit=3)
+    third_page = repo.list_items_page(task.id, after=second_page.next_cursor, limit=3)
+
+    combined = (*first_page.items, *second_page.items, *third_page.items)
+    assert len({item.id for item in combined}) == 7
+    assert [item.id for item in combined] == [
+        item.id for item in repo.list_items(task.id)
+    ]
+    assert first_page.total_count == second_page.total_count == third_page.total_count == 7
+    assert third_page.next_cursor is None
+
+
+@pytest.mark.parametrize("limit", [0, 1001])
+def test_media_keyset_page_rejects_invalid_limit(tmp_path: Path, limit: int) -> None:
+    repo = TaskRepository(tmp_path / "tasks.sqlite3")
+
+    with pytest.raises(ValueError, match="limit"):
+        repo.list_items_page("task-1", limit=limit)
+
+
+def test_get_items_preserves_first_requested_order_and_ignores_missing(
+    tmp_path: Path,
+) -> None:
+    repo = TaskRepository(tmp_path / "tasks.sqlite3")
+    repo.initialize()
+    task, first = records(tmp_path)
+    items = [
+        replace(
+            first,
+            id=f"item-{index}",
+            message_id=7 + index,
+            media_id=f"media-{index}",
+            target_path=tmp_path / f"{index}.bin",
+        )
+        for index in range(1, 4)
+    ]
+    repo.create_task(task, items)
+
+    selected = repo.get_items(["item-3", "missing", "item-1", "item-3"])
+
+    assert [item.id for item in selected] == ["item-3", "item-1"]
+    assert repo.get_items([]) == []
+
+
+def test_task_center_indexes_are_idempotent_and_serve_keyset_order(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "tasks.sqlite3"
+    repo = TaskRepository(database)
+    repo.initialize()
+
+    repo.ensure_task_center_indexes()
+    repo.ensure_task_center_indexes()
+
+    with sqlite3.connect(database) as connection:
+        indexes = [
+            str(row[1])
+            for row in connection.execute("PRAGMA index_list(media_items)").fetchall()
+        ]
+        plan = connection.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT * FROM media_items WHERE task_id = ? "
+            "ORDER BY message_date_utc DESC, message_id DESC, id ASC LIMIT ?",
+            ("task-1", 101),
+        ).fetchall()
+
+    assert indexes.count("idx_items_task_page") == 1
+    assert any("idx_items_task_page" in str(row[3]) for row in plan)
 
 
 def test_initialize_enables_wal_and_foreign_keys_for_operations(tmp_path: Path) -> None:
