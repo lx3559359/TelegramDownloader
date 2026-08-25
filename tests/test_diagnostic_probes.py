@@ -238,6 +238,35 @@ def test_disk_probe_checks_same_volume_once_and_different_volumes_twice(
     assert different.metrics["downloadFreeBytes"] == 2 * GIB
 
 
+def test_disk_probe_distinguishes_directory_mounted_volume_with_same_anchor(
+    tmp_path: Path,
+) -> None:
+    paths = PortablePaths(tmp_path)
+    download_root = tmp_path / "mounted-download"
+    download_root.mkdir()
+    calls: list[Path] = []
+
+    def disk_usage(path: Path) -> DiskUsage:
+        calls.append(path)
+        free = 2 * GIB if path == paths.root else 128 * MIB
+        return usage(8 * GIB, free)
+
+    result = probe_disk(
+        paths,
+        disk_usage,
+        download_root=download_root,
+        volume_identity_provider=(
+            lambda path: "app-volume" if path == paths.root else "download-volume"
+        ),
+    )
+
+    assert calls == [paths.root, download_root]
+    assert result.status is DiagnosticStatus.FAILED
+    assert result.code == "download-disk-space-critical"
+    assert result.metrics["downloadSameVolume"] is False
+    assert result.metrics["downloadFreeBytes"] == 128 * MIB
+
+
 @pytest.mark.parametrize(
     ("app_free", "download_free", "expected_status", "expected_code"),
     [
@@ -514,6 +543,28 @@ def test_task_database_probe_reads_committed_wal_state(tmp_path: Path) -> None:
 
         assert result.status is DiagnosticStatus.PASSED
         assert result.metrics["taskCount"] == 1
+    finally:
+        writer.close()
+
+
+def test_content_database_probe_reads_committed_wal_state(tmp_path: Path) -> None:
+    database = tmp_path / "catalog.sqlite3"
+    CatalogRepository(database).initialize()
+    writer = sqlite3.connect(database)
+    try:
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute(
+            "INSERT INTO accounts(account_id, display_name, last_used_at) "
+            "VALUES(?, ?, ?)",
+            ("private-account", "private-name", "2026-08-16T00:00:00+00:00"),
+        )
+        writer.commit()
+        assert database.with_name(f"{database.name}-wal").is_file()
+
+        result = probe_content_database(database)
+
+        assert result.status is DiagnosticStatus.PASSED
+        assert result.metrics["accountCount"] == 1
     finally:
         writer.close()
 
@@ -833,6 +884,61 @@ def test_database_probe_maps_missing_and_corrupt_files_to_safe_codes(
     assert corrupt.code in {"database-unreadable", "database-corrupt"}
     assert "private" not in corrupt.summary
     assert str(tmp_path) not in corrupt.summary
+
+
+@pytest.mark.parametrize(
+    ("probe", "schema"),
+    [
+        (
+            probe_task_database,
+            """
+            CREATE TABLE tasks (
+                id TEXT,
+                source_kind TEXT,
+                status TEXT,
+                pause_reason TEXT
+            );
+            CREATE TABLE media_items (
+                id TEXT,
+                task_id TEXT REFERENCES tasks(missing_parent_key),
+                media_kind TEXT,
+                status TEXT,
+                integrity_status TEXT
+            );
+            """,
+        ),
+        (
+            probe_content_database,
+            f"""
+            CREATE TABLE accounts (account_id TEXT);
+            CREATE TABLE dialogs (
+                account_id TEXT REFERENCES accounts(account_id),
+                peer_ref TEXT,
+                kind TEXT
+            );
+            CREATE TABLE search_sessions (id TEXT, status TEXT, scope TEXT);
+            CREATE TABLE search_results (id TEXT, media_kind TEXT);
+            CREATE TABLE subscription_rules (id TEXT, state TEXT);
+            CREATE TABLE subscription_runs (id TEXT, keyword_hits INTEGER, status TEXT);
+            PRAGMA user_version={CATALOG_SCHEMA_VERSION};
+            """,
+        ),
+    ],
+)
+def test_database_probe_maps_semantic_query_error_to_semantics_invalid(
+    tmp_path: Path,
+    probe,
+    schema: str,
+) -> None:
+    database = tmp_path / "semantic-query-error.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(schema)
+
+    result = probe(database)
+
+    assert result.status is DiagnosticStatus.FAILED
+    assert result.code == "database-semantics-invalid"
+    assert result.metrics == {}
 
 
 def test_credentials_probe_exposes_only_boolean_state() -> None:

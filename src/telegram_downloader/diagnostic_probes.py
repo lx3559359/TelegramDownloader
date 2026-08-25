@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import importlib
 import math
 import os
@@ -9,6 +10,7 @@ import shutil
 import sqlite3
 from collections.abc import Callable, Mapping
 from contextlib import suppress
+from ctypes import wintypes
 from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
@@ -204,6 +206,7 @@ def probe_disk(
     usage_provider: Callable[[Path], DiskUsage] = shutil.disk_usage,
     *,
     download_root: Path | None = None,
+    volume_identity_provider: Callable[[Path], str] | None = None,
 ) -> DiagnosticResult:
     try:
         usage = usage_provider(paths.root)
@@ -221,7 +224,11 @@ def probe_disk(
     download_total = total
     download_free = free
     if download_root is not None:
-        same_volume = _volume_anchor(paths.root) == _volume_anchor(download_root)
+        same_volume = _same_volume(
+            paths.root,
+            download_root,
+            volume_identity_provider or _volume_identity,
+        )
         metrics["downloadSameVolume"] = same_volume
         if not same_volume:
             try:
@@ -348,20 +355,23 @@ def probe_task_database(database: Path) -> DiagnosticResult:
     if isinstance(connection, DiagnosticResult):
         return _database_failure("task-database", title, connection.code)
     try:
-        if not _database_integrity_ok(connection):
-            return _database_failure("task-database", title, "database-corrupt")
-        compatible = _schema_contains(
-            connection,
-            {
-                "tasks": {"id", "source_kind", "status", "pause_reason"},
-                "media_items": {
-                    "id",
-                    "media_kind",
-                    "status",
-                    "integrity_status",
+        try:
+            if not _database_integrity_ok(connection):
+                return _database_failure("task-database", title, "database-corrupt")
+            compatible = _schema_contains(
+                connection,
+                {
+                    "tasks": {"id", "source_kind", "status", "pause_reason"},
+                    "media_items": {
+                        "id",
+                        "media_kind",
+                        "status",
+                        "integrity_status",
+                    },
                 },
-            },
-        )
+            )
+        except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+            return _database_failure("task-database", title, "database-unreadable")
         if not compatible:
             return _result(
                 "task-database",
@@ -371,82 +381,87 @@ def probe_task_database(database: Path) -> DiagnosticResult:
                 "下载任务数据库结构不兼容",
                 {"schemaCompatible": False},
             )
-        foreign_keys_valid = _foreign_keys_valid(connection)
-        state_values_valid = all(
-            (
-                _column_values_valid(
-                    connection,
-                    "tasks",
-                    "source_kind",
-                    tuple(value.value for value in SourceKind),
-                ),
-                _column_values_valid(
+        try:
+            foreign_keys_valid = _foreign_keys_valid(connection)
+            state_values_valid = all(
+                (
+                    _column_values_valid(
+                        connection,
+                        "tasks",
+                        "source_kind",
+                        tuple(value.value for value in SourceKind),
+                    ),
+                    _column_values_valid(
+                        connection,
+                        "tasks",
+                        "status",
+                        tuple(value.value for value in TaskStatus),
+                    ),
+                    _column_values_valid(
+                        connection,
+                        "tasks",
+                        "pause_reason",
+                        tuple(value.value for value in PauseReason),
+                        nullable=True,
+                    ),
+                    _column_values_valid(
+                        connection,
+                        "media_items",
+                        "media_kind",
+                        tuple(value.value for value in MediaKind),
+                    ),
+                    _column_values_valid(
+                        connection,
+                        "media_items",
+                        "status",
+                        tuple(value.value for value in ItemStatus),
+                    ),
+                    _column_values_valid(
+                        connection,
+                        "media_items",
+                        "integrity_status",
+                        tuple(value.value for value in IntegrityStatus),
+                    ),
+                )
+            )
+            metrics: dict[str, bool | int] = {
+                "taskCount": _row_count(connection, "tasks"),
+                "mediaCount": _row_count(connection, "media_items"),
+                "schemaCompatible": True,
+                "foreignKeysValid": foreign_keys_valid,
+                "stateValuesValid": state_values_valid,
+            }
+            metrics.update(
+                _grouped_state_counts(
                     connection,
                     "tasks",
                     "status",
+                    "taskStatus",
                     tuple(value.value for value in TaskStatus),
-                ),
-                _column_values_valid(
-                    connection,
-                    "tasks",
-                    "pause_reason",
-                    tuple(value.value for value in PauseReason),
-                    nullable=True,
-                ),
-                _column_values_valid(
-                    connection,
-                    "media_items",
-                    "media_kind",
-                    tuple(value.value for value in MediaKind),
-                ),
-                _column_values_valid(
+                )
+            )
+            metrics.update(
+                _grouped_state_counts(
                     connection,
                     "media_items",
                     "status",
+                    "itemStatus",
                     tuple(value.value for value in ItemStatus),
-                ),
-                _column_values_valid(
+                )
+            )
+            metrics.update(
+                _grouped_state_counts(
                     connection,
                     "media_items",
                     "integrity_status",
+                    "integrityStatus",
                     tuple(value.value for value in IntegrityStatus),
-                ),
+                )
             )
-        )
-        metrics: dict[str, bool | int] = {
-            "taskCount": _row_count(connection, "tasks"),
-            "mediaCount": _row_count(connection, "media_items"),
-            "schemaCompatible": True,
-            "foreignKeysValid": foreign_keys_valid,
-            "stateValuesValid": state_values_valid,
-        }
-        metrics.update(
-            _grouped_state_counts(
-                connection,
-                "tasks",
-                "status",
-                "taskStatus",
-                tuple(value.value for value in TaskStatus),
+        except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+            return _database_failure(
+                "task-database", title, "database-semantics-invalid"
             )
-        )
-        metrics.update(
-            _grouped_state_counts(
-                connection,
-                "media_items",
-                "status",
-                "itemStatus",
-                tuple(value.value for value in ItemStatus),
-            )
-        )
-        metrics.update(
-            _grouped_state_counts(
-                connection,
-                "media_items",
-                "integrity_status",
-                "integrityStatus",
-                tuple(value.value for value in IntegrityStatus),
-            )
-        )
         if (
             not foreign_keys_valid
             or not state_values_valid
@@ -460,8 +475,6 @@ def probe_task_database(database: Path) -> DiagnosticResult:
                 "下载任务数据库包含无效关系或状态",
                 metrics,
             )
-    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
-        return _database_failure("task-database", title, "database-unreadable")
     finally:
         connection.close()
     return _result(
@@ -480,21 +493,24 @@ def probe_content_database(database: Path) -> DiagnosticResult:
     if isinstance(connection, DiagnosticResult):
         return _database_failure("content-database", title, connection.code)
     try:
-        if not _database_integrity_ok(connection):
-            return _database_failure("content-database", title, "database-corrupt")
-        schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        tables = {
-            "accounts": {"account_id"},
-            "dialogs": {"account_id", "peer_ref", "kind"},
-            "search_sessions": {"id", "status", "scope"},
-            "search_results": {"id", "media_kind"},
-            "subscription_rules": {"id", "state"},
-            "subscription_runs": {"id", "keyword_hits", "status"},
-        }
-        compatible = (
-            schema_version == CATALOG_SCHEMA_VERSION
-            and _schema_contains(connection, tables)
-        )
+        try:
+            if not _database_integrity_ok(connection):
+                return _database_failure("content-database", title, "database-corrupt")
+            schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            tables = {
+                "accounts": {"account_id"},
+                "dialogs": {"account_id", "peer_ref", "kind"},
+                "search_sessions": {"id", "status", "scope"},
+                "search_results": {"id", "media_kind"},
+                "subscription_rules": {"id", "state"},
+                "subscription_runs": {"id", "keyword_hits", "status"},
+            }
+            compatible = (
+                schema_version == CATALOG_SCHEMA_VERSION
+                and _schema_contains(connection, tables)
+            )
+        except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+            return _database_failure("content-database", title, "database-unreadable")
         if not compatible:
             return _result(
                 "content-database",
@@ -504,59 +520,64 @@ def probe_content_database(database: Path) -> DiagnosticResult:
                 "账号内容数据库结构不兼容",
                 {"schemaVersion": schema_version, "schemaCompatible": False},
             )
-        foreign_keys_valid = _foreign_keys_valid(connection)
-        state_values_valid = all(
-            (
-                _column_values_valid(
-                    connection,
-                    "dialogs",
-                    "kind",
-                    tuple(value.value for value in DialogKind),
-                ),
-                _column_values_valid(
-                    connection,
-                    "search_sessions",
-                    "status",
-                    tuple(value.value for value in SearchStatus),
-                ),
-                _column_values_valid(
-                    connection,
-                    "search_sessions",
-                    "scope",
-                    tuple(value.value for value in SearchScope),
-                ),
-                _column_values_valid(
-                    connection,
-                    "search_results",
-                    "media_kind",
-                    tuple(value.value for value in MediaKind),
-                ),
-                _column_values_valid(
-                    connection,
-                    "subscription_rules",
-                    "state",
-                    tuple(value.value for value in SubscriptionState),
-                ),
-                _column_values_valid(
-                    connection,
-                    "subscription_runs",
-                    "status",
-                    tuple(value.value for value in SubscriptionRunStatus),
-                ),
+        try:
+            foreign_keys_valid = _foreign_keys_valid(connection)
+            state_values_valid = all(
+                (
+                    _column_values_valid(
+                        connection,
+                        "dialogs",
+                        "kind",
+                        tuple(value.value for value in DialogKind),
+                    ),
+                    _column_values_valid(
+                        connection,
+                        "search_sessions",
+                        "status",
+                        tuple(value.value for value in SearchStatus),
+                    ),
+                    _column_values_valid(
+                        connection,
+                        "search_sessions",
+                        "scope",
+                        tuple(value.value for value in SearchScope),
+                    ),
+                    _column_values_valid(
+                        connection,
+                        "search_results",
+                        "media_kind",
+                        tuple(value.value for value in MediaKind),
+                    ),
+                    _column_values_valid(
+                        connection,
+                        "subscription_rules",
+                        "state",
+                        tuple(value.value for value in SubscriptionState),
+                    ),
+                    _column_values_valid(
+                        connection,
+                        "subscription_runs",
+                        "status",
+                        tuple(value.value for value in SubscriptionRunStatus),
+                    ),
+                )
             )
-        )
-        metrics = {
-            "schemaVersion": schema_version,
-            "schemaCompatible": True,
-            "foreignKeysValid": foreign_keys_valid,
-            "stateValuesValid": state_values_valid,
-            "accountCount": _row_count(connection, "accounts"),
-            "dialogCount": _row_count(connection, "dialogs"),
-            "searchCount": _row_count(connection, "search_sessions"),
-            "searchResultCount": _row_count(connection, "search_results"),
-            "subscriptionCount": _row_count(connection, "subscription_rules"),
-            "subscriptionRunCount": _row_count(connection, "subscription_runs"),
-        }
+            metrics = {
+                "schemaVersion": schema_version,
+                "schemaCompatible": True,
+                "foreignKeysValid": foreign_keys_valid,
+                "stateValuesValid": state_values_valid,
+                "accountCount": _row_count(connection, "accounts"),
+                "dialogCount": _row_count(connection, "dialogs"),
+                "searchCount": _row_count(connection, "search_sessions"),
+                "searchResultCount": _row_count(connection, "search_results"),
+                "subscriptionCount": _row_count(connection, "subscription_rules"),
+                "subscriptionRunCount": _row_count(connection, "subscription_runs"),
+            }
+        except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+            return _database_failure(
+                "content-database", title, "database-semantics-invalid"
+            )
         if not foreign_keys_valid or not state_values_valid:
             return _result(
                 "content-database",
@@ -566,8 +587,6 @@ def probe_content_database(database: Path) -> DiagnosticResult:
                 "账号内容数据库包含无效关系或状态",
                 metrics,
             )
-    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
-        return _database_failure("content-database", title, "database-unreadable")
     finally:
         connection.close()
     return _result(
@@ -957,6 +976,7 @@ def _database_failure(result_id: str, title: str, code: str) -> DiagnosticResult
         "database-missing": "数据库文件不存在",
         "database-corrupt": "数据库完整性检查失败",
         "database-unreadable": "数据库无法读取",
+        "database-semantics-invalid": "数据库语义检查失败",
     }
     return _result(
         result_id,
@@ -980,8 +1000,42 @@ def _safe_size(value: object) -> int:
     return value
 
 
-def _volume_anchor(path: Path) -> str:
-    return os.path.normcase(str(Path(path).resolve().anchor))
+def _same_volume(
+    first: Path,
+    second: Path,
+    identity_provider: Callable[[Path], str],
+) -> bool:
+    try:
+        first_identity = identity_provider(first).strip()
+        second_identity = identity_provider(second).strip()
+    except (OSError, TypeError, ValueError):
+        return False
+    return bool(first_identity) and os.path.normcase(first_identity) == os.path.normcase(
+        second_identity
+    )
+
+
+def _volume_identity(path: Path) -> str:
+    resolved = Path(path).resolve()
+    if os.name != "nt":
+        return str(resolved.stat().st_dev)
+
+    mount_buffer = ctypes.create_unicode_buffer(32768)
+    get_volume_path = ctypes.WinDLL("kernel32", use_last_error=True).GetVolumePathNameW
+    get_volume_path.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    get_volume_path.restype = wintypes.BOOL
+    if not get_volume_path(str(resolved), mount_buffer, len(mount_buffer)):
+        raise OSError(ctypes.get_last_error(), "无法识别路径所在卷")
+
+    guid_buffer = ctypes.create_unicode_buffer(64)
+    get_volume_name = ctypes.WinDLL(
+        "kernel32", use_last_error=True
+    ).GetVolumeNameForVolumeMountPointW
+    get_volume_name.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    get_volume_name.restype = wintypes.BOOL
+    if get_volume_name(mount_buffer.value, guid_buffer, len(guid_buffer)):
+        return guid_buffer.value
+    return mount_buffer.value
 
 
 def _result(

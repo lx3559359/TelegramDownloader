@@ -6,7 +6,13 @@ from pathlib import Path
 from telegram_downloader import __version__, app
 from telegram_downloader.app import run_self_test
 from telegram_downloader.catalog import CatalogRepository
-from telegram_downloader.content import AccountProfile, ContentDialog, DialogKind
+from telegram_downloader.content import (
+    AccountProfile,
+    ContentDialog,
+    ContentSearchQuery,
+    DialogKind,
+    SearchResult,
+)
 from telegram_downloader.domain import (
     ItemStatus,
     MediaItem,
@@ -32,11 +38,19 @@ def _business_state_projection(paths: PortablePaths) -> tuple[object, ...]:
             "integrity_status, verified_at FROM media_items ORDER BY id"
         ).fetchall()
     with sqlite3.connect(paths.catalog_database) as connection:
+        search_state = connection.execute(
+            "SELECT id, status, generation, next_offset_id, exhausted, result_count, "
+            "updated_at, last_error FROM search_sessions ORDER BY id"
+        ).fetchall()
+        search_result_state = connection.execute(
+            "SELECT id, selected, available, queued, generation "
+            "FROM search_results ORDER BY id"
+        ).fetchall()
         subscription_state = connection.execute(
             "SELECT id, state, next_run_at, last_run_at, last_error, failure_count, "
             "updated_at FROM subscription_rules ORDER BY id"
         ).fetchall()
-    return task_state, media_state, subscription_state
+    return task_state, media_state, search_state, search_result_state, subscription_state
 
 
 def _seed_live_business_state(paths: PortablePaths) -> None:
@@ -89,6 +103,40 @@ def _seed_live_business_state(paths: PortablePaths) -> None:
             )
         ],
         now,
+    )
+    search = catalog.begin_search(
+        "search-live",
+        "account-live",
+        "peer-live",
+        "测试频道",
+        ContentSearchQuery(
+            "测试",
+            ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 1),
+        ),
+        now,
+    )
+    catalog.save_search_page(
+        "account-live",
+        search.id,
+        search.generation,
+        [
+            SearchResult(
+                "result-live",
+                search.id,
+                "account-live",
+                "peer-live",
+                7,
+                None,
+                "media-live",
+                MediaKind.VIDEO,
+                "live.mp4",
+                8,
+                now,
+                "测试摘要",
+                "thumbnail-live",
+                selected=True,
+            )
+        ],
     )
     catalog.save_subscription(
         SubscriptionRule(
