@@ -766,6 +766,58 @@ def test_task_patch_filter_and_order_keep_selection_current_and_scroll_anchor(
     assert window.completed_value.text() == "1"
 
 
+def test_task_patch_does_not_reload_unchanged_selected_details(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    task = TaskSummary(
+        "task",
+        "Task",
+        TaskStatus.DOWNLOADING,
+        "0 / 1000",
+        "10 KiB",
+        "—",
+        "—",
+        "—",
+        total_items=1000,
+    )
+    window.set_task_snapshot(
+        [task],
+        {task.id: (0.0, task.id)},
+        TaskDashboard(0.0, 0, 1000, task.id),
+    )
+    detail_requests: list[list[str]] = []
+
+    def load_details(task_ids: list[str]) -> None:
+        detail_requests.append(task_ids)
+        if task_ids == [task.id]:
+            window.begin_task_items(task.id, total_count=1000)
+            window.append_task_items(
+                task.id,
+                make_item_summaries(0, 500),
+                total_count=1000,
+            )
+
+    window.task_selection_changed.connect(load_details)
+    window.task_table.selectRow(0)
+    window.append_task_items(
+        task.id,
+        make_item_summaries(500, 500),
+        total_count=1000,
+    )
+    assert window.task_item_model.rowCount() == 1000
+    detail_requests.clear()
+
+    window.apply_task_patch(
+        [replace(task, progress_text="1 / 1000")],
+        {task.id: (0.0, task.id)},
+        (),
+        TaskDashboard(64.0, 1, 999, task.id),
+    )
+
+    assert detail_requests == []
+    assert window.task_item_model.rowCount() == 1000
+
+
 def test_task_workspace_filters_and_emits_stable_multiselect_batches(qtbot) -> None:
     window = MainWindow()
     qtbot.addWidget(window)

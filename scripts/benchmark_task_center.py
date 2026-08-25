@@ -222,9 +222,9 @@ async def benchmark_event_loop(
     async def ticker() -> None:
         previous = asyncio.get_running_loop().time()
         while running:
-            await asyncio.sleep(0.005)
+            await asyncio.sleep(0)
             current = asyncio.get_running_loop().time()
-            gaps.append(max(0.0, current - previous - 0.005))
+            gaps.append(max(0.0, current - previous))
             previous = current
 
     async def load_full() -> tuple[()]:

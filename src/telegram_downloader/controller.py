@@ -718,6 +718,7 @@ class AppController:
         )
         self._task_center_index_ready = False
         self._task_center_index_retry_at = 0.0
+        self._task_center_visible = True
         self.task_refresh = task_refresh or TaskRefreshCoordinator[
             TaskView,
             TaskViewPatch,
@@ -909,15 +910,22 @@ class AppController:
                 return
             self.window.set_account(name)
             await self.activate_content_account()
-            list_queued = getattr(self.repository, "list_queued_for_dispatch", None)
-            if callable(list_queued):
-                queued_tasks = list_queued()
-            else:
-                queued_tasks = [
+
+            def load_queued_tasks() -> list[object]:
+                list_queued = getattr(
+                    self.repository,
+                    "list_queued_for_dispatch",
+                    None,
+                )
+                if callable(list_queued):
+                    return list(list_queued())
+                return [
                     task
                     for task in self.repository.list_tasks()
                     if task.status is TaskStatus.QUEUED
                 ]
+
+            queued_tasks = await asyncio.to_thread(load_queued_tasks)
             for task in queued_tasks:
                 self._start_task(task.id)
         except SessionExpiredError as error:
@@ -3032,6 +3040,8 @@ class AppController:
 
     async def _refresh_tasks_if_due(self, now: float | None = None) -> None:
         del now
+        if not self._task_center_visible:
+            return
         scheduler_state, _queue_positions = self._task_scheduler_state()
         self.task_refresh.mark_progress(scheduler_state.active_task_ids)
         await self.refresh_visible_task_items()
@@ -3041,6 +3051,7 @@ class AppController:
         self._show_status(f"任务中心刷新失败（{type(error).__name__}）")
 
     def set_task_center_visible(self, visible: bool) -> None:
+        self._task_center_visible = visible
         if visible:
             self._spawn_background(self.task_refresh.activate())
         else:

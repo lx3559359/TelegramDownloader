@@ -3492,6 +3492,34 @@ async def test_task_refresh_marks_active_ids_and_updates_only_visible_media() ->
 
 
 @pytest.mark.asyncio
+async def test_hidden_task_center_skips_progress_and_media_refresh() -> None:
+    refresh = _TaskRefreshFake()
+    repository = SimpleNamespace(get_items=Mock(return_value=[]))
+    scheduler = SimpleNamespace(
+        snapshot=Mock(return_value=SchedulerSnapshot(("active",), (), 1, 0)),
+        queue_positions=Mock(return_value={}),
+    )
+    window = SimpleNamespace(
+        visible_task_item_ids=Mock(return_value=("visible",)),
+        selected_media_ids=Mock(return_value=[]),
+    )
+    controller = AppController.for_test(
+        repository=repository,
+        scheduler=scheduler,
+        window=window,
+        task_refresh=refresh,
+    )
+    controller._detail_task_id = "active"
+    controller.set_task_center_visible(False)
+
+    await controller._refresh_tasks_if_due(20.0)
+
+    assert refresh.deactivations == 1
+    assert refresh.marked == []
+    repository.get_items.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_task_refresh_terminal_event_is_immediate() -> None:
     refresh = _TaskRefreshFake()
 
@@ -5638,6 +5666,60 @@ async def test_restore_uses_persistent_dispatch_order() -> None:
     await controller._restore_saved_session()
 
     assert started == ["priority", "oldest"]
+
+
+@pytest.mark.asyncio
+async def test_restore_reads_dispatch_queue_off_event_loop() -> None:
+    loop = asyncio.get_running_loop()
+    main_thread = threading.get_ident()
+    read_started = threading.Event()
+    read_release = threading.Event()
+    heartbeat = asyncio.Event()
+    heartbeat_while_blocked: list[bool] = []
+    repository_threads: list[int] = []
+
+    class Repository:
+        def list_queued_for_dispatch(self):
+            repository_threads.append(threading.get_ident())
+            read_started.set()
+            assert read_release.wait(timeout=1)
+            return []
+
+    controller = AppController.for_test(
+        gateway=ConnectedGateway(),
+        repository=Repository(),
+    )
+
+    async def online() -> bool:
+        return True
+
+    async def account_name() -> str:
+        return "Synthetic account"
+
+    async def activate() -> None:
+        return None
+
+    controller.ensure_telegram_online = online
+    controller._account_name = account_name
+    controller.activate_content_account = activate
+
+    def probe_loop() -> None:
+        assert read_started.wait(timeout=1)
+        loop.call_soon_threadsafe(heartbeat.set)
+        time.sleep(0.05)
+        heartbeat_while_blocked.append(heartbeat.is_set())
+        read_release.set()
+
+    probe = threading.Thread(target=probe_loop)
+    probe.start()
+    try:
+        await controller._restore_saved_session()
+    finally:
+        read_release.set()
+        probe.join(timeout=1)
+
+    assert repository_threads and repository_threads[0] != main_thread
+    assert heartbeat_while_blocked == [True]
 
 
 @pytest.mark.asyncio

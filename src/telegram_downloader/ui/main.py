@@ -877,7 +877,7 @@ class MainWindow(QMainWindow):
         self._task_item_page_pending = False
         self.statusBar().showMessage(message, 8000)
 
-    def _task_selection_changed(self, *_args) -> None:
+    def _task_selection_changed(self, *_args, emit_signal: bool = True) -> None:
         if self._restoring_task_selection:
             return
         tasks = self._selected_task_summaries()
@@ -896,7 +896,8 @@ class MainWindow(QMainWindow):
             )
         else:
             self._clear_task_details("任务详情", "请选择一个任务查看媒体明细")
-        self.task_selection_changed.emit([task.id for task in tasks])
+        if emit_signal:
+            self.task_selection_changed.emit([task.id for task in tasks])
         self._update_action_state()
 
     def _clear_task_details(self, title: str, hint: str) -> None:
@@ -943,7 +944,9 @@ class MainWindow(QMainWindow):
         finally:
             self._restoring_task_selection = False
         self._update_task_filter_labels()
-        self._task_selection_changed()
+        self._task_selection_changed(
+            emit_signal=self.selected_task_ids() != selected_ids,
+        )
 
     def _capture_task_anchors(
         self,
