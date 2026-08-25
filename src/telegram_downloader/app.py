@@ -267,10 +267,8 @@ def run_self_test(root: Path) -> dict[str, object]:
     paths.ensure_layout()
     repository = TaskRepository(paths.database)
     repository.initialize()
-    repository.recover_interrupted()
     catalog = CatalogRepository(paths.catalog_database)
     catalog.initialize()
-    catalog.recover_interrupted_subscriptions(datetime.now(UTC))
     ThumbnailCache(paths.thumbnail_cache)
 
     managed = managed_writable_paths(paths)

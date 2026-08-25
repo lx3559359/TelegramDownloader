@@ -1,9 +1,22 @@
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from telegram_downloader import __main__ as main_module
 from telegram_downloader.bootstrap import configure_process, resolve_runtime_root
+
+
+@dataclass
+class FakeGuard:
+    acquired: bool
+    released: bool = False
+
+    def acquire(self) -> bool:
+        return self.acquired
+
+    def release(self) -> None:
+        self.released = True
 
 
 def test_source_runtime_root_is_repository_root(tmp_path: Path) -> None:
@@ -76,3 +89,72 @@ def test_self_test_json_forces_utf8_stdout(monkeypatch) -> None:
 
     assert output.reconfigured == [("utf-8", "strict")]
     assert json.loads("".join(output.parts))["runtime_root"].endswith("下载器")
+
+
+def test_health_command_refuses_database_access_when_instance_runs(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    called = False
+
+    def forbidden(_root: Path) -> dict[str, object]:
+        nonlocal called
+        called = True
+        return {"ok": True}
+
+    guard = FakeGuard(False)
+
+    code = main_module._run_health_command(
+        tmp_path,
+        confirmation=None,
+        self_test=forbidden,
+        guard=guard,
+    )
+
+    assert code == 2
+    assert called is False
+    assert guard.released is False
+    assert json.loads(capsys.readouterr().out) == {
+        "ok": False,
+        "code": "instance-running",
+    }
+
+
+def test_health_command_writes_confirmation_only_for_success_and_releases_guard(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    confirmation = tmp_path / "data" / "updates" / "health-confirmed"
+    guard = FakeGuard(True)
+
+    code = main_module._run_health_command(
+        tmp_path,
+        confirmation=confirmation,
+        self_test=lambda _root: {"ok": True, "version": "test"},
+        guard=guard,
+    )
+
+    assert code == 0
+    assert guard.released is True
+    assert confirmation.read_bytes() == b"ok\n"
+    assert json.loads(capsys.readouterr().out) == {"ok": True, "version": "test"}
+
+
+def test_health_command_skips_confirmation_for_failure_and_releases_guard(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    confirmation = tmp_path / "data" / "updates" / "health-confirmed"
+    guard = FakeGuard(True)
+
+    code = main_module._run_health_command(
+        tmp_path,
+        confirmation=confirmation,
+        self_test=lambda _root: {"ok": False, "code": "failed"},
+        guard=guard,
+    )
+
+    assert code == 1
+    assert guard.released is True
+    assert confirmation.exists() is False
+    assert json.loads(capsys.readouterr().out) == {"ok": False, "code": "failed"}
