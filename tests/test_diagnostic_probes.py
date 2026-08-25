@@ -9,7 +9,13 @@ from types import SimpleNamespace
 import pytest
 
 from telegram_downloader.catalog import CATALOG_SCHEMA_VERSION, CatalogRepository
-from telegram_downloader.content import AccountProfile, ContentDialog, DialogKind
+from telegram_downloader.content import (
+    AccountProfile,
+    ContentDialog,
+    ContentSearchQuery,
+    DialogKind,
+    SearchResult,
+)
 from telegram_downloader.diagnostic_probes import (
     GIB,
     MIB,
@@ -45,6 +51,13 @@ from telegram_downloader.gateway import (
 from telegram_downloader.paths import PortablePaths
 from telegram_downloader.repository import TaskRepository
 from telegram_downloader.settings import DownloadStorageSettings
+from telegram_downloader.subscription_matching import SubscriptionCriteria
+from telegram_downloader.subscriptions import (
+    SubscriptionRule,
+    SubscriptionRun,
+    SubscriptionRunStatus,
+    SubscriptionState,
+)
 from telegram_downloader.update_sources import SourceCheck, SourceStatus, UpdateSourceId
 
 DiskUsage = namedtuple("DiskUsage", "total used free")
@@ -496,6 +509,8 @@ def test_content_database_probe_reports_schema_and_counts_only(tmp_path: Path) -
     assert result.metrics == {
         "schemaVersion": CATALOG_SCHEMA_VERSION,
         "schemaCompatible": True,
+        "foreignKeysValid": True,
+        "stateValuesValid": True,
         "accountCount": 1,
         "dialogCount": 1,
         "searchCount": 0,
@@ -506,6 +521,163 @@ def test_content_database_probe_reports_schema_and_counts_only(tmp_path: Path) -
     serialized = repr(dict(result.metrics)) + result.summary
     assert "private" not in serialized
     assert str(tmp_path) not in serialized
+
+
+def _seed_content_domain_rows(database: Path) -> None:
+    repository = CatalogRepository(database)
+    repository.initialize()
+    now = datetime(2026, 8, 16, tzinfo=UTC)
+    account_id = "private-account"
+    peer_ref = "private-peer"
+    repository.upsert_account(AccountProfile(account_id, "private-name"), now)
+    repository.replace_dialogs(
+        account_id,
+        [
+            ContentDialog(
+                account_id,
+                peer_ref,
+                "private-group",
+                "private-user",
+                DialogKind.GROUP,
+                False,
+                True,
+                now,
+            )
+        ],
+        now,
+    )
+    session = repository.begin_search(
+        "search-domain",
+        account_id,
+        peer_ref,
+        "private-group",
+        ContentSearchQuery(
+            "private-keyword",
+            ScanFilters(now, now, frozenset({MediaKind.VIDEO}), 1),
+        ),
+        now,
+    )
+    repository.save_search_page(
+        account_id,
+        session.id,
+        session.generation,
+        [
+            SearchResult(
+                "result-domain",
+                session.id,
+                account_id,
+                peer_ref,
+                7,
+                None,
+                "private-media",
+                MediaKind.VIDEO,
+                "private.mp4",
+                8,
+                now,
+                "private-excerpt",
+                "private-thumbnail",
+            )
+        ],
+    )
+    rule = SubscriptionRule(
+        id="rule-domain",
+        account_id=account_id,
+        peer_ref=peer_ref,
+        dialog_title="private-group",
+        criteria=SubscriptionCriteria(("private-keyword",)),
+        media_kinds=frozenset({MediaKind.VIDEO}),
+        interval_minutes=30,
+        history_days=0,
+        enabled=True,
+        state=SubscriptionState.WAITING,
+        last_message_id=7,
+        backfill_from_utc=None,
+        backfill_through_id=None,
+        next_run_at=now,
+        last_run_at=None,
+        last_error=None,
+        failure_count=0,
+        created_at=now,
+        updated_at=now,
+    )
+    repository.save_subscription(rule)
+    repository.save_subscription_run(
+        SubscriptionRun(
+            id="run-domain",
+            rule_id=rule.id,
+            account_id=account_id,
+            started_at=now,
+            finished_at=now,
+            status=SubscriptionRunStatus.COMPLETED,
+            inspected=1,
+            keyword_hits=1,
+            matched=1,
+            queued=1,
+            duplicate=0,
+        )
+    )
+
+
+def test_content_probe_rejects_dangling_foreign_key(tmp_path: Path) -> None:
+    database = tmp_path / "catalog.sqlite3"
+    CatalogRepository(database).initialize()
+    now = datetime(2026, 8, 16, tzinfo=UTC).isoformat()
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute(
+            "INSERT INTO dialogs("
+            "account_id, peer_ref, title, username, kind, archived, available, "
+            "last_synced_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "private-missing-account",
+                "private-peer",
+                "private-title",
+                "private-user",
+                DialogKind.GROUP.value,
+                0,
+                1,
+                now,
+            ),
+        )
+
+    result = probe_content_database(database)
+
+    assert result.status is DiagnosticStatus.FAILED
+    assert result.code == "database-semantics-invalid"
+    assert result.metrics["foreignKeysValid"] is False
+    assert "private" not in result.summary + repr(dict(result.metrics))
+
+
+@pytest.mark.parametrize(
+    ("table", "column"),
+    [
+        ("dialogs", "kind"),
+        ("search_sessions", "status"),
+        ("search_sessions", "scope"),
+        ("search_results", "media_kind"),
+        ("subscription_rules", "state"),
+        ("subscription_runs", "status"),
+    ],
+)
+def test_content_probe_rejects_unknown_domain_value(
+    tmp_path: Path,
+    table: str,
+    column: str,
+) -> None:
+    database = tmp_path / "catalog.sqlite3"
+    _seed_content_domain_rows(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            f"UPDATE {table} SET {column} = ?",
+            ("private-invalid-value",),
+        )
+
+    result = probe_content_database(database)
+
+    assert result.status is DiagnosticStatus.FAILED
+    assert result.code == "database-semantics-invalid"
+    assert result.metrics["stateValuesValid"] is False
+    assert "private-invalid-value" not in result.summary + repr(dict(result.metrics))
 
 
 @pytest.mark.parametrize("probe", [probe_task_database, probe_content_database])

@@ -14,6 +14,7 @@ from typing import Protocol
 from uuid import uuid4
 
 from telegram_downloader.catalog import CATALOG_SCHEMA_VERSION
+from telegram_downloader.content import DialogKind, SearchScope, SearchStatus
 from telegram_downloader.diagnostics import DiagnosticResult, DiagnosticStatus
 from telegram_downloader.domain import (
     IntegrityStatus,
@@ -30,6 +31,7 @@ from telegram_downloader.gateway import (
     TransientNetworkError,
 )
 from telegram_downloader.paths import PortablePaths
+from telegram_downloader.subscriptions import SubscriptionRunStatus, SubscriptionState
 from telegram_downloader.update_sources import SourceCheck, SourceStatus, UpdateSourceId
 
 MIB = 1024 * 1024
@@ -409,11 +411,11 @@ def probe_content_database(database: Path) -> DiagnosticResult:
         schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         tables = {
             "accounts": {"account_id"},
-            "dialogs": {"account_id", "peer_ref"},
-            "search_sessions": {"id"},
-            "search_results": {"id"},
-            "subscription_rules": {"id"},
-            "subscription_runs": {"id", "keyword_hits"},
+            "dialogs": {"account_id", "peer_ref", "kind"},
+            "search_sessions": {"id", "status", "scope"},
+            "search_results": {"id", "media_kind"},
+            "subscription_rules": {"id", "state"},
+            "subscription_runs": {"id", "keyword_hits", "status"},
         }
         compatible = (
             schema_version == CATALOG_SCHEMA_VERSION
@@ -428,9 +430,52 @@ def probe_content_database(database: Path) -> DiagnosticResult:
                 "账号内容数据库结构不兼容",
                 {"schemaVersion": schema_version, "schemaCompatible": False},
             )
+        foreign_keys_valid = _foreign_keys_valid(connection)
+        state_values_valid = all(
+            (
+                _column_values_valid(
+                    connection,
+                    "dialogs",
+                    "kind",
+                    tuple(value.value for value in DialogKind),
+                ),
+                _column_values_valid(
+                    connection,
+                    "search_sessions",
+                    "status",
+                    tuple(value.value for value in SearchStatus),
+                ),
+                _column_values_valid(
+                    connection,
+                    "search_sessions",
+                    "scope",
+                    tuple(value.value for value in SearchScope),
+                ),
+                _column_values_valid(
+                    connection,
+                    "search_results",
+                    "media_kind",
+                    tuple(value.value for value in MediaKind),
+                ),
+                _column_values_valid(
+                    connection,
+                    "subscription_rules",
+                    "state",
+                    tuple(value.value for value in SubscriptionState),
+                ),
+                _column_values_valid(
+                    connection,
+                    "subscription_runs",
+                    "status",
+                    tuple(value.value for value in SubscriptionRunStatus),
+                ),
+            )
+        )
         metrics = {
             "schemaVersion": schema_version,
             "schemaCompatible": True,
+            "foreignKeysValid": foreign_keys_valid,
+            "stateValuesValid": state_values_valid,
             "accountCount": _row_count(connection, "accounts"),
             "dialogCount": _row_count(connection, "dialogs"),
             "searchCount": _row_count(connection, "search_sessions"),
@@ -438,6 +483,15 @@ def probe_content_database(database: Path) -> DiagnosticResult:
             "subscriptionCount": _row_count(connection, "subscription_rules"),
             "subscriptionRunCount": _row_count(connection, "subscription_runs"),
         }
+        if not foreign_keys_valid or not state_values_valid:
+            return _result(
+                "content-database",
+                title,
+                DiagnosticStatus.FAILED,
+                "database-semantics-invalid",
+                "账号内容数据库包含无效关系或状态",
+                metrics,
+            )
     except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
         return _database_failure("content-database", title, "database-unreadable")
     finally:
