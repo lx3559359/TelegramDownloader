@@ -77,7 +77,11 @@ async def test_task_management_persists_archive_restart_restore_and_dedup(
     detail_tasks: set[asyncio.Task[None]] = set()
 
     def load_task_details(task_ids) -> None:
-        task = asyncio.create_task(controller.select_task_details(task_ids))
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = running_loop.create_task(controller.select_task_details(task_ids))
         detail_tasks.add(task)
         task.add_done_callback(detail_tasks.discard)
 
@@ -130,5 +134,8 @@ async def test_task_management_persists_archive_restart_restore_and_dedup(
     assert paths.guard(item.target_path).is_file()
     assert paths.database.is_relative_to(paths.root)
     assert item.target_path.is_relative_to(paths.root)
+    window.task_selection_changed.disconnect(load_task_details)
     await controller.shutdown()
     await restarted_controller.shutdown()
+    window.close()
+    restarted_window.close()
