@@ -482,6 +482,9 @@ class TaskItemTableModel(QAbstractTableModel):
     def __init__(self) -> None:
         super().__init__()
         self._items: list[TaskItemSummary] = []
+        self._task_id: str | None = None
+        self._total_count = 0
+        self._row_by_id: dict[str, int] = {}
 
     def rowCount(self, parent: QModelIndex = _INVALID_INDEX) -> int:
         return 0 if parent.isValid() else len(self._items)
@@ -540,13 +543,115 @@ class TaskItemTableModel(QAbstractTableModel):
             return self.HEADERS[section]
         return super().headerData(section, orientation, role)
 
-    def set_items(self, items: list[TaskItemSummary]) -> None:
+    @property
+    def loaded_count(self) -> int:
+        return len(self._items)
+
+    @property
+    def total_count(self) -> int:
+        return self._total_count
+
+    @property
+    def has_more(self) -> bool:
+        return self.loaded_count < self.total_count
+
+    def begin_task(self, task_id: str, *, total_count: int) -> None:
+        if total_count < 0:
+            raise ValueError("媒体总数不能为负数")
         self.beginResetModel()
-        self._items = list(items)
+        self._task_id = task_id
+        self._total_count = total_count
+        self._items = []
+        self._row_by_id = {}
         self.endResetModel()
+
+    def append_page(
+        self,
+        task_id: str,
+        items: Sequence[TaskItemSummary],
+    ) -> None:
+        self._require_task(task_id)
+        page = tuple(items)
+        page_ids = [item.id for item in page]
+        if len(page_ids) != len(set(page_ids)):
+            raise ValueError("媒体页包含重复 ID")
+        if any(item_id in self._row_by_id for item_id in page_ids):
+            raise ValueError("媒体页与已加载 ID 重复")
+        if self.loaded_count + len(page) > self.total_count:
+            raise ValueError("媒体页超过任务总数")
+        if not page:
+            return
+        first = self.loaded_count
+        last = first + len(page) - 1
+        self.beginInsertRows(_INVALID_INDEX, first, last)
+        self._items.extend(page)
+        self._row_by_id.update(
+            (item.id, row) for row, item in enumerate(page, start=first)
+        )
+        self.endInsertRows()
+
+    def apply_items(
+        self,
+        task_id: str,
+        items: Sequence[TaskItemSummary],
+    ) -> None:
+        self._require_task(task_id)
+        replacements = tuple(items)
+        item_ids = [item.id for item in replacements]
+        if len(item_ids) != len(set(item_ids)):
+            raise ValueError("媒体补丁包含重复 ID")
+        changed_rows: list[int] = []
+        for item in replacements:
+            row = self._row_by_id.get(item.id)
+            if row is None or self._items[row] == item:
+                continue
+            self._items[row] = item
+            changed_rows.append(row)
+        self._emit_changed_rows(sorted(changed_rows))
+
+    def set_items(self, items: list[TaskItemSummary]) -> None:
+        selected_task = self._task_id or ""
+        self.begin_task(selected_task, total_count=len(items))
+        self.append_page(selected_task, items)
 
     def item_at(self, row: int) -> TaskItemSummary | None:
         return self._items[row] if 0 <= row < len(self._items) else None
+
+    def item_by_id(self, item_id: str) -> TaskItemSummary | None:
+        row = self._row_by_id.get(item_id)
+        return self._items[row] if row is not None else None
+
+    def loaded_ids(self) -> tuple[str, ...]:
+        return tuple(item.id for item in self._items)
+
+    def visible_item_ids(self, first_row: int, last_row: int) -> tuple[str, ...]:
+        first = max(0, first_row)
+        last = min(last_row, self.loaded_count - 1)
+        if first > last:
+            return ()
+        return tuple(item.id for item in self._items[first : last + 1])
+
+    def _require_task(self, task_id: str) -> None:
+        if task_id != self._task_id:
+            raise ValueError("媒体页不属于当前任务")
+
+    def _emit_changed_rows(self, rows: Sequence[int]) -> None:
+        if not rows:
+            return
+        start = previous = rows[0]
+        for row in rows[1:]:
+            if row == previous + 1:
+                previous = row
+                continue
+            self.dataChanged.emit(
+                self.index(start, 0),
+                self.index(previous, self.columnCount() - 1),
+            )
+            start = previous = row
+        self.dataChanged.emit(
+            self.index(start, 0),
+            self.index(previous, self.columnCount() - 1),
+        )
 
     @staticmethod
     def _progress_text(item: TaskItemSummary) -> str:

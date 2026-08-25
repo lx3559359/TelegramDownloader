@@ -371,6 +371,75 @@ def test_task_item_model_formats_status_progress_size_and_id() -> None:
     assert model.item_at(99) is None
 
 
+def make_item_summaries(start: int, count: int) -> list[TaskItemSummary]:
+    return [
+        TaskItemSummary(
+            f"item-{index}",
+            f"file-{index}.bin",
+            MediaKind.DOCUMENT,
+            ItemStatus.QUEUED,
+            0,
+            10,
+            0,
+            "—",
+        )
+        for index in range(start, start + count)
+    ]
+
+
+def test_task_item_model_page_append_and_patch_without_reset() -> None:
+    model = TaskItemTableModel()
+    model.begin_task("task", total_count=50_000)
+    model.append_page("task", make_item_summaries(0, 500))
+    reset_spy = QSignalSpy(model.modelReset)
+    reset_count = reset_spy.count()
+    inserted = QSignalSpy(model.rowsInserted)
+    changed = QSignalSpy(model.dataChanged)
+
+    model.append_page("task", make_item_summaries(500, 500))
+    item = model.item_by_id("item-20")
+    assert item is not None
+    model.apply_items("task", [replace(item, downloaded_bytes=8)])
+
+    assert model.rowCount() == 1000
+    assert model.loaded_count == 1000
+    assert model.total_count == 50_000
+    assert model.has_more is True
+    assert reset_spy.count() == reset_count
+    assert inserted.count() == 1
+    assert changed.count() == 1
+    assert model.item_by_id("item-20").downloaded_bytes == 8
+
+
+def test_task_item_model_page_rejects_wrong_task_and_duplicates_atomically() -> None:
+    model = TaskItemTableModel()
+    model.begin_task("task", total_count=3)
+    first = make_item_summaries(0, 1)[0]
+    second = make_item_summaries(1, 1)[0]
+    model.append_page("task", [first])
+
+    with pytest.raises(ValueError):
+        model.append_page("other", [second])
+    with pytest.raises(ValueError):
+        model.append_page("task", [second, second])
+    with pytest.raises(ValueError):
+        model.append_page("task", [first, second])
+
+    assert model.loaded_ids() == (first.id,)
+    assert model.item_by_id(second.id) is None
+
+
+def test_task_item_model_page_visible_ids_are_bounded() -> None:
+    model = TaskItemTableModel()
+    model.begin_task("task", total_count=5)
+    model.append_page("task", make_item_summaries(0, 5))
+
+    assert model.visible_item_ids(-5, 2) == ("item-0", "item-1", "item-2")
+    assert model.visible_item_ids(3, 99) == ("item-3", "item-4")
+    assert model.visible_item_ids(4, 2) == ()
+    assert model.has_more is False
+
+
 def test_task_item_model_formats_integrity_and_verified_tooltip() -> None:
     model = TaskItemTableModel()
     verified_at = datetime(2026, 8, 16, 8, 9, tzinfo=UTC)
