@@ -15,6 +15,7 @@ from telegram_downloader import __version__
 from telegram_downloader.branding import APP_CHANNEL, APP_NAME, APP_SUBTITLE
 from telegram_downloader.domain import IntegrityStatus, ItemStatus, MediaKind, TaskStatus
 from telegram_downloader.file_integrity import IntegrityProgress
+from telegram_downloader.task_center import TaskDashboard
 from telegram_downloader.ui.effects import ElevationLevel
 from telegram_downloader.ui.main import MainWindow
 from telegram_downloader.ui.models import (
@@ -624,6 +625,147 @@ def test_incremental_filter_preserves_selected_persistent_task(qtbot) -> None:
     assert window.selected_task_id() == paused.id
 
 
+def test_task_filter_debounce_is_latest_wins_and_immediate_actions_stop_timer(
+    qtbot,
+    monkeypatch,
+) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    qtbot.wait(1)
+    calls: list[tuple[TaskFilter, str]] = []
+    monkeypatch.setattr(
+        window.task_model,
+        "set_filter",
+        lambda selected, search="": calls.append((selected, search)),
+    )
+
+    assert window._task_filter_timer.interval() == 150
+    for character in "abc":
+        qtbot.keyClick(window.task_search, character)
+        qtbot.wait(25)
+    assert calls == []
+    qtbot.waitUntil(lambda: calls == [(TaskFilter.ALL, "abc")], timeout=500)
+
+    window.task_search.returnPressed.emit()
+    assert calls[-1] == (TaskFilter.ALL, "abc")
+    assert window._task_filter_timer.isActive() is False
+    window.task_search.clear()
+    assert calls[-1] == (TaskFilter.ALL, "")
+    window.task_filter.setCurrentIndex(window.task_filter.findData(TaskFilter.PAUSED))
+    assert calls[-1] == (TaskFilter.PAUSED, "")
+
+
+def test_task_items_page_requested_once_until_page_finishes(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.resize(1280, 780)
+    window.show()
+    window.set_task_summaries(
+        [
+            TaskSummary(
+                "task",
+                "Task",
+                TaskStatus.QUEUED,
+                "0 / 1",
+                "1 B",
+                "—",
+                "—",
+                "—",
+            )
+        ]
+    )
+    window.task_table.selectRow(0)
+    window.begin_task_items("task", total_count=50_000)
+    window.append_task_items(
+        "task",
+        make_item_summaries(0, 500),
+        total_count=50_000,
+    )
+    requested = QSignalSpy(window.task_items_page_requested)
+    scrollbar = window.task_item_table.verticalScrollBar()
+    qtbot.waitUntil(lambda: scrollbar.maximum() > 0, timeout=500)
+
+    scrollbar.setValue(scrollbar.maximum())
+    window._task_items_scrolled()
+    window._task_items_scrolled()
+
+    assert requested.count() == 1
+    assert requested.at(0) == ["task"]
+    previous_maximum = scrollbar.maximum()
+    window.append_task_items(
+        "task",
+        make_item_summaries(500, 500),
+        total_count=50_000,
+    )
+    qtbot.waitUntil(lambda: scrollbar.maximum() > previous_maximum, timeout=500)
+    scrollbar.setValue(scrollbar.maximum())
+    window._task_items_scrolled()
+    assert requested.count() == 2
+    assert len(window.visible_task_item_ids()) > 0
+
+    rows_before = window.task_item_model.rowCount()
+    window.show_task_items_page_error("分页读取失败")
+    assert window.task_item_model.rowCount() == rows_before
+    assert "分页读取失败" in window.statusBar().currentMessage()
+
+
+def test_task_patch_filter_and_order_keep_selection_current_and_scroll_anchor(
+    qtbot,
+) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.resize(1280, 780)
+    window.show()
+    tasks = [
+        TaskSummary(
+            f"task-{index:03d}",
+            f"Task {index:03d}",
+            TaskStatus.DOWNLOADING if index == 150 else TaskStatus.QUEUED,
+            "0 / 1",
+            "1 B",
+            "—",
+            "—",
+            "—",
+            total_items=1,
+        )
+        for index in range(200)
+    ]
+    order_keys = {task.id: (float(index), task.id) for index, task in enumerate(tasks)}
+    dashboard = TaskDashboard(0.0, 0, 200, "task-150")
+    window.set_task_snapshot(tasks, order_keys, dashboard)
+    selected_row = window.task_model.row_for_task_id("task-150")
+    top_row = window.task_model.row_for_task_id("task-100")
+    assert selected_row is not None and top_row is not None
+    window.task_table.selectRow(selected_row)
+    window.task_table.setCurrentIndex(window.task_model.index(selected_row, 0))
+    window.task_table.scrollTo(
+        window.task_model.index(top_row, 0),
+        QAbstractItemView.ScrollHint.PositionAtTop,
+    )
+    qtbot.wait(10)
+    top_id = window._first_visible_task_id()
+    selected = window.task_model.task_by_id("task-150")
+    moved = window.task_model.task_by_id("task-199")
+    assert selected is not None and moved is not None
+
+    window.apply_task_patch(
+        [replace(selected, progress_text="1 / 1"), moved],
+        {"task-150": order_keys["task-150"], "task-199": (-1.0, "task-199")},
+        (),
+        TaskDashboard(64.0, 1, 199, "task-150"),
+    )
+    window.task_filter.setCurrentIndex(window.task_filter.findData(TaskFilter.ACTIVE))
+
+    assert window.selected_task_id() == "task-150"
+    assert window.task_model.data(
+        window.task_table.currentIndex(),
+        Qt.ItemDataRole.UserRole,
+    ) == "task-150"
+    assert window._first_visible_task_id() == top_id
+    assert window.speed_value.text() == "64 B/s"
+    assert window.completed_value.text() == "1"
+
+
 def test_task_workspace_filters_and_emits_stable_multiselect_batches(qtbot) -> None:
     window = MainWindow()
     qtbot.addWidget(window)
@@ -648,7 +790,7 @@ def test_task_workspace_filters_and_emits_stable_multiselect_batches(qtbot) -> N
 
     window.task_search.setText("Done")
 
-    assert window.task_model.rowCount() == 1
+    qtbot.waitUntil(lambda: window.task_model.rowCount() == 1, timeout=500)
     assert window.task_model.task_at(0).id == "done"
     assert window.task_filter.currentText().startswith("全部 (1)")
 

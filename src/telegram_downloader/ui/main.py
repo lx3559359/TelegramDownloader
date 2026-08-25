@@ -1,8 +1,16 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Mapping, Sequence
 
-from PySide6.QtCore import QDate, QItemSelectionModel, QSignalBlocker, QSize, Qt, Signal
+from PySide6.QtCore import (
+    QDate,
+    QItemSelectionModel,
+    QSignalBlocker,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -38,6 +46,7 @@ from telegram_downloader.branding import (
 from telegram_downloader.domain import IntegrityStatus, ItemStatus, MediaKind, TaskStatus
 from telegram_downloader.file_integrity import IntegrityProgress
 from telegram_downloader.planner import BatchScanProgress
+from telegram_downloader.task_center import TaskDashboard
 from telegram_downloader.ui.batch_import import BatchImportDialog
 from telegram_downloader.ui.content_browser import ContentBrowserPage
 from telegram_downloader.ui.effects import ElevationLevel, apply_elevation
@@ -104,11 +113,17 @@ class MainWindow(QMainWindow):
     integrity_cancel_requested = Signal()
     settings_requested = Signal()
     login_requested = Signal()
+    task_items_page_requested = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
         self._restoring_task_selection = False
         self._detail_task_id: str | None = None
+        self._task_item_page_pending = False
+        self._task_filter_timer = QTimer(self)
+        self._task_filter_timer.setSingleShot(True)
+        self._task_filter_timer.setInterval(150)
+        self._task_filter_timer.timeout.connect(self._apply_task_filter_now)
         self._integrity_busy = False
         self._batch_dialogs: set[BatchImportDialog] = set()
         self._pending_batch_dialog: BatchImportDialog | None = None
@@ -177,13 +192,17 @@ class MainWindow(QMainWindow):
         self.repair_media_button.clicked.connect(self._confirm_repair_media)
         self.verify_tasks_button.clicked.connect(self._emit_verify_tasks)
         self.integrity_cancel_button.clicked.connect(self._emit_integrity_cancel)
-        self.task_search.textChanged.connect(self._apply_task_filter)
-        self.task_filter.currentIndexChanged.connect(self._apply_task_filter)
+        self.task_search.textChanged.connect(self._schedule_task_filter)
+        self.task_search.returnPressed.connect(self._apply_task_filter_now)
+        self.task_filter.currentIndexChanged.connect(self._apply_task_filter_now)
         self.task_table.selectionModel().selectionChanged.connect(self._task_selection_changed)
         self.task_item_table.selectionModel().selectionChanged.connect(
             self._update_media_action_state
         )
         self.task_item_table.doubleClicked.connect(self._emit_open_media)
+        self.task_item_table.verticalScrollBar().valueChanged.connect(
+            self._task_items_scrolled
+        )
         self.tasks_nav_button.clicked.connect(lambda: self.show_page("tasks"))
         self.content_nav_button.clicked.connect(lambda: self.show_page("content"))
         self.subscriptions_nav_button.clicked.connect(lambda: self.show_page("subscriptions"))
@@ -696,26 +715,12 @@ class MainWindow(QMainWindow):
         return frozenset(kind for kind, check in self.media_checks.items() if check.isChecked())
 
     def set_task_summaries(self, tasks: list[TaskSummary]) -> None:
-        selected_task_ids = self.selected_task_ids()
-        self._restoring_task_selection = True
-        try:
-            self.task_model.set_tasks(tasks)
-            self._restore_task_selection(selected_task_ids)
-        finally:
-            self._restoring_task_selection = False
-        self._update_task_filter_labels()
-        self._task_selection_changed()
-
         active_tasks = [task for task in tasks if not task.archived]
         total_speed = sum(
             task.speed_bps for task in active_tasks if task.status is TaskStatus.DOWNLOADING
         )
         completed = sum(task.completed_items for task in active_tasks)
         remaining = sum(max(0, task.total_items - task.completed_items) for task in active_tasks)
-        self.speed_value.setText(self._format_rate(total_speed))
-        self.completed_value.setText(str(completed))
-        self.remaining_value.setText(str(remaining))
-
         active = next(
             (
                 task
@@ -723,6 +728,52 @@ class MainWindow(QMainWindow):
                 if task.status in {TaskStatus.DOWNLOADING, TaskStatus.WAITING_RETRY}
             ),
             None,
+        )
+        order_keys = {
+            task.id: (float(row), task.id) for row, task in enumerate(tasks)
+        }
+        self.set_task_snapshot(
+            tasks,
+            order_keys,
+            TaskDashboard(
+                total_speed,
+                completed,
+                remaining,
+                active.id if active is not None else None,
+            ),
+        )
+
+    def set_task_snapshot(
+        self,
+        tasks: Sequence[TaskSummary],
+        order_keys: Mapping[str, tuple[float, str]],
+        dashboard: TaskDashboard,
+    ) -> None:
+        self._apply_task_model_change(
+            lambda: self.task_model.apply_snapshot(tasks, order_keys)
+        )
+        self._update_task_dashboard(dashboard)
+
+    def apply_task_patch(
+        self,
+        tasks: Sequence[TaskSummary],
+        order_keys: Mapping[str, tuple[float, str]],
+        removed_ids: Collection[str],
+        dashboard: TaskDashboard,
+    ) -> None:
+        self._apply_task_model_change(
+            lambda: self.task_model.apply_tasks(tasks, order_keys, removed_ids)
+        )
+        self._update_task_dashboard(dashboard)
+
+    def _update_task_dashboard(self, dashboard: TaskDashboard) -> None:
+        self.speed_value.setText(self._format_rate(dashboard.total_speed_bps))
+        self.completed_value.setText(str(dashboard.completed_items))
+        self.remaining_value.setText(str(dashboard.remaining_items))
+        active = (
+            self.task_model.task_by_id(dashboard.current_task_id)
+            if dashboard.current_task_id is not None
+            else None
         )
         if active is None:
             self.current_task_label.setText("暂无活动任务")
@@ -764,16 +815,66 @@ class MainWindow(QMainWindow):
         task_id: str,
         items: list[TaskItemSummary],
     ) -> None:
+        self.begin_task_items(task_id, total_count=len(items))
+        self.append_task_items(task_id, items, total_count=len(items))
+        if self._detail_task_id == task_id:
+            self.task_detail_hint.setText(f"共 {len(items)} 个媒体文件")
+
+    def begin_task_items(self, task_id: str, *, total_count: int) -> None:
         tasks = self._selected_task_summaries()
         if len(tasks) != 1 or tasks[0].id != task_id:
             return
         selected_media_ids = self.selected_media_ids() if self._detail_task_id == task_id else []
         self._detail_task_id = task_id
+        self._task_item_page_pending = False
         self.task_detail_title.setText(tasks[0].title)
-        self.task_detail_hint.setText(f"共 {len(items)} 个媒体文件")
-        self.task_item_model.set_items(items)
+        self.task_detail_hint.setText(f"已加载 0 / 共 {total_count} 项")
+        self.task_item_model.begin_task(task_id, total_count=total_count)
         self._restore_media_selection(selected_media_ids)
         self._update_media_action_state()
+
+    def append_task_items(
+        self,
+        task_id: str,
+        items: Sequence[TaskItemSummary],
+        *,
+        total_count: int,
+    ) -> None:
+        if self._detail_task_id != task_id:
+            return
+        if self.task_item_model.total_count != total_count:
+            raise ValueError("媒体分页总数发生变化")
+        selected_media_ids = self.selected_media_ids()
+        self.task_item_model.append_page(task_id, items)
+        self._task_item_page_pending = False
+        self.task_detail_hint.setText(
+            f"已加载 {self.task_item_model.loaded_count} / 共 {total_count} 项"
+        )
+        self._restore_media_selection(selected_media_ids)
+        self._update_media_action_state()
+
+    def apply_task_items(
+        self,
+        task_id: str,
+        items: Sequence[TaskItemSummary],
+    ) -> None:
+        if self._detail_task_id != task_id:
+            return
+        selected_media_ids = self.selected_media_ids()
+        self.task_item_model.apply_items(task_id, items)
+        self._restore_media_selection(selected_media_ids)
+        self._update_media_action_state()
+
+    def visible_task_item_ids(self) -> tuple[str, ...]:
+        first, last = self._visible_rows(self.task_item_table)
+        return self.task_item_model.visible_item_ids(first, last)
+
+    def set_task_items_page_busy(self, busy: bool) -> None:
+        self._task_item_page_pending = busy
+
+    def show_task_items_page_error(self, message: str) -> None:
+        self._task_item_page_pending = False
+        self.statusBar().showMessage(message, 8000)
 
     def _task_selection_changed(self, *_args) -> None:
         if self._restoring_task_selection:
@@ -783,7 +884,8 @@ class MainWindow(QMainWindow):
             task = tasks[0]
             if self._detail_task_id != task.id:
                 self._detail_task_id = task.id
-                self.task_item_model.set_items([])
+                self._task_item_page_pending = False
+                self.task_item_model.begin_task(task.id, total_count=0)
             self.task_detail_title.setText(task.title)
             self.task_detail_hint.setText("正在加载媒体明细…")
         elif tasks:
@@ -798,9 +900,10 @@ class MainWindow(QMainWindow):
 
     def _clear_task_details(self, title: str, hint: str) -> None:
         self._detail_task_id = None
+        self._task_item_page_pending = False
         self.task_detail_title.setText(title)
         self.task_detail_hint.setText(hint)
-        self.task_item_model.set_items([])
+        self.task_item_model.begin_task("", total_count=0)
         self._update_media_action_state()
 
     def _restore_task_selection(self, task_ids: list[str]) -> None:
@@ -822,17 +925,118 @@ class MainWindow(QMainWindow):
             if item is not None and item.id in wanted:
                 selection.select(self.task_item_model.index(row, 0), flags)
 
-    def _apply_task_filter(self, *_args) -> None:
-        selected_task_ids = self.selected_task_ids()
-        selected = TaskFilter(str(self.task_filter.currentData()))
+    def _apply_task_model_change(self, apply_change: Callable[[], None]) -> None:
+        selected_ids, current_id, current_row, top_id, top_row = (
+            self._capture_task_anchors()
+        )
         self._restoring_task_selection = True
         try:
-            self.task_model.set_filter(selected, self.task_search.text())
-            self._restore_task_selection(selected_task_ids)
+            apply_change()
+            self._restore_task_anchors(
+                selected_ids,
+                current_id,
+                current_row,
+                top_id,
+                top_row,
+            )
         finally:
             self._restoring_task_selection = False
         self._update_task_filter_labels()
         self._task_selection_changed()
+
+    def _capture_task_anchors(
+        self,
+    ) -> tuple[list[str], str | None, int | None, str | None, int | None]:
+        current = self.task_table.currentIndex()
+        current_task = self.task_model.task_at(current.row()) if current.isValid() else None
+        first_row, _last_row = self._visible_rows(self.task_table)
+        first_task = self.task_model.task_at(first_row)
+        return (
+            self.selected_task_ids(),
+            current_task.id if current_task is not None else None,
+            current.row() if current.isValid() else None,
+            first_task.id if first_task is not None else None,
+            first_row if first_row >= 0 else None,
+        )
+
+    def _restore_task_anchors(
+        self,
+        selected_ids: list[str],
+        current_id: str | None,
+        current_row: int | None,
+        top_id: str | None,
+        top_row: int | None,
+    ) -> None:
+        selection = self.task_table.selectionModel()
+        selection.clearSelection()
+        self._restore_task_selection(selected_ids)
+        target_current = (
+            self.task_model.row_for_task_id(current_id)
+            if current_id is not None
+            else None
+        )
+        if target_current is None and current_row is not None and self.task_model.rowCount():
+            target_current = min(current_row, self.task_model.rowCount() - 1)
+        if target_current is not None:
+            self.task_table.setCurrentIndex(self.task_model.index(target_current, 0))
+        target_top = (
+            self.task_model.row_for_task_id(top_id) if top_id is not None else None
+        )
+        if target_top is None and top_row is not None and self.task_model.rowCount():
+            target_top = min(top_row, self.task_model.rowCount() - 1)
+        if target_top is not None:
+            self.task_table.scrollTo(
+                self.task_model.index(target_top, 0),
+                QAbstractItemView.ScrollHint.PositionAtTop,
+            )
+
+    def _first_visible_task_id(self) -> str | None:
+        first, _last = self._visible_rows(self.task_table)
+        task = self.task_model.task_at(first)
+        return task.id if task is not None else None
+
+    @staticmethod
+    def _visible_rows(table: QTableView) -> tuple[int, int]:
+        model = table.model()
+        row_count = model.rowCount() if model is not None else 0
+        if row_count <= 0:
+            return -1, -1
+        first = table.rowAt(0)
+        scrollbar = table.verticalScrollBar()
+        if first < 0:
+            first = min(max(0, scrollbar.value()), row_count - 1)
+        last = table.rowAt(max(0, table.viewport().height() - 1))
+        if last < 0:
+            last = min(row_count - 1, first + max(1, scrollbar.pageStep()) - 1)
+        return first, last
+
+    def _schedule_task_filter(self, *_args) -> None:
+        self._task_filter_timer.stop()
+        if not self.task_search.text().strip():
+            self._apply_task_filter_now()
+            return
+        self._task_filter_timer.start()
+
+    def _apply_task_filter_now(self, *_args) -> None:
+        self._task_filter_timer.stop()
+        selected = TaskFilter(str(self.task_filter.currentData()))
+        self._apply_task_model_change(
+            lambda: self.task_model.set_filter(selected, self.task_search.text())
+        )
+
+    def _task_items_scrolled(self, *_args) -> None:
+        if (
+            self._detail_task_id is None
+            or self._task_item_page_pending
+            or not self.task_item_model.has_more
+        ):
+            return
+        row_count = self.task_item_model.rowCount()
+        _first, last = self._visible_rows(self.task_item_table)
+        if last < row_count - 100:
+            return
+        self._task_item_page_pending = True
+        self.task_items_page_requested.emit(self._detail_task_id)
 
     def _update_task_filter_labels(self) -> None:
         counts = self.task_model.filter_counts()
