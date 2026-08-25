@@ -341,3 +341,28 @@ def test_file_integrity_runtime_is_reachable_and_project_local() -> None:
     assert "asyncio.to_thread" in service
     for forbidden in ("appdata", "localappdata", "qsettings", "tempfile"):
         assert forbidden not in service.casefold()
+
+
+def test_task_center_benchmark_is_synthetic_and_private() -> None:
+    root = Path(__file__).parents[1]
+    source = (root / "scripts/benchmark_task_center.py").read_text(
+        encoding="utf-8"
+    ).casefold()
+    assert "temporarydirectory" in source
+    assert "10_000" in source
+    assert "50_000" in source
+    for forbidden in (
+        "telethongateway",
+        "secrets.dat",
+        "runtime_root(",
+        "t.me/",
+        "api_hash",
+        "catalog.sqlite3",
+    ):
+        assert forbidden not in source
+
+    controller = (root / "src/telegram_downloader/controller.py").read_text(
+        encoding="utf-8"
+    )
+    assert ".set_task_summaries(" not in controller
+    assert ".set_task_items(" not in controller
