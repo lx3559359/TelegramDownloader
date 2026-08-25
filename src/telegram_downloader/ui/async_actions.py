@@ -70,6 +70,8 @@ ACTION_POLICIES: dict[str, ActionPolicy] = {
     "tasks.restore": ActionPolicy.DEDUPLICATE,
     "tasks.resume": ActionPolicy.DEDUPLICATE,
     "tasks.retry": ActionPolicy.DEDUPLICATE,
+    "task.details": ActionPolicy.REPLACE_LATEST,
+    "task.page": ActionPolicy.DEDUPLICATE,
     "integrity.operation": ActionPolicy.DEDUPLICATE,
     "maintenance.storage.activate": ActionPolicy.DEDUPLICATE,
     "maintenance.storage.scan": ActionPolicy.DEDUPLICATE,

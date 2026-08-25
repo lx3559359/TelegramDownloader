@@ -96,7 +96,7 @@ async def test_shutdown_cancels_running_actions_and_calls_cleanup() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("key", ["tasks.resume", "content.queue"])
+@pytest.mark.parametrize("key", ["tasks.resume", "content.queue", "task.page"])
 async def test_payload_signal_forwards_value_and_deduplicates_running_key(
     key: str,
 ) -> None:
@@ -168,6 +168,7 @@ async def test_started_hook_runs_before_action_coroutine_starts() -> None:
         "content.history.open",
         "content.search",
         "content.load_more",
+        "task.details",
     ],
 )
 async def test_replace_latest_policy_cancels_old_without_clearing_new_busy_state(

@@ -56,6 +56,8 @@ EXPECTED_POLICIES = {
     "content.search": ActionPolicy.REPLACE_LATEST,
     "content.load_more": ActionPolicy.REPLACE_LATEST,
     "content.queue": ActionPolicy.DEDUPLICATE,
+    "task.details": ActionPolicy.REPLACE_LATEST,
+    "task.page": ActionPolicy.DEDUPLICATE,
     "dialogs.refresh": ActionPolicy.DEDUPLICATE,
     "telegram.retry": ActionPolicy.DEDUPLICATE,
     "diagnostics.run": ActionPolicy.DEDUPLICATE,
@@ -570,7 +572,7 @@ def test_create_application_initializes_project_local_content_services(
         assert "content_preview_requested" in slot_names
         assert "subscription_probe_requested" in slot_names
         assert controller._async_actions.active_keys == frozenset()
-        assert len(controller._async_actions._slots) == 44
+        assert len(controller._async_actions._slots) == 46
         assert controller.diagnostics is not None
         assert controller.diagnostic_store.paths.root == tmp_path.resolve()
         controller.window.content_page.link_requested.emit("https://t.me/example/1#fragment")
@@ -965,7 +967,11 @@ def test_task_management_signals_route_sync_and_async_actions(
     async def record_async(name, value):
         calls.append((name, value))
 
-    monkeypatch.setattr(controller, "select_task_details", record_sync("select"))
+    monkeypatch.setattr(
+        controller,
+        "select_task_details",
+        lambda value: record_async("select", value),
+    )
     monkeypatch.setattr(
         controller,
         "pause_tasks",
@@ -1040,8 +1046,8 @@ def test_task_management_signals_route_sync_and_async_actions(
         loop.run_until_complete(emit_actions())
 
         assert calls == [
-            ("select", ["one"]),
             ("open", "media"),
+            ("select", ["one"]),
             ("pause", ["one", "two"]),
             ("priority", "queued"),
             ("archive", ["done"]),
@@ -1064,6 +1070,55 @@ def test_task_management_signals_route_sync_and_async_actions(
         assert "verify_media_requested" in slot_names
         assert "verify_tasks_requested" in slot_names
         assert "repair_media_requested" in slot_names
+    finally:
+        loop.run_until_complete(controller._async_actions.shutdown())
+        controller.window.close()
+        loop.close()
+        application.processEvents()
+
+
+def test_task_detail_page_and_visibility_signals_use_responsive_routes(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    application, loop, controller = app.create_application(tmp_path)
+    details_seen = asyncio.Event()
+    page_seen = asyncio.Event()
+    details: list[list[str]] = []
+    pages: list[str] = []
+    visibility: list[bool] = []
+
+    async def select_details(task_ids):
+        details.append(task_ids)
+        details_seen.set()
+
+    async def load_page(task_id):
+        pages.append(task_id)
+        page_seen.set()
+
+    monkeypatch.setattr(controller, "select_task_details", select_details)
+    monkeypatch.setattr(controller, "load_more_task_items", load_page)
+    monkeypatch.setattr(
+        controller,
+        "set_task_center_visible",
+        visibility.append,
+    )
+
+    async def emit() -> None:
+        controller.window.task_selection_changed.emit(["task"])
+        controller.window.task_items_page_requested.emit("task")
+        controller.window.task_center_visibility_changed.emit(True)
+        await asyncio.wait_for(
+            asyncio.gather(details_seen.wait(), page_seen.wait()),
+            timeout=1,
+        )
+        await controller._async_actions.wait_idle()
+
+    try:
+        loop.run_until_complete(emit())
+        assert details == [["task"]]
+        assert pages == ["task"]
+        assert visibility == [True]
     finally:
         loop.run_until_complete(controller._async_actions.shutdown())
         controller.window.close()

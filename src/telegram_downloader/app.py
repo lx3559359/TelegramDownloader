@@ -384,6 +384,7 @@ def create_application(
     from telegram_downloader.ui.account_status import AccountStatusDialog
     from telegram_downloader.ui.async_actions import (
         ActionHooks,
+        ActionPolicy,
         AsyncActionBridge,
     )
     from telegram_downloader.ui.checkmark_style import install_checkmark_style
@@ -914,8 +915,14 @@ def create_application(
             return []
         return list(dict.fromkeys(str(item) for item in value if item))
 
-    def task_selection_changed(value: object) -> None:
-        controller.select_task_details(_task_ids(value))
+    async def task_selection_changed(value: object) -> None:
+        await controller.select_task_details(_task_ids(value))
+
+    async def task_items_page_requested(task_id: str) -> None:
+        await controller.load_more_task_items(task_id)
+
+    def task_center_visibility_changed(visible: bool) -> None:
+        controller.set_task_center_visible(visible)
 
     async def pause_tasks_requested(value: object) -> None:
         await controller.pause_tasks(_task_ids(value))
@@ -1189,7 +1196,7 @@ def create_application(
 
     window.scan_requested.connect(scan_requested)
     window.batch_scan_requested.connect(batch_scan_requested)
-    window.task_selection_changed.connect(task_selection_changed)
+    window.task_center_visibility_changed.connect(task_center_visibility_changed)
     window.open_media_requested.connect(open_media_requested)
     window.integrity_cancel_requested.connect(integrity_cancel_signal_slot)
     window.open_directory_requested.connect(controller.open_task_directory)
@@ -1426,6 +1433,21 @@ def create_application(
         window.statusBar().showMessage(controller._safe_error(error), 0)
 
     async_actions.connect_payload(
+        window.task_selection_changed,
+        "task.details",
+        task_selection_changed,
+        policy=ActionPolicy.REPLACE_LATEST,
+        hooks=ActionHooks(failed=task_failure),
+    )
+    async_actions.connect_payload(
+        window.task_items_page_requested,
+        "task.page",
+        task_items_page_requested,
+        policy=ActionPolicy.DEDUPLICATE,
+        hooks=ActionHooks(failed=task_failure),
+    )
+
+    async_actions.connect_payload(
         window.subscriptions_page.run_requested,
         "subscriptions.run",
         subscription_run_requested,
@@ -1554,6 +1576,8 @@ def create_application(
             code_submitted,
             password_submitted,
             task_selection_changed,
+            task_items_page_requested,
+            task_center_visibility_changed,
             pause_tasks_requested,
             prioritize_task_requested,
             resume_tasks_requested,

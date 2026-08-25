@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime
 
@@ -73,13 +74,22 @@ async def test_task_management_persists_archive_restart_restore_and_dedup(
         window=window,
         paths=paths,
     )
-    window.task_selection_changed.connect(controller.select_task_details)
+    detail_tasks: set[asyncio.Task[None]] = set()
+
+    def load_task_details(task_ids) -> None:
+        task = asyncio.create_task(controller.select_task_details(task_ids))
+        detail_tasks.add(task)
+        task.add_done_callback(detail_tasks.discard)
+
+    window.task_selection_changed.connect(load_task_details)
     controller.refresh_tasks(now=1.0)
 
     assert window.task_model.filter_counts()[TaskFilter.COMPLETED] == 1
     window.task_search.setText("finished")
     assert window.task_model.rowCount() == 1
     window.task_table.selectRow(0)
+    if detail_tasks:
+        await asyncio.gather(*tuple(detail_tasks))
     assert window.task_item_model.rowCount() == 1
     assert window.task_item_model.item_at(0).id == item.id
 
@@ -120,3 +130,5 @@ async def test_task_management_persists_archive_restart_restore_and_dedup(
     assert paths.guard(item.target_path).is_file()
     assert paths.database.is_relative_to(paths.root)
     assert item.target_path.is_relative_to(paths.root)
+    await controller.shutdown()
+    await restarted_controller.shutdown()

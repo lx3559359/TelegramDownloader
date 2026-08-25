@@ -114,6 +114,7 @@ class MainWindow(QMainWindow):
     settings_requested = Signal()
     login_requested = Signal()
     task_items_page_requested = Signal(str)
+    task_center_visibility_changed = Signal(bool)
 
     def __init__(self) -> None:
         super().__init__()
@@ -1217,6 +1218,7 @@ class MainWindow(QMainWindow):
         self.subscriptions_page.set_logged_in(bool(display_name))
 
     def show_page(self, name: str) -> None:
+        task_center_was_visible = self.page_stack.currentWidget() is self.task_page
         content = name == "content"
         subscriptions = name == "subscriptions"
         diagnostics = name == "diagnostics"
@@ -1233,6 +1235,9 @@ class MainWindow(QMainWindow):
             else self.task_page
         )
         self.page_stack.setCurrentWidget(page)
+        task_center_is_visible = page is self.task_page
+        if task_center_is_visible != task_center_was_visible:
+            self.task_center_visibility_changed.emit(task_center_is_visible)
         self.statistics_panel.setVisible(not (content or subscriptions or maintenance))
         active = (
             self.content_nav_button

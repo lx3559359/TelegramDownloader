@@ -1067,6 +1067,21 @@ def test_content_navigation_switches_page_and_hides_statistics(qtbot) -> None:
     assert window.tasks_nav_button.property("active") is True
 
 
+def test_task_center_visibility_emits_only_when_page_state_changes(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    states: list[bool] = []
+    window.task_center_visibility_changed.connect(states.append)
+
+    window.show_page("tasks")
+    window.show_page("content")
+    window.show_page("content")
+    window.show_page("tasks")
+    window.show_page("tasks")
+
+    assert states == [False, True]
+
+
 def test_content_navigation_emits_activation_and_link_preview_routes_to_tasks(
     qtbot,
 ) -> None:
