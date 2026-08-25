@@ -972,18 +972,26 @@ def _grouped_state_counts(
 
 
 def _database_failure(result_id: str, title: str, code: str) -> DiagnosticResult:
+    semantic_summaries = {
+        "task-database": "下载任务数据库包含无效关系或状态",
+        "content-database": "账号内容数据库包含无效关系或状态",
+    }
     summaries = {
         "database-missing": "数据库文件不存在",
         "database-corrupt": "数据库完整性检查失败",
         "database-unreadable": "数据库无法读取",
-        "database-semantics-invalid": "数据库语义检查失败",
     }
+    summary = (
+        semantic_summaries.get(result_id, "数据库语义检查失败")
+        if code == "database-semantics-invalid"
+        else summaries.get(code, "数据库检查失败")
+    )
     return _result(
         result_id,
         title,
         DiagnosticStatus.FAILED,
         code,
-        summaries.get(code, "数据库检查失败"),
+        summary,
     )
 
 

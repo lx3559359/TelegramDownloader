@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,7 +10,7 @@ from zipfile import ZipFile
 
 import pytest
 
-from telegram_downloader.catalog import CatalogRepository
+from telegram_downloader.catalog import CATALOG_SCHEMA_VERSION, CatalogRepository
 from telegram_downloader.content import AccountProfile, ContentDialog, DialogKind
 from telegram_downloader.diagnostic_probes import (
     probe_components,
@@ -400,3 +401,73 @@ def test_hardened_diagnostic_variants_round_trip_without_private_data(
     for private in private_values:
         assert private.encode("utf-8") not in serialized
         assert private.encode("utf-8") not in payload
+
+
+@pytest.mark.parametrize(
+    ("probe", "database_name", "schema", "expected_summary"),
+    [
+        (
+            probe_task_database,
+            "tasks.sqlite3",
+            """
+            CREATE TABLE tasks (
+                id TEXT,
+                source_kind TEXT,
+                status TEXT,
+                pause_reason TEXT
+            );
+            CREATE TABLE media_items (
+                id TEXT,
+                task_id TEXT REFERENCES tasks(missing_parent_key),
+                media_kind TEXT,
+                status TEXT,
+                integrity_status TEXT
+            );
+            """,
+            "下载任务数据库包含无效关系或状态",
+        ),
+        (
+            probe_content_database,
+            "catalog.sqlite3",
+            f"""
+            CREATE TABLE accounts (account_id TEXT);
+            CREATE TABLE dialogs (
+                account_id TEXT REFERENCES accounts(account_id),
+                peer_ref TEXT,
+                kind TEXT
+            );
+            CREATE TABLE search_sessions (id TEXT, status TEXT, scope TEXT);
+            CREATE TABLE search_results (id TEXT, media_kind TEXT);
+            CREATE TABLE subscription_rules (id TEXT, state TEXT);
+            CREATE TABLE subscription_runs (id TEXT, keyword_hits INTEGER, status TEXT);
+            PRAGMA user_version={CATALOG_SCHEMA_VERSION};
+            """,
+            "账号内容数据库包含无效关系或状态",
+        ),
+    ],
+)
+def test_semantic_query_failure_can_be_saved_and_exported(
+    tmp_path: Path,
+    probe,
+    database_name: str,
+    schema: str,
+    expected_summary: str,
+) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    database = paths.database.parent / database_name
+    with sqlite3.connect(database) as connection:
+        connection.executescript(schema)
+
+    result = probe(database)
+    report = DiagnosticReport.build("0.18.4", NOW, NOW, (result,))
+    store = DiagnosticReportStore(paths, secrets=set())
+
+    assert result.code == "database-semantics-invalid"
+    assert result.summary == expected_summary
+    serialized = store.serialize(report)
+    assert store.deserialize(serialized) == report
+    store.save(report)
+    assert store.load_latest() == report
+    package = store.export(report)
+    assert package.is_file()
