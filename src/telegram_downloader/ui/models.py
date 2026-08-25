@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from bisect import bisect_left
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -129,8 +131,14 @@ class TaskTableModel(QAbstractTableModel):
         super().__init__()
         self._all_tasks: list[TaskSummary] = []
         self._tasks: list[TaskSummary] = []
+        self._all_by_id: dict[str, TaskSummary] = {}
+        self._row_by_id: dict[str, int] = {}
+        self._normalized_titles: dict[str, str] = {}
+        self._order_keys: dict[str, tuple[float, str]] = {}
+        self._filter_counts = {selected: 0 for selected in TaskFilter}
         self._filter = TaskFilter.ALL
         self._search = ""
+        self._initialized = False
 
     def rowCount(self, parent: QModelIndex = _INVALID_INDEX) -> int:
         return 0 if parent.isValid() else len(self._tasks)
@@ -179,55 +187,95 @@ class TaskTableModel(QAbstractTableModel):
         return super().headerData(section, orientation, role)
 
     def set_tasks(self, tasks: list[TaskSummary]) -> None:
-        target_all = list(tasks)
-        target = [
-            task
-            for task in target_all
-            if self._matches_search(task)
-            and self._matches_filter(task, self._filter)
-        ]
-        if [task.id for task in self._tasks] == [task.id for task in target]:
-            previous = self._tasks
-            self._all_tasks = target_all
-            self._tasks = target
-            for row, (before, after) in enumerate(zip(previous, target, strict=True)):
-                if before == after:
-                    continue
-                self.dataChanged.emit(
-                    self.index(row, 0),
-                    self.index(row, self.columnCount() - 1),
-                )
+        order_keys = {
+            task.id: (float(row), task.id) for row, task in enumerate(tasks)
+        }
+        self.apply_snapshot(tasks, order_keys)
+
+    def apply_snapshot(
+        self,
+        tasks: Sequence[TaskSummary],
+        order_keys: Mapping[str, tuple[float, str]],
+    ) -> None:
+        target = tuple(tasks)
+        self._validate_unique(target)
+        self._require_order_keys(target, order_keys)
+        if not self._initialized:
+            self.beginResetModel()
+            self._all_by_id = {task.id: task for task in target}
+            self._order_keys = {
+                task.id: order_keys[task.id] for task in target
+            }
+            self._normalized_titles = {
+                task.id: task.title.casefold() for task in target
+            }
+            self._rebuild_all_tasks()
+            self._tasks, self._filter_counts = self._compute_filter_state()
+            self._rebuild_row_index()
+            self._initialized = True
+            self.endResetModel()
             return
-        self.beginResetModel()
-        self._all_tasks = target_all
-        self._tasks = target
-        self.endResetModel()
+        removed_ids = set(self._all_by_id) - {task.id for task in target}
+        self.apply_tasks(target, order_keys, removed_ids)
+
+    def apply_tasks(
+        self,
+        tasks: Sequence[TaskSummary],
+        order_keys: Mapping[str, tuple[float, str]],
+        removed_ids: Collection[str] = (),
+    ) -> None:
+        replacements = tuple(tasks)
+        self._validate_unique(replacements)
+        self._require_order_keys(replacements, order_keys)
+        replacement_ids = {task.id for task in replacements}
+        removed = set(removed_ids) - replacement_ids
+        old_order_keys = dict(self._order_keys)
+        existing_ids = set(self._all_by_id)
+        for task_id in removed:
+            self._all_by_id.pop(task_id, None)
+            self._order_keys.pop(task_id, None)
+            self._normalized_titles.pop(task_id, None)
+        for task in replacements:
+            self._all_by_id[task.id] = task
+            self._order_keys[task.id] = order_keys[task.id]
+            self._normalized_titles[task.id] = task.title.casefold()
+        self._rebuild_all_tasks()
+        target, counts = self._compute_filter_state()
+        moved_ids = {
+            task.id
+            for task in replacements
+            if task.id in existing_ids
+            and old_order_keys.get(task.id) != self._order_keys[task.id]
+        }
+        self._apply_visible_incremental(target, moved_ids=moved_ids)
+        self._filter_counts = counts
 
     def set_filter(self, selected: TaskFilter, search: str = "") -> None:
         normalized = search.strip().casefold()
         if selected is self._filter and normalized == self._search:
             return
-        self.beginResetModel()
         self._filter = selected
         self._search = normalized
-        self._tasks = self._filtered_tasks()
-        self.endResetModel()
+        target, counts = self._compute_filter_state()
+        self._apply_layout_tasks(target)
+        self._filter_counts = counts
 
     def filter_counts(self) -> dict[TaskFilter, int]:
-        matching_search = [task for task in self._all_tasks if self._matches_search(task)]
-        return {
-            selected: sum(self._matches_filter(task, selected) for task in matching_search)
-            for selected in TaskFilter
-        }
+        _target, counts = self._compute_filter_state()
+        self._filter_counts = counts
+        return dict(self._filter_counts)
+
+    def task_by_id(self, task_id: str) -> TaskSummary | None:
+        return self._all_by_id.get(task_id)
+
+    def all_tasks(self) -> tuple[TaskSummary, ...]:
+        return tuple(self._all_tasks)
 
     def task_at(self, row: int) -> TaskSummary | None:
         return self._tasks[row] if 0 <= row < len(self._tasks) else None
 
     def row_for_task_id(self, task_id: str) -> int | None:
-        return next(
-            (row for row, task in enumerate(self._tasks) if task.id == task_id),
-            None,
-        )
+        return self._row_by_id.get(task_id)
 
     @staticmethod
     def _status_text(task: TaskSummary) -> str:
@@ -240,15 +288,37 @@ class TaskTableModel(QAbstractTableModel):
             return f"{label} · 第 {task.queue_position} 位"
         return label
 
-    def _filtered_tasks(self) -> list[TaskSummary]:
-        return [
-            task
-            for task in self._all_tasks
-            if self._matches_search(task) and self._matches_filter(task, self._filter)
-        ]
+    def _compute_filter_state(
+        self,
+    ) -> tuple[list[TaskSummary], dict[TaskFilter, int]]:
+        counts = {selected: 0 for selected in TaskFilter}
+        visible: list[TaskSummary] = []
+        for task in self._all_tasks:
+            if not self._matches_search(task):
+                continue
+            if task.archived:
+                counts[TaskFilter.ARCHIVED] += 1
+            else:
+                counts[TaskFilter.ALL] += 1
+                if task.status in {
+                    TaskStatus.SCANNING,
+                    TaskStatus.QUEUED,
+                    TaskStatus.DOWNLOADING,
+                    TaskStatus.WAITING_RETRY,
+                }:
+                    counts[TaskFilter.ACTIVE] += 1
+                elif task.status is TaskStatus.PAUSED:
+                    counts[TaskFilter.PAUSED] += 1
+                elif task.status is TaskStatus.PARTIAL_FAILURE:
+                    counts[TaskFilter.FAILED] += 1
+                elif task.status is TaskStatus.COMPLETED:
+                    counts[TaskFilter.COMPLETED] += 1
+            if self._matches_filter(task, self._filter):
+                visible.append(task)
+        return visible, counts
 
     def _matches_search(self, task: TaskSummary) -> bool:
-        return not self._search or self._search in task.title.casefold()
+        return not self._search or self._search in self._normalized_titles[task.id]
 
     @staticmethod
     def _matches_filter(task: TaskSummary, selected: TaskFilter) -> bool:
@@ -272,6 +342,138 @@ class TaskTableModel(QAbstractTableModel):
         if selected is TaskFilter.COMPLETED:
             return task.status is TaskStatus.COMPLETED
         return False
+
+    @staticmethod
+    def _validate_unique(tasks: Sequence[TaskSummary]) -> None:
+        task_ids = [task.id for task in tasks]
+        if len(task_ids) != len(set(task_ids)):
+            raise ValueError("任务视图包含重复 ID")
+
+    @staticmethod
+    def _require_order_keys(
+        tasks: Sequence[TaskSummary],
+        order_keys: Mapping[str, tuple[float, str]],
+    ) -> None:
+        for task in tasks:
+            if task.id not in order_keys:
+                raise KeyError(task.id)
+
+    def _rebuild_all_tasks(self) -> None:
+        self._all_tasks = sorted(
+            self._all_by_id.values(),
+            key=lambda task: self._order_keys[task.id],
+        )
+
+    def _rebuild_row_index(self) -> None:
+        self._row_by_id = {task.id: row for row, task in enumerate(self._tasks)}
+
+    def _apply_visible_incremental(
+        self,
+        target: Sequence[TaskSummary],
+        *,
+        moved_ids: set[str],
+    ) -> None:
+        target_by_id = {task.id: task for task in target}
+        target_ids = set(target_by_id)
+        for row in range(len(self._tasks) - 1, -1, -1):
+            if self._tasks[row].id in target_ids:
+                continue
+            self.beginRemoveRows(_INVALID_INDEX, row, row)
+            self._tasks.pop(row)
+            self.endRemoveRows()
+
+        current_ids = {task.id for task in self._tasks}
+        desired_existing = [task.id for task in target if task.id in current_ids]
+        current_order = [task.id for task in self._tasks]
+        if current_order != desired_existing:
+            visible_moves = moved_ids & current_ids
+            if len(visible_moves) == 1:
+                task_id = next(iter(visible_moves))
+                source = current_order.index(task_id)
+                destination = desired_existing.index(task_id)
+                self._move_visible_row(source, destination)
+            else:
+                by_id = {task.id: task for task in self._tasks}
+                self._apply_layout_tasks([by_id[task_id] for task_id in desired_existing])
+
+        current_ids = {task.id for task in self._tasks}
+        for task in target:
+            if task.id in current_ids:
+                continue
+            keys = [self._order_keys[value.id] for value in self._tasks]
+            row = bisect_left(keys, self._order_keys[task.id])
+            self.beginInsertRows(_INVALID_INDEX, row, row)
+            self._tasks.insert(row, task)
+            self.endInsertRows()
+            current_ids.add(task.id)
+
+        changed_rows: list[int] = []
+        for row, task in enumerate(target):
+            if self._tasks[row] == task:
+                continue
+            self._tasks[row] = task
+            changed_rows.append(row)
+        self._rebuild_row_index()
+        self._emit_changed_rows(changed_rows)
+
+    def _move_visible_row(self, source: int, destination: int) -> None:
+        if source == destination:
+            return
+        destination_child = destination + 1 if source < destination else destination
+        self.beginMoveRows(
+            _INVALID_INDEX,
+            source,
+            source,
+            _INVALID_INDEX,
+            destination_child,
+        )
+        task = self._tasks.pop(source)
+        self._tasks.insert(destination, task)
+        self.endMoveRows()
+
+    def _apply_layout_tasks(self, target: Sequence[TaskSummary]) -> None:
+        if [task.id for task in self._tasks] == [task.id for task in target]:
+            self._tasks = list(target)
+            self._rebuild_row_index()
+            return
+        persistent = self.persistentIndexList()
+        anchors = [
+            (self._tasks[index.row()].id, index.column())
+            if index.isValid() and 0 <= index.row() < len(self._tasks)
+            else None
+            for index in persistent
+        ]
+        self.layoutAboutToBeChanged.emit()
+        self._tasks = list(target)
+        self._rebuild_row_index()
+        mapped = [
+            (
+                self.index(self._row_by_id[anchor[0]], anchor[1])
+                if anchor is not None and anchor[0] in self._row_by_id
+                else _INVALID_INDEX
+            )
+            for anchor in anchors
+        ]
+        self.changePersistentIndexList(persistent, mapped)
+        self.layoutChanged.emit()
+
+    def _emit_changed_rows(self, rows: Sequence[int]) -> None:
+        if not rows:
+            return
+        start = previous = rows[0]
+        for row in rows[1:]:
+            if row == previous + 1:
+                previous = row
+                continue
+            self.dataChanged.emit(
+                self.index(start, 0),
+                self.index(previous, self.columnCount() - 1),
+            )
+            start = previous = row
+        self.dataChanged.emit(
+            self.index(start, 0),
+            self.index(previous, self.columnCount() - 1),
+        )
 
 
 class TaskItemTableModel(QAbstractTableModel):

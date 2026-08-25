@@ -2,7 +2,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
-from PySide6.QtCore import QItemSelectionModel, Qt
+from PySide6.QtCore import QItemSelectionModel, QPersistentModelIndex, Qt
 from PySide6.QtTest import QSignalSpy
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -524,6 +524,35 @@ def test_progress_only_task_update_does_not_reset_model(qtbot) -> None:
 
     assert resets.count() == 0
     assert changes.count() >= 1
+
+
+def test_incremental_filter_preserves_selected_persistent_task(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    active = TaskSummary(
+        "active",
+        "Active",
+        TaskStatus.DOWNLOADING,
+        "0 / 1",
+        "1 B",
+        "—",
+        "—",
+        "—",
+    )
+    paused = replace(active, id="paused", title="Paused", status=TaskStatus.PAUSED)
+    window.set_task_summaries([active, paused])
+    paused_row = window.task_model.row_for_task_id(paused.id)
+    assert paused_row is not None
+    window.task_table.selectRow(paused_row)
+    persistent = QPersistentModelIndex(window.task_model.index(paused_row, 0))
+    resets = QSignalSpy(window.task_model.modelReset)
+
+    window.task_filter.setCurrentIndex(window.task_filter.findData(TaskFilter.PAUSED))
+
+    assert resets.count() == 0
+    assert persistent.isValid()
+    assert persistent.data(Qt.ItemDataRole.UserRole) == paused.id
+    assert window.selected_task_id() == paused.id
 
 
 def test_task_workspace_filters_and_emits_stable_multiselect_batches(qtbot) -> None:
