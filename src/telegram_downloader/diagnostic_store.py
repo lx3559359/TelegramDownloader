@@ -33,8 +33,16 @@ _ALLOWED_METRICS = {
     "environment": frozenset(
         {"frozen", "windowsX64", "nonSystemVolume", "guardedPathCount"}
     ),
-    "project-write": frozenset(),
-    "disk": frozenset({"totalBytes", "freeBytes"}),
+    "project-write": frozenset({"downloadWritable"}),
+    "disk": frozenset(
+        {
+            "totalBytes",
+            "freeBytes",
+            "downloadSameVolume",
+            "downloadTotalBytes",
+            "downloadFreeBytes",
+        }
+    ),
     "components": frozenset(
         {"pyside6", "telethon", "qasync", "qrcode", "sqlite", "dpapi"}
     ),
@@ -116,6 +124,8 @@ _BOOLEAN_METRICS = frozenset(
         "frozen",
         "windowsX64",
         "nonSystemVolume",
+        "downloadWritable",
+        "downloadSameVolume",
         "schemaCompatible",
         "foreignKeysValid",
         "stateValuesValid",
@@ -193,9 +203,19 @@ _RESULT_VARIANTS = {
                 "项目内临时写入和读取正常",
             ),
             (
+                DiagnosticStatus.PASSED,
+                "project-write-ok",
+                "项目内临时写入和当前下载目录写入正常",
+            ),
+            (
                 DiagnosticStatus.FAILED,
                 "project-write-failed",
                 "项目内临时写入检查失败",
+            ),
+            (
+                DiagnosticStatus.FAILED,
+                "download-write-failed",
+                "当前下载目录写入检查失败",
             ),
         }
     ),
@@ -211,8 +231,38 @@ _RESULT_VARIANTS = {
                 "disk-space-critical",
                 "磁盘可用空间低于 256 MiB",
             ),
+            (
+                DiagnosticStatus.FAILED,
+                "disk-space-critical",
+                "应用所在磁盘可用空间低于 256 MiB",
+            ),
             (DiagnosticStatus.WARNING, "disk-space-low", "磁盘可用空间低于 1 GiB"),
+            (
+                DiagnosticStatus.WARNING,
+                "disk-space-low",
+                "应用所在磁盘可用空间低于 1 GiB",
+            ),
+            (
+                DiagnosticStatus.FAILED,
+                "download-disk-unavailable",
+                "无法读取下载所在磁盘的空间信息",
+            ),
+            (
+                DiagnosticStatus.FAILED,
+                "download-disk-space-critical",
+                "下载所在磁盘可用空间低于 256 MiB",
+            ),
+            (
+                DiagnosticStatus.WARNING,
+                "download-disk-space-low",
+                "下载所在磁盘可用空间低于 1 GiB",
+            ),
             (DiagnosticStatus.PASSED, "disk-space-ok", "磁盘可用空间正常"),
+            (
+                DiagnosticStatus.PASSED,
+                "disk-space-ok",
+                "应用和下载所在磁盘可用空间正常",
+            ),
         }
     ),
     "components": frozenset(

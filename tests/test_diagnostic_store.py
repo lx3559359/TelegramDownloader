@@ -136,6 +136,93 @@ def test_credentials_configuration_metric_round_trips(tmp_path: Path) -> None:
     assert store.load_latest() == credential_report
 
 
+@pytest.mark.parametrize(
+    ("result_id", "title", "status", "code", "summary", "metrics"),
+    [
+        (
+            "project-write",
+            "项目内写入",
+            DiagnosticStatus.FAILED,
+            "download-write-failed",
+            "当前下载目录写入检查失败",
+            {"downloadWritable": False},
+        ),
+        (
+            "disk",
+            "磁盘空间",
+            DiagnosticStatus.FAILED,
+            "download-disk-unavailable",
+            "无法读取下载所在磁盘的空间信息",
+            {
+                "totalBytes": 8 * 1024**3,
+                "freeBytes": 2 * 1024**3,
+                "downloadSameVolume": False,
+            },
+        ),
+        (
+            "disk",
+            "磁盘空间",
+            DiagnosticStatus.FAILED,
+            "download-disk-space-critical",
+            "下载所在磁盘可用空间低于 256 MiB",
+            {
+                "totalBytes": 8 * 1024**3,
+                "freeBytes": 2 * 1024**3,
+                "downloadSameVolume": False,
+                "downloadTotalBytes": 8 * 1024**3,
+                "downloadFreeBytes": 128 * 1024**2,
+            },
+        ),
+        (
+            "disk",
+            "磁盘空间",
+            DiagnosticStatus.WARNING,
+            "download-disk-space-low",
+            "下载所在磁盘可用空间低于 1 GiB",
+            {
+                "totalBytes": 8 * 1024**3,
+                "freeBytes": 2 * 1024**3,
+                "downloadSameVolume": False,
+                "downloadTotalBytes": 8 * 1024**3,
+                "downloadFreeBytes": 512 * 1024**2,
+            },
+        ),
+    ],
+)
+def test_active_download_storage_variants_round_trip(
+    tmp_path: Path,
+    result_id: str,
+    title: str,
+    status: DiagnosticStatus,
+    code: str,
+    summary: str,
+    metrics: dict[str, bool | int],
+) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    storage_report = DiagnosticReport.build(
+        "0.18.4",
+        NOW,
+        NOW + timedelta(seconds=1),
+        (
+            DiagnosticResult(
+                result_id,
+                title,
+                status,
+                code,
+                summary,
+                3,
+                metrics,
+            ),
+        ),
+    )
+    store = DiagnosticReportStore(paths, secrets=set())
+
+    store.save(storage_report)
+
+    assert store.load_latest() == storage_report
+
+
 def test_report_accepts_only_whitelisted_authorization_reasons(tmp_path: Path) -> None:
     store = DiagnosticReportStore(PortablePaths(tmp_path), secrets=set())
 

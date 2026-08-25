@@ -745,13 +745,16 @@ def create_application(
             _FunctionDiagnosticProbe(
                 "project-write",
                 "项目内写入",
-                lambda: probe_project_write(paths),
+                lambda: probe_project_write(paths, download_paths=download_paths),
                 threaded=True,
             ),
             _FunctionDiagnosticProbe(
                 "disk",
                 "磁盘空间",
-                lambda: probe_disk(paths),
+                lambda: probe_disk(
+                    paths,
+                    download_root=download_paths.current_root,
+                ),
                 threaded=True,
             ),
             _FunctionDiagnosticProbe(

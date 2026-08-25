@@ -264,6 +264,46 @@ def test_create_application_keeps_structurally_safe_offline_download_root(tmp_pa
         close_created_application(application, loop, controller)
 
 
+def test_create_application_diagnostics_receive_active_download_context(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    external = tmp_path / "external-media"
+    external.mkdir()
+    SettingsStore(paths.settings).save(
+        AppSettings(download_storage=DownloadStorageSettings(str(external)))
+    )
+    calls: dict[str, object] = {}
+
+    def project_write(paths_value, *, download_paths):
+        calls["projectPaths"] = paths_value
+        calls["downloadPolicy"] = download_paths
+        return object()
+
+    def disk(paths_value, *, download_root):
+        calls["diskPaths"] = paths_value
+        calls["downloadRoot"] = download_root
+        return object()
+
+    monkeypatch.setattr(app, "probe_project_write", project_write)
+    monkeypatch.setattr(app, "probe_disk", disk)
+
+    application, loop, controller = app.create_application(tmp_path)
+    try:
+        probes = {probe.id: probe for probe in controller.diagnostics.probes}
+        probes["project-write"].action()
+        probes["disk"].action()
+
+        assert calls["projectPaths"] == paths
+        assert calls["downloadPolicy"] is controller.download_paths
+        assert calls["diskPaths"] == paths
+        assert calls["downloadRoot"] == external.resolve()
+    finally:
+        close_created_application(application, loop, controller)
+
+
 def test_responsive_action_policy_map_is_complete() -> None:
     from telegram_downloader.ui import async_actions
 

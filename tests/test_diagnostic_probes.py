@@ -42,7 +42,7 @@ from telegram_downloader.domain import (
     TaskRecord,
     TaskStatus,
 )
-from telegram_downloader.download_paths import DownloadPathPolicy
+from telegram_downloader.download_paths import DownloadPathError, DownloadPathPolicy
 from telegram_downloader.gateway import (
     AuthorizationFailureReason,
     SessionExpiredError,
@@ -206,6 +206,100 @@ def test_disk_probe_maps_provider_failure_to_fixed_safe_result(tmp_path: Path) -
     assert result.metrics == {}
 
 
+def test_disk_probe_checks_same_volume_once_and_different_volumes_twice(
+    tmp_path: Path,
+) -> None:
+    paths = PortablePaths(tmp_path)
+    calls: list[Path] = []
+
+    def record(path: Path) -> DiskUsage:
+        calls.append(path)
+        return usage(10 * GIB, 2 * GIB)
+
+    same = probe_disk(paths, record, download_root=paths.downloads)
+
+    assert len(calls) == 1
+    assert same.metrics == {
+        "totalBytes": 10 * GIB,
+        "freeBytes": 2 * GIB,
+        "downloadSameVolume": True,
+        "downloadTotalBytes": 10 * GIB,
+        "downloadFreeBytes": 2 * GIB,
+    }
+
+    calls.clear()
+    other_drive = Path("Z:/Media" if tmp_path.drive.casefold() != "z:" else "Y:/Media")
+    different = probe_disk(paths, record, download_root=other_drive)
+
+    assert len(calls) == 2
+    assert different.metrics["downloadSameVolume"] is False
+    assert different.metrics["downloadTotalBytes"] == 10 * GIB
+    assert different.metrics["downloadFreeBytes"] == 2 * GIB
+
+
+@pytest.mark.parametrize(
+    ("app_free", "download_free", "expected_status", "expected_code"),
+    [
+        (128 * MIB, 2 * GIB, DiagnosticStatus.FAILED, "disk-space-critical"),
+        (512 * MIB, 2 * GIB, DiagnosticStatus.WARNING, "disk-space-low"),
+        (
+            2 * GIB,
+            128 * MIB,
+            DiagnosticStatus.FAILED,
+            "download-disk-space-critical",
+        ),
+        (
+            2 * GIB,
+            512 * MIB,
+            DiagnosticStatus.WARNING,
+            "download-disk-space-low",
+        ),
+    ],
+)
+def test_disk_probe_distinguishes_app_and_download_thresholds(
+    tmp_path: Path,
+    app_free: int,
+    download_free: int,
+    expected_status: DiagnosticStatus,
+    expected_code: str,
+) -> None:
+    paths = PortablePaths(tmp_path)
+    other_drive = Path("Z:/Media" if tmp_path.drive.casefold() != "z:" else "Y:/Media")
+
+    def disk_usage(path: Path) -> DiskUsage:
+        free = app_free if path.drive.casefold() == tmp_path.drive.casefold() else download_free
+        return usage(8 * GIB, free)
+
+    result = probe_disk(paths, disk_usage, download_root=other_drive)
+
+    assert (result.status, result.code) == (expected_status, expected_code)
+    assert result.metrics["downloadFreeBytes"] == download_free
+    assert str(other_drive) not in result.summary
+
+
+def test_disk_probe_maps_download_volume_failure_to_fixed_safe_result(
+    tmp_path: Path,
+) -> None:
+    paths = PortablePaths(tmp_path)
+    other_drive = Path("Z:/Media" if tmp_path.drive.casefold() != "z:" else "Y:/Media")
+
+    def fail_download(path: Path) -> DiskUsage:
+        if path.drive.casefold() != tmp_path.drive.casefold():
+            raise OSError(r"Z:\\private\\media")
+        return usage(8 * GIB, 2 * GIB)
+
+    result = probe_disk(paths, fail_download, download_root=other_drive)
+
+    assert result.status is DiagnosticStatus.FAILED
+    assert result.code == "download-disk-unavailable"
+    assert result.metrics == {
+        "totalBytes": 8 * GIB,
+        "freeBytes": 2 * GIB,
+        "downloadSameVolume": False,
+    }
+    assert "private" not in result.summary
+
+
 def test_write_probe_cleans_project_local_marker(tmp_path: Path) -> None:
     paths = PortablePaths(tmp_path)
     paths.ensure_layout()
@@ -236,6 +330,46 @@ def test_write_probe_cleans_partial_marker_after_failure(tmp_path: Path) -> None
     assert result.code == "project-write-failed"
     assert "private" not in result.summary
     assert list(paths.diagnostic_temp.iterdir()) == []
+
+
+def test_write_probe_checks_active_download_root(tmp_path: Path) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    checked: list[Path] = []
+    policy = DownloadPathPolicy(
+        paths,
+        DownloadStorageSettings(),
+        probe=checked.append,
+    )
+
+    result = probe_project_write(paths, download_paths=policy)
+
+    assert result.status is DiagnosticStatus.PASSED
+    assert result.metrics["downloadWritable"] is True
+    assert checked == [policy.current_root]
+
+
+def test_write_probe_maps_active_download_failure_to_fixed_safe_result(
+    tmp_path: Path,
+) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+
+    def fail(_root: Path) -> None:
+        raise DownloadPathError(r"Z:\\private\\media")
+
+    policy = DownloadPathPolicy(
+        paths,
+        DownloadStorageSettings(),
+        probe=fail,
+    )
+
+    result = probe_project_write(paths, download_paths=policy)
+
+    assert result.status is DiagnosticStatus.FAILED
+    assert result.code == "download-write-failed"
+    assert result.metrics == {"downloadWritable": False}
+    assert "private" not in result.summary
 
 
 def test_component_availability_uses_six_fixed_keys() -> None:

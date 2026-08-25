@@ -24,7 +24,7 @@ from telegram_downloader.domain import (
     SourceKind,
     TaskStatus,
 )
-from telegram_downloader.download_paths import DownloadPathPolicy
+from telegram_downloader.download_paths import DownloadPathError, DownloadPathPolicy
 from telegram_downloader.gateway import (
     AuthorizationFailureReason,
     SessionExpiredError,
@@ -145,6 +145,7 @@ def probe_environment(
 def probe_project_write(
     paths: PortablePaths,
     *,
+    download_paths: DownloadPathPolicy | None = None,
     marker: bytes | None = None,
     token_factory: Callable[[], str] | None = None,
     writer: Callable[[Path, bytes], None] | None = None,
@@ -158,13 +159,6 @@ def probe_project_write(
         write(target, marker)
         if target.read_bytes() != marker:
             raise OSError("write verification failed")
-        return _result(
-            "project-write",
-            "项目内写入",
-            DiagnosticStatus.PASSED,
-            "project-write-ok",
-            "项目内临时写入和读取正常",
-        )
     except Exception:
         return _result(
             "project-write",
@@ -176,11 +170,40 @@ def probe_project_write(
     finally:
         with suppress(OSError):
             target.unlink(missing_ok=True)
+    if download_paths is not None:
+        try:
+            download_paths.require_current_writable()
+        except (DownloadPathError, OSError, ValueError):
+            return _result(
+                "project-write",
+                "项目内写入",
+                DiagnosticStatus.FAILED,
+                "download-write-failed",
+                "当前下载目录写入检查失败",
+                {"downloadWritable": False},
+            )
+        return _result(
+            "project-write",
+            "项目内写入",
+            DiagnosticStatus.PASSED,
+            "project-write-ok",
+            "项目内临时写入和当前下载目录写入正常",
+            {"downloadWritable": True},
+        )
+    return _result(
+        "project-write",
+        "项目内写入",
+        DiagnosticStatus.PASSED,
+        "project-write-ok",
+        "项目内临时写入和读取正常",
+    )
 
 
 def probe_disk(
     paths: PortablePaths,
     usage_provider: Callable[[Path], DiskUsage] = shutil.disk_usage,
+    *,
+    download_root: Path | None = None,
 ) -> DiagnosticResult:
     try:
         usage = usage_provider(paths.root)
@@ -194,14 +217,48 @@ def probe_disk(
             "disk-unavailable",
             "无法读取应用所在磁盘的空间信息",
         )
-    metrics = {"totalBytes": total, "freeBytes": free}
+    metrics: dict[str, bool | int] = {"totalBytes": total, "freeBytes": free}
+    download_total = total
+    download_free = free
+    if download_root is not None:
+        same_volume = _volume_anchor(paths.root) == _volume_anchor(download_root)
+        metrics["downloadSameVolume"] = same_volume
+        if not same_volume:
+            try:
+                download_usage = usage_provider(download_root)
+                download_total = _safe_size(download_usage.total)
+                download_free = _safe_size(download_usage.free)
+            except (OSError, TypeError, ValueError):
+                return _result(
+                    "disk",
+                    "磁盘空间",
+                    DiagnosticStatus.FAILED,
+                    "download-disk-unavailable",
+                    "无法读取下载所在磁盘的空间信息",
+                    metrics,
+                )
+        metrics["downloadTotalBytes"] = download_total
+        metrics["downloadFreeBytes"] = download_free
     if free < 256 * MIB:
         return _result(
             "disk",
             "磁盘空间",
             DiagnosticStatus.FAILED,
             "disk-space-critical",
-            "磁盘可用空间低于 256 MiB",
+            (
+                "应用所在磁盘可用空间低于 256 MiB"
+                if download_root is not None
+                else "磁盘可用空间低于 256 MiB"
+            ),
+            metrics,
+        )
+    if download_root is not None and download_free < 256 * MIB:
+        return _result(
+            "disk",
+            "磁盘空间",
+            DiagnosticStatus.FAILED,
+            "download-disk-space-critical",
+            "下载所在磁盘可用空间低于 256 MiB",
             metrics,
         )
     if free < GIB:
@@ -210,7 +267,20 @@ def probe_disk(
             "磁盘空间",
             DiagnosticStatus.WARNING,
             "disk-space-low",
-            "磁盘可用空间低于 1 GiB",
+            (
+                "应用所在磁盘可用空间低于 1 GiB"
+                if download_root is not None
+                else "磁盘可用空间低于 1 GiB"
+            ),
+            metrics,
+        )
+    if download_root is not None and download_free < GIB:
+        return _result(
+            "disk",
+            "磁盘空间",
+            DiagnosticStatus.WARNING,
+            "download-disk-space-low",
+            "下载所在磁盘可用空间低于 1 GiB",
             metrics,
         )
     return _result(
@@ -218,7 +288,11 @@ def probe_disk(
         "磁盘空间",
         DiagnosticStatus.PASSED,
         "disk-space-ok",
-        "磁盘可用空间正常",
+        (
+            "应用和下载所在磁盘可用空间正常"
+            if download_root is not None
+            else "磁盘可用空间正常"
+        ),
         metrics,
     )
 
@@ -881,6 +955,10 @@ def _safe_size(value: object) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ValueError("invalid disk size")
     return value
+
+
+def _volume_anchor(path: Path) -> str:
+    return os.path.normcase(str(Path(path).resolve().anchor))
 
 
 def _result(
