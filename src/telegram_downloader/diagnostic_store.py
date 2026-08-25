@@ -353,6 +353,11 @@ _RESULT_VARIANTS = {
                 "暂时无法连接 Telegram 服务",
             ),
             (
+                DiagnosticStatus.WARNING,
+                "telegram-network-timeout",
+                "Telegram 连接检查超时",
+            ),
+            (
                 DiagnosticStatus.FAILED,
                 "telegram-check-failed",
                 "Telegram 连接检查失败",
@@ -375,6 +380,11 @@ _RESULT_VARIANTS = {
                 DiagnosticStatus.WARNING,
                 "update-sources-unavailable",
                 "暂时无法检查签名更新源",
+            ),
+            (
+                DiagnosticStatus.WARNING,
+                "update-sources-timeout",
+                "签名更新源检查超时",
             ),
             (
                 DiagnosticStatus.FAILED,

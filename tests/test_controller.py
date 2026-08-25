@@ -5872,6 +5872,7 @@ class DiagnosticPage:
         self.report = None
         self.progress = None
         self.running: list[bool] = []
+        self.cancelling: list[bool] = []
         self.errors: list[str] = []
         self.historical = None
 
@@ -5884,6 +5885,9 @@ class DiagnosticPage:
 
     def set_running(self, running: bool) -> None:
         self.running.append(running)
+
+    def set_cancelling(self, cancelling: bool) -> None:
+        self.cancelling.append(cancelling)
 
     def show_error(self, message: str) -> None:
         self.errors.append(message)
@@ -5974,3 +5978,33 @@ async def test_controller_loads_history_runs_persists_exports_and_opens_director
 
     await controller.shutdown()
     assert diagnostics.cancelled == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_diagnostics_exposes_cancelling_state_until_converged(
+    tmp_path,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingDiagnostics:
+        async def cancel(self) -> None:
+            started.set()
+            await release.wait()
+
+    page = DiagnosticPage()
+    controller = AppController.for_test(
+        window=SimpleNamespace(diagnostics_page=page),
+        paths=PortablePaths(tmp_path),
+        diagnostics=BlockingDiagnostics(),
+    )
+
+    operation = asyncio.create_task(controller.cancel_diagnostics())
+    await started.wait()
+
+    assert page.cancelling == [True]
+
+    release.set()
+    await operation
+
+    assert page.cancelling == [True, False]

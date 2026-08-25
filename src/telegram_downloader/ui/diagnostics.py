@@ -117,6 +117,7 @@ class DiagnosticsPage(QWidget):
         super().__init__()
         self.report: DiagnosticReport | None = None
         self._running = False
+        self._cancelling = False
         self._exporting = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 18)
@@ -256,6 +257,11 @@ class DiagnosticsPage(QWidget):
         self.progress_bar.setFormat(
             f"{progress.completed} / {progress.total} · {percent}%"
         )
+        if self._cancelling:
+            message = "正在取消，当前本地检查完成后停止"
+            self.progress_label.setText(message)
+            self._set_status_banner(message, DiagnosticStatus.RUNNING)
+            return
         self.progress_label.setText(
             f"正在检查：{progress.current_title}"
             if progress.current_title is not None
@@ -272,6 +278,7 @@ class DiagnosticsPage(QWidget):
 
     def set_running(self, running: bool) -> None:
         self._running = running
+        self._cancelling = False
         if running:
             self.report_context_label.setText("本次自检进行中")
             self._set_status_banner(
@@ -279,6 +286,14 @@ class DiagnosticsPage(QWidget):
                 DiagnosticStatus.RUNNING,
             )
             self.show_error("")
+        self._update_buttons()
+
+    def set_cancelling(self, cancelling: bool) -> None:
+        self._cancelling = bool(cancelling and self._running)
+        if self._cancelling:
+            message = "正在取消，当前本地检查完成后停止"
+            self.progress_label.setText(message)
+            self._set_status_banner(message, DiagnosticStatus.RUNNING)
         self._update_buttons()
 
     def set_export_busy(self, busy: bool) -> None:
@@ -292,7 +307,7 @@ class DiagnosticsPage(QWidget):
 
     def _update_buttons(self) -> None:
         self.start_button.setEnabled(not self._running)
-        self.cancel_button.setEnabled(self._running)
+        self.cancel_button.setEnabled(self._running and not self._cancelling)
         self.export_button.setEnabled(
             not self._running and not self._exporting and self.report is not None
         )

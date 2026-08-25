@@ -223,6 +223,54 @@ def test_active_download_storage_variants_round_trip(
     assert store.load_latest() == storage_report
 
 
+@pytest.mark.parametrize(
+    ("result_id", "title", "code", "summary"),
+    [
+        (
+            "telegram",
+            "Telegram 连接",
+            "telegram-network-timeout",
+            "Telegram 连接检查超时",
+        ),
+        (
+            "updates",
+            "签名更新源",
+            "update-sources-timeout",
+            "签名更新源检查超时",
+        ),
+    ],
+)
+def test_online_timeout_variants_round_trip(
+    tmp_path: Path,
+    result_id: str,
+    title: str,
+    code: str,
+    summary: str,
+) -> None:
+    paths = PortablePaths(tmp_path)
+    paths.ensure_layout()
+    timeout_report = DiagnosticReport.build(
+        "0.18.4",
+        NOW,
+        NOW + timedelta(seconds=1),
+        (
+            DiagnosticResult(
+                result_id,
+                title,
+                DiagnosticStatus.WARNING,
+                code,
+                summary,
+                20_000,
+            ),
+        ),
+    )
+    store = DiagnosticReportStore(paths, secrets=set())
+
+    store.save(timeout_report)
+
+    assert store.load_latest() == timeout_report
+
+
 def test_report_accepts_only_whitelisted_authorization_reasons(tmp_path: Path) -> None:
     store = DiagnosticReportStore(PortablePaths(tmp_path), secrets=set())
 

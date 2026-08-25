@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from collections import namedtuple
 from datetime import UTC, datetime
@@ -901,6 +902,31 @@ class Gateway:
             raise self.error
 
 
+class BlockingGateway:
+    def __init__(self) -> None:
+        self.cancelled = False
+
+    async def test_connection(self) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
+@pytest.mark.asyncio
+async def test_telegram_probe_times_out_and_cancels_blocking_gateway() -> None:
+    gateway = BlockingGateway()
+
+    result = await probe_telegram(gateway, timeout_seconds=0.001)
+
+    assert (result.status, result.code) == (
+        DiagnosticStatus.WARNING,
+        "telegram-network-timeout",
+    )
+    assert gateway.cancelled is True
+
+
 @pytest.mark.asyncio
 async def test_telegram_probe_maps_connection_outcomes_without_error_text() -> None:
     skipped = await probe_telegram(None)
@@ -959,6 +985,32 @@ class UpdateChecks:
 
     async def check_sources(self) -> tuple[SourceCheck, SourceCheck]:
         return self.checks
+
+
+class BlockingUpdateChecks:
+    def __init__(self) -> None:
+        self.cancelled = False
+
+    async def check_sources(self) -> tuple[SourceCheck, SourceCheck]:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        raise AssertionError("unreachable")
+
+
+@pytest.mark.asyncio
+async def test_update_probe_times_out_and_cancels_blocking_sources() -> None:
+    checks = BlockingUpdateChecks()
+
+    result = await probe_update_sources(checks, timeout_seconds=0.001)
+
+    assert (result.status, result.code) == (
+        DiagnosticStatus.WARNING,
+        "update-sources-timeout",
+    )
+    assert checks.cancelled is True
 
 
 def source_check(

@@ -420,6 +420,9 @@ class _NullDiagnosticsPage:
     def set_running(self, _running: bool) -> None:
         pass
 
+    def set_cancelling(self, _cancelling: bool) -> None:
+        pass
+
     def show_error(self, _message: str) -> None:
         pass
 
@@ -2240,7 +2243,12 @@ class AppController:
 
     async def cancel_diagnostics(self) -> None:
         if self.diagnostics is not None:
-            await self.diagnostics.cancel()
+            page = self._diagnostics_page()
+            page.set_cancelling(True)
+            try:
+                await self.diagnostics.cancel()
+            finally:
+                page.set_cancelling(False)
 
     async def export_diagnostics(self) -> None:
         page = self._diagnostics_page()

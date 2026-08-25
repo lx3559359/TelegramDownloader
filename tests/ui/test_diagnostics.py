@@ -108,6 +108,23 @@ def test_page_button_state_tracks_run_report_and_history(qtbot) -> None:
     assert page.export_button.isEnabled() is True
 
 
+def test_page_exposes_cancellation_convergence_and_disables_repeat(qtbot) -> None:
+    page = DiagnosticsPage()
+    qtbot.addWidget(page)
+    page.set_running(True)
+
+    page.set_cancelling(True)
+
+    assert page.progress_label.text() == "正在取消，当前本地检查完成后停止"
+    assert page.status_banner.text() == "正在取消，当前本地检查完成后停止"
+    assert page.cancel_button.isEnabled() is False
+    assert page.start_button.isEnabled() is False
+
+    page.set_running(True)
+
+    assert page.cancel_button.isEnabled() is True
+
+
 def test_page_progress_is_bounded_and_shows_current_check(qtbot) -> None:
     page = DiagnosticsPage()
     qtbot.addWidget(page)

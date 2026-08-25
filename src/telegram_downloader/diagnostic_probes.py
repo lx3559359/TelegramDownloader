@@ -643,6 +643,7 @@ async def probe_telegram(
     gateway: ConnectionProbe | None,
     *,
     authorization_reason: AuthorizationFailureReason | None = None,
+    timeout_seconds: float = 20.0,
 ) -> DiagnosticResult:
     if authorization_reason is not None:
         return _telegram_authorization_failure(authorization_reason)
@@ -655,9 +656,18 @@ async def probe_telegram(
             "尚未建立可检查的 Telegram 会话",
         )
     try:
-        await gateway.test_connection()
+        async with asyncio.timeout(timeout_seconds):
+            await gateway.test_connection()
     except asyncio.CancelledError:
         raise
+    except TimeoutError:
+        return _result(
+            "telegram",
+            "Telegram 连接",
+            DiagnosticStatus.WARNING,
+            "telegram-network-timeout",
+            "Telegram 连接检查超时",
+        )
     except SessionExpiredError as error:
         return _telegram_authorization_failure(error.reason)
     except TransientNetworkError:
@@ -698,7 +708,11 @@ def _telegram_authorization_failure(
     )
 
 
-async def probe_update_sources(coordinator: UpdateSourceProbe | None) -> DiagnosticResult:
+async def probe_update_sources(
+    coordinator: UpdateSourceProbe | None,
+    *,
+    timeout_seconds: float = 20.0,
+) -> DiagnosticResult:
     if coordinator is None:
         return _result(
             "updates",
@@ -708,9 +722,18 @@ async def probe_update_sources(coordinator: UpdateSourceProbe | None) -> Diagnos
             "当前未配置签名更新检查",
         )
     try:
-        checks = await coordinator.check_sources()
+        async with asyncio.timeout(timeout_seconds):
+            checks = await coordinator.check_sources()
     except asyncio.CancelledError:
         raise
+    except TimeoutError:
+        return _result(
+            "updates",
+            "签名更新源",
+            DiagnosticStatus.WARNING,
+            "update-sources-timeout",
+            "签名更新源检查超时",
+        )
     except Exception:
         return _result(
             "updates",

@@ -157,13 +157,7 @@ async def _telegram_health(controller: AppController) -> DiagnosticResult:
     gateway_value = controller.gateway
     if gateway_value is None:
         return await probe_telegram(None)
-
-    class RecoveredConnection:
-        async def test_connection(self) -> None:
-            await controller.connection_recovery.ensure_connected(gateway_value)
-            await gateway_value.test_connection()
-
-    return await probe_telegram(RecoveredConnection())
+    return await probe_telegram(gateway_value)
 
 
 class _GracefulShutdown:

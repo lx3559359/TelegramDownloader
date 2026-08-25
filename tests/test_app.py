@@ -836,6 +836,38 @@ async def test_telegram_health_uses_retained_authorization_reason() -> None:
     assert result.metrics == {"authorizationReason": "auth-key-duplicated"}
 
 
+@pytest.mark.asyncio
+async def test_telegram_health_does_not_use_shared_connection_recovery() -> None:
+    class Gateway:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def test_connection(self) -> None:
+            self.calls += 1
+
+    class Recovery:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ensure_connected(self, _gateway) -> None:
+            self.calls += 1
+            raise AssertionError("diagnostics must not mutate shared recovery state")
+
+    gateway = Gateway()
+    recovery = Recovery()
+    controller = SimpleNamespace(
+        gateway=gateway,
+        connection_recovery=recovery,
+        last_authorization_failure_reason=None,
+    )
+
+    result = await app._telegram_health(controller)
+
+    assert result.code == "telegram-connected"
+    assert gateway.calls == 1
+    assert recovery.calls == 0
+
+
 def test_service_builder_shares_runtime_download_resource_settings(tmp_path) -> None:
     application, loop, controller = app.create_application(tmp_path)
     naming = DownloadNamingSettings(
