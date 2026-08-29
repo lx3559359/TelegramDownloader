@@ -614,16 +614,41 @@ def _create_task_probe_schema(
     task_columns = [
         "id TEXT PRIMARY KEY",
         "source_kind TEXT NOT NULL",
+        "source_ref TEXT",
+        "source_title TEXT",
+        "source_url TEXT",
+        "date_from_utc TEXT",
+        "date_to_utc TEXT",
         f"media_kinds {task_media_kinds_declaration}",
+        "item_limit INTEGER",
         "status TEXT NOT NULL",
+        "created_at TEXT",
+        "updated_at TEXT",
+        "last_error TEXT",
+        "display_title TEXT",
+        "archived_at TEXT",
+        "queue_priority INTEGER",
         "pause_reason TEXT",
     ]
     item_columns = [
         "id TEXT PRIMARY KEY",
         "task_id TEXT NOT NULL",
+        "peer_ref TEXT",
+        "message_id INTEGER",
+        "grouped_id INTEGER",
+        "media_id TEXT",
         "media_kind TEXT NOT NULL",
+        "original_name TEXT",
+        "target_path TEXT",
+        "expected_size INTEGER",
+        "message_date_utc TEXT",
+        "downloaded_bytes INTEGER",
         "status TEXT NOT NULL",
+        "retry_count INTEGER",
+        "last_error TEXT",
         "integrity_status TEXT NOT NULL",
+        "content_sha256 TEXT",
+        "verified_at TEXT",
     ]
     if missing_column is not None:
         table, column = missing_column.split(".", 1)
@@ -1066,42 +1091,108 @@ def _create_content_probe_schema(
     missing_column: str | None = None,
     broken_foreign_key: str | None = None,
     search_media_kinds_declaration: str = "TEXT NOT NULL",
+    invalid_dialog_parent_column: bool = False,
 ) -> None:
     columns = {
-        "accounts": ["account_id TEXT PRIMARY KEY"],
+        "accounts": [
+            "account_id TEXT PRIMARY KEY",
+            "display_name TEXT",
+            "last_used_at TEXT",
+        ],
         "dialogs": [
             "account_id TEXT NOT NULL",
             "peer_ref TEXT NOT NULL",
+            "title TEXT",
+            "username TEXT",
             "kind TEXT NOT NULL",
+            "archived INTEGER",
+            "available INTEGER",
+            "last_synced_at TEXT",
             "PRIMARY KEY(account_id, peer_ref)",
         ],
         "search_sessions": [
             "id TEXT PRIMARY KEY",
             "account_id TEXT NOT NULL",
-            "status TEXT NOT NULL",
-            "scope TEXT NOT NULL",
+            "peer_ref TEXT",
+            "dialog_title TEXT",
+            "keyword TEXT",
+            "normalized_keyword TEXT",
+            "date_from_utc TEXT",
+            "date_to_utc TEXT",
             f"media_kinds {search_media_kinds_declaration}",
+            "item_limit INTEGER",
+            "filters_fingerprint TEXT",
+            "status TEXT NOT NULL",
+            "generation INTEGER",
+            "next_offset_id INTEGER",
+            "exhausted INTEGER",
+            "result_count INTEGER",
+            "created_at TEXT",
+            "updated_at TEXT",
+            "last_error TEXT",
+            "scope TEXT NOT NULL",
+            "cursor_json TEXT",
         ],
         "search_results": [
             "id TEXT PRIMARY KEY",
             "search_id TEXT NOT NULL",
+            "account_id TEXT",
+            "peer_ref TEXT",
+            "message_id INTEGER",
+            "grouped_id INTEGER",
+            "media_id TEXT",
             "media_kind TEXT NOT NULL",
+            "original_name TEXT",
+            "expected_size INTEGER",
+            "message_date_utc TEXT",
+            "excerpt TEXT",
+            "thumbnail_key TEXT",
+            "selected INTEGER",
+            "available INTEGER",
+            "queued INTEGER",
+            "generation INTEGER",
+            "source_title TEXT",
             "source_kind TEXT NOT NULL",
         ],
         "subscription_rules": [
             "id TEXT PRIMARY KEY",
             "account_id TEXT NOT NULL",
             "peer_ref TEXT NOT NULL",
-            "state TEXT NOT NULL",
-            "match_mode TEXT NOT NULL",
+            "dialog_title TEXT",
+            "keyword TEXT",
+            "normalized_keyword TEXT",
             "media_kinds TEXT NOT NULL",
+            "interval_minutes INTEGER",
+            "enabled INTEGER",
+            "state TEXT NOT NULL",
+            "last_message_id INTEGER",
+            "next_run_at TEXT",
+            "last_run_at TEXT",
+            "last_error TEXT",
+            "failure_count INTEGER",
+            "created_at TEXT",
+            "updated_at TEXT",
+            "include_keywords_json TEXT",
+            "exclude_keywords_json TEXT",
+            "match_mode TEXT NOT NULL",
+            "matcher_fingerprint TEXT",
+            "history_days INTEGER",
+            "backfill_from_utc TEXT",
+            "backfill_through_id INTEGER",
         ],
         "subscription_runs": [
             "id TEXT PRIMARY KEY",
             "rule_id TEXT NOT NULL",
             "account_id TEXT NOT NULL",
-            "keyword_hits INTEGER NOT NULL",
+            "started_at TEXT",
+            "finished_at TEXT",
             "status TEXT NOT NULL",
+            "inspected INTEGER",
+            "keyword_hits INTEGER NOT NULL",
+            "matched INTEGER",
+            "queued INTEGER",
+            "duplicate INTEGER",
+            "error TEXT",
         ],
     }
     if missing_column is not None:
@@ -1149,12 +1240,98 @@ def _create_content_probe_schema(
             "FOREIGN KEY(account_id) REFERENCES accounts(account_id)",
         ),
     }
+    if invalid_dialog_parent_column:
+        foreign_keys["dialogs-account"] = (
+            "dialogs",
+            "FOREIGN KEY(account_id) "
+            "REFERENCES accounts(missing_parent_key) ON DELETE CASCADE",
+            "",
+        )
     for key, (table, correct, wrong) in foreign_keys.items():
         columns[table].append(wrong if key == broken_foreign_key else correct)
     with sqlite3.connect(database) as connection:
         for table, definitions in columns.items():
             connection.execute(f"CREATE TABLE {table} ({','.join(definitions)})")
         connection.execute(f"PRAGMA user_version={CATALOG_SCHEMA_VERSION}")
+
+
+@pytest.mark.parametrize(
+    ("database_kind", "table", "column"),
+    [
+        ("task", "tasks", "source_ref"),
+        ("task", "media_items", "original_name"),
+        ("content", "search_sessions", "keyword"),
+        ("content", "search_results", "original_name"),
+    ],
+)
+def test_database_probe_rejects_missing_repository_read_column(
+    tmp_path: Path,
+    database_kind: str,
+    table: str,
+    column: str,
+) -> None:
+    database = tmp_path / f"{database_kind}.sqlite3"
+    if database_kind == "task":
+        TaskRepository(database).initialize()
+        probe = probe_task_database
+        expected_metrics = {"schemaCompatible": False}
+    else:
+        CatalogRepository(database).initialize()
+        probe = probe_content_database
+        expected_metrics = {
+            "schemaVersion": CATALOG_SCHEMA_VERSION,
+            "schemaCompatible": False,
+        }
+    with sqlite3.connect(database) as connection:
+        connection.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+
+    result = probe(database)
+
+    assert result.status is DiagnosticStatus.FAILED
+    assert result.code == "database-schema-incompatible"
+    assert result.metrics == expected_metrics
+    assert column not in result.summary + result.code + repr(dict(result.metrics))
+
+
+def _schema_columns(database: Path, tables: tuple[str, ...]) -> dict[str, set[str]]:
+    with sqlite3.connect(database) as connection:
+        return {
+            table: {
+                str(row[1])
+                for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            for table in tables
+        }
+
+
+def test_task_required_column_contract_matches_authoritative_schema(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "tasks.sqlite3"
+    TaskRepository(database).initialize()
+
+    actual = _schema_columns(database, ("tasks", "media_items"))
+
+    assert actual == diagnostic_probes._TASK_REQUIRED_COLUMNS
+
+
+def test_content_required_column_contract_matches_authoritative_schema(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "catalog.sqlite3"
+    CatalogRepository(database).initialize()
+    tables = (
+        "accounts",
+        "dialogs",
+        "search_sessions",
+        "search_results",
+        "subscription_rules",
+        "subscription_runs",
+    )
+
+    actual = _schema_columns(database, tables)
+
+    assert actual == diagnostic_probes._CONTENT_REQUIRED_COLUMNS
 
 
 def test_content_probe_rejects_dangling_foreign_key(tmp_path: Path) -> None:
@@ -1479,78 +1656,24 @@ def test_database_probe_maps_missing_and_corrupt_files_to_safe_codes(
     assert str(tmp_path) not in corrupt.summary
 
 
-@pytest.mark.parametrize(
-    ("probe", "schema"),
-    [
-        (
-            probe_task_database,
-            """
-            CREATE TABLE tasks (
-                id TEXT,
-                source_kind TEXT,
-                media_kinds TEXT,
-                status TEXT,
-                pause_reason TEXT
-            );
-            CREATE TABLE media_items (
-                id TEXT,
-                task_id TEXT REFERENCES tasks(missing_parent_key),
-                media_kind TEXT,
-                status TEXT,
-                integrity_status TEXT
-            );
-            """,
-        ),
-        (
-            probe_content_database,
-            f"""
-            CREATE TABLE accounts (account_id TEXT);
-            CREATE TABLE dialogs (
-                account_id TEXT REFERENCES accounts(account_id),
-                peer_ref TEXT,
-                kind TEXT
-            );
-            CREATE TABLE search_sessions (
-                id TEXT,
-                account_id TEXT,
-                status TEXT,
-                scope TEXT,
-                media_kinds TEXT
-            );
-            CREATE TABLE search_results (
-                id TEXT,
-                search_id TEXT,
-                media_kind TEXT,
-                source_kind TEXT
-            );
-            CREATE TABLE subscription_rules (
-                id TEXT,
-                account_id TEXT,
-                peer_ref TEXT,
-                state TEXT,
-                match_mode TEXT,
-                media_kinds TEXT
-            );
-            CREATE TABLE subscription_runs (
-                id TEXT,
-                rule_id TEXT,
-                account_id TEXT,
-                keyword_hits INTEGER,
-                status TEXT
-            );
-            PRAGMA user_version={CATALOG_SCHEMA_VERSION};
-            """,
-        ),
-    ],
-)
+@pytest.mark.parametrize("database_kind", ["task", "content"])
 def test_database_probe_maps_semantic_query_error_to_semantics_invalid(
     tmp_path: Path,
-    probe,
-    schema: str,
+    database_kind: str,
 ) -> None:
     database = tmp_path / "semantic-query-error.sqlite3"
-    with sqlite3.connect(database) as connection:
-        connection.executescript(schema)
+    if database_kind == "task":
+        _create_task_probe_schema(
+            database,
+            task_foreign_key="REFERENCES tasks(missing_parent_key)",
+        )
+        probe = probe_task_database
+    else:
+        _create_content_probe_schema(
+            database,
+            invalid_dialog_parent_column=True,
+        )
+        probe = probe_content_database
 
     result = probe(database)
 

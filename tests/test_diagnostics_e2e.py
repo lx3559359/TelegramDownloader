@@ -10,7 +10,7 @@ from zipfile import ZipFile
 
 import pytest
 
-from telegram_downloader.catalog import CATALOG_SCHEMA_VERSION, CatalogRepository
+from telegram_downloader.catalog import CatalogRepository
 from telegram_downloader.content import AccountProfile, ContentDialog, DialogKind
 from telegram_downloader.diagnostic_probes import (
     probe_components,
@@ -404,85 +404,70 @@ def test_hardened_diagnostic_variants_round_trip_without_private_data(
 
 
 @pytest.mark.parametrize(
-    ("probe", "database_name", "schema", "expected_summary"),
+    ("probe", "database_name", "expected_summary"),
     [
         (
             probe_task_database,
             "tasks.sqlite3",
-            """
-            CREATE TABLE tasks (
-                id TEXT,
-                source_kind TEXT,
-                media_kinds TEXT,
-                status TEXT,
-                pause_reason TEXT
-            );
-            CREATE TABLE media_items (
-                id TEXT,
-                task_id TEXT REFERENCES tasks(missing_parent_key),
-                media_kind TEXT,
-                status TEXT,
-                integrity_status TEXT
-            );
-            """,
             "下载任务数据库包含无效关系或状态",
         ),
         (
             probe_content_database,
             "catalog.sqlite3",
-            f"""
-            CREATE TABLE accounts (account_id TEXT);
-            CREATE TABLE dialogs (
-                account_id TEXT REFERENCES accounts(account_id),
-                peer_ref TEXT,
-                kind TEXT
-            );
-            CREATE TABLE search_sessions (
-                id TEXT,
-                account_id TEXT,
-                status TEXT,
-                scope TEXT,
-                media_kinds TEXT
-            );
-            CREATE TABLE search_results (
-                id TEXT,
-                search_id TEXT,
-                media_kind TEXT,
-                source_kind TEXT
-            );
-            CREATE TABLE subscription_rules (
-                id TEXT,
-                account_id TEXT,
-                peer_ref TEXT,
-                state TEXT,
-                match_mode TEXT,
-                media_kinds TEXT
-            );
-            CREATE TABLE subscription_runs (
-                id TEXT,
-                rule_id TEXT,
-                account_id TEXT,
-                keyword_hits INTEGER,
-                status TEXT
-            );
-            PRAGMA user_version={CATALOG_SCHEMA_VERSION};
-            """,
             "账号内容数据库包含无效关系或状态",
         ),
     ],
 )
-def test_semantic_query_failure_can_be_saved_and_exported(
+def test_database_semantic_failure_can_be_saved_and_exported(
     tmp_path: Path,
     probe,
     database_name: str,
-    schema: str,
     expected_summary: str,
 ) -> None:
     paths = PortablePaths(tmp_path)
     paths.ensure_layout()
     database = paths.database.parent / database_name
+    timestamp = NOW.isoformat()
+    if probe is probe_task_database:
+        TaskRepository(database).initialize()
+        statement = (
+            "INSERT INTO media_items("
+            "id, task_id, peer_ref, message_id, media_id, media_kind, original_name, "
+            "target_path, message_date_utc, status"
+            ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        values = (
+            "item-orphan",
+            "private-missing-task",
+            "private-peer",
+            7,
+            "private-media",
+            MediaKind.VIDEO.value,
+            "private.mp4",
+            str(tmp_path / "private.mp4"),
+            timestamp,
+            ItemStatus.QUEUED.value,
+        )
+    else:
+        CatalogRepository(database).initialize()
+        statement = (
+            "INSERT INTO dialogs("
+            "account_id, peer_ref, title, username, kind, archived, available, "
+            "last_synced_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        values = (
+            "private-missing-account",
+            "private-peer",
+            "private-title",
+            "private-user",
+            DialogKind.GROUP.value,
+            0,
+            1,
+            timestamp,
+        )
     with sqlite3.connect(database) as connection:
-        connection.executescript(schema)
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute(statement, values)
 
     result = probe(database)
     report = DiagnosticReport.build("0.18.4", NOW, NOW, (result,))
