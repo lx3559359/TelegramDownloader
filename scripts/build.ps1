@@ -1,5 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
+. (Join-Path $PSScriptRoot 'invoke-with-trusted-path.ps1')
+
 $projectRoot = (Resolve-Path (Split-Path -Parent $PSScriptRoot)).Path
 $projectPrefix = $projectRoot.TrimEnd('\') + '\'
 
@@ -98,15 +100,22 @@ try {
     ) | Where-Object {
         $_ -and (Test-Path -LiteralPath $_ -PathType Container)
     } | Select-Object -Unique
-    $inheritedPath = $env:PATH
     $pyinstallerExitCode = 0
-    try {
-        $env:PATH = $trustedBuildPath -join [IO.Path]::PathSeparator
-        & $python -m PyInstaller --noconfirm --clean --workpath $work --distpath $dist (Join-Path $projectRoot 'TelegramDownloader.spec')
-        $pyinstallerExitCode = $LASTEXITCODE
-    } finally {
-        $env:PATH = $inheritedPath
-    }
+    $pyinstallerArguments = @(
+        '-m',
+        'PyInstaller',
+        '--noconfirm',
+        '--clean',
+        '--workpath',
+        $work,
+        '--distpath',
+        $dist,
+        (Join-Path $projectRoot 'TelegramDownloader.spec')
+    )
+    Invoke-WithTrustedPath -TrustedPath $trustedBuildPath `
+        -FilePath $python `
+        -ArgumentList $pyinstallerArguments `
+        -ExitCode ([ref]$pyinstallerExitCode)
     if ($pyinstallerExitCode -ne 0) { exit $pyinstallerExitCode }
 
     $appDir = Assert-ProjectChild (Join-Path $dist 'TelegramDownloader')

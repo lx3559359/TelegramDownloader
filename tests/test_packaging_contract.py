@@ -1,5 +1,148 @@
+import json
+import os
+import shutil
+import subprocess
 import tomllib
 from pathlib import Path
+
+
+def _powershell_literal(value: str | Path) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _run_trusted_path_script(
+    tmp_path: Path, body: str
+) -> tuple[subprocess.CompletedProcess[str], str, list[str]]:
+    root = Path(__file__).parents[1]
+    helper = root / "scripts" / "invoke-with-trusted-path.ps1"
+    trusted = tmp_path / "trusted"
+    external = tmp_path / "external-sentinel"
+    trusted.mkdir()
+    external.mkdir()
+    trusted_paths = [str(trusted), str(Path(os.environ["SYSTEMROOT"]) / "System32")]
+    inherited_path = os.pathsep.join((str(external), "EXTERNAL_PATH_SENTINEL"))
+    script = f"""
+$ErrorActionPreference = 'Stop'
+. {_powershell_literal(helper)}
+$before = $env:PATH
+$trustedPath = @(
+    {_powershell_literal(trusted_paths[0])}
+    {_powershell_literal(trusted_paths[1])}
+)
+{body}
+"""
+    powershell = shutil.which("powershell.exe")
+    assert powershell is not None
+    environment = os.environ.copy()
+    environment["PATH"] = inherited_path
+    completed = subprocess.run(
+        [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        check=False,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+    )
+    return completed, inherited_path, trusted_paths
+
+
+def _last_json_line(output: str) -> dict[str, object]:
+    return json.loads(output.strip().splitlines()[-1])
+
+
+def test_trusted_path_command_is_isolated_and_restores_path_on_success(
+    tmp_path: Path,
+) -> None:
+    system_cmd = Path(os.environ["SYSTEMROOT"]) / "System32" / "cmd.exe"
+    completed, inherited_path, trusted_paths = _run_trusted_path_script(
+        tmp_path,
+        f"""
+$exitCode = -1
+$childPath = @(
+    Invoke-WithTrustedPath -TrustedPath $trustedPath `
+        -FilePath {_powershell_literal(system_cmd)} `
+        -ArgumentList @('/d', '/c', 'echo %PATH%') `
+        -ExitCode ([ref]$exitCode)
+)
+[pscustomobject]@{{
+    Before = $before
+    After = $env:PATH
+    ChildPath = ($childPath -join "`n").Trim()
+    ExitCode = $exitCode
+}} | ConvertTo-Json -Compress
+""",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = _last_json_line(completed.stdout)
+    assert result["ExitCode"] == 0
+    assert result["ChildPath"] == os.pathsep.join(trusted_paths)
+    assert "EXTERNAL_PATH_SENTINEL" not in str(result["ChildPath"])
+    assert result["Before"] == inherited_path
+    assert result["After"] == inherited_path
+
+
+def test_trusted_path_command_preserves_nonzero_exit_and_restores_path(
+    tmp_path: Path,
+) -> None:
+    system_cmd = Path(os.environ["SYSTEMROOT"]) / "System32" / "cmd.exe"
+    completed, inherited_path, _ = _run_trusted_path_script(
+        tmp_path,
+        f"""
+$exitCode = -1
+Invoke-WithTrustedPath -TrustedPath $trustedPath `
+    -FilePath {_powershell_literal(system_cmd)} `
+    -ArgumentList @('/d', '/c', 'exit /b 7') `
+    -ExitCode ([ref]$exitCode)
+[pscustomobject]@{{
+    Before = $before
+    After = $env:PATH
+    ExitCode = $exitCode
+}} | ConvertTo-Json -Compress
+exit $exitCode
+""",
+    )
+
+    assert completed.returncode == 7, completed.stderr
+    result = _last_json_line(completed.stdout)
+    assert result["ExitCode"] == 7
+    assert result["Before"] == inherited_path
+    assert result["After"] == inherited_path
+
+
+def test_trusted_path_command_propagates_exception_and_restores_path(
+    tmp_path: Path,
+) -> None:
+    missing_executable = tmp_path / "trusted" / "missing-command.exe"
+    completed, inherited_path, _ = _run_trusted_path_script(
+        tmp_path,
+        f"""
+$exitCode = -1
+$caught = $null
+try {{
+    Invoke-WithTrustedPath -TrustedPath $trustedPath `
+        -FilePath {_powershell_literal(missing_executable)} `
+        -ExitCode ([ref]$exitCode)
+}} catch {{
+    $caught = $_
+}}
+if ($null -eq $caught) {{
+    throw 'Missing native executable did not raise an exception.'
+}}
+[pscustomobject]@{{
+    Before = $before
+    After = $env:PATH
+    ExceptionType = $caught.Exception.GetType().FullName
+}} | ConvertTo-Json -Compress
+throw $caught
+""",
+    )
+
+    assert completed.returncode != 0
+    result = _last_json_line(completed.stdout)
+    assert result["ExceptionType"] == "System.Management.Automation.CommandNotFoundException"
+    assert result["Before"] == inherited_path
+    assert result["After"] == inherited_path
 
 
 def test_build_contract_uses_onedir_and_project_local_workpaths() -> None:
@@ -21,7 +164,8 @@ def test_build_contract_uses_onedir_and_project_local_workpaths() -> None:
     assert "console=False" in spec
     assert "QtWebEngine" in spec
     assert "--onefile" not in build
-    assert "-m PyInstaller" in build
+    assert "'-m'," in build
+    assert "'PyInstaller'," in build
     assert ".venv\\Scripts\\pyinstaller.exe" not in build
     assert ".build-temp" in build
     assert ".tool-cache" in build
@@ -37,13 +181,15 @@ def test_build_contract_uses_onedir_and_project_local_workpaths() -> None:
 
 def test_pyinstaller_build_uses_trusted_path_and_restores_inherited_path() -> None:
     root = Path(__file__).parents[1]
-    script = (root / "scripts" / "build.ps1").read_text(encoding="utf-8")
+    build = (root / "scripts" / "build.ps1").read_text(encoding="utf-8")
+    helper = (root / "scripts" / "invoke-with-trusted-path.ps1").read_text(
+        encoding="utf-8"
+    )
 
-    assert "$inheritedPath = $env:PATH" in script
-    assert "import sys; print(sys.base_prefix)" in script
-    trusted_path_start = script.index("$trustedBuildPath = @(")
-    trusted_path_end = script.index(") | Where-Object", trusted_path_start)
-    trusted_path = script[trusted_path_start:trusted_path_end]
+    assert "import sys; print(sys.base_prefix)" in build
+    trusted_path_start = build.index("$trustedBuildPath = @(")
+    trusted_path_end = build.index(") | Where-Object", trusted_path_start)
+    trusted_path = build[trusted_path_start:trusted_path_end]
     for required in (
         "(Split-Path -Parent $python)",
         "$pythonBasePrefix",
@@ -53,21 +199,31 @@ def test_pyinstaller_build_uses_trusted_path_and_restores_inherited_path() -> No
     ):
         assert required in trusted_path
 
-    path_assignment = script.index(
-        "$env:PATH = $trustedBuildPath -join [IO.Path]::PathSeparator"
+    for required in (
+        ". (Join-Path $PSScriptRoot 'invoke-with-trusted-path.ps1')",
+        "Invoke-WithTrustedPath -TrustedPath $trustedBuildPath",
+        "-FilePath $python",
+        "-ExitCode ([ref]$pyinstallerExitCode)",
+        "if ($pyinstallerExitCode -ne 0) { exit $pyinstallerExitCode }",
+    ):
+        assert required in build
+
+    inherited_path_save = helper.index("$inheritedPath = $env:PATH")
+    try_start = helper.index("try {", inherited_path_save)
+    path_assignment = helper.index(
+        "$env:PATH = $TrustedPath -join [IO.Path]::PathSeparator"
     )
-    pyinstaller_call = script.index("& $python -m PyInstaller")
-    path_restore = script.index("$env:PATH = $inheritedPath", pyinstaller_call)
-    inherited_path_save = script.index("$inheritedPath = $env:PATH")
-    try_start = script.index("try {", inherited_path_save, path_assignment)
-    finally_start = script.index("} finally {", pyinstaller_call, path_restore)
+    native_call = helper.index("& $FilePath @ArgumentList")
+    exit_capture = helper.index("$ExitCode.Value = $LASTEXITCODE", native_call)
+    finally_start = helper.index("} finally {", exit_capture)
+    path_restore = helper.index("$env:PATH = $inheritedPath", finally_start)
 
     assert (
-        trusted_path_start
-        < inherited_path_save
+        inherited_path_save
         < try_start
         < path_assignment
-        < pyinstaller_call
+        < native_call
+        < exit_capture
         < finally_start
         < path_restore
     )
