@@ -8,6 +8,7 @@ import os
 import secrets
 import shutil
 import sqlite3
+from collections import Counter
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from ctypes import wintypes
@@ -1061,7 +1062,7 @@ def _foreign_key_definitions_valid(
                     str(row[7]).upper(),
                 )
             )
-        actual: set[ForeignKeyDefinition] = set()
+        actual: list[ForeignKeyDefinition] = []
         for parts in grouped.values():
             ordered = sorted(parts)
             if [part[0] for part in ordered] != list(range(len(ordered))):
@@ -1073,7 +1074,7 @@ def _foreign_key_definitions_valid(
                 for part in ordered[1:]
             ):
                 return False
-            actual.add(
+            actual.append(
                 (
                     first[1],
                     tuple((part[2], part[3]) for part in ordered),
@@ -1082,7 +1083,7 @@ def _foreign_key_definitions_valid(
                     first[6],
                 )
             )
-        if frozenset(actual) != expected:
+        if Counter(actual) != Counter(expected):
             return False
     return True
 

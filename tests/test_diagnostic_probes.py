@@ -607,6 +607,7 @@ def _create_task_probe_schema(
     *,
     missing_column: str | None = None,
     task_foreign_key: str | None = "REFERENCES tasks(id) ON DELETE CASCADE",
+    duplicate_task_foreign_key: bool = False,
 ) -> None:
     task_columns = [
         "id TEXT PRIMARY KEY",
@@ -627,7 +628,10 @@ def _create_task_probe_schema(
         selected = task_columns if table == "tasks" else item_columns
         selected[:] = [value for value in selected if not value.startswith(f"{column} ")]
     if task_foreign_key is not None and missing_column != "media_items.task_id":
-        item_columns.append(f"FOREIGN KEY(task_id) {task_foreign_key}")
+        foreign_key = f"FOREIGN KEY(task_id) {task_foreign_key}"
+        item_columns.extend(
+            [foreign_key] * (2 if duplicate_task_foreign_key else 1)
+        )
     with sqlite3.connect(database) as connection:
         connection.executescript(
             f"CREATE TABLE tasks ({','.join(task_columns)});"
@@ -663,6 +667,19 @@ def test_task_database_probe_rejects_missing_or_wrong_foreign_key_definition(
 ) -> None:
     database = tmp_path / "tasks-wrong-foreign-key.sqlite3"
     _create_task_probe_schema(database, task_foreign_key=task_foreign_key)
+
+    result = probe_task_database(database)
+
+    assert result.status is DiagnosticStatus.FAILED
+    assert result.code == "database-semantics-invalid"
+    assert result.metrics["foreignKeysValid"] is False
+
+
+def test_task_database_probe_rejects_duplicate_foreign_key_definition(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "tasks-duplicate-foreign-key.sqlite3"
+    _create_task_probe_schema(database, duplicate_task_foreign_key=True)
 
     result = probe_task_database(database)
 
