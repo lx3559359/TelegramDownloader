@@ -35,6 +35,44 @@ def test_build_contract_uses_onedir_and_project_local_workpaths() -> None:
     assert "LOCALAPPDATA" in test
 
 
+def test_pyinstaller_build_uses_trusted_path_and_restores_inherited_path() -> None:
+    root = Path(__file__).parents[1]
+    script = (root / "scripts" / "build.ps1").read_text(encoding="utf-8")
+
+    assert "$inheritedPath = $env:PATH" in script
+    assert "import sys; print(sys.base_prefix)" in script
+    trusted_path_start = script.index("$trustedBuildPath = @(")
+    trusted_path_end = script.index(") | Where-Object", trusted_path_start)
+    trusted_path = script[trusted_path_start:trusted_path_end]
+    for required in (
+        "(Split-Path -Parent $python)",
+        "$pythonBasePrefix",
+        "(Join-Path $pythonBasePrefix 'DLLs')",
+        "[Environment+SpecialFolder]::System",
+        "[Environment+SpecialFolder]::Windows",
+    ):
+        assert required in trusted_path
+
+    path_assignment = script.index(
+        "$env:PATH = $trustedBuildPath -join [IO.Path]::PathSeparator"
+    )
+    pyinstaller_call = script.index("& $python -m PyInstaller")
+    path_restore = script.index("$env:PATH = $inheritedPath", pyinstaller_call)
+    inherited_path_save = script.index("$inheritedPath = $env:PATH")
+    try_start = script.index("try {", inherited_path_save, path_assignment)
+    finally_start = script.index("} finally {", pyinstaller_call, path_restore)
+
+    assert (
+        trusted_path_start
+        < inherited_path_save
+        < try_start
+        < path_assignment
+        < pyinstaller_call
+        < finally_start
+        < path_restore
+    )
+
+
 def test_chinese_guide_documents_portable_data_and_security() -> None:
     readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
 

@@ -87,8 +87,27 @@ try {
     New-Item -ItemType Directory -Force -Path $work, $dist | Out-Null
 
     $python = Join-Path $projectRoot '.venv\Scripts\python.exe'
-    & $python -m PyInstaller --noconfirm --clean --workpath $work --distpath $dist (Join-Path $projectRoot 'TelegramDownloader.spec')
+    $pythonBasePrefix = (& $python -c "import sys; print(sys.base_prefix)").Trim()
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $trustedBuildPath = @(
+        (Split-Path -Parent $python)
+        $pythonBasePrefix
+        (Join-Path $pythonBasePrefix 'DLLs')
+        [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
+        [Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)
+    ) | Where-Object {
+        $_ -and (Test-Path -LiteralPath $_ -PathType Container)
+    } | Select-Object -Unique
+    $inheritedPath = $env:PATH
+    $pyinstallerExitCode = 0
+    try {
+        $env:PATH = $trustedBuildPath -join [IO.Path]::PathSeparator
+        & $python -m PyInstaller --noconfirm --clean --workpath $work --distpath $dist (Join-Path $projectRoot 'TelegramDownloader.spec')
+        $pyinstallerExitCode = $LASTEXITCODE
+    } finally {
+        $env:PATH = $inheritedPath
+    }
+    if ($pyinstallerExitCode -ne 0) { exit $pyinstallerExitCode }
 
     $appDir = Assert-ProjectChild (Join-Path $dist 'TelegramDownloader')
     $helperExe = $helperOutput
