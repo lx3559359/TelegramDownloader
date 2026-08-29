@@ -413,6 +413,7 @@ def test_hardened_diagnostic_variants_round_trip_without_private_data(
             CREATE TABLE tasks (
                 id TEXT,
                 source_kind TEXT,
+                media_kinds TEXT,
                 status TEXT,
                 pause_reason TEXT
             );
@@ -436,10 +437,34 @@ def test_hardened_diagnostic_variants_round_trip_without_private_data(
                 peer_ref TEXT,
                 kind TEXT
             );
-            CREATE TABLE search_sessions (id TEXT, status TEXT, scope TEXT);
-            CREATE TABLE search_results (id TEXT, media_kind TEXT);
-            CREATE TABLE subscription_rules (id TEXT, state TEXT);
-            CREATE TABLE subscription_runs (id TEXT, keyword_hits INTEGER, status TEXT);
+            CREATE TABLE search_sessions (
+                id TEXT,
+                account_id TEXT,
+                status TEXT,
+                scope TEXT,
+                media_kinds TEXT
+            );
+            CREATE TABLE search_results (
+                id TEXT,
+                search_id TEXT,
+                media_kind TEXT,
+                source_kind TEXT
+            );
+            CREATE TABLE subscription_rules (
+                id TEXT,
+                account_id TEXT,
+                peer_ref TEXT,
+                state TEXT,
+                match_mode TEXT,
+                media_kinds TEXT
+            );
+            CREATE TABLE subscription_runs (
+                id TEXT,
+                rule_id TEXT,
+                account_id TEXT,
+                keyword_hits INTEGER,
+                status TEXT
+            );
             PRAGMA user_version={CATALOG_SCHEMA_VERSION};
             """,
             "账号内容数据库包含无效关系或状态",

@@ -16,7 +16,12 @@ from typing import Protocol
 from uuid import uuid4
 
 from telegram_downloader.catalog import CATALOG_SCHEMA_VERSION
-from telegram_downloader.content import DialogKind, SearchScope, SearchStatus
+from telegram_downloader.content import (
+    ContentSourceKind,
+    DialogKind,
+    SearchScope,
+    SearchStatus,
+)
 from telegram_downloader.diagnostics import DiagnosticResult, DiagnosticStatus
 from telegram_downloader.domain import (
     IntegrityStatus,
@@ -33,11 +38,143 @@ from telegram_downloader.gateway import (
     TransientNetworkError,
 )
 from telegram_downloader.paths import PortablePaths
+from telegram_downloader.subscription_matching import SubscriptionMatchMode
 from telegram_downloader.subscriptions import SubscriptionRunStatus, SubscriptionState
 from telegram_downloader.update_sources import SourceCheck, SourceStatus, UpdateSourceId
 
 MIB = 1024 * 1024
 GIB = 1024 * MIB
+
+type ForeignKeyColumns = tuple[tuple[str, str], ...]
+type ForeignKeyDefinition = tuple[
+    str,
+    ForeignKeyColumns,
+    str,
+    str,
+    str,
+]
+type ForeignKeyContract = Mapping[str, frozenset[ForeignKeyDefinition]]
+type EnumSetContract = tuple[str, str, frozenset[str], bool]
+
+_MEDIA_KIND_VALUES = frozenset(value.value for value in MediaKind)
+_TASK_REQUIRED_COLUMNS = {
+    "tasks": {"id", "source_kind", "media_kinds", "status", "pause_reason"},
+    "media_items": {
+        "id",
+        "task_id",
+        "media_kind",
+        "status",
+        "integrity_status",
+    },
+}
+_CONTENT_REQUIRED_COLUMNS = {
+    "accounts": {"account_id"},
+    "dialogs": {"account_id", "peer_ref", "kind"},
+    "search_sessions": {"id", "account_id", "status", "scope", "media_kinds"},
+    "search_results": {"id", "search_id", "media_kind", "source_kind"},
+    "subscription_rules": {
+        "id",
+        "account_id",
+        "peer_ref",
+        "state",
+        "match_mode",
+        "media_kinds",
+    },
+    "subscription_runs": {"id", "rule_id", "account_id", "keyword_hits", "status"},
+}
+_TASK_FOREIGN_KEYS: ForeignKeyContract = {
+    "tasks": frozenset(),
+    "media_items": frozenset(
+        {
+            (
+                "tasks",
+                (("task_id", "id"),),
+                "NO ACTION",
+                "CASCADE",
+                "NONE",
+            )
+        }
+    ),
+}
+_CONTENT_FOREIGN_KEYS: ForeignKeyContract = {
+    "accounts": frozenset(),
+    "dialogs": frozenset(
+        {
+            (
+                "accounts",
+                (("account_id", "account_id"),),
+                "NO ACTION",
+                "CASCADE",
+                "NONE",
+            )
+        }
+    ),
+    "search_sessions": frozenset(
+        {
+            (
+                "accounts",
+                (("account_id", "account_id"),),
+                "NO ACTION",
+                "CASCADE",
+                "NONE",
+            )
+        }
+    ),
+    "search_results": frozenset(
+        {
+            (
+                "search_sessions",
+                (("search_id", "id"),),
+                "NO ACTION",
+                "CASCADE",
+                "NONE",
+            )
+        }
+    ),
+    "subscription_rules": frozenset(
+        {
+            (
+                "accounts",
+                (("account_id", "account_id"),),
+                "NO ACTION",
+                "CASCADE",
+                "NONE",
+            ),
+            (
+                "dialogs",
+                (("account_id", "account_id"), ("peer_ref", "peer_ref")),
+                "NO ACTION",
+                "NO ACTION",
+                "NONE",
+            ),
+        }
+    ),
+    "subscription_runs": frozenset(
+        {
+            (
+                "accounts",
+                (("account_id", "account_id"),),
+                "NO ACTION",
+                "CASCADE",
+                "NONE",
+            ),
+            (
+                "subscription_rules",
+                (("rule_id", "id"),),
+                "NO ACTION",
+                "CASCADE",
+                "NONE",
+            ),
+        }
+    ),
+}
+_TASK_ENUM_SETS: tuple[EnumSetContract, ...] = (
+    ("tasks", "media_kinds", _MEDIA_KIND_VALUES, True),
+)
+_CONTENT_ENUM_SETS: tuple[EnumSetContract, ...] = (
+    ("search_sessions", "media_kinds", _MEDIA_KIND_VALUES, False),
+    ("subscription_rules", "media_kinds", _MEDIA_KIND_VALUES, False),
+)
 
 
 class DiskUsage(Protocol):
@@ -358,18 +495,7 @@ def probe_task_database(database: Path) -> DiagnosticResult:
         try:
             if not _database_integrity_ok(connection):
                 return _database_failure("task-database", title, "database-corrupt")
-            compatible = _schema_contains(
-                connection,
-                {
-                    "tasks": {"id", "source_kind", "status", "pause_reason"},
-                    "media_items": {
-                        "id",
-                        "media_kind",
-                        "status",
-                        "integrity_status",
-                    },
-                },
-            )
+            compatible = _schema_contains(connection, _TASK_REQUIRED_COLUMNS)
         except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
             return _database_failure("task-database", title, "database-unreadable")
         if not compatible:
@@ -382,7 +508,12 @@ def probe_task_database(database: Path) -> DiagnosticResult:
                 {"schemaCompatible": False},
             )
         try:
-            foreign_keys_valid = _foreign_keys_valid(connection)
+            definitions_valid = _foreign_key_definitions_valid(
+                connection,
+                _TASK_FOREIGN_KEYS,
+            )
+            references_valid = _foreign_keys_valid(connection)
+            foreign_keys_valid = definitions_valid and references_valid
             state_values_valid = all(
                 (
                     _column_values_valid(
@@ -422,6 +553,7 @@ def probe_task_database(database: Path) -> DiagnosticResult:
                         "integrity_status",
                         tuple(value.value for value in IntegrityStatus),
                     ),
+                    _enum_sets_valid(connection, _TASK_ENUM_SETS),
                 )
             )
             metrics: dict[str, bool | int] = {
@@ -497,17 +629,9 @@ def probe_content_database(database: Path) -> DiagnosticResult:
             if not _database_integrity_ok(connection):
                 return _database_failure("content-database", title, "database-corrupt")
             schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            tables = {
-                "accounts": {"account_id"},
-                "dialogs": {"account_id", "peer_ref", "kind"},
-                "search_sessions": {"id", "status", "scope"},
-                "search_results": {"id", "media_kind"},
-                "subscription_rules": {"id", "state"},
-                "subscription_runs": {"id", "keyword_hits", "status"},
-            }
             compatible = (
                 schema_version == CATALOG_SCHEMA_VERSION
-                and _schema_contains(connection, tables)
+                and _schema_contains(connection, _CONTENT_REQUIRED_COLUMNS)
             )
         except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
             return _database_failure("content-database", title, "database-unreadable")
@@ -521,7 +645,12 @@ def probe_content_database(database: Path) -> DiagnosticResult:
                 {"schemaVersion": schema_version, "schemaCompatible": False},
             )
         try:
-            foreign_keys_valid = _foreign_keys_valid(connection)
+            definitions_valid = _foreign_key_definitions_valid(
+                connection,
+                _CONTENT_FOREIGN_KEYS,
+            )
+            references_valid = _foreign_keys_valid(connection)
+            foreign_keys_valid = definitions_valid and references_valid
             state_values_valid = all(
                 (
                     _column_values_valid(
@@ -550,9 +679,21 @@ def probe_content_database(database: Path) -> DiagnosticResult:
                     ),
                     _column_values_valid(
                         connection,
+                        "search_results",
+                        "source_kind",
+                        tuple(value.value for value in ContentSourceKind),
+                    ),
+                    _column_values_valid(
+                        connection,
                         "subscription_rules",
                         "state",
                         tuple(value.value for value in SubscriptionState),
+                    ),
+                    _column_values_valid(
+                        connection,
+                        "subscription_rules",
+                        "match_mode",
+                        tuple(value.value for value in SubscriptionMatchMode),
                     ),
                     _column_values_valid(
                         connection,
@@ -560,6 +701,7 @@ def probe_content_database(database: Path) -> DiagnosticResult:
                         "status",
                         tuple(value.value for value in SubscriptionRunStatus),
                     ),
+                    _enum_sets_valid(connection, _CONTENT_ENUM_SETS),
                 )
             )
             metrics = {
@@ -896,6 +1038,68 @@ def _database_integrity_ok(connection: sqlite3.Connection) -> bool:
 
 def _foreign_keys_valid(connection: sqlite3.Connection) -> bool:
     return connection.execute("PRAGMA foreign_key_check").fetchone() is None
+
+
+def _foreign_key_definitions_valid(
+    connection: sqlite3.Connection,
+    contract: ForeignKeyContract,
+) -> bool:
+    for table, expected in contract.items():
+        grouped: dict[int, list[tuple[int, str, str, str, str, str, str]]] = {}
+        for row in connection.execute(f"PRAGMA foreign_key_list({table})"):
+            if len(row) < 8:
+                return False
+            foreign_key_id = int(row[0])
+            grouped.setdefault(foreign_key_id, []).append(
+                (
+                    int(row[1]),
+                    str(row[2]),
+                    str(row[3]),
+                    str(row[4]),
+                    str(row[5]).upper(),
+                    str(row[6]).upper(),
+                    str(row[7]).upper(),
+                )
+            )
+        actual: set[ForeignKeyDefinition] = set()
+        for parts in grouped.values():
+            ordered = sorted(parts)
+            if [part[0] for part in ordered] != list(range(len(ordered))):
+                return False
+            first = ordered[0]
+            if any(
+                (part[1], part[4], part[5], part[6])
+                != (first[1], first[4], first[5], first[6])
+                for part in ordered[1:]
+            ):
+                return False
+            actual.add(
+                (
+                    first[1],
+                    tuple((part[2], part[3]) for part in ordered),
+                    first[4],
+                    first[5],
+                    first[6],
+                )
+            )
+        if frozenset(actual) != expected:
+            return False
+    return True
+
+
+def _enum_sets_valid(
+    connection: sqlite3.Connection,
+    contracts: tuple[EnumSetContract, ...],
+) -> bool:
+    for table, column, allowed, allow_empty in contracts:
+        for row in connection.execute(f"SELECT {column} FROM {table}"):
+            raw = row[0]
+            if not isinstance(raw, str):
+                return False
+            values = frozenset(value for value in raw.split(",") if value)
+            if (not allow_empty and not values) or not values <= allowed:
+                return False
+    return True
 
 
 def _column_values_valid(
