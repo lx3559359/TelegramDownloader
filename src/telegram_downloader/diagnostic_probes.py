@@ -58,6 +58,8 @@ type ForeignKeyContract = Mapping[str, frozenset[ForeignKeyDefinition]]
 type EnumSetContract = tuple[str, str, frozenset[str], bool]
 
 _MEDIA_KIND_VALUES = frozenset(value.value for value in MediaKind)
+_ENUM_SET_TEXT_LENGTH_LIMIT = 256
+_ENUM_SET_TOKEN_COUNT_LIMIT = len(MediaKind)
 _TASK_REQUIRED_COLUMNS = {
     "tasks": {"id", "source_kind", "media_kinds", "status", "pause_reason"},
     "media_items": {
@@ -515,47 +517,45 @@ def probe_task_database(database: Path) -> DiagnosticResult:
             )
             references_valid = _foreign_keys_valid(connection)
             foreign_keys_valid = definitions_valid and references_valid
-            state_values_valid = all(
-                (
-                    _column_values_valid(
-                        connection,
-                        "tasks",
-                        "source_kind",
-                        tuple(value.value for value in SourceKind),
-                    ),
-                    _column_values_valid(
-                        connection,
-                        "tasks",
-                        "status",
-                        tuple(value.value for value in TaskStatus),
-                    ),
-                    _column_values_valid(
-                        connection,
-                        "tasks",
-                        "pause_reason",
-                        tuple(value.value for value in PauseReason),
-                        nullable=True,
-                    ),
-                    _column_values_valid(
-                        connection,
-                        "media_items",
-                        "media_kind",
-                        tuple(value.value for value in MediaKind),
-                    ),
-                    _column_values_valid(
-                        connection,
-                        "media_items",
-                        "status",
-                        tuple(value.value for value in ItemStatus),
-                    ),
-                    _column_values_valid(
-                        connection,
-                        "media_items",
-                        "integrity_status",
-                        tuple(value.value for value in IntegrityStatus),
-                    ),
-                    _enum_sets_valid(connection, _TASK_ENUM_SETS),
+            state_values_valid = (
+                _column_values_valid(
+                    connection,
+                    "tasks",
+                    "source_kind",
+                    tuple(value.value for value in SourceKind),
                 )
+                and _column_values_valid(
+                    connection,
+                    "tasks",
+                    "status",
+                    tuple(value.value for value in TaskStatus),
+                )
+                and _column_values_valid(
+                    connection,
+                    "tasks",
+                    "pause_reason",
+                    tuple(value.value for value in PauseReason),
+                    nullable=True,
+                )
+                and _column_values_valid(
+                    connection,
+                    "media_items",
+                    "media_kind",
+                    tuple(value.value for value in MediaKind),
+                )
+                and _column_values_valid(
+                    connection,
+                    "media_items",
+                    "status",
+                    tuple(value.value for value in ItemStatus),
+                )
+                and _column_values_valid(
+                    connection,
+                    "media_items",
+                    "integrity_status",
+                    tuple(value.value for value in IntegrityStatus),
+                )
+                and _enum_sets_valid(connection, _TASK_ENUM_SETS)
             )
             metrics: dict[str, bool | int] = {
                 "taskCount": _row_count(connection, "tasks"),
@@ -652,58 +652,56 @@ def probe_content_database(database: Path) -> DiagnosticResult:
             )
             references_valid = _foreign_keys_valid(connection)
             foreign_keys_valid = definitions_valid and references_valid
-            state_values_valid = all(
-                (
-                    _column_values_valid(
-                        connection,
-                        "dialogs",
-                        "kind",
-                        tuple(value.value for value in DialogKind),
-                    ),
-                    _column_values_valid(
-                        connection,
-                        "search_sessions",
-                        "status",
-                        tuple(value.value for value in SearchStatus),
-                    ),
-                    _column_values_valid(
-                        connection,
-                        "search_sessions",
-                        "scope",
-                        tuple(value.value for value in SearchScope),
-                    ),
-                    _column_values_valid(
-                        connection,
-                        "search_results",
-                        "media_kind",
-                        tuple(value.value for value in MediaKind),
-                    ),
-                    _column_values_valid(
-                        connection,
-                        "search_results",
-                        "source_kind",
-                        tuple(value.value for value in ContentSourceKind),
-                    ),
-                    _column_values_valid(
-                        connection,
-                        "subscription_rules",
-                        "state",
-                        tuple(value.value for value in SubscriptionState),
-                    ),
-                    _column_values_valid(
-                        connection,
-                        "subscription_rules",
-                        "match_mode",
-                        tuple(value.value for value in SubscriptionMatchMode),
-                    ),
-                    _column_values_valid(
-                        connection,
-                        "subscription_runs",
-                        "status",
-                        tuple(value.value for value in SubscriptionRunStatus),
-                    ),
-                    _enum_sets_valid(connection, _CONTENT_ENUM_SETS),
+            state_values_valid = (
+                _column_values_valid(
+                    connection,
+                    "dialogs",
+                    "kind",
+                    tuple(value.value for value in DialogKind),
                 )
+                and _column_values_valid(
+                    connection,
+                    "search_sessions",
+                    "status",
+                    tuple(value.value for value in SearchStatus),
+                )
+                and _column_values_valid(
+                    connection,
+                    "search_sessions",
+                    "scope",
+                    tuple(value.value for value in SearchScope),
+                )
+                and _column_values_valid(
+                    connection,
+                    "search_results",
+                    "media_kind",
+                    tuple(value.value for value in MediaKind),
+                )
+                and _column_values_valid(
+                    connection,
+                    "search_results",
+                    "source_kind",
+                    tuple(value.value for value in ContentSourceKind),
+                )
+                and _column_values_valid(
+                    connection,
+                    "subscription_rules",
+                    "state",
+                    tuple(value.value for value in SubscriptionState),
+                )
+                and _column_values_valid(
+                    connection,
+                    "subscription_rules",
+                    "match_mode",
+                    tuple(value.value for value in SubscriptionMatchMode),
+                )
+                and _column_values_valid(
+                    connection,
+                    "subscription_runs",
+                    "status",
+                    tuple(value.value for value in SubscriptionRunStatus),
+                )
+                and _enum_sets_valid(connection, _CONTENT_ENUM_SETS)
             )
             metrics = {
                 "schemaVersion": schema_version,
@@ -1093,11 +1091,21 @@ def _enum_sets_valid(
     contracts: tuple[EnumSetContract, ...],
 ) -> bool:
     for table, column, allowed, allow_empty in contracts:
+        invalid_storage = connection.execute(
+            f"SELECT 1 FROM {table} "
+            f"WHERE typeof({column}) <> 'text' OR length({column}) > ? LIMIT 1",
+            (_ENUM_SET_TEXT_LENGTH_LIMIT,),
+        ).fetchone()
+        if invalid_storage is not None:
+            return False
         for row in connection.execute(f"SELECT {column} FROM {table}"):
             raw = row[0]
             if not isinstance(raw, str):
                 return False
-            values = frozenset(value for value in raw.split(",") if value)
+            tokens = raw.split(",")
+            if len(tokens) > _ENUM_SET_TOKEN_COUNT_LIMIT:
+                return False
+            values = frozenset(value for value in tokens if value)
             if (not allow_empty and not values) or not values <= allowed:
                 return False
     return True

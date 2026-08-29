@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import telegram_downloader.diagnostic_probes as diagnostic_probes
 from telegram_downloader.catalog import CATALOG_SCHEMA_VERSION, CatalogRepository
 from telegram_downloader.content import (
     AccountProfile,
@@ -608,11 +609,12 @@ def _create_task_probe_schema(
     missing_column: str | None = None,
     task_foreign_key: str | None = "REFERENCES tasks(id) ON DELETE CASCADE",
     duplicate_task_foreign_key: bool = False,
+    task_media_kinds_declaration: str = "TEXT NOT NULL",
 ) -> None:
     task_columns = [
         "id TEXT PRIMARY KEY",
         "source_kind TEXT NOT NULL",
-        "media_kinds TEXT NOT NULL",
+        f"media_kinds {task_media_kinds_declaration}",
         "status TEXT NOT NULL",
         "pause_reason TEXT",
     ]
@@ -719,6 +721,106 @@ def test_task_database_probe_rejects_private_unknown_media_kind_set(
     assert result.code == "database-semantics-invalid"
     assert result.metrics["stateValuesValid"] is False
     assert private_token not in result.summary + result.code + repr(dict(result.metrics))
+
+
+def test_task_database_probe_rejects_oversized_repeated_valid_media_kinds(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "tasks.sqlite3"
+    _create_task_probe_schema(database)
+    oversized = ",".join([MediaKind.VIDEO.value] * 1024)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO tasks(id, source_kind, media_kinds, status) "
+            "VALUES(?, ?, ?, ?)",
+            (
+                "task-oversized-media-kinds",
+                SourceKind.CHANNEL_OR_GROUP.value,
+                oversized,
+                TaskStatus.QUEUED.value,
+            ),
+        )
+
+    result = probe_task_database(database)
+
+    assert result.status is DiagnosticStatus.FAILED
+    assert result.code == "database-semantics-invalid"
+    assert result.metrics["stateValuesValid"] is False
+    assert oversized not in result.summary + result.code + repr(dict(result.metrics))
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "declaration", "private_marker"),
+    [
+        (None, "TEXT", None),
+        (sqlite3.Binary(b"private-media-kinds-blob"), "TEXT NOT NULL", "private-media-kinds-blob"),
+    ],
+    ids=["null", "blob"],
+)
+def test_task_database_probe_rejects_non_text_media_kind_set(
+    tmp_path: Path,
+    raw_value: object,
+    declaration: str,
+    private_marker: str | None,
+) -> None:
+    database = tmp_path / "tasks-non-text-media-kinds.sqlite3"
+    _create_task_probe_schema(
+        database,
+        task_media_kinds_declaration=declaration,
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO tasks(id, source_kind, media_kinds, status) "
+            "VALUES(?, ?, ?, ?)",
+            (
+                "task-non-text-media-kinds",
+                SourceKind.CHANNEL_OR_GROUP.value,
+                raw_value,
+                TaskStatus.QUEUED.value,
+            ),
+        )
+
+    result = probe_task_database(database)
+
+    assert result.status is DiagnosticStatus.FAILED
+    assert result.code == "database-semantics-invalid"
+    assert result.metrics["stateValuesValid"] is False
+    if private_marker is not None:
+        assert private_marker not in result.summary + repr(dict(result.metrics))
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected_status", "expected_state_values_valid"),
+    [
+        (",,,", DiagnosticStatus.PASSED, True),
+        ("   ", DiagnosticStatus.FAILED, False),
+    ],
+    ids=["empty-tokens", "whitespace-token"],
+)
+def test_task_database_probe_handles_empty_and_whitespace_media_kind_tokens(
+    tmp_path: Path,
+    raw_value: str,
+    expected_status: DiagnosticStatus,
+    expected_state_values_valid: bool,
+) -> None:
+    database = tmp_path / "tasks-media-kind-token-boundary.sqlite3"
+    _create_task_probe_schema(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO tasks(id, source_kind, media_kinds, status) "
+            "VALUES(?, ?, ?, ?)",
+            (
+                "task-media-kind-token-boundary",
+                SourceKind.CHANNEL_OR_GROUP.value,
+                raw_value,
+                TaskStatus.QUEUED.value,
+            ),
+        )
+
+    result = probe_task_database(database)
+
+    assert result.status is expected_status
+    assert result.metrics["stateValuesValid"] is expected_state_values_valid
 
 
 def test_task_database_probe_accepts_runtime_readable_empty_media_kind_set(
@@ -963,6 +1065,7 @@ def _create_content_probe_schema(
     *,
     missing_column: str | None = None,
     broken_foreign_key: str | None = None,
+    search_media_kinds_declaration: str = "TEXT NOT NULL",
 ) -> None:
     columns = {
         "accounts": ["account_id TEXT PRIMARY KEY"],
@@ -977,7 +1080,7 @@ def _create_content_probe_schema(
             "account_id TEXT NOT NULL",
             "status TEXT NOT NULL",
             "scope TEXT NOT NULL",
-            "media_kinds TEXT NOT NULL",
+            f"media_kinds {search_media_kinds_declaration}",
         ],
         "search_results": [
             "id TEXT PRIMARY KEY",
@@ -1196,6 +1299,95 @@ def test_content_probe_rejects_private_unknown_runtime_value(
     assert private_token not in result.summary + result.code + repr(dict(result.metrics))
 
 
+def test_content_probe_rejects_oversized_repeated_valid_media_kinds(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "catalog.sqlite3"
+    _seed_content_domain_rows(database)
+    oversized = ",".join([MediaKind.VIDEO.value] * 1024)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE search_sessions SET media_kinds=?",
+            (oversized,),
+        )
+
+    result = probe_content_database(database)
+
+    assert result.status is DiagnosticStatus.FAILED
+    assert result.code == "database-semantics-invalid"
+    assert result.metrics["stateValuesValid"] is False
+    assert oversized not in result.summary + result.code + repr(dict(result.metrics))
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "declaration", "private_marker"),
+    [
+        (None, "TEXT", None),
+        (
+            sqlite3.Binary(b"private-search-media-kinds-blob"),
+            "TEXT NOT NULL",
+            "private-search-media-kinds-blob",
+        ),
+    ],
+    ids=["null", "blob"],
+)
+def test_content_probe_rejects_non_text_media_kind_set(
+    tmp_path: Path,
+    raw_value: object,
+    declaration: str,
+    private_marker: str | None,
+) -> None:
+    database = tmp_path / "content-non-text-media-kinds.sqlite3"
+    _create_content_probe_schema(
+        database,
+        search_media_kinds_declaration=declaration,
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO accounts(account_id) VALUES(?)",
+            ("private-account",),
+        )
+        connection.execute(
+            "INSERT INTO search_sessions(id, account_id, status, scope, media_kinds) "
+            "VALUES(?, ?, ?, ?, ?)",
+            (
+                "search-non-text-media-kinds",
+                "private-account",
+                "running",
+                "single_dialog",
+                raw_value,
+            ),
+        )
+
+    result = probe_content_database(database)
+
+    assert result.status is DiagnosticStatus.FAILED
+    assert result.code == "database-semantics-invalid"
+    assert result.metrics["stateValuesValid"] is False
+    if private_marker is not None:
+        assert private_marker not in result.summary + repr(dict(result.metrics))
+
+
+@pytest.mark.parametrize("raw_value", [",,,", "   "], ids=["empty-tokens", "whitespace-token"])
+def test_content_probe_rejects_empty_and_whitespace_media_kind_tokens(
+    tmp_path: Path,
+    raw_value: str,
+) -> None:
+    database = tmp_path / "catalog.sqlite3"
+    _seed_content_domain_rows(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE search_sessions SET media_kinds=?",
+            (raw_value,),
+        )
+
+    result = probe_content_database(database)
+
+    assert result.status is DiagnosticStatus.FAILED
+    assert result.code == "database-semantics-invalid"
+    assert result.metrics["stateValuesValid"] is False
+
+
 @pytest.mark.parametrize(
     ("table", "column"),
     [
@@ -1218,6 +1410,53 @@ def test_content_probe_rejects_runtime_unreadable_empty_media_kind_set(
     assert result.status is DiagnosticStatus.FAILED
     assert result.code == "database-semantics-invalid"
     assert result.metrics["stateValuesValid"] is False
+
+
+@pytest.mark.parametrize(
+    ("probe", "database_name", "expected_first_check"),
+    [
+        (probe_task_database, "tasks.sqlite3", ("tasks", "source_kind")),
+        (probe_content_database, "catalog.sqlite3", ("dialogs", "kind")),
+    ],
+)
+def test_database_state_value_validation_short_circuits_after_first_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    probe,
+    database_name: str,
+    expected_first_check: tuple[str, str],
+) -> None:
+    database = tmp_path / database_name
+    if probe is probe_task_database:
+        TaskRepository(database).initialize()
+    else:
+        CatalogRepository(database).initialize()
+    checks: list[tuple[str, str]] = []
+
+    def reject_column(
+        _connection,
+        table: str,
+        column: str,
+        _allowed,
+        *,
+        nullable: bool = False,
+    ) -> bool:
+        del nullable
+        checks.append((table, column))
+        return False
+
+    def record_enum_sets(_connection, _contracts) -> bool:
+        checks.append(("enum-sets", "all"))
+        return True
+
+    monkeypatch.setattr(diagnostic_probes, "_column_values_valid", reject_column)
+    monkeypatch.setattr(diagnostic_probes, "_enum_sets_valid", record_enum_sets)
+
+    result = probe(database)
+
+    assert result.status is DiagnosticStatus.FAILED
+    assert result.metrics["stateValuesValid"] is False
+    assert checks == [expected_first_check]
 
 
 @pytest.mark.parametrize("probe", [probe_task_database, probe_content_database])
