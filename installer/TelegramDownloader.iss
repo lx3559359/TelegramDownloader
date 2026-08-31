@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "0.18.4"
+  #define AppVersion "0.19.0"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\dist\TelegramDownloader"

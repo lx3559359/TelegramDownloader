@@ -320,7 +320,7 @@ def test_subscription_modules_do_not_escape_project_local_storage() -> None:
         assert all(value not in source for value in diagnostic_forbidden), module.name
 
 
-def test_v0184_version_and_runtime_contracts_are_consistent() -> None:
+def test_v0190_version_and_runtime_contracts_are_consistent() -> None:
     root = Path(__file__).parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     package_init = (root / "src/telegram_downloader/__init__.py").read_text(
@@ -337,11 +337,11 @@ def test_v0184_version_and_runtime_contracts_are_consistent() -> None:
         encoding="utf-8"
     )
     readme = (root / "README.md").read_text(encoding="utf-8")
-    release_notes = root / "docs/releases/v0.18.4.md"
+    release_notes = root / "docs/releases/v0.19.0.md"
 
-    assert project["project"]["version"] == "0.18.4"
-    assert '__version__ = "0.18.4"' in package_init
-    assert '#define AppVersion "0.18.4"' in installer
+    assert project["project"]["version"] == "0.19.0"
+    assert '__version__ = "0.19.0"' in package_init
+    assert '#define AppVersion "0.19.0"' in installer
     assert "qrcode==8.2" in requirements
     assert '"qrcode"' in spec
     assert "app_version=__version__" in gateway
@@ -371,16 +371,21 @@ def test_v0184_version_and_runtime_contracts_are_consistent() -> None:
     assert '"--background"' in entry
     assert release_notes.is_file()
     notes = release_notes.read_text(encoding="utf-8")
-    assert "# TG 快取 v0.18.4" in notes
+    assert "# TG 快取 v0.19.0" in notes
     assert all(
         term in notes
         for term in (
-            "10,000",
-            "50,000",
-            "150 ms",
-            "500 ms",
-            "5 秒",
-            "键集分页",
+            "--self-test",
+            "--update-health-check",
+            "单实例",
+            "业务状态",
+            "WAL",
+            "外键",
+            "凭据",
+            "下载目录",
+            "20 秒",
+            "正在取消",
+            "脱敏",
             "兼容性",
             "隐私边界",
         )
