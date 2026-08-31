@@ -543,7 +543,7 @@ async def test_slow_repository_keeps_event_loop_responsive_and_coalesces_progres
     paths.ensure_layout()
     target = paths.downloads / "responsive.bin"
     repository = SlowPersistenceRepository()
-    persistence = DownloadPersistenceCoordinator(repository)
+    persistence = DownloadPersistenceCoordinator(repository, flush_interval=60)
     event_loop_thread = threading.get_ident()
     media = MediaDownloader(
         FakeGateway([b"x"] * 20),
@@ -562,7 +562,7 @@ async def test_slow_repository_keeps_event_loop_responsive_and_coalesces_progres
 
     assert repository.repository_threads
     assert event_loop_thread not in repository.repository_threads
-    assert repository.media_write_calls <= 4
+    assert repository.media_write_calls == 3
     assert repository.terminal_committed is True
 
 

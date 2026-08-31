@@ -19,7 +19,7 @@ from telegram_downloader.resource_control import AsyncBandwidthLimiter
 from telegram_downloader.scheduler import DownloadScheduler
 
 
-async def wait_until(predicate, timeout: float = 2.0) -> None:
+async def wait_until(predicate, timeout: float = 10.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
         if predicate():

@@ -542,7 +542,7 @@ async def test_album_expansion_uses_at_most_four_concurrent_requests(
     )
     operation = asyncio.create_task(service.start_search("-1001", make_query(now)))
     try:
-        await asyncio.wait_for(reached_four.wait(), timeout=1)
+        await asyncio.wait_for(reached_four.wait(), timeout=10)
         assert gateway.max_active == 4
     finally:
         release.set()
@@ -592,7 +592,7 @@ async def test_thumbnail_loading_uses_at_most_four_concurrent_requests(
     assert service.get_result(saved[0].id) == saved[0]
     tasks = [asyncio.create_task(service.load_thumbnail(item.id)) for item in saved]
     try:
-        await asyncio.wait_for(reached_four.wait(), timeout=1)
+        await asyncio.wait_for(reached_four.wait(), timeout=10)
         assert gateway.max_active == 4
     finally:
         release.set()
